@@ -44,8 +44,7 @@ jobs:
         run: |
           for file in \
             bootstrap.sh install.sh proxmox-host-setup.sh \
-            scripts/proxmox-lab scripts/install-watchdog \
-            scripts/sync-repo
+            scripts/proxmox-lab scripts/install-watchdog
           do
             bash -n "$file"
           done

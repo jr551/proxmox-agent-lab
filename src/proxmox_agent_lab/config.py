@@ -134,8 +134,9 @@ DEFAULTS: dict[str, Any] = {
     "audit": {
         "backend": "sqlite",   # sqlite | jsonl
         "journal_dir": "",     # defaults to <state>/journal
-        "git_sync": False,     # push the journal to a git remote (jsonl only)
+        "git_sync": False,     # copy redacted events to a private git repo
         "git_repo": "",
+        "git_branch": "logs",
     },
 }
 
@@ -399,5 +400,7 @@ backend = "auto"             # auto | keychain | secret-tool | env | file
 
 [audit]
 backend = "sqlite"           # sqlite (queryable) | jsonl (git-friendly)
-git_sync = false             # push the journal to a git remote (jsonl only)
+git_sync = false             # copy redacted events to a private git repo
+git_repo = ""                # dedicated private logging checkout
+git_branch = "logs"
 """

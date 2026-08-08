@@ -6,6 +6,13 @@ All notable changes to this project will be documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- Git audit sync now keeps the local SQLite ledger queryable while copying
+  redacted JSONL records to a dedicated private `logs` branch.
+- Log sync fails closed on a dirty checkout and can stage only the daily
+  journal file, preventing source edits from entering audit commits.
+
 ## 0.1.0 - 2026-08-08
 
 First public beta release of the leased, auditable Proxmox lab controller.

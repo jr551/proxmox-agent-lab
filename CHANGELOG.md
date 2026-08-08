@@ -10,8 +10,8 @@ All notable changes to this project will be documented here. The format follows
 
 - Console input commands can capture a settled post-action screenshot in the
   same response with `--screenshot-after`.
-- Coordinate clicks now use a vision-confirmed cursor calibration, cached per
-  lease and resolution and automatically invalidated on resolution changes.
+- Coordinate clicks now use a vision-confirmed cursor calibration scoped to
+  the exact target, lease, VM and resolution.
 - A bounded GUI-installer playbook gives small models a deterministic workflow
   and delegates graphical checkpoints to vision instead of external OCR.
 - An opt-in, lease-bound `console inspect` wrapper tries NVIDIA Nemotron Nano
@@ -26,6 +26,9 @@ All notable changes to this project will be documented here. The format follows
   redacted JSONL records to a dedicated private `logs` branch.
 - A project-scoped OpenRouter key now wins over a stale inherited shell key;
   free-router singleton JSON responses are normalized and validated.
+- Cloud vision receives a labelled, same-size 100-pixel coordinate grid while
+  the original screenshot remains untouched; changed click targets can no
+  longer inherit an unrelated cursor approval.
 - Log sync fails closed on a dirty checkout and can stage only the daily
   journal file, preventing source edits from entering audit commits.
 

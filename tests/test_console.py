@@ -127,6 +127,19 @@ class PngTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             lab_png.encode_png(2, 2, b"\x00" * 3)
 
+    def test_coordinate_grid_preserves_canvas_and_labels_original_axes(self) -> None:
+        width, height = 220, 120
+        original = bytes((10, 20, 30)) * (width * height)
+        gridded = lab_png.overlay_coordinate_grid(width, height, original, 100)
+        self.assertEqual(len(gridded), len(original))
+        untouched = (50 * width + 50) * 3
+        grid_line = (50 * width + 100) * 3
+        self.assertEqual(gridded[untouched:untouched + 3], original[untouched:untouched + 3])
+        self.assertNotEqual(gridded[grid_line:grid_line + 3],
+                            original[grid_line:grid_line + 3])
+        encoded = lab_png.encode_png(width, height, gridded)
+        self.assertEqual(struct.unpack(">II", encoded[16:24]), (width, height))
+
 
 class RfbTests(unittest.TestCase):
     def test_capture_decodes_raw_rectangle(self) -> None:
@@ -210,6 +223,18 @@ class TextModeTests(unittest.TestCase):
             value % 251 for value in range(640 * 480 * 3)
         )  # many distinct colours
         self.assertFalse(lab_textmode.analyse(rgb, 640, 480)["looks_like_text_console"])
+
+    def test_flat_desktop_with_icons_is_not_reported_as_text(self) -> None:
+        width, height = 1280, 800
+        rgb = bytearray(b"\x35\x70\xa0" * (width * height))
+        for index in range(10_000):
+            offset = index * 3
+            rgb[offset:offset + 3] = bytes(
+                (index % 251, (index * 3) % 251, (index * 7) % 251)
+            )
+        analysis = lab_textmode.analyse(bytes(rgb), width, height)
+        self.assertGreater(analysis["distinct_colours"], 24)
+        self.assertFalse(analysis["looks_like_text_console"])
 
     def test_two_colour_grid_is_reported_as_text(self) -> None:
         rgb = b"\x00\x00\x00" * (640 * 400)
@@ -664,13 +689,22 @@ class ScreenshotCommandTests(unittest.TestCase):
                                        "provider": "nvidia",
                                        "model": lab_console.vision.MODEL,
                                        "analysis": {"screen": "gui"},
-                                   }), \
+                                   }) as analyze, \
                  mock.patch("builtins.print") as printed:
                 lab_console.cmd_inspect(lab, args)
+                payload = json.loads(printed.call_args.args[0])
+                original_png = out.read_bytes()
+                model_png = analyze.call_args.args[1]
+                grid_existed = Path(payload["model_input"]["path"]).exists()
 
-        payload = json.loads(printed.call_args.args[0])
         self.assertEqual(payload["transmitted_to"], "integrate.api.nvidia.com")
         self.assertEqual(payload["vision"]["analysis"]["screen"], "gui")
+        self.assertEqual(payload["model_input"]["grid_step"], 100)
+        self.assertEqual(payload["model_input"]["origin"], "top-left")
+        self.assertTrue(payload["model_input"]["path"].endswith("-grid.png"))
+        self.assertTrue(grid_existed)
+        self.assertNotEqual(model_png, original_png)
+        self.assertIn("X increases right", analyze.call_args.kwargs["prompt"])
         lab.audit.assert_called_once_with(
             "console-vision-inspect", lease=args.lease, vmid=7,
             provider="nvidia", model=lab_console.vision.MODEL, sync=False,
@@ -701,7 +735,7 @@ class ScreenshotCommandTests(unittest.TestCase):
             self.assertTrue(out.exists())
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
 
-    def test_click_calibrates_once_and_resets_on_resolution_change(self) -> None:
+    def test_click_calibration_is_target_specific_and_resets_on_resolution_change(self) -> None:
         from proxmox_agent_lab import console as lab_console
 
         lab = mock.Mock()
@@ -736,16 +770,25 @@ class ScreenshotCommandTests(unittest.TestCase):
                 lab_console.cmd_click(lab, args)
                 payload = json.loads(printed.call_args.args[0])
 
+                # The exact verified coordinate remains calibrated at this
+                # resolution, but an unrelated target must show its cursor.
+                args.confirm_calibration = False
+                lab_console.cmd_click(lab, args)
+                args.x = 1
+                lab_console.cmd_click(lab, args)
+                different_target = json.loads(printed.call_args.args[0])
+                self.assertTrue(different_target["calibration_required"])
+
                 # A resolution change invalidates the saved calibration and
                 # returns another cursor checkpoint instead of blind input.
                 session.client.width, session.client.height = 3, 2
                 session.client.capture.return_value = b"\x00\x00\x00" * 6
-                args.confirm_calibration = False
+                args.x = 0
                 lab_console.cmd_click(lab, args)
                 changed = json.loads(printed.call_args.args[0])
 
-            session.client.click.assert_called_once_with(0, 0, button=1,
-                                                         double=False)
+            self.assertEqual(session.client.click.call_count, 2)
+            session.client.click.assert_called_with(0, 0, button=1, double=False)
             self.assertTrue(changed["calibration_required"])
             self.assertEqual(changed["resolution"], [3, 2])
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))

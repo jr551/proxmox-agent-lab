@@ -35,7 +35,8 @@ decoding into a PNG written with `zlib` alone. No Pillow, numpy, or noVNC.
 proxmox-lab console inspect --lease "$L" --vmid 9001
 ```
 
-This captures one PNG and tries NVIDIA Nemotron Nano 12B v2 VL, the named
+This stores the untouched PNG locally, overlays a labelled 100-pixel X/Y grid
+on a separate same-size model-input PNG, and tries NVIDIA Nemotron Nano 12B v2 VL, the named
 OpenRouter Nemotron Omni free endpoint, and finally `openrouter/free`, in that
 order. Use `--provider` to test one stage. The guest must be registered to the
 given lease. The command audits the selected provider/model but never the
@@ -69,14 +70,16 @@ proxmox-lab console keys --lease "$L" --vmid 9001 enter --screenshot-after 3
 - `type` takes `--text-stdin` so a password never appears in `argv`, the shell
   history, or the audit ledger. Only the character count is recorded.
 - Clicks are refused outside the current screen bounds.
-- `--screenshot-out PATH` gives the post-input PNG a stable checkpoint name.
+- `--screenshot-out PATH` (or the shorter `--out PATH`) gives the post-input
+  PNG a stable checkpoint name.
 
-The first click at a given VM resolution is intentionally not a click. The
+The first click at a target coordinate is intentionally not a click. The
 client moves the visible cursor to the requested coordinate and returns a PNG.
 Confirm the pointer is on the intended control, then repeat the same command
-with `--confirm-calibration`. The confirmed calibration is cached for that
-lease and VM until the framebuffer resolution changes, at which point the safe
-two-step check repeats.
+with `--confirm-calibration`. Approval is cached only for that exact coordinate,
+lease, VM and framebuffer resolution. A different target or resolution repeats
+the safe two-step check; approval for empty background can never authorize an
+unrelated installer button.
 
 See [gui-installers.md](gui-installers.md) for the bounded state loop agents
 should use with installers, including Haiku. A model without image vision

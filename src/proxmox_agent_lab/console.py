@@ -417,10 +417,34 @@ def cmd_inspect(lab: Any, args: Any) -> None:
         rgb = session.client.capture(timeout=25.0, settle=args.settle)
         width, height = session.client.width, session.client.height
     screenshot = _save_screenshot(args.vmid, rgb, width, height, args.out)
-    image = Path(screenshot["path"]).read_bytes()
+    grid_step = 100
+    gridded = png_module.overlay_coordinate_grid(
+        width, height, rgb, step=grid_step
+    )
+    original_path = Path(screenshot["path"])
+    grid_path = original_path.with_name(
+        original_path.stem + "-grid" + original_path.suffix
+    )
+    grid_png = png_module.encode_png(width, height, gridded)
+    grid_path.write_bytes(grid_png)
+    model_input = {
+        "path": str(grid_path),
+        "bytes": len(grid_png),
+        "width": width,
+        "height": height,
+        "grid_step": grid_step,
+        "origin": "top-left",
+        "x_direction": "right",
+        "y_direction": "down",
+    }
+    grid_prompt = (args.prompt or vision.DEFAULT_PROMPT) + (
+        "\nA coordinate grid is overlaid every 100 pixels. The labels are "
+        "original framebuffer coordinates: origin top-left, X increases "
+        "right, Y increases down. Use the grid to estimate control centers."
+    )
     try:
         analysis = vision.analyze_png(
-            lab.CONFIG, image, width=width, height=height, prompt=args.prompt,
+            lab.CONFIG, grid_png, width=width, height=height, prompt=grid_prompt,
             timeout=args.timeout, max_tokens=args.max_tokens,
             provider=args.provider,
         )
@@ -438,6 +462,7 @@ def cmd_inspect(lab: Any, args: Any) -> None:
     print(json.dumps({
         "vmid": args.vmid,
         "screenshot": screenshot,
+        "model_input": model_input,
         "transmitted_to": destination,
         "vision": analysis,
     }, indent=2, sort_keys=True))
@@ -497,7 +522,8 @@ def cmd_click(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     with VncSession(lab, api, args.vmid) as session:
-        if args.x >= session.client.width or args.y >= session.client.height:
+        if not (0 <= args.x < session.client.width
+                and 0 <= args.y < session.client.height):
             raise _api_error(
                 lab,
                 f"({args.x},{args.y}) is outside the "
@@ -510,7 +536,12 @@ def cmd_click(lab: Any, args: Any) -> None:
             and calibration.get("width") == width
             and calibration.get("height") == height
         )
-        calibrated = same_resolution and calibration.get("confirmed") is True
+        calibrated = (
+            same_resolution
+            and calibration.get("confirmed") is True
+            and calibration.get("x") == args.x
+            and calibration.get("y") == args.y
+        )
         if not calibrated:
             pending_matches = (
                 same_resolution
@@ -527,7 +558,7 @@ def cmd_click(lab: Any, args: Any) -> None:
                     )
                 _save_calibration(lab, args.vmid, {
                     "lease": args.lease, "width": width, "height": height,
-                    "confirmed": True,
+                    "confirmed": True, "x": args.x, "y": args.y,
                 })
             else:
                 session.client.pointer(args.x, args.y, 0)
@@ -785,7 +816,7 @@ def register(sub: Any, lab: Any) -> None:
             help="after input, wait this long and include a PNG in the result",
         )
         parser.add_argument(
-            "--screenshot-out",
+            "--screenshot-out", "--out", dest="screenshot_out",
             help="path for --screenshot-after (default: state screens directory)",
         )
 

@@ -115,7 +115,15 @@ def load_font_table() -> dict[str, Any] | None:
 
 def _distinct_colours(rgb: bytes, limit: int = 64) -> int:
     seen: set[bytes] = set()
-    step = max(3, (len(rgb) // 3 // 4000) * 3)
+    # Sample roughly 100k pixels. The old 4k-pixel stride resonated with wide
+    # framebuffers (for 1280px it repeatedly hit the same five columns), so a
+    # mostly flat desktop with colourful icons along the top looked like a
+    # one-colour text console. An odd pixel stride walks across rows and edges.
+    pixels = len(rgb) // 3
+    pixel_step = max(1, pixels // 100_000)
+    if pixel_step % 2 == 0:
+        pixel_step += 1
+    step = pixel_step * 3
     for offset in range(0, len(rgb) - 2, step):
         seen.add(rgb[offset : offset + 3])
         if len(seen) > limit:

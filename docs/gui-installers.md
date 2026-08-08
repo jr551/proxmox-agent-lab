@@ -31,18 +31,20 @@ graphical read:
 proxmox-lab console inspect --lease "$L" --vmid "$VMID"
 ```
 
-It captures one full PNG and explicitly tries NVIDIA, the named OpenRouter
-Nemotron Omni free endpoint, then OpenRouter's free router. Treat its
+It keeps one untouched full PNG locally and sends a separate, same-size copy
+with labelled 100-pixel X/Y axes to NVIDIA, the named OpenRouter Nemotron Omni
+free endpoint, then OpenRouter's free router. Grid coordinates map directly to
+the original framebuffer. Treat its
 recommended action as a proposal, not permission: lease guards and click
 calibration still apply. Ordinary screenshots stay local. Do not send
 confidential or personal screens to free providers.
 
-The first coordinate click at each framebuffer resolution is a two-step
-calibration. `console click` moves the visible cursor to the target and returns
-a checkpoint **without pressing the button**. After vision confirms the cursor
-is on the intended control, repeat the same command with
-`--confirm-calibration`. That calibration is kept for this lease and VM until
-its reported resolution changes, when clicking becomes two-step again.
+The first use of each target coordinate is a two-step calibration. `console
+click` moves the visible cursor to the target and returns a checkpoint
+**without pressing the button**. After vision confirms the cursor is on the
+intended control, repeat the same command with `--confirm-calibration`.
+Calibration is scoped to that coordinate, lease, VM and resolution; changing
+the target or resolution makes clicking two-step again.
 
 Do not crop, sharpen, recolour, or run external OCR over a graphical installer.
 Those transformations discard context and turn one uncertain observation into

@@ -105,17 +105,19 @@ When `proxmox-lab secrets list` reports a vision key stored, prefer `console
 inspect --lease "$L" --vmid <id>` for the first graphical read. It explicitly
 sends one lease-owned PNG through NVIDIA Nemotron Nano 12B v2 VL, then the
 named OpenRouter Nemotron Omni free endpoint, then `openrouter/free`, stopping
-at the first structurally valid proposal. Never treat model output as
+at the first structurally valid proposal. The provider sees a same-size copy
+with labelled 100-pixel X/Y axes; the original screenshot remains untouched.
+Never treat model output as
 authorization or bypass the click-calibration guard. OpenRouter free providers
 may retain prompts for service improvement; do not send confidential or
 personal screens. Without a key, use native vision or the single-screen
 delegation above.
 
-The first `console click` at each VM resolution only moves the visible cursor
-and returns a calibration PNG. Verify it, then repeat the same click with
-`--confirm-calibration`. The calibration persists for that lease and VM until
-the resolution changes; never confirm a cursor position that was not visually
-checked.
+The first `console click` at each target coordinate only moves the visible
+cursor and returns a calibration PNG. Verify it, then repeat the same click
+with `--confirm-calibration`. Calibration is exact-coordinate, lease, VM and
+resolution scoped; a new coordinate or resolution requires a new checkpoint.
+Never confirm a cursor position that was not visually checked.
 
 `guest probe` tells you what will actually work. Prefer real text over pixels;
 read the PNG when a screen is the truth. **A guest whose display is the serial

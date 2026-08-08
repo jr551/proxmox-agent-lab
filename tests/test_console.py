@@ -750,7 +750,7 @@ class ScreenshotCommandTests(unittest.TestCase):
             args = mock.Mock(
                 lease="lease-12345678", vmid=1, x=0, y=0, button=1,
                 double=False, screenshot_after=2.5, screenshot_out=str(out),
-                target="Install", calibration_settle=1.0,
+                target="OK", calibration_settle=1.0,
                 vision_timeout=10, provider="auto",
             )
             with mock.patch.object(lab, "STATE_ROOT", Path(tmp)), \

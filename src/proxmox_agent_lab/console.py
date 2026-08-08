@@ -502,9 +502,9 @@ def cmd_click(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     target = str(getattr(args, "target", "") or "").strip()
-    if len(target) < 3:
+    if len(target) < 2:
         raise _api_error(
-            lab, "--target must describe the visible control in at least 3 characters"
+            lab, "--target must describe the visible control in at least 2 characters"
         )
     if len(target) > 80 or any(ord(char) < 32 for char in target):
         raise _api_error(lab, "--target must be a single printable label of at most 80 characters")

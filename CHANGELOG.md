@@ -4,6 +4,14 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.1 - 2026-08-08
+
+### Fixed
+
+- Guarded clicks accept legitimate two-character control labels such as
+  Haiku's `OK` button while continuing to reject empty and one-character
+  targets.
+
 ## 0.2.0 - 2026-08-08
 
 ### Added

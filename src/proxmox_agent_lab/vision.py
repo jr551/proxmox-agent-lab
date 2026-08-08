@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import time
 from typing import Any
@@ -17,12 +18,21 @@ from urllib import error, request
 
 from . import secrets_store
 
-ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
+ENDPOINT = NVIDIA_ENDPOINT  # compatibility for callers
 STATUS_ENDPOINT = "https://integrate.api.nvidia.com/v1/status/{request_id}"
-MODEL = "nvidia/nemotron-nano-12b-v2-vl"
-SECRET_ACCOUNT = "nvidia-api-key"
+NVIDIA_MODEL = "nvidia/nemotron-nano-12b-v2-vl"
+NVIDIA_SECRET_ACCOUNT = "nvidia-api-key"
+OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+OPENROUTER_FREE_MODEL = "openrouter/free"
+OPENROUTER_SECRET_ACCOUNT = "openrouter-api-key"
+MODEL = NVIDIA_MODEL  # compatibility for callers and older audit assertions
+SECRET_ACCOUNT = NVIDIA_SECRET_ACCOUNT
 REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{1,36}$")
-API_KEY_SHAPE = re.compile(r"nvapi-[A-Za-z0-9_-]+")
+API_KEY_SHAPE = re.compile(
+    r"(?:nvapi-|sk-or-v1-)[A-Za-z0-9_-]+", re.IGNORECASE
+)
 
 DEFAULT_PROMPT = """Analyze this operating-system GUI screenshot. Return only JSON:
 {
@@ -50,10 +60,15 @@ class VisionError(RuntimeError):
 
 
 def available(config: Any) -> bool:
-    return bool(secrets_store.get(config, SECRET_ACCOUNT, required=False))
+    return bool(
+        secrets_store.get(config, NVIDIA_SECRET_ACCOUNT, required=False)
+        or os.environ.get("OPENROUTER_API_KEY")
+        or secrets_store.get(config, OPENROUTER_SECRET_ACCOUNT, required=False)
+    )
 
 
-def _http_json(req: request.Request, timeout: float) -> tuple[int, dict[str, Any]]:
+def _http_json(req: request.Request, timeout: float,
+               provider: str) -> tuple[int, dict[str, Any]]:
     try:
         with request.urlopen(req, timeout=timeout) as response:
             status = response.status
@@ -61,15 +76,15 @@ def _http_json(req: request.Request, timeout: float) -> tuple[int, dict[str, Any
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
         detail = API_KEY_SHAPE.sub("[REDACTED]", detail)
-        raise VisionError(f"NVIDIA vision HTTP {exc.code}: {detail}") from None
+        raise VisionError(f"{provider} vision HTTP {exc.code}: {detail}") from None
     except (error.URLError, TimeoutError, OSError) as exc:
-        raise VisionError(f"NVIDIA vision unavailable: {exc}") from None
+        raise VisionError(f"{provider} vision unavailable: {exc}") from None
     try:
         value = json.loads(body)
     except (TypeError, ValueError):
-        raise VisionError("NVIDIA vision returned invalid JSON") from None
+        raise VisionError(f"{provider} vision returned invalid JSON") from None
     if not isinstance(value, dict):
-        raise VisionError("NVIDIA vision returned a non-object response")
+        raise VisionError(f"{provider} vision returned a non-object response")
     return status, value
 
 
@@ -84,9 +99,9 @@ def _content(value: dict[str, Any]) -> str:
     try:
         content = value["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        raise VisionError("NVIDIA vision response has no assistant content") from None
+        raise VisionError("vision response has no assistant content") from None
     if not isinstance(content, str) or not content.strip():
-        raise VisionError("NVIDIA vision returned empty assistant content")
+        raise VisionError("vision response has empty assistant content")
     return content.strip()
 
 
@@ -103,12 +118,22 @@ def _parse_analysis(content: str) -> dict[str, Any] | None:
         value = json.loads(candidate)
     except ValueError:
         return None
-    return value if isinstance(value, dict) else None
+    if isinstance(value, dict):
+        return value
+    # Some free vision models wrap the one requested checkpoint in a JSON
+    # array even in json_object mode. A singleton object is unambiguous; never
+    # guess which result to trust when there is zero or more than one.
+    if (isinstance(value, list) and len(value) == 1
+            and isinstance(value[0], dict)):
+        return value[0]
+    return None
 
 
 def _validate_analysis(value: dict[str, Any], width: int,
                        height: int) -> dict[str, Any]:
     warnings: list[str] = []
+    if not isinstance(value.get("screen"), str) or not value["screen"].strip():
+        warnings.append("screen is not a non-empty string")
     positions: dict[tuple[int, int], list[str]] = {}
     controls = value.get("controls")
     if not isinstance(controls, list):
@@ -135,7 +160,13 @@ def _validate_analysis(value: dict[str, Any], width: int,
             )
 
     action = value.get("recommended_action")
-    click = isinstance(action, dict) and action.get("kind") == "click"
+    if not isinstance(action, dict):
+        warnings.append("recommended_action is not an object")
+        action = {}
+    kind = action.get("kind")
+    if kind not in ("key", "click", "wait", "stop"):
+        warnings.append("recommended action kind is invalid")
+    click = kind == "click"
     if click:
         match = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*", str(action.get("value", "")))
         if not match:
@@ -156,21 +187,11 @@ def _validate_analysis(value: dict[str, Any], width: int,
     }
 
 
-def analyze_png(config: Any, image: bytes, *, width: int, height: int,
-                prompt: str | None = None, timeout: int = 120,
-                max_tokens: int = 1024) -> dict[str, Any]:
-    if not image.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise VisionError("NVIDIA vision wrapper accepts PNG screenshots only")
-    if not 1 <= max_tokens <= 8192:
-        raise VisionError("max_tokens must be between 1 and 8192")
-    api_key = secrets_store.get(config, SECRET_ACCOUNT)
-    task = (prompt or DEFAULT_PROMPT) + (
-        f"\nThe original framebuffer is {width}x{height} pixels."
-    )
-    payload = {
-        "model": MODEL,
+def _payload(image: bytes, task: str, model: str,
+             max_tokens: int) -> dict[str, Any]:
+    return {
+        "model": model,
         "messages": [
-            {"role": "system", "content": "/no_think"},
             {
                 "role": "user",
                 "content": [
@@ -189,38 +210,17 @@ def analyze_png(config: Any, image: bytes, *, width: int, height: int,
         "temperature": 0.1,
         "stream": False,
     }
-    req = request.Request(
-        ENDPOINT,
-        data=json.dumps(payload, separators=(",", ":")).encode(),
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    deadline = time.monotonic() + timeout
-    status, value = _http_json(req, timeout)
-    while status == 202:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise VisionError(f"NVIDIA vision did not finish within {timeout}s")
-        request_id = _request_id(value)
-        time.sleep(min(2.0, remaining))
-        poll = request.Request(
-            STATUS_ENDPOINT.format(request_id=request_id),
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="GET",
-        )
-        status, value = _http_json(poll, remaining)
+
+
+def _result(value: dict[str, Any], *, provider: str, requested_model: str,
+            width: int, height: int) -> dict[str, Any]:
     content = _content(value)
     parsed = _parse_analysis(content)
+    model = value.get("model")
     result: dict[str, Any] = {
-        "provider": "nvidia",
-        "model": MODEL,
+        "provider": provider,
+        "requested_model": requested_model,
+        "model": model if isinstance(model, str) and model else requested_model,
         "analysis": parsed if parsed is not None else content,
         "structured": parsed is not None,
     }
@@ -237,3 +237,152 @@ def analyze_png(config: Any, image: bytes, *, width: int, height: int,
     if isinstance(usage, dict):
         result["usage"] = usage
     return result
+
+
+def _nvidia(config: Any, image: bytes, task: str, *, width: int,
+            height: int, timeout: int, max_tokens: int) -> dict[str, Any]:
+    api_key = secrets_store.get(config, NVIDIA_SECRET_ACCOUNT)
+    payload = _payload(image, task, NVIDIA_MODEL, max_tokens)
+    payload["messages"].insert(0, {"role": "system", "content": "/no_think"})
+    req = request.Request(
+        NVIDIA_ENDPOINT,
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    deadline = time.monotonic() + timeout
+    status, value = _http_json(req, timeout, "NVIDIA")
+    while status == 202:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise VisionError(f"NVIDIA vision did not finish within {timeout}s")
+        request_id = _request_id(value)
+        time.sleep(min(2.0, remaining))
+        poll = request.Request(
+            STATUS_ENDPOINT.format(request_id=request_id),
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="GET",
+        )
+        status, value = _http_json(poll, remaining, "NVIDIA")
+    return _result(
+        value, provider="nvidia", requested_model=NVIDIA_MODEL,
+        width=width, height=height,
+    )
+
+
+def _openrouter_key(config: Any) -> str:
+    # A project-scoped key deliberately stored through `proxmox-lab secrets`
+    # wins over an inherited shell value, which may be stale or belong to a
+    # different tool. The conventional variable remains a compatibility
+    # fallback for installs whose selected secret backend has no stored key.
+    stored = secrets_store.get(
+        config, OPENROUTER_SECRET_ACCOUNT, required=False
+    )
+    fallback = os.environ.get("OPENROUTER_API_KEY")
+    key = stored or fallback
+    if not key:
+        raise secrets_store.SecretError(
+            "secret 'openrouter-api-key' is not stored; run "
+            "'proxmox-lab secrets set openrouter-api-key' or export "
+            "OPENROUTER_API_KEY"
+        )
+    return key
+
+
+def _openrouter(config: Any, image: bytes, task: str, *, model: str,
+                width: int, height: int, timeout: int,
+                max_tokens: int) -> dict[str, Any]:
+    payload = _payload(image, task, model, max_tokens)
+    # The free router may have no vision endpoint that supports strict JSON
+    # Schema. JSON-object mode plus response healing is broadly compatible;
+    # `_validate_analysis` remains the authoritative fail-closed schema and
+    # coordinate check after healing.
+    payload["response_format"] = {"type": "json_object"}
+    payload["plugins"] = [{"id": "response-healing"}]
+    if model == OPENROUTER_MODEL:
+        payload["reasoning"] = {"enabled": True}
+    req = request.Request(
+        OPENROUTER_ENDPOINT,
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {_openrouter_key(config)}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    status, value = _http_json(req, timeout, "OpenRouter")
+    if status != 200:
+        raise VisionError(f"OpenRouter vision returned HTTP {status}")
+    return _result(
+        value, provider="openrouter", requested_model=model,
+        width=width, height=height,
+    )
+
+
+def _accepted(result: dict[str, Any]) -> bool:
+    validation = result.get("validation")
+    return bool(
+        result.get("structured")
+        and isinstance(validation, dict)
+        and validation.get("structurally_valid") is True
+    )
+
+
+def analyze_png(config: Any, image: bytes, *, width: int, height: int,
+                prompt: str | None = None, timeout: int = 120,
+                max_tokens: int = 1024, provider: str = "auto") -> dict[str, Any]:
+    if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise VisionError("vision wrapper accepts PNG screenshots only")
+    if not 1 <= max_tokens <= 8192:
+        raise VisionError("max_tokens must be between 1 and 8192")
+    task = (prompt or DEFAULT_PROMPT) + (
+        f"\nThe original framebuffer is {width}x{height} pixels."
+    )
+    providers = {
+        "nvidia": lambda: _nvidia(
+            config, image, task, width=width, height=height,
+            timeout=timeout, max_tokens=max_tokens,
+        ),
+        "openrouter-nemotron": lambda: _openrouter(
+            config, image, task, model=OPENROUTER_MODEL, width=width,
+            height=height, timeout=timeout, max_tokens=max_tokens,
+        ),
+        "openrouter-free": lambda: _openrouter(
+            config, image, task, model=OPENROUTER_FREE_MODEL, width=width,
+            height=height, timeout=timeout, max_tokens=max_tokens,
+        ),
+    }
+    if provider != "auto" and provider not in providers:
+        raise VisionError(f"unknown vision provider {provider!r}")
+    order = list(providers) if provider == "auto" else [provider]
+    attempts: list[dict[str, Any]] = []
+    for name in order:
+        try:
+            result = providers[name]()
+        except (VisionError, secrets_store.SecretError) as exc:
+            attempts.append({"provider": name, "status": "failed", "error": str(exc)})
+            continue
+        if not _accepted(result):
+            attempts.append({
+                "provider": name,
+                "status": "rejected",
+                "validation": result.get("validation"),
+            })
+            continue
+        attempts.append({"provider": name, "status": "selected"})
+        result["provider_chain"] = attempts
+        return result
+    summary = "; ".join(
+        f"{item['provider']}: {item['status']}"
+        + (f" ({item['error']})" if item.get("error") else "")
+        for item in attempts
+    )
+    raise VisionError(f"no vision provider returned a valid analysis: {summary}")

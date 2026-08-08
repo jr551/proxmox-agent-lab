@@ -29,17 +29,18 @@ The capture path is a self-contained RFB client: Proxmox `vncproxy`, a
 WebSocket upgrade, RFB 3.8 with VNC authentication, and Raw/Zlib/CopyRect
 decoding into a PNG written with `zlib` alone. No Pillow, numpy, or noVNC.
 
-## Optional NVIDIA vision
+## Optional cloud vision fallback
 
 ```bash
 proxmox-lab console inspect --lease "$L" --vmid 9001
 ```
 
-If `nvidia-api-key` is in the project secret store, this captures one PNG and
-sends it to NVIDIA's Nemotron Nano 12B v2 VL endpoint for a structured screen,
-control, and safest-next-action proposal. The guest must be registered to the
-given lease. The command audits the provider/model but never the image, prompt,
-or key.
+This captures one PNG and tries NVIDIA Nemotron Nano 12B v2 VL, the named
+OpenRouter Nemotron Omni free endpoint, and finally `openrouter/free`, in that
+order. Use `--provider` to test one stage. The guest must be registered to the
+given lease. The command audits the selected provider/model but never the
+image, prompt, or key. Free OpenRouter providers may log prompts for service
+improvement, so do not submit confidential or personal screens.
 
 This is intentionally separate from `screenshot`: external image transmission
 must be explicit. The model's coordinates are advisory and still pass through

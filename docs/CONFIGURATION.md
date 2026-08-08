@@ -217,7 +217,7 @@ one-off run.
 - **`secret-tool`** — Linux libsecret (GNOME Keyring, KWallet). Install
   `libsecret-tools`.
 
-### Optional NVIDIA vision
+### Optional cloud vision
 
 Store an NVIDIA API key to let an agent explicitly send a lease-owned console
 screenshot to Nemotron Nano 12B v2 VL:
@@ -227,10 +227,21 @@ proxmox-lab secrets set nvidia-api-key
 proxmox-lab console inspect --lease "$L" --vmid 9001
 ```
 
-The key remains in the selected secret backend. `console inspect` sends the PNG
-to `integrate.api.nvidia.com`; ordinary `console screenshot` never uploads it.
-The environment fallback name is `PROXMOX_AGENT_LAB_NVIDIA_API_KEY` for CI or
-ephemeral containers.
+Add OpenRouter fallback access with:
+
+```bash
+proxmox-lab secrets set openrouter-api-key
+```
+
+`console inspect` tries NVIDIA, the named Nemotron Omni free endpoint, then
+`openrouter/free`. The OpenRouter response-healing plugin repairs JSON syntax;
+the local wrapper still rejects ambiguous controls and invalid coordinates.
+Ordinary `console screenshot` never uploads anything. Environment fallbacks
+are `PROXMOX_AGENT_LAB_NVIDIA_API_KEY`,
+`PROXMOX_AGENT_LAB_OPENROUTER_API_KEY`, and conventional
+`OPENROUTER_API_KEY`. A project-scoped stored OpenRouter key wins over a stale
+conventional shell value. OpenRouter free providers may log prompts for
+service improvement; do not submit confidential or personal screens.
 - **`env`** — read `PROXMOX_AGENT_LAB_<NAME>`, e.g.
   `PROXMOX_AGENT_LAB_PROXMOX_TOKEN`. Read-only; good for CI and containers.
 - **`file`** — a TOML file that must be `0600`. For headless boxes with no
@@ -259,6 +270,8 @@ pushed anywhere. If you enable it, point `git_repo` at the root of a clean,
 VMIDs. The local backend can remain `sqlite`; the logging checkout receives
 one JSONL file per day. Sync fails closed if that checkout contains any other
 uncommitted file, and only `journal/YYYY-MM-DD.jsonl` is ever staged.
+`doctor` reports these independently as `audit.local_backend` and
+`audit.git_sync`; SQLite plus Git sync is an intentional supported setup.
 
 ---
 

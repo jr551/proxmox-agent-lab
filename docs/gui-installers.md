@@ -24,16 +24,18 @@ chooses one next action.
 5. Read the returned PNG. Record `screen -> action -> observed screen`, then
    repeat.
 
-When `nvidia-api-key` is stored, use the vision wrapper as the first graphical
-read:
+When a cloud vision key is stored, use the guarded wrapper as the first
+graphical read:
 
 ```bash
 proxmox-lab console inspect --lease "$L" --vmid "$VMID"
 ```
 
-It captures one full PNG and explicitly transmits it to NVIDIA Nemotron Nano
-12B v2 VL. Treat its recommended action as a proposal, not permission: lease
-guards and click calibration still apply. Ordinary screenshots stay local.
+It captures one full PNG and explicitly tries NVIDIA, the named OpenRouter
+Nemotron Omni free endpoint, then OpenRouter's free router. Treat its
+recommended action as a proposal, not permission: lease guards and click
+calibration still apply. Ordinary screenshots stay local. Do not send
+confidential or personal screens to free providers.
 
 The first coordinate click at each framebuffer resolution is a two-step
 calibration. `console click` moves the visible cursor to the target and returns

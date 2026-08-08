@@ -14,8 +14,9 @@ All notable changes to this project will be documented here. The format follows
   lease and resolution and automatically invalidated on resolution changes.
 - A bounded GUI-installer playbook gives small models a deterministic workflow
   and delegates graphical checkpoints to vision instead of external OCR.
-- An opt-in, lease-bound `console inspect` wrapper sends one PNG to NVIDIA
-  Nemotron Nano 12B v2 VL using a key from the OS secret store.
+- An opt-in, lease-bound `console inspect` wrapper tries NVIDIA Nemotron Nano
+  12B v2 VL, the named OpenRouter Nemotron Omni free endpoint, then
+  `openrouter/free`, using keys from the OS secret store.
 
 ### Fixed
 
@@ -23,6 +24,8 @@ All notable changes to this project will be documented here. The format follows
   than 90 seconds, preventing premature failure and duplicate leases.
 - Git audit sync now keeps the local SQLite ledger queryable while copying
   redacted JSONL records to a dedicated private `logs` branch.
+- A project-scoped OpenRouter key now wins over a stale inherited shell key;
+  free-router singleton JSON responses are normalized and validated.
 - Log sync fails closed on a dirty checkout and can stage only the daily
   journal file, preventing source edits from entering audit commits.
 

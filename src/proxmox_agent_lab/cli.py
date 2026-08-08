@@ -1074,6 +1074,20 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         "config_expected_at": str(CONFIG.intended),
         "state_dir": str(STATE_ROOT),
         "journal_dir": str(JOURNAL_ROOT),
+        "audit": {
+            "local_backend": AUDIT_BACKEND,
+            # Git sync is an independent, redacted JSONL export. It remains
+            # valid when the richer local ledger is SQLite.
+            "git_sync": bool(CONFIG.audit.get("git_sync")),
+            "git_repo": (
+                str(CONFIG.audit.get("git_repo") or "")
+                if CONFIG.audit.get("git_sync") else None
+            ),
+            "git_branch": (
+                str(CONFIG.audit.get("git_branch") or "logs")
+                if CONFIG.audit.get("git_sync") else None
+            ),
+        },
     }
     if CONFIG.unknown_sections:
         report["unknown_sections"] = CONFIG.unknown_sections
@@ -1107,8 +1121,14 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                         "'proxmox-lab secrets set proxmox-token'")
 
     mode = CONFIG.power.get("mode")
-    report["power"] = {"mode": mode, "can_force_off":
-                       power_module.can_force_off(CONFIG)}
+    report["power"] = {
+        "mode": mode,
+        "can_force_off": power_module.can_force_off(CONFIG),
+        "boot_timeout_seconds": int(
+            CONFIG.power.get("boot_timeout_seconds", 300)
+        ),
+        "minimum_cold_boot_timeout_seconds": MIN_COLD_BOOT_TIMEOUT_SECONDS,
+    }
     if mode == "wake-on-lan" and not CONFIG.power.get("mac"):
         problems.append("[power] mac is not set (needed for wake-on-lan)")
     if mode == "none":

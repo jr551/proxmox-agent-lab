@@ -402,7 +402,7 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
 
 
 def cmd_inspect(lab: Any, args: Any) -> None:
-    """Capture and explicitly send one lease-owned screen to NVIDIA vision."""
+    """Capture and explicitly send one lease-owned screen to cloud vision."""
     lease = lab.load_lease(args.lease)
     owned = any(
         item.get("kind") == "qemu" and int(item.get("vmid", -1)) == args.vmid
@@ -422,17 +422,23 @@ def cmd_inspect(lab: Any, args: Any) -> None:
         analysis = vision.analyze_png(
             lab.CONFIG, image, width=width, height=height, prompt=args.prompt,
             timeout=args.timeout, max_tokens=args.max_tokens,
+            provider=args.provider,
         )
     except (vision.VisionError, secrets_store.SecretError) as exc:
         raise _api_error(lab, str(exc)) from None
     lab.audit(
         "console-vision-inspect", lease=args.lease, vmid=args.vmid,
-        provider="nvidia", model=vision.MODEL, sync=False,
+        provider=analysis["provider"], model=analysis["model"], sync=False,
+    )
+    destination = (
+        "integrate.api.nvidia.com"
+        if analysis["provider"] == "nvidia"
+        else "openrouter.ai"
     )
     print(json.dumps({
         "vmid": args.vmid,
         "screenshot": screenshot,
-        "transmitted_to": "integrate.api.nvidia.com",
+        "transmitted_to": destination,
         "vision": analysis,
     }, indent=2, sort_keys=True))
 
@@ -800,7 +806,7 @@ def register(sub: Any, lab: Any) -> None:
     shot.set_defaults(func=bind(cmd_screenshot))
 
     inspect = console_sub.add_parser(
-        "inspect", help="send one lease-owned screenshot to NVIDIA vision"
+        "inspect", help="inspect one lease-owned screenshot with cloud vision"
     )
     inspect.add_argument("--lease", required=True)
     inspect.add_argument("--vmid", type=int, required=True)
@@ -809,6 +815,12 @@ def register(sub: Any, lab: Any) -> None:
     inspect.add_argument("--timeout", type=int, default=120)
     inspect.add_argument("--max-tokens", type=int, default=1024)
     inspect.add_argument("--prompt")
+    inspect.add_argument(
+        "--provider",
+        choices=("auto", "nvidia", "openrouter-nemotron", "openrouter-free"),
+        default="auto",
+        help="provider override; auto uses the guarded fallback chain",
+    )
     inspect.set_defaults(func=bind(cmd_inspect))
 
     keys = console_sub.add_parser("keys", help="send key combinations")

@@ -47,7 +47,7 @@ Agent dies → a watchdog cleans up anyway.
 |---|---|---|
 | 🖥️ | Create throwaway VMs and containers | `api`, clone a template |
 | 👀 | **See and drive the screen** (input + settled PNG) | `console screenshot`, `--screenshot-after` |
-| 🧠 | Optional guarded NVIDIA vision for small agents | `console inspect` |
+| 🧠 | Guarded NVIDIA → OpenRouter free vision fallback | `console inspect` |
 | ⌨️ | **Type and click** | `console type`, `keys`, `click` |
 | 🔧 | **Run commands** (picks the channel for you) | `guest run` |
 | 📄 | Read a console as exact text | `console text` |

@@ -35,6 +35,23 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertIsNone(begin.timeout)
         self.assertIsNone(power.timeout)
 
+    def test_sqlite_audit_can_export_redacted_jsonl_to_git(self) -> None:
+        """The local query backend and remote logging transport are separate."""
+        record = {"timestamp": "2026-08-08T12:00:00Z", "event": "test"}
+        config = mock.Mock()
+        config.audit.get.side_effect = lambda key, default=None: {
+            "git_sync": True,
+            "git_repo": "/tmp/dedicated-audit-repo",
+            "git_branch": "logs",
+        }.get(key, default)
+        with mock.patch.object(LAB, "CONFIG", config), \
+             mock.patch.object(LAB, "AUDIT_BACKEND", "sqlite"), \
+             mock.patch.object(LAB.journal_module, "sync_git") as sync:
+            LAB.sync_repo(record, "test")
+        sync.assert_called_once_with(
+            Path("/tmp/dedicated-audit-repo"), record, "test", "logs"
+        )
+
     def test_redacts_nested_secrets(self) -> None:
         value = {
             "ok": "visible",

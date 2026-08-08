@@ -654,13 +654,17 @@ class ScreenshotCommandTests(unittest.TestCase):
             out = Path(tmp) / "inspect.png"
             args = mock.Mock(
                 lease="lease-12345678", vmid=7, settle=2.0, out=str(out),
-                prompt=None, timeout=120, max_tokens=1024,
+                prompt=None, timeout=120, max_tokens=1024, provider="auto",
             )
             with mock.patch.object(lab_console, "VncSession",
                                    return_value=session), \
                  mock.patch.object(lab, "ProxmoxAPI"), \
                  mock.patch.object(lab_console.vision, "analyze_png",
-                                   return_value={"analysis": {"screen": "gui"}}), \
+                                   return_value={
+                                       "provider": "nvidia",
+                                       "model": lab_console.vision.MODEL,
+                                       "analysis": {"screen": "gui"},
+                                   }), \
                  mock.patch("builtins.print") as printed:
                 lab_console.cmd_inspect(lab, args)
 

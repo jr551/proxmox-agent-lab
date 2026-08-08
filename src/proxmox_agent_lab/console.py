@@ -301,25 +301,88 @@ def _screenshot_path(vmid: int, override: str | None) -> Path:
     return DEFAULT_SCREENSHOT_DIR / f"vm{vmid}-{stamp}.png"
 
 
+def _save_screenshot(vmid: int, rgb: bytes, width: int, height: int,
+                     override: str | None = None) -> dict[str, Any]:
+    """Write one captured framebuffer and return its machine-readable facts."""
+    encoded = png_module.encode_png(width, height, rgb)
+    target = _screenshot_path(vmid, override)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(encoded)
+    analysis = textmode.analyse(rgb, width, height)
+    result: dict[str, Any] = {
+        "vmid": vmid,
+        "path": str(target),
+        "width": width,
+        "height": height,
+        "bytes": len(encoded),
+        "looks_like_text_console": analysis["looks_like_text_console"],
+        "distinct_colours": analysis["distinct_colours"],
+    }
+    if analysis["looks_like_text_console"]:
+        result["agent_hint"] = (
+            "Prefer console text for exact characters; use --ocr only for a "
+            "VGA text grid"
+        )
+    else:
+        result["agent_hint"] = (
+            "Read this PNG with vision. If this model has no vision, delegate "
+            "the single-screen decision to a vision-capable model; do not use "
+            "Tesseract, OCR, crops, or image filters."
+        )
+    return result
+
+
+def _capture_after_action(lab: Any, api: Any, args: Any,
+                          session: VncSession | None = None) -> dict[str, Any] | None:
+    """Optionally capture the settled screen as part of an input command.
+
+    Keeping input and observation in one command avoids the common agent loop
+    of click, reconnect, screenshot, crop, OCR, and repeat.
+    """
+    settle = getattr(args, "screenshot_after", None)
+    if settle is None:
+        return None
+    if session is None:
+        with VncSession(lab, api, args.vmid) as new_session:
+            rgb = new_session.client.capture(timeout=25.0, settle=settle)
+            width, height = new_session.client.width, new_session.client.height
+    else:
+        rgb = session.client.capture(timeout=25.0, settle=settle)
+        width, height = session.client.width, session.client.height
+    return _save_screenshot(
+        args.vmid, rgb, width, height, getattr(args, "screenshot_out", None)
+    )
+
+
+def _calibration_path(lab: Any, vmid: int) -> Path:
+    return Path(lab.STATE_ROOT) / "console-calibration" / f"vm{vmid}.json"
+
+
+def _load_calibration(lab: Any, vmid: int) -> dict[str, Any]:
+    try:
+        value = json.loads(_calibration_path(lab, vmid).read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_calibration(lab: Any, vmid: int, value: dict[str, Any]) -> None:
+    target = _calibration_path(lab, vmid)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n")
+    temporary.replace(target)
+
+
 def cmd_screenshot(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     with VncSession(lab, api, args.vmid) as session:
         rgb = session.client.capture(timeout=args.timeout, settle=args.settle)
         width, height = session.client.width, session.client.height
-    png = png_module.encode_png(width, height, rgb)
-    target = _screenshot_path(args.vmid, args.out)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(png)
+    result = _save_screenshot(args.vmid, rgb, width, height, args.out)
+    target = Path(result["path"])
+    png = target.read_bytes()
     analysis = textmode.analyse(rgb, width, height)
-    result: dict[str, Any] = {
-        "vmid": args.vmid,
-        "path": str(target),
-        "width": width,
-        "height": height,
-        "bytes": len(png),
-        "looks_like_text_console": analysis["looks_like_text_console"],
-        "distinct_colours": analysis["distinct_colours"],
-    }
     if args.upload:
         key = f"screens/vm{args.vmid}-{int(time.time())}.png"
         s3.put_bytes(key, png, "image/png")
@@ -340,21 +403,27 @@ def cmd_keys(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     combos = args.keys
+    screenshot = None
     if args.via == "api":
         for combo in combos:
             api.call(
                 "PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/sendkey", {"key": combo}
             )
             time.sleep(args.delay)
+        screenshot = _capture_after_action(lab, api, args)
     else:
         with VncSession(lab, api, args.vmid) as session:
             for combo in combos:
                 modifiers, keysym = rfb.parse_key_combo(combo)
                 session.client.tap(keysym, modifiers)
                 time.sleep(args.delay)
+            screenshot = _capture_after_action(lab, api, args, session)
     lab.audit("console-keys", lease=args.lease, vmid=args.vmid,
               count=len(combos), via=args.via, sync=False)
-    print(json.dumps({"vmid": args.vmid, "keys_sent": len(combos), "via": args.via}))
+    result = {"vmid": args.vmid, "keys_sent": len(combos), "via": args.via}
+    if screenshot is not None:
+        result["screenshot_after"] = screenshot
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_type(lab: Any, args: Any) -> None:
@@ -370,10 +439,14 @@ def cmd_type(lab: Any, args: Any) -> None:
         sent = session.client.type_text(text, delay=args.delay)
         if args.enter:
             session.client.tap(rfb.KEYSYMS["enter"])
+        screenshot = _capture_after_action(lab, api, args, session)
     # The text itself is never audited: it may contain a password.
     lab.audit("console-type", lease=args.lease, vmid=args.vmid,
               characters=sent, sync=False)
-    print(json.dumps({"vmid": args.vmid, "characters_sent": sent}))
+    result = {"vmid": args.vmid, "characters_sent": sent}
+    if screenshot is not None:
+        result["screenshot_after"] = screenshot
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_click(lab: Any, args: Any) -> None:
@@ -386,10 +459,70 @@ def cmd_click(lab: Any, args: Any) -> None:
                 f"({args.x},{args.y}) is outside the "
                 f"{session.client.width}x{session.client.height} screen",
             )
+        width, height = session.client.width, session.client.height
+        calibration = _load_calibration(lab, args.vmid)
+        same_resolution = (
+            calibration.get("lease") == args.lease
+            and calibration.get("width") == width
+            and calibration.get("height") == height
+        )
+        calibrated = same_resolution and calibration.get("confirmed") is True
+        if not calibrated:
+            pending_matches = (
+                same_resolution
+                and calibration.get("confirmed") is False
+                and calibration.get("x") == args.x
+                and calibration.get("y") == args.y
+            )
+            if getattr(args, "confirm_calibration", False):
+                if not pending_matches:
+                    raise _api_error(
+                        lab,
+                        "no matching click calibration is pending; run the same "
+                        "click without --confirm-calibration first",
+                    )
+                _save_calibration(lab, args.vmid, {
+                    "lease": args.lease, "width": width, "height": height,
+                    "confirmed": True,
+                })
+            else:
+                session.client.pointer(args.x, args.y, 0)
+                settle = getattr(args, "calibration_settle", 1.0)
+                rgb = session.client.capture(timeout=25.0, settle=settle)
+                checkpoint = _save_screenshot(
+                    args.vmid, rgb, width, height,
+                    getattr(args, "screenshot_out", None),
+                )
+                _save_calibration(lab, args.vmid, {
+                    "lease": args.lease, "width": width, "height": height,
+                    "confirmed": False, "x": args.x, "y": args.y,
+                })
+                lab.audit(
+                    "console-click-calibration", lease=args.lease,
+                    vmid=args.vmid, width=width, height=height, sync=False,
+                )
+                print(json.dumps({
+                    "vmid": args.vmid,
+                    "clicked": False,
+                    "calibration_required": True,
+                    "cursor_moved_to": [args.x, args.y],
+                    "resolution": [width, height],
+                    "checkpoint": checkpoint,
+                    "next_step": (
+                        "Verify the cursor is on the intended control, then repeat "
+                        "this click with --confirm-calibration. If this model has "
+                        "no vision, delegate that checkpoint decision."
+                    ),
+                }, indent=2, sort_keys=True))
+                return
         session.client.click(args.x, args.y, button=args.button, double=args.double)
+        screenshot = _capture_after_action(lab, api, args, session)
     lab.audit("console-click", lease=args.lease, vmid=args.vmid,
               x=args.x, y=args.y, button=args.button, sync=False)
-    print(json.dumps({"vmid": args.vmid, "clicked": [args.x, args.y]}))
+    result = {"vmid": args.vmid, "clicked": [args.x, args.y]}
+    if screenshot is not None:
+        result["screenshot_after"] = screenshot
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_text(lab: Any, args: Any) -> None:
@@ -602,6 +735,16 @@ def register(sub: Any, lab: Any) -> None:
     def bind(handler: Any) -> Any:
         return lambda args: handler(lab, args)
 
+    def add_after_screenshot(parser: Any) -> None:
+        parser.add_argument(
+            "--screenshot-after", type=float, metavar="SECONDS",
+            help="after input, wait this long and include a PNG in the result",
+        )
+        parser.add_argument(
+            "--screenshot-out",
+            help="path for --screenshot-after (default: state screens directory)",
+        )
+
     console = sub.add_parser("console", help="VNC, terminal and guest access")
     console_sub = console.add_subparsers(dest="console_command", required=True)
 
@@ -624,6 +767,7 @@ def register(sub: Any, lab: Any) -> None:
     keys.add_argument("keys", nargs="+", help="e.g. ctrl-alt-delete f2 enter")
     keys.add_argument("--via", choices=("vnc", "api"), default="vnc")
     keys.add_argument("--delay", type=float, default=0.08)
+    add_after_screenshot(keys)
     keys.set_defaults(func=bind(cmd_keys))
 
     typing = console_sub.add_parser("type", help="type text at the console")
@@ -634,6 +778,7 @@ def register(sub: Any, lab: Any) -> None:
                         help="read the text from stdin, keeping it out of argv")
     typing.add_argument("--enter", action="store_true")
     typing.add_argument("--delay", type=float, default=0.012)
+    add_after_screenshot(typing)
     typing.set_defaults(func=bind(cmd_type))
 
     click = console_sub.add_parser("click", help="click at a pixel position")
@@ -643,6 +788,15 @@ def register(sub: Any, lab: Any) -> None:
     click.add_argument("--y", type=int, required=True)
     click.add_argument("--button", type=int, choices=(1, 2, 3), default=1)
     click.add_argument("--double", action="store_true")
+    click.add_argument(
+        "--confirm-calibration", action="store_true",
+        help="confirm a pending cursor checkpoint and perform the first click",
+    )
+    click.add_argument(
+        "--calibration-settle", type=float, default=1.0,
+        help="seconds to settle before the cursor calibration checkpoint",
+    )
+    add_after_screenshot(click)
     click.set_defaults(func=bind(cmd_click))
 
     text = console_sub.add_parser(

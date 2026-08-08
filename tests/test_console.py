@@ -644,3 +644,53 @@ class ScreenshotCommandTests(unittest.TestCase):
                 lab_console.cmd_screenshot(lab, args)
             self.assertTrue(out.exists())
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+
+    def test_click_calibrates_once_and_resets_on_resolution_change(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 2, 2
+        session.client.capture.return_value = b"\x00\x00\x00" * 4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "after.png"
+            args = mock.Mock(
+                lease="lease-12345678", vmid=1, x=0, y=0, button=1,
+                double=False, screenshot_after=2.5, screenshot_out=str(out),
+                confirm_calibration=False, calibration_settle=1.0,
+            )
+            with mock.patch.object(lab, "STATE_ROOT", Path(tmp)), \
+                 mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch("builtins.print") as printed:
+                # First use at a resolution only positions the visible cursor.
+                lab_console.cmd_click(lab, args)
+                first = json.loads(printed.call_args.args[0])
+                self.assertFalse(first["clicked"])
+                self.assertTrue(first["calibration_required"])
+                session.client.click.assert_not_called()
+
+                # Confirming that exact cursor checkpoint performs the click
+                # and keeps the calibration for this resolution.
+                args.confirm_calibration = True
+                lab_console.cmd_click(lab, args)
+                payload = json.loads(printed.call_args.args[0])
+
+                # A resolution change invalidates the saved calibration and
+                # returns another cursor checkpoint instead of blind input.
+                session.client.width, session.client.height = 3, 2
+                session.client.capture.return_value = b"\x00\x00\x00" * 6
+                args.confirm_calibration = False
+                lab_console.cmd_click(lab, args)
+                changed = json.loads(printed.call_args.args[0])
+
+            session.client.click.assert_called_once_with(0, 0, button=1,
+                                                         double=False)
+            self.assertTrue(changed["calibration_required"])
+            self.assertEqual(changed["resolution"], [3, 2])
+            self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+            self.assertEqual(payload["screenshot_after"]["path"], str(out))

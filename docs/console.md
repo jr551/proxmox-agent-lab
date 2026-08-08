@@ -37,11 +37,32 @@ proxmox-lab console click --lease "$L" --vmid 9001 --x 640 --y 412
 proxmox-lab console type  --lease "$L" --vmid 9001 --text-stdin --enter
 ```
 
+For a graphical workflow, add `--screenshot-after SECONDS` to any input
+command. It waits for the UI to settle and returns the resulting PNG in the
+same JSON response, avoiding a separate reconnect and screenshot call:
+
+```bash
+proxmox-lab console keys --lease "$L" --vmid 9001 enter --screenshot-after 3
+```
+
 - `keys` defaults to the VNC path; `--via api` uses Proxmox `sendkey`, which
   works even when RFB input is unavailable.
 - `type` takes `--text-stdin` so a password never appears in `argv`, the shell
   history, or the audit ledger. Only the character count is recorded.
 - Clicks are refused outside the current screen bounds.
+- `--screenshot-out PATH` gives the post-input PNG a stable checkpoint name.
+
+The first click at a given VM resolution is intentionally not a click. The
+client moves the visible cursor to the requested coordinate and returns a PNG.
+Confirm the pointer is on the intended control, then repeat the same command
+with `--confirm-calibration`. The confirmed calibration is cached for that
+lease and VM until the framebuffer resolution changes, at which point the safe
+two-step check repeats.
+
+See [gui-installers.md](gui-installers.md) for the bounded state loop agents
+should use with installers, including Haiku. A model without image vision
+should delegate the current full-screen decision to a vision-capable model,
+not run Tesseract over crops.
 
 ### Keyboard input needs a VGA display
 

@@ -37,6 +37,8 @@ trap 'proxmox-lab lease-end --lease "$L"' EXIT
 ```
 
 1. `lease-begin` powers the machine on if needed. It takes a minute or two.
+   Omit `--timeout` to use the configured boot budget; cold-start values below
+   90 seconds are rejected.
 2. Pass `--lease "$L"` to every mutating command.
 3. `lease-heartbeat --lease "$L"` if the work runs beyond 30 minutes.
 4. `lease-end` must report `host_powered_off=true`. **Never claim completion
@@ -90,6 +92,20 @@ proxmox-lab console keys  --lease "$L" --vmid <id> enter f2
 proxmox-lab console click --lease "$L" --vmid <id> --x 640 --y 412
 proxmox-lab console type  --lease "$L" --vmid <id> --text-stdin --enter
 ```
+
+For GUI installers, attach `--screenshot-after 3` to `keys`, `type`, or
+`click`. Make one action, read the returned full PNG, and repeat. After three
+unchanged attempts, stop and diagnose; never build an ad-hoc Pillow/Tesseract
+crop loop. If the active model has no vision, delegate the single-screen
+decision to a vision-capable model while keeping all mutations in the primary
+agent. Follow [docs/gui-installers.md](docs/gui-installers.md), including its
+Haiku checkpoint map.
+
+The first `console click` at each VM resolution only moves the visible cursor
+and returns a calibration PNG. Verify it, then repeat the same click with
+`--confirm-calibration`. The calibration persists for that lease and VM until
+the resolution changes; never confirm a cursor position that was not visually
+checked.
 
 `guest probe` tells you what will actually work. Prefer real text over pixels;
 read the PNG when a screen is the truth. **A guest whose display is the serial

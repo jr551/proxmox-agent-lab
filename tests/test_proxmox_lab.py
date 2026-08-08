@@ -21,6 +21,20 @@ from proxmox_agent_lab import cli as LAB  # noqa: E402
 
 
 class ProxmoxLabTests(unittest.TestCase):
+    def test_cold_boot_timeout_uses_config_and_rejects_impatient_override(self) -> None:
+        api = mock.Mock()
+        api.reachable.return_value = False
+        with mock.patch.object(LAB.power_module, "power_on") as power_on:
+            with self.assertRaises(LAB.LabError) as caught:
+                LAB.ensure_on(api, timeout=20)
+        self.assertIn("at least 90s", str(caught.exception))
+        power_on.assert_not_called()
+
+        begin = LAB.parser().parse_args(["lease-begin", "--purpose", "check"])
+        power = LAB.parser().parse_args(["power-on"])
+        self.assertIsNone(begin.timeout)
+        self.assertIsNone(power.timeout)
+
     def test_redacts_nested_secrets(self) -> None:
         value = {
             "ok": "visible",

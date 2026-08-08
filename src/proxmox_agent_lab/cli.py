@@ -56,6 +56,7 @@ TOKEN_NAME = CONFIG.proxmox.token_name
 VERIFY_TLS = bool(CONFIG.proxmox.verify_tls)
 DEFAULT_TTL_SECONDS = int(CONFIG.lease.default_ttl_seconds)
 MCP_IDLE_SHUTDOWN_SECONDS = int(CONFIG.lease.idle_shutdown_seconds)
+MIN_COLD_BOOT_TIMEOUT_SECONDS = 90
 STATE_ROOT = config_module.state_dir()
 LEASE_ROOT = STATE_ROOT / "leases"
 LOCK_PATH = STATE_ROOT / "controller.lock"
@@ -257,6 +258,11 @@ def ensure_on(api: ProxmoxAPI, timeout: int | None = None) -> bool:
         return False
     if timeout is None:
         timeout = int(CONFIG.power.get("boot_timeout_seconds", 300))
+    if timeout < MIN_COLD_BOOT_TIMEOUT_SECONDS:
+        raise LabError(
+            f"cold-boot timeout must be at least {MIN_COLD_BOOT_TIMEOUT_SECONDS}s; "
+            "the lab host commonly needs a minute or two before its API answers"
+        )
     try:
         detail = power_module.power_on(CONFIG)
     except (power_module.PowerError, ConfigError) as exc:
@@ -1200,7 +1206,10 @@ def parser() -> argparse.ArgumentParser:
     ledger.set_defaults(func=cmd_journal)
 
     power = sub.add_parser("power-on")
-    power.add_argument("--timeout", type=int, default=180)
+    power.add_argument(
+        "--timeout", type=int,
+        help="cold-boot wait (default: power.boot_timeout_seconds; minimum: 90)",
+    )
     power.set_defaults(func=cmd_power_on)
 
     begin = sub.add_parser("lease-begin")
@@ -1210,7 +1219,10 @@ def parser() -> argparse.ArgumentParser:
         help="keep these machines (and the host powered on) until destroyed",
     )
     begin.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
-    begin.add_argument("--timeout", type=int, default=180)
+    begin.add_argument(
+        "--timeout", type=int,
+        help="cold-boot wait (default: power.boot_timeout_seconds; minimum: 90)",
+    )
     begin.set_defaults(func=cmd_lease_begin)
 
     heartbeat = sub.add_parser("lease-heartbeat")

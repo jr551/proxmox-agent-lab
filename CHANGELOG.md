@@ -6,8 +6,19 @@ All notable changes to this project will be documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- Console input commands can capture a settled post-action screenshot in the
+  same response with `--screenshot-after`.
+- Coordinate clicks now use a vision-confirmed cursor calibration, cached per
+  lease and resolution and automatically invalidated on resolution changes.
+- A bounded GUI-installer playbook gives small models a deterministic workflow
+  and delegates graphical checkpoints to vision instead of external OCR.
+
 ### Fixed
 
+- Cold lab starts now use the configured boot timeout and reject waits shorter
+  than 90 seconds, preventing premature failure and duplicate leases.
 - Git audit sync now keeps the local SQLite ledger queryable while copying
   redacted JSONL records to a dedicated private `logs` branch.
 - Log sync fails closed on a dirty checkout and can stage only the daily

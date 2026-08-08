@@ -1,0 +1,17 @@
+{
+  "kind": "qemu",
+  "name": "ubuntu-2404-agent",
+  "image_match": "ubuntu-24.04-server-cloudimg-amd64.img",
+  "storage": "local-lvm",
+  "disk_gib": 32,
+  "cores": 4,
+  "memory_mib": 8192,
+  "cpu": "host",
+  "machine": "q35",
+  "scsihw": "virtio-scsi-single",
+  "network": "virtio,bridge=vmbr0",
+  "cloud_init": true,
+  "agent": true,
+  "onboot": false,
+  "cleanup_policy": "delete"
+}

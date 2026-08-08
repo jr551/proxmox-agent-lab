@@ -1,0 +1,6 @@
+#!/bin/sh
+# Run from a checkout without installing. Once installed (pip install .), the
+# `proxmox-lab` entry point on PATH does the same thing.
+set -eu
+here="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m proxmox_agent_lab "$@"

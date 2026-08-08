@@ -1,0 +1,90 @@
+# Lease and shutdown policy
+
+## Invariants
+
+1. Every write belongs to one active lease.
+2. Every created guest carries `codex-lab` and `lease-<id>` tags.
+3. Cleanup deletes only guests registered to that lease.
+4. Durable templates use `codex-template` and policy `retain`.
+5. Lease expiry is two hours by default and is extended by heartbeats.
+6. Ending or expiring the last lease powers off `pve`.
+7. Completion requires the Proxmox API to remain unreachable for two
+   consecutive checks.
+8. Every operation writes a redacted audit event and attempts a normal
+   fast-forward/rebase Forgejo sync.
+9. Every MCP tool call records only its tool name and refreshes the idle clock.
+10. A reachable host with no active leases is shut down after eight hours
+    without an MCP tool call.
+11. Console input (keys, typing, clicks), guest execution and file transfer
+    require an active lease. Screenshots and terminal reads do not.
+12. Typed text and generated passwords are never audited; only counts,
+    exit codes and object keys are.
+13. A no-op watchdog sweep writes nothing. The journal and the Forgejo history
+    record events, not heartbeats.
+14. Lab guests that reach the internet do so through the VPN gateway. The
+    gateway forwards only `eth1 -> wg0` and drops everything else, so a
+    dropped tunnel stops egress rather than leaking to the home WAN.
+15. `net verify` must pass before a guest behind the gateway is used for real
+    work, and after any change to the gateway ruleset.
+16. A long-term lease suspends invariant 6: while one is active the host stays
+    powered on, and every command that would otherwise shut it down reports
+    that it did not, and why.
+17. Long-term guests carry Proxmox `protection` and policy `retain`. They are
+    removed only by `lease-destroy --confirm`, which lifts protection first.
+18. A long-term backup marks success only when every guest in the lease
+    succeeded, so a partial failure retries instead of waiting a week.
+
+## Graceful finalization
+
+For each disposable registered guest:
+
+1. request ACPI shutdown for QEMU or shutdown for LXC;
+2. wait up to 120 seconds for `stopped`;
+3. issue a hard guest stop only if graceful guest shutdown timed out;
+4. delete the stopped guest;
+5. preserve the Proxmox task ID and result.
+
+After all leases are closed:
+
+1. request `command=shutdown` on `/nodes/pve/status`;
+2. wait up to 240 seconds for the API to disappear;
+3. retry one reachability check;
+4. invoke `script.nanokvm_pc2_force_off` only if the API remains reachable;
+5. wait up to 60 seconds and verify the API is down.
+
+## Refuse or stop
+
+- Refuse a write with no active lease.
+- Refuse deletion of an unregistered VMID.
+- Refuse host storage, network, access-control, cluster, SDN, firewall-default,
+  or device-passthrough changes unless the user's current request explicitly
+  authorizes that category.
+- Stop and report if an untagged or pre-existing guest would be deleted.
+- Treat the `[memflow]` SSH connection as a distinct trust boundary: it reaches
+  the host as root outside the API token, so it stays off unless the user has
+  configured it, and `memflow host-setup` / `usb attach` are host changes gated
+  behind `--host-change-authorized`. `netcap` (capture, SSL inspection, MITM)
+  rides the same connection and is subject to the same boundary.
+- Refuse a `memflow write` or `memflow phys-write` (both mutate live guest
+  memory -- kernel-virtual and physical/RAM-injection respectively) unless the
+  user's current request explicitly authorizes it, then pass `--i-understand`.
+  Never pass a USB device backing active storage through to a guest.
+- Capture and decrypt only a guest's own traffic, within a lease. `netcap
+  intercept` is an active MITM: install its CA only in guests the user controls,
+  for work the user has authorized, and never rewrite traffic the user did not
+  ask to rewrite.
+- Do not log cloud-init passwords, tokens, authorization headers, SSH private
+  keys, presigned S3 URLs, or full environment files. Guest memory, USB and
+  network captures — and decrypted MITM flows — are never written to the ledger;
+  only the fact of the capture is.
+- Refuse to write any credential into this repository. The S3 key ID and
+  secret belong in the macOS Keychain; `scripts/check-secrets.py` blocks the
+  common shapes at commit time.
+
+## Recovery
+
+The macOS LaunchAgent runs `cleanup-expired` every five minutes. It makes
+abandoned work eventually safe even if the calling agent crashes or loses its
+thread, and enforces the eight-hour MCP-idle shutdown threshold. A lease
+heartbeat prevents cleanup and idle shutdown during legitimate long-running
+work.

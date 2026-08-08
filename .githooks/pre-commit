@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+repo="$(git rev-parse --show-toplevel)"
+python3 "$repo/scripts/check-secrets.py" "$repo"
+python3 "$repo/scripts/check-public.py" "$repo"

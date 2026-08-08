@@ -1,0 +1,23 @@
+{
+  "kind": "qemu",
+  "name": "kali-lab",
+  "release": "2026.2",
+  "image_url": "https://kali.download/cloud-images/current/kali-linux-2026.2-cloud-genericcloud-amd64.tar.xz",
+  "source_sha256": "3f4ca86ae1eca0dc2bf2092f065a959508e186c6b44f85758813a8e9a0604f3e",
+  "import_sha256": "0792f7008c008655795666f40657796da3e630c6b95887ea8029fdc792adccde",
+  "storage": "local-lvm",
+  "disk_gib": 25,
+  "cores": 4,
+  "memory_mib": 8192,
+  "cpu": "host",
+  "machine": "q35",
+  "scsihw": "virtio-scsi-single",
+  "network": "virtio,bridge=vmbr0,firewall=1",
+  "cloud_init": true,
+  "cloud_init_user": "kali",
+  "ipconfig0": "ip=dhcp",
+  "agent": true,
+  "baseline_snapshot": "baseline-kali-2026-2",
+  "onboot": false,
+  "cleanup_policy": "retain"
+}

@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a portable capability or safety improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Research or lab use case
+      description: What authorized workflow should this enable?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Safety and trust boundary
+      description: What can this read, mutate, retain, expose, or leave running?
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: How could it be verified?
+      description: Include the guard test and any disposable-hardware test you expect.
+    validations:
+      required: true

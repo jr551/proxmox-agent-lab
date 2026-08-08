@@ -1,0 +1,51 @@
+{
+  "verified_at": "2026-08-02",
+  "windows_media": [
+    {
+      "name": "windows-server-2025-eval-en-us.iso",
+      "source_page": "https://www.microsoft.com/en-us/evalcenter/download-windows-server-2025",
+      "source_url": "https://go.microsoft.com/fwlink/?linkid=2345730&clcid=0x409&culture=en-us&country=us",
+      "size_bytes": 8152356864,
+      "license_note": "Microsoft evaluation media; no product key is stored"
+    },
+    {
+      "name": "windows-server-2022-eval-en-us.iso",
+      "source_page": "https://www.microsoft.com/en-us/evalcenter/download-windows-server-2022",
+      "source_url": "https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US",
+      "size_bytes": 5044094976,
+      "license_note": "Microsoft evaluation media; no product key is stored"
+    },
+    {
+      "name": "virtio-win-0.1.285.iso",
+      "source_page": "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/",
+      "source_url": "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso",
+      "size_bytes": 789645312
+    }
+  ],
+  "cloud_templates": [
+    {
+      "name": "Ubuntu Server 24.04 LTS",
+      "cloud_user": "ubuntu",
+      "source_url": "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img",
+      "checksum_algorithm": "sha256",
+      "checksum": "0533b0655c32e68b31d792ecd6ccfca95abdbc536c4446874fe0513bd4140ffe",
+      "boot_verified": true
+    },
+    {
+      "name": "Debian 13",
+      "cloud_user": "debian",
+      "source_url": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2",
+      "checksum_algorithm": "sha512",
+      "checksum": "735d1b2d0ef265a0c2323fdaa7d46e7bd7a1b984f73e8a785e638034bf07876e26374a9d809d713501270c071b3464d2ada0c5589f07742b95ed853cc6d48f45",
+      "boot_verified": true
+    },
+    {
+      "name": "Rocky Linux 10.2",
+      "cloud_user": "rocky",
+      "source_url": "https://download.rockylinux.org/pub/rocky/10.2/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2",
+      "checksum_algorithm": "sha256",
+      "checksum": "9fc9e9ff16888bb68ac39b0392e25c9c92684d50c85f1cce6ab549363bbc4b48",
+      "boot_verified": true
+    }
+  ]
+}

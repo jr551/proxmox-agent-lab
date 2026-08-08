@@ -1,0 +1,41 @@
+#!/bin/sh
+# Commit and push to Forgejo.
+#
+#   sync-repo <suffix>                  commit everything (skill/script edits)
+#   sync-repo --journal-only <suffix>   commit only journal/ (runtime audit)
+#
+# Runtime audit events use --journal-only. Without it a sync fired by an
+# ordinary lab operation would sweep whatever happens to be in the working
+# tree into a commit named after that operation, so unrelated source edits
+# land under a misleading message.
+set -eu
+
+repo="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+
+journal_only=0
+if [ "${1:-}" = "--journal-only" ]; then
+  journal_only=1
+  shift
+fi
+suffix="${1:-update}"
+
+python3 "$repo/scripts/check-secrets.py" "$repo"
+git -C "$repo" fetch origin
+
+if [ "$journal_only" -eq 1 ]; then
+  git -C "$repo" add -- "$repo/journal"
+  if ! git -C "$repo" diff --cached --quiet -- "$repo/journal"; then
+    git -C "$repo" commit -m "proxmox-agent-lab: $suffix" -- "$repo/journal"
+  fi
+elif ! git -C "$repo" diff --quiet || ! git -C "$repo" diff --cached --quiet ||
+     [ -n "$(git -C "$repo" ls-files --others --exclude-standard)" ]; then
+  git -C "$repo" add --all
+  git -C "$repo" commit -m "proxmox-agent-lab: $suffix"
+fi
+
+if git -C "$repo" show-ref --verify --quiet refs/remotes/origin/main; then
+  # --autostash: a journal-only sync can fire while source edits are in the
+  # working tree, and an unstaged change would otherwise abort the rebase.
+  git -C "$repo" rebase --autostash origin/main
+fi
+git -C "$repo" push origin main

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+work/
+runtime/
+*.env
+*.secret
+*.token
+# Generated from a console font whose licence is not this repository's to carry
+assets/console-font.json
+
+# Runtime state and anything describing a specific site
+journal/
+docs/site-notes.md
+proxmox-agent-lab.toml
+secrets.toml

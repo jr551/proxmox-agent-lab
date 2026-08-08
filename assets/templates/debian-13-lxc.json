@@ -1,0 +1,15 @@
+{
+  "kind": "lxc",
+  "name": "debian-13-agent",
+  "template_match": "debian-13-standard",
+  "storage": "local-lvm",
+  "rootfs_gib": 16,
+  "cores": 4,
+  "memory_mib": 4096,
+  "swap_mib": 512,
+  "unprivileged": true,
+  "features": "nesting=1",
+  "network": "name=eth0,bridge=vmbr0,ip=dhcp,type=veth",
+  "onboot": false,
+  "cleanup_policy": "delete"
+}

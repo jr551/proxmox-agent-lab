@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible defect without including private lab data
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, host addresses, VM captures, presigned URLs,
+        guest memory, or private topology. Report security issues privately via SECURITY.md.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include the command and sanitized output.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: proxmox-lab --version
+    validations:
+      required: true
+  - type: dropdown
+    id: evidence
+    attributes:
+      label: Verification level
+      options:
+        - Unit test or fake server
+        - Disposable guest on real hardware
+        - Documentation or packaging only
+    validations:
+      required: true
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Data hygiene
+      options:
+        - label: I removed credentials, addresses, VMIDs, captures, and other site-specific data.
+          required: true

@@ -1,0 +1,52 @@
+# Deterministic configuration for the test suite. Tests must never depend on
+# whatever the developer happens to have installed locally.
+
+[proxmox]
+host = "192.0.2.10"
+node = "testnode"
+token_user = "tester@pve"
+token_name = "test"
+
+[power]
+mode = "wake-on-lan"
+mac = "aa:bb:cc:dd:ee:ff"
+broadcast = "192.0.2.255"
+
+[storage]
+upload_storages = ["local", "bulk"]
+bulk_storage = "bulk"
+
+[network]
+lab_bridge = "vmbr1"
+lab_network = "10.66.0.0/24"
+lab_gateway_ip = "10.66.0.1"
+dhcp_start = "10.66.0.50"
+dhcp_end = "10.66.0.200"
+gateway_template_vmid = 900
+
+[vpn]
+enabled = true
+address = "10.100.0.2/32"
+dns = "10.100.0.1"
+endpoint = "vpn.example.invalid:51820"
+
+[s3]
+enabled = true
+endpoint = "https://s3.example.invalid"
+bucket = "test-bucket"
+region = "us-east-1"
+
+[memflow]
+enabled = true
+ssh_host = "192.0.2.10"
+ssh_user = "root"
+ssh_port = 22
+ssh_key = "/dev/null"
+helper = "pxl-memflow-run"
+
+[windows]
+template_2025_vmid = 910
+template_2022_vmid = 911
+
+[secrets]
+backend = "env"

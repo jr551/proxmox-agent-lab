@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+skill="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+label="lol.rowe.proxmox-agent-lab-watchdog"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+
+mkdir -p "$HOME/Library/LaunchAgents"
+python3 - "$plist" "$skill" <<'PY'
+import pathlib
+import plistlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+skill = pathlib.Path(sys.argv[2])
+payload = {
+    "Label": "lol.rowe.proxmox-agent-lab-watchdog",
+    "ProgramArguments": [
+        str(skill / "scripts" / "proxmox-lab"),
+        "cleanup-expired",
+    ],
+    "StartInterval": 300,
+    "RunAtLoad": True,
+    "StandardOutPath": str(
+        pathlib.Path.home() / "Library/Logs/proxmox-agent-lab-watchdog.log"
+    ),
+    "StandardErrorPath": str(
+        pathlib.Path.home() / "Library/Logs/proxmox-agent-lab-watchdog.log"
+    ),
+}
+path.write_bytes(plistlib.dumps(payload, sort_keys=True))
+PY
+
+launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$plist"
+launchctl enable "gui/$(id -u)/$label"
+launchctl kickstart -k "gui/$(id -u)/$label"

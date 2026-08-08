@@ -620,6 +620,58 @@ if __name__ == "__main__":
 
 
 class ScreenshotCommandTests(unittest.TestCase):
+    def test_inspect_refuses_to_transmit_an_unowned_guest(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.load_lease.return_value = {
+            "resources": [{"kind": "qemu", "vmid": 8}]
+        }
+        args = mock.Mock(lease="lease-12345678", vmid=7)
+        with mock.patch.object(lab_console, "VncSession") as vnc, \
+             mock.patch.object(lab_console.vision, "analyze_png") as analyze:
+            with self.assertRaises(RuntimeError) as caught:
+                lab_console.cmd_inspect(lab, args)
+        self.assertIn("not a qemu guest registered", str(caught.exception))
+        vnc.assert_not_called()
+        analyze.assert_not_called()
+
+    def test_inspect_requires_lease_ownership_and_audits_provider(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.load_lease.return_value = {
+            "resources": [{"kind": "qemu", "vmid": 7}]
+        }
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 2, 2
+        session.client.capture.return_value = b"\x00\x00\x00" * 4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "inspect.png"
+            args = mock.Mock(
+                lease="lease-12345678", vmid=7, settle=2.0, out=str(out),
+                prompt=None, timeout=120, max_tokens=1024,
+            )
+            with mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch.object(lab_console.vision, "analyze_png",
+                                   return_value={"analysis": {"screen": "gui"}}), \
+                 mock.patch("builtins.print") as printed:
+                lab_console.cmd_inspect(lab, args)
+
+        payload = json.loads(printed.call_args.args[0])
+        self.assertEqual(payload["transmitted_to"], "integrate.api.nvidia.com")
+        self.assertEqual(payload["vision"]["analysis"]["screen"], "gui")
+        lab.audit.assert_called_once_with(
+            "console-vision-inspect", lease=args.lease, vmid=7,
+            provider="nvidia", model=lab_console.vision.MODEL, sync=False,
+        )
+
     def test_cmd_screenshot_writes_a_file(self) -> None:
         """Regression: the module `png` was shadowed by a local of the same
         name, so this command raised UnboundLocalError. Testing the encoder

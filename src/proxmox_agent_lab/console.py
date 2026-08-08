@@ -25,7 +25,9 @@ from typing import Any
 from . import png as png_module
 from . import rfb
 from . import s3
+from . import secrets_store
 from . import textmode
+from . import vision
 from . import ws
 
 WS_PATH_TEMPLATE = "/api2/json/nodes/{node}/{kind}/{vmid}/vncwebsocket"
@@ -399,6 +401,42 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def cmd_inspect(lab: Any, args: Any) -> None:
+    """Capture and explicitly send one lease-owned screen to NVIDIA vision."""
+    lease = lab.load_lease(args.lease)
+    owned = any(
+        item.get("kind") == "qemu" and int(item.get("vmid", -1)) == args.vmid
+        for item in lease.get("resources", [])
+    )
+    if not owned:
+        raise _api_error(
+            lab, f"VMID {args.vmid} is not a qemu guest registered to this lease"
+        )
+    api = lab.ProxmoxAPI()
+    with VncSession(lab, api, args.vmid) as session:
+        rgb = session.client.capture(timeout=25.0, settle=args.settle)
+        width, height = session.client.width, session.client.height
+    screenshot = _save_screenshot(args.vmid, rgb, width, height, args.out)
+    image = Path(screenshot["path"]).read_bytes()
+    try:
+        analysis = vision.analyze_png(
+            lab.CONFIG, image, width=width, height=height, prompt=args.prompt,
+            timeout=args.timeout, max_tokens=args.max_tokens,
+        )
+    except (vision.VisionError, secrets_store.SecretError) as exc:
+        raise _api_error(lab, str(exc)) from None
+    lab.audit(
+        "console-vision-inspect", lease=args.lease, vmid=args.vmid,
+        provider="nvidia", model=vision.MODEL, sync=False,
+    )
+    print(json.dumps({
+        "vmid": args.vmid,
+        "screenshot": screenshot,
+        "transmitted_to": "integrate.api.nvidia.com",
+        "vision": analysis,
+    }, indent=2, sort_keys=True))
+
+
 def cmd_keys(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
@@ -760,6 +798,18 @@ def register(sub: Any, lab: Any) -> None:
     shot.add_argument("--ocr", action="store_true",
                       help="decode text-mode screens; refused on graphical screens")
     shot.set_defaults(func=bind(cmd_screenshot))
+
+    inspect = console_sub.add_parser(
+        "inspect", help="send one lease-owned screenshot to NVIDIA vision"
+    )
+    inspect.add_argument("--lease", required=True)
+    inspect.add_argument("--vmid", type=int, required=True)
+    inspect.add_argument("--out")
+    inspect.add_argument("--settle", type=float, default=2.0)
+    inspect.add_argument("--timeout", type=int, default=120)
+    inspect.add_argument("--max-tokens", type=int, default=1024)
+    inspect.add_argument("--prompt")
+    inspect.set_defaults(func=bind(cmd_inspect))
 
     keys = console_sub.add_parser("keys", help="send key combinations")
     keys.add_argument("--lease", required=True)

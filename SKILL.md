@@ -101,6 +101,13 @@ decision to a vision-capable model while keeping all mutations in the primary
 agent. Follow [docs/gui-installers.md](docs/gui-installers.md), including its
 Haiku checkpoint map.
 
+When `proxmox-lab secrets list` reports `nvidia-api-key` stored, prefer
+`console inspect --lease "$L" --vmid <id>` for the first graphical read. It
+explicitly sends one lease-owned PNG to NVIDIA Nemotron Nano 12B v2 VL and
+returns a structured proposal. Never treat model output as authorization or
+bypass the click-calibration guard. Without the key, use native vision or the
+single-screen delegation above.
+
 The first `console click` at each VM resolution only moves the visible cursor
 and returns a calibration PNG. Verify it, then repeat the same click with
 `--confirm-calibration`. The calibration persists for that lease and VM until

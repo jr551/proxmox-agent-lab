@@ -138,8 +138,9 @@ empty" may not be — check before you wipe, and report what you found.
   images, painful to boot from.
 - **For GUI installers, use the bounded checkpoint loop.** One action can
   return its settled screenshot with `--screenshot-after 3`; do not create
-  external OCR/Pillow crop loops. If the current model has no vision, delegate
-  the single-screen decision to one that does. See
+  external OCR/Pillow crop loops. Use `console inspect` first when the optional
+  NVIDIA vision key is configured. Otherwise, if the current model has no
+  vision, delegate the single-screen decision to one that does. See
   [gui-installers.md](gui-installers.md).
 
 ## 📝 A worked example

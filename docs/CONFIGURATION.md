@@ -216,6 +216,21 @@ one-off run.
 - **`keychain`** — macOS `security`.
 - **`secret-tool`** — Linux libsecret (GNOME Keyring, KWallet). Install
   `libsecret-tools`.
+
+### Optional NVIDIA vision
+
+Store an NVIDIA API key to let an agent explicitly send a lease-owned console
+screenshot to Nemotron Nano 12B v2 VL:
+
+```bash
+proxmox-lab secrets set nvidia-api-key
+proxmox-lab console inspect --lease "$L" --vmid 9001
+```
+
+The key remains in the selected secret backend. `console inspect` sends the PNG
+to `integrate.api.nvidia.com`; ordinary `console screenshot` never uploads it.
+The environment fallback name is `PROXMOX_AGENT_LAB_NVIDIA_API_KEY` for CI or
+ephemeral containers.
 - **`env`** — read `PROXMOX_AGENT_LAB_<NAME>`, e.g.
   `PROXMOX_AGENT_LAB_PROXMOX_TOKEN`. Read-only; good for CI and containers.
 - **`file`** — a TOML file that must be `0600`. For headless boxes with no

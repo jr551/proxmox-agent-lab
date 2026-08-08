@@ -14,6 +14,8 @@ All notable changes to this project will be documented here. The format follows
   lease and resolution and automatically invalidated on resolution changes.
 - A bounded GUI-installer playbook gives small models a deterministic workflow
   and delegates graphical checkpoints to vision instead of external OCR.
+- An opt-in, lease-bound `console inspect` wrapper sends one PNG to NVIDIA
+  Nemotron Nano 12B v2 VL using a key from the OS secret store.
 
 ### Fixed
 

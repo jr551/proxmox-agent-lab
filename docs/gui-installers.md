@@ -24,6 +24,17 @@ chooses one next action.
 5. Read the returned PNG. Record `screen -> action -> observed screen`, then
    repeat.
 
+When `nvidia-api-key` is stored, use the vision wrapper as the first graphical
+read:
+
+```bash
+proxmox-lab console inspect --lease "$L" --vmid "$VMID"
+```
+
+It captures one full PNG and explicitly transmits it to NVIDIA Nemotron Nano
+12B v2 VL. Treat its recommended action as a proposal, not permission: lease
+guards and click calibration still apply. Ordinary screenshots stay local.
+
 The first coordinate click at each framebuffer resolution is a two-step
 calibration. `console click` moves the visible cursor to the target and returns
 a checkpoint **without pressing the button**. After vision confirms the cursor
@@ -36,11 +47,12 @@ Those transformations discard context and turn one uncertain observation into
 dozens of guesses. `console screenshot --ocr` is only for a VGA text grid and
 will refuse a graphical screen.
 
-If the active model cannot see images, delegate **only the current full-screen
-checkpoint** to a vision-capable model and ask it for the screen name, relevant
-controls, and safest single next action. Keep lease ownership and all mutations
-in the primary agent. Tesseract is not a substitute for vision on a graphical
-desktop or installer.
+If the active model cannot see images, use `console inspect` first when its key
+is configured. Otherwise delegate **only the current full-screen checkpoint**
+to a vision-capable model and ask it for the screen name, relevant controls,
+and safest single next action. Keep lease ownership and all mutations in the
+primary agent. Tesseract is not a substitute for vision on a graphical desktop
+or installer.
 
 ## Hard limits
 

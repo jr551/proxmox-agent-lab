@@ -32,6 +32,11 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertEqual(redacted["token"], "[REDACTED]")
         self.assertEqual(redacted["nested"]["cipassword"], "[REDACTED]")
 
+    def test_lease_begin_timeout_default(self) -> None:
+        parsed = LAB.parser().parse_args(["lease-begin", "--purpose", "pr-test"])
+        self.assertEqual(parsed.command, "lease-begin")
+        self.assertEqual(parsed.timeout, 90)
+
     def test_parse_data(self) -> None:
         self.assertEqual(
             LAB.parse_data(["vmid=9000", "name=test"]),

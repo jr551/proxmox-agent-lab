@@ -1210,7 +1210,7 @@ def parser() -> argparse.ArgumentParser:
         help="keep these machines (and the host powered on) until destroyed",
     )
     begin.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
-    begin.add_argument("--timeout", type=int, default=180)
+    begin.add_argument("--timeout", type=int, default=90)
     begin.set_defaults(func=cmd_lease_begin)
 
     heartbeat = sub.add_parser("lease-heartbeat")

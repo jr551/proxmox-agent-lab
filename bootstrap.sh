@@ -49,19 +49,21 @@ done
 
 VENV="${TMPDIR:-/tmp}/proxmox-agent-lab-env"
 BIN="$VENV/bin/proxmox-lab"
-CHECK_STAMP="$VENV/.github-checked-at"
+CHECK_STAMP="${XDG_STATE_HOME:-$HOME/.local/state}/proxmox-agent-lab/github-update-check.json"
 LATEST_TAG=""
 CHECK_DUE=1
 if [ -f "$CHECK_STAMP" ] && "$PYTHON" - "$CHECK_STAMP" <<'PY' 2>/dev/null
-import os, sys, time
-raise SystemExit(0 if time.time() - os.path.getmtime(sys.argv[1]) < 86400 else 1)
+import json, sys, time
+try: checked = json.load(open(sys.argv[1], encoding="utf-8"))["checked_at"]
+except (OSError, KeyError, TypeError, ValueError): raise SystemExit(1)
+raise SystemExit(0 if time.time() - checked < 86400 else 1)
 PY
 then CHECK_DUE=0; fi
 
 if [ "$CHECK_DUE" -eq 1 ]; then
     # One GitHub request at most per 24 hours. Failure is deliberately cached:
     # an offline update service must never block access to the lab.
-    mkdir -p "$VENV"
+    mkdir -p "$VENV" "$(dirname "$CHECK_STAMP")"
     if command -v curl >/dev/null 2>&1; then
         LATEST_TAG=$(curl -fsSL --max-time 4 \
             -H 'Accept: application/vnd.github+json' \
@@ -70,7 +72,28 @@ if [ "$CHECK_DUE" -eq 1 ]; then
             'import json,sys; print(json.load(sys.stdin).get("tag_name", ""))' \
             2>/dev/null || true)
     fi
-    : >"$CHECK_STAMP"
+    CURRENT_FOR_CACHE=""
+    if [ -x "$BIN" ]; then
+        CURRENT_FOR_CACHE=$($VENV/bin/python -c \
+            'import proxmox_agent_lab; print(proxmox_agent_lab.__version__)' \
+            2>/dev/null || true)
+    fi
+    "$PYTHON" - "$CHECK_STAMP" "$CURRENT_FOR_CACHE" "$LATEST_TAG" <<'PY'
+import json, os, sys, tempfile, time
+path, current, tag = sys.argv[1:]
+latest = tag.removeprefix("v") or None
+def version(value):
+    try: return tuple(int(x) for x in value.split("."))
+    except (AttributeError, ValueError): return ()
+value = {"checked_at": time.time(), "current": current or None,
+         "latest": latest, "update_available": version(latest) > version(current),
+         "cached": False}
+if latest is None: value["error"] = "github update check unavailable"
+temporary = path + ".tmp"
+with open(temporary, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, sort_keys=True); handle.write("\n")
+os.replace(temporary, path)
+PY
 fi
 
 if [ -x "$BIN" ]; then

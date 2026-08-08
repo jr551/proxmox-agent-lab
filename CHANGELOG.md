@@ -4,6 +4,13 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.3.2 - 2026-08-09
+
+### Fixed
+
+- Bootstrap and CLI now share one update-check cache, enforcing the 24-hour
+  GitHub request limit across both startup paths rather than once per path.
+
 ## 0.3.1 - 2026-08-09
 
 ### Fixed

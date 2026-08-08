@@ -12,6 +12,8 @@ the opposite promise, and it changes three things:
 
 Nothing here expires. The only way out is `lease-destroy --confirm`, which
 lifts the protection, deletes the guests, and lets the host power down again.
+`lease-release --confirm` is the distinct preservation path: it closes the
+lease, retains its stopped guests, and also lets the host power down.
 """
 
 from __future__ import annotations
@@ -172,6 +174,60 @@ def cmd_destroy(lab: Any, args: Any) -> None:
         raise lab.LabError("some guests could not be destroyed")
 
 
+def cmd_release(lab: Any, args: Any) -> None:
+    """Close a long-term lease while preserving every registered guest."""
+    api = lab.ProxmoxAPI()
+    lease = lab.load_lease(args.lease, active=False)
+    if not lab.is_long_term(lease):
+        raise lab.LabError(
+            f"{args.lease} is an ordinary lease; end it with 'lease-end'"
+        )
+    guests = [
+        f"{r['kind']}/{r['vmid']} ({r.get('name') or 'unnamed'})"
+        for r in lease.get("resources", [])
+    ]
+    if not args.confirm:
+        raise lab.LabError(
+            "This closes the long-term lease and leaves its stopped guests "
+            "outside lease ownership:\n  "
+            + ("\n  ".join(guests) or "(no registered guests)")
+            + "\nRe-run with --confirm if that is what you want."
+        )
+    if not api.reachable():
+        lab.ensure_on(api)
+    for resource in lease.get("resources", []):
+        resource["policy"] = "retain"
+        try:
+            set_protection(
+                lab, api, resource["kind"], int(resource["vmid"]), False
+            )
+        except lab.LabError as exc:
+            lab.audit(
+                "long-term-unprotect-failed", lease=lease["id"],
+                vmid=resource["vmid"], error=str(exc), sync=False,
+            )
+    lease["kind"] = "session"
+    lab.save_lease(lease)
+    failures = lab.finalize_lease(api, lease)
+    others = lab.active_leases(excluding=args.lease)
+    host_powered_off = False
+    if not others:
+        host_powered_off = lab.shutdown_host(api)
+    lab.audit(
+        "long-term-released", lease=args.lease, failures=failures,
+        retained=len(guests), host_powered_off=host_powered_off,
+    )
+    print(json.dumps({
+        "lease": args.lease,
+        "retained_guests": guests,
+        "failures": failures,
+        "host_powered_off": host_powered_off,
+        "remaining_active_leases": [x["id"] for x in others],
+    }, indent=2, sort_keys=True))
+    if failures:
+        raise lab.LabError("some retained guests could not be finalized")
+
+
 def cmd_list(lab: Any, args: Any) -> None:
     """All active leases, and whether the machine is pinned on."""
     leases = lab.active_leases()
@@ -208,6 +264,17 @@ def register(sub: Any, lab: Any) -> None:
     destroy.add_argument("--confirm", action="store_true",
                          help="required: this deletes protected machines")
     destroy.set_defaults(func=bind(cmd_destroy))
+
+    release = sub.add_parser(
+        "lease-release",
+        help="close a long-term lease but retain its stopped machines",
+    )
+    release.add_argument("--lease", required=True)
+    release.add_argument(
+        "--confirm", action="store_true",
+        help="required: retained machines become independent of the lease",
+    )
+    release.set_defaults(func=bind(cmd_release))
 
     backup = sub.add_parser(
         "backup", help="run weekly backups for long-term leases that are due"

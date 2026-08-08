@@ -4,6 +4,22 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.3.0 - 2026-08-08
+
+### Added
+
+- Automatic vision races NVIDIA and both OpenRouter routes and returns the
+  first structurally valid answer with provider timing.
+- Later model-input screenshots dim stable pixels and retain bright,
+  magenta-outlined changes. Baselines are isolated by lease.
+- `lease-release --confirm` closes a long-term lease while preserving guests
+  registered with policy `retain`.
+
+### Changed
+
+- Single-provider vision results report their elapsed time and strategy.
+- The GUI playbook prefers keyboard selection inside open popup menus.
+
 ## 0.2.1 - 2026-08-08
 
 ### Fixed

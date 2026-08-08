@@ -140,6 +140,23 @@ class PngTests(unittest.TestCase):
         encoded = lab_png.encode_png(width, height, gridded)
         self.assertEqual(struct.unpack(">II", encoded[16:24]), (width, height))
 
+    def test_change_highlight_dims_stable_pixels_and_outlines_delta(self) -> None:
+        width, height = 3, 1
+        previous = bytes((100, 100, 100)) * 3
+        current = bytearray(previous)
+        current[3:6] = bytes((220, 100, 100))
+        highlighted, changed = lab_png.highlight_changes(
+            width, height, bytes(current), previous
+        )
+        self.assertEqual(changed, 1)
+        self.assertEqual(highlighted[3:6], current[3:6])
+        self.assertEqual(highlighted[0:3], b"\xff\x00\xff")
+        self.assertEqual(highlighted[6:9], b"\xff\x00\xff")
+
+    def test_change_highlight_rejects_mismatched_frames(self) -> None:
+        with self.assertRaises(ValueError):
+            lab_png.highlight_changes(2, 1, b"\x00" * 6, b"\x00" * 3)
+
 
 class RfbTests(unittest.TestCase):
     def test_capture_decodes_raw_rectangle(self) -> None:
@@ -645,6 +662,28 @@ if __name__ == "__main__":
 
 
 class ScreenshotCommandTests(unittest.TestCase):
+    def test_temporal_baselines_are_isolated_by_lease(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
+            first = b"\x00\x00\x00" * 4
+            changed = b"\xff\xff\xff" * 4
+            _, initial = lab_console._model_frame(
+                lab, "lease-one", 7, first, 2, 2
+            )
+            _, other_lease = lab_console._model_frame(
+                lab, "lease-two", 7, changed, 2, 2
+            )
+            _, repeated = lab_console._model_frame(
+                lab, "lease-one", 7, changed, 2, 2
+            )
+
+        self.assertFalse(initial["baseline"])
+        self.assertFalse(other_lease["baseline"])
+        self.assertTrue(repeated["baseline"])
+
     def test_inspect_refuses_to_transmit_an_unowned_guest(self) -> None:
         from proxmox_agent_lab import console as lab_console
 
@@ -676,6 +715,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         session.client.capture.return_value = b"\x00\x00\x00" * 4
 
         with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
             out = Path(tmp) / "inspect.png"
             args = mock.Mock(
                 lease="lease-12345678", vmid=7, settle=2.0, out=str(out),

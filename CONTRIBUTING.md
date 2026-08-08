@@ -49,3 +49,17 @@ Keep each pull request focused. Explain the failure mode, the safety boundary
 affected, how the change was tested, and whether real hardware was involved.
 Never paste tokens, presigned links, captures, guest memory, or site topology
 into an issue or pull request.
+
+## Releases
+
+Maintainers release from a clean, green `main` branch:
+
+1. Update the version in `pyproject.toml` and
+   `src/proxmox_agent_lab/__init__.py`.
+2. Move the relevant changelog entries under a dated version heading.
+3. Run `python scripts/check-release.py --tag vX.Y.Z` with the intended tag.
+4. Create and push the annotated `vX.Y.Z` tag.
+
+The tag-gated release workflow reruns the tests and public-release guards,
+builds and smoke-installs the wheel, generates SHA-256 checksums, and publishes
+the wheel, source archive, checksums, and changelog notes to GitHub Releases.

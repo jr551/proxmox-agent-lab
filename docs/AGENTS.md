@@ -20,7 +20,10 @@ Put `lease-end` in a trap, a `finally`, or the equivalent, so it runs even when
 the work fails. It must print `"host_powered_off": true`; if it does not, say
 so plainly rather than reporting success.
 
-`lease-begin` powers the machine on. Expect it to take a minute or two.
+`lease-begin` powers the machine on. Expect it to take a minute or two. Omit
+`--timeout` so the configured boot budget is used. A cold-start override below
+90 seconds is rejected; a short timeout creates duplicate leases and false
+failure reports rather than making the host boot faster.
 
 Work lasting more than 30 minutes needs `lease-heartbeat --lease "$L"`, or the
 watchdog will clean up underneath you.
@@ -133,6 +136,12 @@ empty" may not be — check before you wipe, and report what you found.
   than installing an OS.
 - **Keep guest disks on fast storage.** A bulk USB disk is fine for ISOs and
   images, painful to boot from.
+- **For GUI installers, use the bounded checkpoint loop.** One action can
+  return its settled screenshot with `--screenshot-after 3`; do not create
+  external OCR/Pillow crop loops. Use `console inspect` first when an optional
+  cloud vision key is configured. Otherwise, if the current model has no
+  vision, delegate the single-screen decision to one that does. See
+  [gui-installers.md](gui-installers.md).
 
 ## 📝 A worked example
 

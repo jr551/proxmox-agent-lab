@@ -25,7 +25,9 @@ from typing import Any
 from . import png as png_module
 from . import rfb
 from . import s3
+from . import secrets_store
 from . import textmode
+from . import vision
 from . import ws
 
 WS_PATH_TEMPLATE = "/api2/json/nodes/{node}/{kind}/{vmid}/vncwebsocket"
@@ -301,25 +303,68 @@ def _screenshot_path(vmid: int, override: str | None) -> Path:
     return DEFAULT_SCREENSHOT_DIR / f"vm{vmid}-{stamp}.png"
 
 
+def _save_screenshot(vmid: int, rgb: bytes, width: int, height: int,
+                     override: str | None = None) -> dict[str, Any]:
+    """Write one captured framebuffer and return its machine-readable facts."""
+    encoded = png_module.encode_png(width, height, rgb)
+    target = _screenshot_path(vmid, override)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(encoded)
+    analysis = textmode.analyse(rgb, width, height)
+    result: dict[str, Any] = {
+        "vmid": vmid,
+        "path": str(target),
+        "width": width,
+        "height": height,
+        "bytes": len(encoded),
+        "looks_like_text_console": analysis["looks_like_text_console"],
+        "distinct_colours": analysis["distinct_colours"],
+    }
+    if analysis["looks_like_text_console"]:
+        result["agent_hint"] = (
+            "Prefer console text for exact characters; use --ocr only for a "
+            "VGA text grid"
+        )
+    else:
+        result["agent_hint"] = (
+            "Read this PNG with vision. If this model has no vision, delegate "
+            "the single-screen decision to a vision-capable model; do not use "
+            "Tesseract, OCR, crops, or image filters."
+        )
+    return result
+
+
+def _capture_after_action(lab: Any, api: Any, args: Any,
+                          session: VncSession | None = None) -> dict[str, Any] | None:
+    """Optionally capture the settled screen as part of an input command.
+
+    Keeping input and observation in one command avoids the common agent loop
+    of click, reconnect, screenshot, crop, OCR, and repeat.
+    """
+    settle = getattr(args, "screenshot_after", None)
+    if settle is None:
+        return None
+    if session is None:
+        with VncSession(lab, api, args.vmid) as new_session:
+            rgb = new_session.client.capture(timeout=25.0, settle=settle)
+            width, height = new_session.client.width, new_session.client.height
+    else:
+        rgb = session.client.capture(timeout=25.0, settle=settle)
+        width, height = session.client.width, session.client.height
+    return _save_screenshot(
+        args.vmid, rgb, width, height, getattr(args, "screenshot_out", None)
+    )
+
+
 def cmd_screenshot(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     with VncSession(lab, api, args.vmid) as session:
         rgb = session.client.capture(timeout=args.timeout, settle=args.settle)
         width, height = session.client.width, session.client.height
-    png = png_module.encode_png(width, height, rgb)
-    target = _screenshot_path(args.vmid, args.out)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(png)
+    result = _save_screenshot(args.vmid, rgb, width, height, args.out)
+    target = Path(result["path"])
+    png = target.read_bytes()
     analysis = textmode.analyse(rgb, width, height)
-    result: dict[str, Any] = {
-        "vmid": args.vmid,
-        "path": str(target),
-        "width": width,
-        "height": height,
-        "bytes": len(png),
-        "looks_like_text_console": analysis["looks_like_text_console"],
-        "distinct_colours": analysis["distinct_colours"],
-    }
     if args.upload:
         key = f"screens/vm{args.vmid}-{int(time.time())}.png"
         s3.put_bytes(key, png, "image/png")
@@ -336,25 +381,98 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def cmd_inspect(lab: Any, args: Any) -> None:
+    """Capture and explicitly send one lease-owned screen to cloud vision."""
+    lease = lab.load_lease(args.lease)
+    owned = any(
+        item.get("kind") == "qemu" and int(item.get("vmid", -1)) == args.vmid
+        for item in lease.get("resources", [])
+    )
+    if not owned:
+        raise _api_error(
+            lab, f"VMID {args.vmid} is not a qemu guest registered to this lease"
+        )
+    api = lab.ProxmoxAPI()
+    with VncSession(lab, api, args.vmid) as session:
+        rgb = session.client.capture(timeout=25.0, settle=args.settle)
+        width, height = session.client.width, session.client.height
+    screenshot = _save_screenshot(args.vmid, rgb, width, height, args.out)
+    grid_step = 100
+    gridded = png_module.overlay_coordinate_grid(
+        width, height, rgb, step=grid_step
+    )
+    original_path = Path(screenshot["path"])
+    grid_path = original_path.with_name(
+        original_path.stem + "-grid" + original_path.suffix
+    )
+    grid_png = png_module.encode_png(width, height, gridded)
+    grid_path.write_bytes(grid_png)
+    model_input = {
+        "path": str(grid_path),
+        "bytes": len(grid_png),
+        "width": width,
+        "height": height,
+        "grid_step": grid_step,
+        "origin": "top-left",
+        "x_direction": "right",
+        "y_direction": "down",
+    }
+    grid_prompt = (args.prompt or vision.DEFAULT_PROMPT) + (
+        "\nA coordinate grid is overlaid every 100 pixels. The labels are "
+        "original framebuffer coordinates: origin top-left, X increases "
+        "right, Y increases down. Use the grid to estimate control centers."
+    )
+    try:
+        analysis = vision.analyze_png(
+            lab.CONFIG, grid_png, width=width, height=height, prompt=grid_prompt,
+            timeout=args.timeout, max_tokens=args.max_tokens,
+            provider=args.provider,
+        )
+    except (vision.VisionError, secrets_store.SecretError) as exc:
+        raise _api_error(lab, str(exc)) from None
+    lab.audit(
+        "console-vision-inspect", lease=args.lease, vmid=args.vmid,
+        provider=analysis["provider"], model=analysis["model"], sync=False,
+    )
+    destination = (
+        "integrate.api.nvidia.com"
+        if analysis["provider"] == "nvidia"
+        else "openrouter.ai"
+    )
+    print(json.dumps({
+        "vmid": args.vmid,
+        "screenshot": screenshot,
+        "model_input": model_input,
+        "transmitted_to": destination,
+        "vision": analysis,
+    }, indent=2, sort_keys=True))
+
+
 def cmd_keys(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     combos = args.keys
+    screenshot = None
     if args.via == "api":
         for combo in combos:
             api.call(
                 "PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/sendkey", {"key": combo}
             )
             time.sleep(args.delay)
+        screenshot = _capture_after_action(lab, api, args)
     else:
         with VncSession(lab, api, args.vmid) as session:
             for combo in combos:
                 modifiers, keysym = rfb.parse_key_combo(combo)
                 session.client.tap(keysym, modifiers)
                 time.sleep(args.delay)
+            screenshot = _capture_after_action(lab, api, args, session)
     lab.audit("console-keys", lease=args.lease, vmid=args.vmid,
               count=len(combos), via=args.via, sync=False)
-    print(json.dumps({"vmid": args.vmid, "keys_sent": len(combos), "via": args.via}))
+    result = {"vmid": args.vmid, "keys_sent": len(combos), "via": args.via}
+    if screenshot is not None:
+        result["screenshot_after"] = screenshot
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_type(lab: Any, args: Any) -> None:
@@ -370,26 +488,92 @@ def cmd_type(lab: Any, args: Any) -> None:
         sent = session.client.type_text(text, delay=args.delay)
         if args.enter:
             session.client.tap(rfb.KEYSYMS["enter"])
+        screenshot = _capture_after_action(lab, api, args, session)
     # The text itself is never audited: it may contain a password.
     lab.audit("console-type", lease=args.lease, vmid=args.vmid,
               characters=sent, sync=False)
-    print(json.dumps({"vmid": args.vmid, "characters_sent": sent}))
+    result = {"vmid": args.vmid, "characters_sent": sent}
+    if screenshot is not None:
+        result["screenshot_after"] = screenshot
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_click(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
+    target = str(getattr(args, "target", "") or "").strip()
+    if len(target) < 3:
+        raise _api_error(
+            lab, "--target must describe the visible control in at least 3 characters"
+        )
+    if len(target) > 80 or any(ord(char) < 32 for char in target):
+        raise _api_error(lab, "--target must be a single printable label of at most 80 characters")
+    target_json = json.dumps(target, ensure_ascii=False)
     with VncSession(lab, api, args.vmid) as session:
-        if args.x >= session.client.width or args.y >= session.client.height:
+        if not (0 <= args.x < session.client.width
+                and 0 <= args.y < session.client.height):
             raise _api_error(
                 lab,
                 f"({args.x},{args.y}) is outside the "
                 f"{session.client.width}x{session.client.height} screen",
             )
+        width, height = session.client.width, session.client.height
+        session.client.pointer(args.x, args.y, 0)
+        rgb = session.client.capture(timeout=25.0, settle=args.calibration_settle)
+        checkpoint = _save_screenshot(
+            args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
+        )
+        gridded = png_module.overlay_coordinate_grid(width, height, rgb, step=100)
+        grid_png = png_module.encode_png(width, height, gridded)
+        prompt = f"""Verify one cursor checkpoint. Return only JSON:
+{{
+  "screen": "short checkpoint name",
+  "summary": "what is visibly happening",
+  "controls": [{{"label": {target_json}, "x": {args.x}, "y": {args.y}, "confidence": 0.0}}],
+  "recommended_action": {{"kind": "click", "value": "{args.x},{args.y}", "reason": "cursor visibly overlaps the named control"}},
+  "expected_change": "the named control opens",
+  "warnings": []
+}}
+The harness has already moved the visible cursor to ({args.x},{args.y}). Decide
+only whether that cursor visibly overlaps the one control named {target!r}. Do
+not estimate or change coordinates: if it overlaps, copy the supplied
+coordinates exactly into both coordinate fields. If it does not overlap, is
+ambiguous, or the named control is absent, return controls=[] and
+recommended_action kind=stop. Never infer from coordinates alone."""
+        try:
+            analysis = vision.analyze_png(
+                lab.CONFIG, grid_png, width=width, height=height, prompt=prompt,
+                timeout=args.vision_timeout, provider=args.provider,
+            )
+        except (vision.VisionError, secrets_store.SecretError) as exc:
+            raise _api_error(lab, f"click blocked: vision checkpoint failed: {exc}") from None
+        verified, reason = vision.verifies_target(
+            analysis, target, args.x, args.y
+        )
+        lab.audit(
+            "console-click-calibration", lease=args.lease, vmid=args.vmid,
+            width=width, height=height, target=target, verified=verified,
+            provider=analysis.get("provider"), sync=False,
+        )
+        if not verified:
+            print(json.dumps({
+                "vmid": args.vmid, "clicked": False, "target": target,
+                "cursor_moved_to": [args.x, args.y], "checkpoint": checkpoint,
+                "verification": {"accepted": False, "reason": reason},
+                "next_step": "Stop. Take a fresh inspection; do not retry or reboot.",
+            }, indent=2, sort_keys=True))
+            return
         session.client.click(args.x, args.y, button=args.button, double=args.double)
+        screenshot = _capture_after_action(lab, api, args, session)
     lab.audit("console-click", lease=args.lease, vmid=args.vmid,
               x=args.x, y=args.y, button=args.button, sync=False)
-    print(json.dumps({"vmid": args.vmid, "clicked": [args.x, args.y]}))
+    result = {
+        "vmid": args.vmid, "clicked": [args.x, args.y], "target": target,
+        "verification": {"accepted": True, "reason": reason},
+    }
+    if screenshot is not None:
+        result["screenshot_after"] = screenshot
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_text(lab: Any, args: Any) -> None:
@@ -602,6 +786,16 @@ def register(sub: Any, lab: Any) -> None:
     def bind(handler: Any) -> Any:
         return lambda args: handler(lab, args)
 
+    def add_after_screenshot(parser: Any) -> None:
+        parser.add_argument(
+            "--screenshot-after", type=float, metavar="SECONDS",
+            help="after input, wait this long and include a PNG in the result",
+        )
+        parser.add_argument(
+            "--screenshot-out", "--out", dest="screenshot_out",
+            help="path for --screenshot-after (default: state screens directory)",
+        )
+
     console = sub.add_parser("console", help="VNC, terminal and guest access")
     console_sub = console.add_subparsers(dest="console_command", required=True)
 
@@ -618,12 +812,31 @@ def register(sub: Any, lab: Any) -> None:
                       help="decode text-mode screens; refused on graphical screens")
     shot.set_defaults(func=bind(cmd_screenshot))
 
+    inspect = console_sub.add_parser(
+        "inspect", help="inspect one lease-owned screenshot with cloud vision"
+    )
+    inspect.add_argument("--lease", required=True)
+    inspect.add_argument("--vmid", type=int, required=True)
+    inspect.add_argument("--out")
+    inspect.add_argument("--settle", type=float, default=2.0)
+    inspect.add_argument("--timeout", type=int, default=120)
+    inspect.add_argument("--max-tokens", type=int, default=1024)
+    inspect.add_argument("--prompt")
+    inspect.add_argument(
+        "--provider",
+        choices=("auto", "nvidia", "openrouter-nemotron", "openrouter-free"),
+        default="auto",
+        help="provider override; auto uses the guarded fallback chain",
+    )
+    inspect.set_defaults(func=bind(cmd_inspect))
+
     keys = console_sub.add_parser("keys", help="send key combinations")
     keys.add_argument("--lease", required=True)
     keys.add_argument("--vmid", type=int, required=True)
     keys.add_argument("keys", nargs="+", help="e.g. ctrl-alt-delete f2 enter")
     keys.add_argument("--via", choices=("vnc", "api"), default="vnc")
     keys.add_argument("--delay", type=float, default=0.08)
+    add_after_screenshot(keys)
     keys.set_defaults(func=bind(cmd_keys))
 
     typing = console_sub.add_parser("type", help="type text at the console")
@@ -634,6 +847,7 @@ def register(sub: Any, lab: Any) -> None:
                         help="read the text from stdin, keeping it out of argv")
     typing.add_argument("--enter", action="store_true")
     typing.add_argument("--delay", type=float, default=0.012)
+    add_after_screenshot(typing)
     typing.set_defaults(func=bind(cmd_type))
 
     click = console_sub.add_parser("click", help="click at a pixel position")
@@ -641,8 +855,21 @@ def register(sub: Any, lab: Any) -> None:
     click.add_argument("--vmid", type=int, required=True)
     click.add_argument("--x", type=int, required=True)
     click.add_argument("--y", type=int, required=True)
+    click.add_argument("--target", required=True,
+                       help="short visible label of the intended control")
     click.add_argument("--button", type=int, choices=(1, 2, 3), default=1)
     click.add_argument("--double", action="store_true")
+    click.add_argument(
+        "--calibration-settle", type=float, default=1.0,
+        help="seconds to settle before the cursor calibration checkpoint",
+    )
+    click.add_argument("--vision-timeout", type=int, default=45)
+    click.add_argument(
+        "--provider",
+        choices=("auto", "nvidia", "openrouter-nemotron", "openrouter-free"),
+        default="auto",
+    )
+    add_after_screenshot(click)
     click.set_defaults(func=bind(cmd_click))
 
     text = console_sub.add_parser(

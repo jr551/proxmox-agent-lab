@@ -29,6 +29,26 @@ The capture path is a self-contained RFB client: Proxmox `vncproxy`, a
 WebSocket upgrade, RFB 3.8 with VNC authentication, and Raw/Zlib/CopyRect
 decoding into a PNG written with `zlib` alone. No Pillow, numpy, or noVNC.
 
+## Optional cloud vision fallback
+
+```bash
+proxmox-lab console inspect --lease "$L" --vmid 9001
+```
+
+This stores the untouched PNG locally, overlays a labelled 100-pixel X/Y grid
+on a separate same-size model-input PNG, and tries NVIDIA Nemotron Nano 12B v2 VL, the named
+OpenRouter Nemotron Omni free endpoint, and finally `openrouter/free`, in that
+order. Use `--provider` to test one stage. The guest must be registered to the
+given lease. The command audits the selected provider/model but never the
+image, prompt, or key. Free OpenRouter providers may log prompts for service
+improvement, so do not submit confidential or personal screens.
+
+This is intentionally separate from `screenshot`: external image transmission
+must be explicit. The model's coordinates are advisory and still pass through
+the cursor-calibration workflow before any click occurs. Accordingly, a vision
+response recommending a click always reports `actionable: false` and
+`requires_cursor_calibration: true`, even when its JSON is structurally valid.
+
 ## Input
 
 ```bash
@@ -37,11 +57,38 @@ proxmox-lab console click --lease "$L" --vmid 9001 --x 640 --y 412
 proxmox-lab console type  --lease "$L" --vmid 9001 --text-stdin --enter
 ```
 
+For a graphical workflow, add `--screenshot-after SECONDS` to any input
+command. It waits for the UI to settle and returns the resulting PNG in the
+same JSON response, avoiding a separate reconnect and screenshot call:
+
+```bash
+proxmox-lab console keys --lease "$L" --vmid 9001 enter --screenshot-after 3
+```
+
 - `keys` defaults to the VNC path; `--via api` uses Proxmox `sendkey`, which
   works even when RFB input is unavailable.
 - `type` takes `--text-stdin` so a password never appears in `argv`, the shell
   history, or the audit ledger. Only the character count is recorded.
 - Clicks are refused outside the current screen bounds.
+- `--screenshot-out PATH` (or the shorter `--out PATH`) gives the post-input
+  PNG a stable checkpoint name.
+
+Every click names its visible target. The harness moves the cursor, captures a
+full checkpoint, and asks cloud vision to independently match the label and
+coordinate before pressing the button:
+
+```bash
+proxmox-lab console click --lease "$L" --vmid 9001 \
+  --target "Install" --x 640 --y 412 --screenshot-after 3
+```
+
+Failure, timeout, ambiguity, or disagreement leaves `clicked: false`. Stop and
+inspect; there is no self-confirmation option.
+
+See [gui-installers.md](gui-installers.md) for the bounded state loop agents
+should use with installers, including Haiku. A model without image vision
+should delegate the current full-screen decision to a vision-capable model,
+not run Tesseract over crops.
 
 ### Keyboard input needs a VGA display
 

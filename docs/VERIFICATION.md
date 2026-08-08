@@ -14,6 +14,7 @@ Read it as a statement of confidence, not a feature list. Anything marked
 | Leases | Power-on by WoL, heartbeat, `lease-end` reporting `host_powered_off=true`, refusal to delete a guest the lease did not create |
 | Audit ledger | Every mutating call recorded; secrets redacted (see below) |
 | VNC console | Screenshots of a graphical desktop, `keys`, `click` and `type` driving a real Windows installer |
+| Guarded GUI vision | An untouched 1280x800 Haiku capture and a same-size labelled grid were produced; OpenRouter free vision returned structured controls; a new target moved the visible cursor and returned `clicked=false` despite an older resolution-level approval |
 | Serial console | Text read back from a Linux guest without VNC |
 | S3 scratch | `health`, `put`, `list`, `get` — byte-identical round trip |
 | File transfer | 200 KB pushed into a guest and verified by SHA-256 inside it, then pulled back byte-identical |
@@ -28,6 +29,7 @@ Read it as a statement of confidence, not a feature list. Anything marked
 | Long-term leases | Proxmox refused to delete a protected guest, as intended |
 | Physical memory patch | A marker was found in a running Debian guest, read from outside it, changed with `phys-write`, and observed changing inside the live process |
 | Compiled pin-check patch | A live conditional branch in a disposable test client was patched in RAM and the client changed behaviour without a restart |
+| Guarded GUI click | On Haiku VM 9060, `Installer` at `(900,700)` was rejected with `clicked: false`; the cursor on `Install Haiku` at `(781,582)` was independently accepted, clicked once, and the returned frame changed to `Welcome to the Haiku Installer!` |
 
 ### Security properties, checked rather than assumed
 

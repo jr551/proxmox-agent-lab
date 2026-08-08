@@ -31,6 +31,8 @@ KNOWN_SECRETS = {
     "wg-preshared-key": "WireGuard preshared key",
     "wg-peer-public-key": "WireGuard server public key",
     "ngrok-authtoken": "ngrok authtoken, for sharing a guest console",
+    "nvidia-api-key": "NVIDIA API key for opt-in screenshot vision analysis",
+    "openrouter-api-key": "OpenRouter API key for fallback vision analysis",
 }
 
 

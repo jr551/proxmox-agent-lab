@@ -37,6 +37,8 @@ trap 'proxmox-lab lease-end --lease "$L"' EXIT
 ```
 
 1. `lease-begin` powers the machine on if needed. It takes a minute or two.
+   Omit `--timeout` to use the configured boot budget; cold-start values below
+   90 seconds are rejected.
 2. Pass `--lease "$L"` to every mutating command.
 3. `lease-heartbeat --lease "$L"` if the work runs beyond 30 minutes.
 4. `lease-end` must report `host_powered_off=true`. **Never claim completion
@@ -87,9 +89,36 @@ proxmox-lab guest probe --vmid <id>                        # ask before assuming
 proxmox-lab guest run --lease "$L" --vmid <id> uname -a     # picks the channel
 proxmox-lab console screenshot --vmid <id> --settle 2       # PNG
 proxmox-lab console keys  --lease "$L" --vmid <id> enter f2
-proxmox-lab console click --lease "$L" --vmid <id> --x 640 --y 412
+proxmox-lab console click --lease "$L" --vmid <id> \
+  --target "visible label" --x 640 --y 412
 proxmox-lab console type  --lease "$L" --vmid <id> --text-stdin --enter
 ```
+
+For GUI installers, attach `--screenshot-after 3` to `keys`, `type`, or
+`click`. Make one action, read the returned full PNG, and repeat. After three
+unchanged attempts, stop and diagnose; never build an ad-hoc Pillow/Tesseract
+crop loop. If the active model has no vision, delegate the single-screen
+decision to a vision-capable model while keeping all mutations in the primary
+agent. Follow [docs/gui-installers.md](docs/gui-installers.md), including its
+Haiku checkpoint map.
+
+When `proxmox-lab secrets list` reports a vision key stored, prefer `console
+inspect --lease "$L" --vmid <id>` for the first graphical read. It explicitly
+sends one lease-owned PNG through NVIDIA Nemotron Nano 12B v2 VL, then the
+named OpenRouter Nemotron Omni free endpoint, then `openrouter/free`, stopping
+at the first structurally valid proposal. The provider sees a same-size copy
+with labelled 100-pixel X/Y axes; the original screenshot remains untouched.
+Never treat model output as
+authorization or bypass the click-calibration guard. OpenRouter free providers
+may retain prompts for service improvement; do not send confidential or
+personal screens. Without a key, use native vision or the single-screen
+delegation above.
+
+`console click` requires a visible target label. The harness moves the cursor,
+captures a full checkpoint, and clicks only when cloud vision independently
+matches that one label and coordinate. A failed or timed-out verdict returns no
+click: stop and diagnose. Never bypass it with raw `api`, keyboard input, or a
+reboot, and never mutate guest storage as a GUI recovery step.
 
 `guest probe` tells you what will actually work. Prefer real text over pixels;
 read the PNG when a screen is the truth. **A guest whose display is the serial

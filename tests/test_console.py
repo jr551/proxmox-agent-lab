@@ -127,6 +127,19 @@ class PngTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             lab_png.encode_png(2, 2, b"\x00" * 3)
 
+    def test_coordinate_grid_preserves_canvas_and_labels_original_axes(self) -> None:
+        width, height = 220, 120
+        original = bytes((10, 20, 30)) * (width * height)
+        gridded = lab_png.overlay_coordinate_grid(width, height, original, 100)
+        self.assertEqual(len(gridded), len(original))
+        untouched = (50 * width + 50) * 3
+        grid_line = (50 * width + 100) * 3
+        self.assertEqual(gridded[untouched:untouched + 3], original[untouched:untouched + 3])
+        self.assertNotEqual(gridded[grid_line:grid_line + 3],
+                            original[grid_line:grid_line + 3])
+        encoded = lab_png.encode_png(width, height, gridded)
+        self.assertEqual(struct.unpack(">II", encoded[16:24]), (width, height))
+
 
 class RfbTests(unittest.TestCase):
     def test_capture_decodes_raw_rectangle(self) -> None:
@@ -210,6 +223,18 @@ class TextModeTests(unittest.TestCase):
             value % 251 for value in range(640 * 480 * 3)
         )  # many distinct colours
         self.assertFalse(lab_textmode.analyse(rgb, 640, 480)["looks_like_text_console"])
+
+    def test_flat_desktop_with_icons_is_not_reported_as_text(self) -> None:
+        width, height = 1280, 800
+        rgb = bytearray(b"\x35\x70\xa0" * (width * height))
+        for index in range(10_000):
+            offset = index * 3
+            rgb[offset:offset + 3] = bytes(
+                (index % 251, (index * 3) % 251, (index * 7) % 251)
+            )
+        analysis = lab_textmode.analyse(bytes(rgb), width, height)
+        self.assertGreater(analysis["distinct_colours"], 24)
+        self.assertFalse(analysis["looks_like_text_console"])
 
     def test_two_colour_grid_is_reported_as_text(self) -> None:
         rgb = b"\x00\x00\x00" * (640 * 400)
@@ -620,6 +645,71 @@ if __name__ == "__main__":
 
 
 class ScreenshotCommandTests(unittest.TestCase):
+    def test_inspect_refuses_to_transmit_an_unowned_guest(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.load_lease.return_value = {
+            "resources": [{"kind": "qemu", "vmid": 8}]
+        }
+        args = mock.Mock(lease="lease-12345678", vmid=7)
+        with mock.patch.object(lab_console, "VncSession") as vnc, \
+             mock.patch.object(lab_console.vision, "analyze_png") as analyze:
+            with self.assertRaises(RuntimeError) as caught:
+                lab_console.cmd_inspect(lab, args)
+        self.assertIn("not a qemu guest registered", str(caught.exception))
+        vnc.assert_not_called()
+        analyze.assert_not_called()
+
+    def test_inspect_requires_lease_ownership_and_audits_provider(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.load_lease.return_value = {
+            "resources": [{"kind": "qemu", "vmid": 7}]
+        }
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 2, 2
+        session.client.capture.return_value = b"\x00\x00\x00" * 4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "inspect.png"
+            args = mock.Mock(
+                lease="lease-12345678", vmid=7, settle=2.0, out=str(out),
+                prompt=None, timeout=120, max_tokens=1024, provider="auto",
+            )
+            with mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch.object(lab_console.vision, "analyze_png",
+                                   return_value={
+                                       "provider": "nvidia",
+                                       "model": lab_console.vision.MODEL,
+                                       "analysis": {"screen": "gui"},
+                                   }) as analyze, \
+                 mock.patch("builtins.print") as printed:
+                lab_console.cmd_inspect(lab, args)
+                payload = json.loads(printed.call_args.args[0])
+                original_png = out.read_bytes()
+                model_png = analyze.call_args.args[1]
+                grid_existed = Path(payload["model_input"]["path"]).exists()
+
+        self.assertEqual(payload["transmitted_to"], "integrate.api.nvidia.com")
+        self.assertEqual(payload["vision"]["analysis"]["screen"], "gui")
+        self.assertEqual(payload["model_input"]["grid_step"], 100)
+        self.assertEqual(payload["model_input"]["origin"], "top-left")
+        self.assertTrue(payload["model_input"]["path"].endswith("-grid.png"))
+        self.assertTrue(grid_existed)
+        self.assertNotEqual(model_png, original_png)
+        self.assertIn("X increases right", analyze.call_args.kwargs["prompt"])
+        lab.audit.assert_called_once_with(
+            "console-vision-inspect", lease=args.lease, vmid=7,
+            provider="nvidia", model=lab_console.vision.MODEL, sync=False,
+        )
+
     def test_cmd_screenshot_writes_a_file(self) -> None:
         """Regression: the module `png` was shadowed by a local of the same
         name, so this command raised UnboundLocalError. Testing the encoder
@@ -644,3 +734,48 @@ class ScreenshotCommandTests(unittest.TestCase):
                 lab_console.cmd_screenshot(lab, args)
             self.assertTrue(out.exists())
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+
+    def test_click_requires_independent_target_verification(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 2, 2
+        session.client.capture.return_value = b"\x00\x00\x00" * 4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "after.png"
+            args = mock.Mock(
+                lease="lease-12345678", vmid=1, x=0, y=0, button=1,
+                double=False, screenshot_after=2.5, screenshot_out=str(out),
+                target="Install", calibration_settle=1.0,
+                vision_timeout=10, provider="auto",
+            )
+            with mock.patch.object(lab, "STATE_ROOT", Path(tmp)), \
+                 mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch.object(lab_console.vision, "analyze_png",
+                                   return_value={"provider": "nvidia"}), \
+                 mock.patch.object(lab_console.vision, "verifies_target",
+                                   side_effect=[(False, "wrong target"),
+                                                (True, "matched")]), \
+                 mock.patch("builtins.print") as printed:
+                # A rejected checkpoint moves the cursor but cannot click.
+                lab_console.cmd_click(lab, args)
+                first = json.loads(printed.call_args.args[0])
+                self.assertFalse(first["clicked"])
+                self.assertFalse(first["verification"]["accepted"])
+                session.client.click.assert_not_called()
+
+                # Only an independent positive verdict performs the click.
+                lab_console.cmd_click(lab, args)
+                payload = json.loads(printed.call_args.args[0])
+
+            self.assertEqual(session.client.click.call_count, 1)
+            session.client.click.assert_called_with(0, 0, button=1, double=False)
+            self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+            self.assertEqual(payload["screenshot_after"]["path"], str(out))
+            self.assertTrue(payload["verification"]["accepted"])

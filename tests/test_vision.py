@@ -191,6 +191,39 @@ class VisionApiTests(unittest.TestCase):
                 )
         secret.assert_not_called()
 
+    def test_target_verification_requires_label_and_coordinate_agreement(self) -> None:
+        result = {
+            "analysis": {
+                "controls": [{"label": "Installer", "x": 396, "y": 38}],
+                "recommended_action": {"kind": "click", "value": "396,38"},
+            },
+            "validation": {"structurally_valid": True},
+        }
+        self.assertTrue(
+            vision.verifies_target(result, "Installer", 400, 40)[0]
+        )
+        self.assertFalse(
+            vision.verifies_target(result, "Trash", 400, 40)[0]
+        )
+        self.assertFalse(
+            vision.verifies_target(result, "Installer", 700, 700)[0]
+        )
+
+    def test_target_verification_rejects_non_click_and_duplicate_labels(self) -> None:
+        result = {
+            "analysis": {
+                "controls": [
+                    {"label": "Install", "x": 10, "y": 10},
+                    {"label": "Install now", "x": 20, "y": 20},
+                ],
+                "recommended_action": {"kind": "stop", "value": ""},
+            },
+            "validation": {"structurally_valid": True},
+        }
+        accepted, reason = vision.verifies_target(result, "Install", 10, 10)
+        self.assertFalse(accepted)
+        self.assertIn("2 controls", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

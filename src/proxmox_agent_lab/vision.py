@@ -336,6 +336,53 @@ def _accepted(result: dict[str, Any]) -> bool:
     )
 
 
+def verifies_target(result: dict[str, Any], target: str, x: int, y: int,
+                    tolerance: int = 48) -> tuple[bool, str]:
+    """Accept a click only when vision independently names the same target.
+
+    Structural validity alone is deliberately insufficient: the provider must
+    identify exactly one labelled control matching ``target`` and recommend a
+    click close to the proposed coordinate.  This turns calibration into a
+    machine-enforced checkpoint instead of a model self-attestation flag.
+    """
+    validation = result.get("validation")
+    analysis = result.get("analysis")
+    if not isinstance(validation, dict) or not validation.get("structurally_valid"):
+        return False, "vision response was not structurally valid"
+    if not isinstance(analysis, dict):
+        return False, "vision response contained no structured analysis"
+    wanted = " ".join(target.casefold().split())
+    matches = []
+    for control in analysis.get("controls", []):
+        if not isinstance(control, dict):
+            continue
+        label = " ".join(str(control.get("label", "")).casefold().split())
+        if wanted and (wanted in label or label in wanted):
+            matches.append(control)
+    if len(matches) != 1:
+        return False, f"vision identified {len(matches)} controls matching {target!r}"
+    action = analysis.get("recommended_action")
+    if not isinstance(action, dict) or action.get("kind") != "click":
+        return False, "vision did not recommend a click"
+    match = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*", str(action.get("value", "")))
+    if not match:
+        return False, "vision did not return a click coordinate"
+    proposed = (int(match.group(1)), int(match.group(2)))
+    control = matches[0]
+    control_point = (control.get("x"), control.get("y"))
+    if control_point != proposed:
+        return False, (
+            f"recommended coordinate {proposed} does not match the named "
+            f"control coordinate {control_point}"
+        )
+    if abs(proposed[0] - x) > tolerance or abs(proposed[1] - y) > tolerance:
+        return False, (
+            f"vision coordinate {proposed} does not agree with requested "
+            f"coordinate ({x}, {y}) within {tolerance}px"
+        )
+    return True, "independent vision matched the named target and coordinate"
+
+
 def analyze_png(config: Any, image: bytes, *, width: int, height: int,
                 prompt: str | None = None, timeout: int = 120,
                 max_tokens: int = 1024, provider: str = "auto") -> dict[str, Any]:

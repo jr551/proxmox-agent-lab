@@ -89,7 +89,8 @@ proxmox-lab guest probe --vmid <id>                        # ask before assuming
 proxmox-lab guest run --lease "$L" --vmid <id> uname -a     # picks the channel
 proxmox-lab console screenshot --vmid <id> --settle 2       # PNG
 proxmox-lab console keys  --lease "$L" --vmid <id> enter f2
-proxmox-lab console click --lease "$L" --vmid <id> --x 640 --y 412
+proxmox-lab console click --lease "$L" --vmid <id> \
+  --target "visible label" --x 640 --y 412
 proxmox-lab console type  --lease "$L" --vmid <id> --text-stdin --enter
 ```
 
@@ -113,11 +114,11 @@ may retain prompts for service improvement; do not send confidential or
 personal screens. Without a key, use native vision or the single-screen
 delegation above.
 
-The first `console click` at each target coordinate only moves the visible
-cursor and returns a calibration PNG. Verify it, then repeat the same click
-with `--confirm-calibration`. Calibration is exact-coordinate, lease, VM and
-resolution scoped; a new coordinate or resolution requires a new checkpoint.
-Never confirm a cursor position that was not visually checked.
+`console click` requires a visible target label. The harness moves the cursor,
+captures a full checkpoint, and clicks only when cloud vision independently
+matches that one label and coordinate. A failed or timed-out verdict returns no
+click: stop and diagnose. Never bypass it with raw `api`, keyboard input, or a
+reboot, and never mutate guest storage as a GUI recovery step.
 
 `guest probe` tells you what will actually work. Prefer real text over pixels;
 read the PNG when a screen is the truth. **A guest whose display is the serial

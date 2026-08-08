@@ -356,26 +356,6 @@ def _capture_after_action(lab: Any, api: Any, args: Any,
     )
 
 
-def _calibration_path(lab: Any, vmid: int) -> Path:
-    return Path(lab.STATE_ROOT) / "console-calibration" / f"vm{vmid}.json"
-
-
-def _load_calibration(lab: Any, vmid: int) -> dict[str, Any]:
-    try:
-        value = json.loads(_calibration_path(lab, vmid).read_text())
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_calibration(lab: Any, vmid: int, value: dict[str, Any]) -> None:
-    target = _calibration_path(lab, vmid)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, sort_keys=True) + "\n")
-    temporary.replace(target)
-
-
 def cmd_screenshot(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     with VncSession(lab, api, args.vmid) as session:
@@ -521,6 +501,14 @@ def cmd_type(lab: Any, args: Any) -> None:
 def cmd_click(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
+    target = str(getattr(args, "target", "") or "").strip()
+    if len(target) < 3:
+        raise _api_error(
+            lab, "--target must describe the visible control in at least 3 characters"
+        )
+    if len(target) > 80 or any(ord(char) < 32 for char in target):
+        raise _api_error(lab, "--target must be a single printable label of at most 80 characters")
+    target_json = json.dumps(target, ensure_ascii=False)
     with VncSession(lab, api, args.vmid) as session:
         if not (0 <= args.x < session.client.width
                 and 0 <= args.y < session.client.height):
@@ -530,71 +518,59 @@ def cmd_click(lab: Any, args: Any) -> None:
                 f"{session.client.width}x{session.client.height} screen",
             )
         width, height = session.client.width, session.client.height
-        calibration = _load_calibration(lab, args.vmid)
-        same_resolution = (
-            calibration.get("lease") == args.lease
-            and calibration.get("width") == width
-            and calibration.get("height") == height
+        session.client.pointer(args.x, args.y, 0)
+        rgb = session.client.capture(timeout=25.0, settle=args.calibration_settle)
+        checkpoint = _save_screenshot(
+            args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
         )
-        calibrated = (
-            same_resolution
-            and calibration.get("confirmed") is True
-            and calibration.get("x") == args.x
-            and calibration.get("y") == args.y
-        )
-        if not calibrated:
-            pending_matches = (
-                same_resolution
-                and calibration.get("confirmed") is False
-                and calibration.get("x") == args.x
-                and calibration.get("y") == args.y
+        gridded = png_module.overlay_coordinate_grid(width, height, rgb, step=100)
+        grid_png = png_module.encode_png(width, height, gridded)
+        prompt = f"""Verify one cursor checkpoint. Return only JSON:
+{{
+  "screen": "short checkpoint name",
+  "summary": "what is visibly happening",
+  "controls": [{{"label": {target_json}, "x": {args.x}, "y": {args.y}, "confidence": 0.0}}],
+  "recommended_action": {{"kind": "click", "value": "{args.x},{args.y}", "reason": "cursor visibly overlaps the named control"}},
+  "expected_change": "the named control opens",
+  "warnings": []
+}}
+The harness has already moved the visible cursor to ({args.x},{args.y}). Decide
+only whether that cursor visibly overlaps the one control named {target!r}. Do
+not estimate or change coordinates: if it overlaps, copy the supplied
+coordinates exactly into both coordinate fields. If it does not overlap, is
+ambiguous, or the named control is absent, return controls=[] and
+recommended_action kind=stop. Never infer from coordinates alone."""
+        try:
+            analysis = vision.analyze_png(
+                lab.CONFIG, grid_png, width=width, height=height, prompt=prompt,
+                timeout=args.vision_timeout, provider=args.provider,
             )
-            if getattr(args, "confirm_calibration", False):
-                if not pending_matches:
-                    raise _api_error(
-                        lab,
-                        "no matching click calibration is pending; run the same "
-                        "click without --confirm-calibration first",
-                    )
-                _save_calibration(lab, args.vmid, {
-                    "lease": args.lease, "width": width, "height": height,
-                    "confirmed": True, "x": args.x, "y": args.y,
-                })
-            else:
-                session.client.pointer(args.x, args.y, 0)
-                settle = getattr(args, "calibration_settle", 1.0)
-                rgb = session.client.capture(timeout=25.0, settle=settle)
-                checkpoint = _save_screenshot(
-                    args.vmid, rgb, width, height,
-                    getattr(args, "screenshot_out", None),
-                )
-                _save_calibration(lab, args.vmid, {
-                    "lease": args.lease, "width": width, "height": height,
-                    "confirmed": False, "x": args.x, "y": args.y,
-                })
-                lab.audit(
-                    "console-click-calibration", lease=args.lease,
-                    vmid=args.vmid, width=width, height=height, sync=False,
-                )
-                print(json.dumps({
-                    "vmid": args.vmid,
-                    "clicked": False,
-                    "calibration_required": True,
-                    "cursor_moved_to": [args.x, args.y],
-                    "resolution": [width, height],
-                    "checkpoint": checkpoint,
-                    "next_step": (
-                        "Verify the cursor is on the intended control, then repeat "
-                        "this click with --confirm-calibration. If this model has "
-                        "no vision, delegate that checkpoint decision."
-                    ),
-                }, indent=2, sort_keys=True))
-                return
+        except (vision.VisionError, secrets_store.SecretError) as exc:
+            raise _api_error(lab, f"click blocked: vision checkpoint failed: {exc}") from None
+        verified, reason = vision.verifies_target(
+            analysis, target, args.x, args.y
+        )
+        lab.audit(
+            "console-click-calibration", lease=args.lease, vmid=args.vmid,
+            width=width, height=height, target=target, verified=verified,
+            provider=analysis.get("provider"), sync=False,
+        )
+        if not verified:
+            print(json.dumps({
+                "vmid": args.vmid, "clicked": False, "target": target,
+                "cursor_moved_to": [args.x, args.y], "checkpoint": checkpoint,
+                "verification": {"accepted": False, "reason": reason},
+                "next_step": "Stop. Take a fresh inspection; do not retry or reboot.",
+            }, indent=2, sort_keys=True))
+            return
         session.client.click(args.x, args.y, button=args.button, double=args.double)
         screenshot = _capture_after_action(lab, api, args, session)
     lab.audit("console-click", lease=args.lease, vmid=args.vmid,
               x=args.x, y=args.y, button=args.button, sync=False)
-    result = {"vmid": args.vmid, "clicked": [args.x, args.y]}
+    result = {
+        "vmid": args.vmid, "clicked": [args.x, args.y], "target": target,
+        "verification": {"accepted": True, "reason": reason},
+    }
     if screenshot is not None:
         result["screenshot_after"] = screenshot
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -879,15 +855,19 @@ def register(sub: Any, lab: Any) -> None:
     click.add_argument("--vmid", type=int, required=True)
     click.add_argument("--x", type=int, required=True)
     click.add_argument("--y", type=int, required=True)
+    click.add_argument("--target", required=True,
+                       help="short visible label of the intended control")
     click.add_argument("--button", type=int, choices=(1, 2, 3), default=1)
     click.add_argument("--double", action="store_true")
     click.add_argument(
-        "--confirm-calibration", action="store_true",
-        help="confirm a pending cursor checkpoint and perform the first click",
-    )
-    click.add_argument(
         "--calibration-settle", type=float, default=1.0,
         help="seconds to settle before the cursor calibration checkpoint",
+    )
+    click.add_argument("--vision-timeout", type=int, default=45)
+    click.add_argument(
+        "--provider",
+        choices=("auto", "nvidia", "openrouter-nemotron", "openrouter-free"),
+        default="auto",
     )
     add_after_screenshot(click)
     click.set_defaults(func=bind(cmd_click))

@@ -17,7 +17,8 @@ chooses one next action.
    proxmox-lab console keys --lease "$L" --vmid "$VMID" enter \
      --screenshot-after 3
 
-   proxmox-lab console click --lease "$L" --vmid "$VMID" --x 640 --y 412 \
+   proxmox-lab console click --lease "$L" --vmid "$VMID" \
+     --target "Install" --x 640 --y 412 \
      --screenshot-after 3
    ```
 
@@ -35,16 +36,16 @@ It keeps one untouched full PNG locally and sends a separate, same-size copy
 with labelled 100-pixel X/Y axes to NVIDIA, the named OpenRouter Nemotron Omni
 free endpoint, then OpenRouter's free router. Grid coordinates map directly to
 the original framebuffer. Treat its
-recommended action as a proposal, not permission: lease guards and click
-calibration still apply. Ordinary screenshots stay local. Do not send
+recommended action as a proposal, not permission. Ordinary screenshots stay
+local. Do not send
 confidential or personal screens to free providers.
 
-The first use of each target coordinate is a two-step calibration. `console
-click` moves the visible cursor to the target and returns a checkpoint
-**without pressing the button**. After vision confirms the cursor is on the
-intended control, repeat the same command with `--confirm-calibration`.
-Calibration is scoped to that coordinate, lease, VM and resolution; changing
-the target or resolution makes clicking two-step again.
+`console click` has one minimal guarded interface: name the visible `--target`
+and provide its proposed coordinates. The harness moves the cursor, captures a
+full checkpoint, and asks cloud vision to independently match the named control
+and coordinate. It clicks only after that positive verdict. Failure, timeout,
+ambiguity, or disagreement returns `clicked: false`; stop instead of retrying.
+There is no self-confirmation flag.
 
 Do not crop, sharpen, recolour, or run external OCR over a graphical installer.
 Those transformations discard context and turn one uncertain observation into
@@ -62,7 +63,7 @@ or installer.
 
 - Never make more than three attempts on an unchanged screen.
 - Never sweep coordinates or click controls whose purpose is unknown.
-- Never pass `--confirm-calibration` without reading its cursor checkpoint.
+- Never retry a rejected click or bypass it with raw `api`, `keys`, or reboot.
 - After an unchanged action, run `guest probe`; confirm `keyboard_input` and
   take a fresh full screenshot before trying a different input path.
 - After three unchanged attempts, stop and report the exact screen and actions.

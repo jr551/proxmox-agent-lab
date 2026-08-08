@@ -73,13 +73,17 @@ proxmox-lab console keys --lease "$L" --vmid 9001 enter --screenshot-after 3
 - `--screenshot-out PATH` (or the shorter `--out PATH`) gives the post-input
   PNG a stable checkpoint name.
 
-The first click at a target coordinate is intentionally not a click. The
-client moves the visible cursor to the requested coordinate and returns a PNG.
-Confirm the pointer is on the intended control, then repeat the same command
-with `--confirm-calibration`. Approval is cached only for that exact coordinate,
-lease, VM and framebuffer resolution. A different target or resolution repeats
-the safe two-step check; approval for empty background can never authorize an
-unrelated installer button.
+Every click names its visible target. The harness moves the cursor, captures a
+full checkpoint, and asks cloud vision to independently match the label and
+coordinate before pressing the button:
+
+```bash
+proxmox-lab console click --lease "$L" --vmid 9001 \
+  --target "Install" --x 640 --y 412 --screenshot-after 3
+```
+
+Failure, timeout, ambiguity, or disagreement leaves `clicked: false`. Stop and
+inspect; there is no self-confirmation option.
 
 See [gui-installers.md](gui-installers.md) for the bounded state loop agents
 should use with installers, including Haiku. A model without image vision

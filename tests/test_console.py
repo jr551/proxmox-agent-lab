@@ -735,7 +735,7 @@ class ScreenshotCommandTests(unittest.TestCase):
             self.assertTrue(out.exists())
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
 
-    def test_click_calibration_is_target_specific_and_resets_on_resolution_change(self) -> None:
+    def test_click_requires_independent_target_verification(self) -> None:
         from proxmox_agent_lab import console as lab_console
 
         lab = mock.Mock()
@@ -750,46 +750,32 @@ class ScreenshotCommandTests(unittest.TestCase):
             args = mock.Mock(
                 lease="lease-12345678", vmid=1, x=0, y=0, button=1,
                 double=False, screenshot_after=2.5, screenshot_out=str(out),
-                confirm_calibration=False, calibration_settle=1.0,
+                target="Install", calibration_settle=1.0,
+                vision_timeout=10, provider="auto",
             )
             with mock.patch.object(lab, "STATE_ROOT", Path(tmp)), \
                  mock.patch.object(lab_console, "VncSession",
                                    return_value=session), \
                  mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch.object(lab_console.vision, "analyze_png",
+                                   return_value={"provider": "nvidia"}), \
+                 mock.patch.object(lab_console.vision, "verifies_target",
+                                   side_effect=[(False, "wrong target"),
+                                                (True, "matched")]), \
                  mock.patch("builtins.print") as printed:
-                # First use at a resolution only positions the visible cursor.
+                # A rejected checkpoint moves the cursor but cannot click.
                 lab_console.cmd_click(lab, args)
                 first = json.loads(printed.call_args.args[0])
                 self.assertFalse(first["clicked"])
-                self.assertTrue(first["calibration_required"])
+                self.assertFalse(first["verification"]["accepted"])
                 session.client.click.assert_not_called()
 
-                # Confirming that exact cursor checkpoint performs the click
-                # and keeps the calibration for this resolution.
-                args.confirm_calibration = True
+                # Only an independent positive verdict performs the click.
                 lab_console.cmd_click(lab, args)
                 payload = json.loads(printed.call_args.args[0])
 
-                # The exact verified coordinate remains calibrated at this
-                # resolution, but an unrelated target must show its cursor.
-                args.confirm_calibration = False
-                lab_console.cmd_click(lab, args)
-                args.x = 1
-                lab_console.cmd_click(lab, args)
-                different_target = json.loads(printed.call_args.args[0])
-                self.assertTrue(different_target["calibration_required"])
-
-                # A resolution change invalidates the saved calibration and
-                # returns another cursor checkpoint instead of blind input.
-                session.client.width, session.client.height = 3, 2
-                session.client.capture.return_value = b"\x00\x00\x00" * 6
-                args.x = 0
-                lab_console.cmd_click(lab, args)
-                changed = json.loads(printed.call_args.args[0])
-
-            self.assertEqual(session.client.click.call_count, 2)
+            self.assertEqual(session.client.click.call_count, 1)
             session.client.click.assert_called_with(0, 0, button=1, double=False)
-            self.assertTrue(changed["calibration_required"])
-            self.assertEqual(changed["resolution"], [3, 2])
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
             self.assertEqual(payload["screenshot_after"]["path"], str(out))
+            self.assertTrue(payload["verification"]["accepted"])

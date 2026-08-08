@@ -104,10 +104,12 @@ Haiku checkpoint map.
 
 When `proxmox-lab secrets list` reports a vision key stored, prefer `console
 inspect --lease "$L" --vmid <id>` for the first graphical read. It explicitly
-sends one lease-owned PNG through NVIDIA Nemotron Nano 12B v2 VL, then the
-named OpenRouter Nemotron Omni free endpoint, then `openrouter/free`, stopping
-at the first structurally valid proposal. The provider sees a same-size copy
-with labelled 100-pixel X/Y axes; the original screenshot remains untouched.
+sends one lease-owned PNG concurrently through NVIDIA Nemotron Nano 12B v2 VL,
+the named OpenRouter Nemotron Omni free endpoint, and `openrouter/free`, using
+the first structurally valid proposal. Every configured route receives the
+screen in automatic mode. The provider sees a same-size copy with labelled
+100-pixel X/Y axes; later frames dim stable pixels while changes stay bright
+and outlined. The original screenshot remains untouched.
 Never treat model output as
 authorization or bypass the click-calibration guard. OpenRouter free providers
 may retain prompts for service improvement; do not send confidential or
@@ -119,6 +121,9 @@ captures a full checkpoint, and clicks only when cloud vision independently
 matches that one label and coordinate. A failed or timed-out verdict returns no
 click: stop and diagnose. Never bypass it with raw `api`, keyboard input, or a
 reboot, and never mutate guest storage as a GUI recovery step.
+
+After a calibrated click opens a popup menu, prefer arrow keys and `enter` for
+the visibly highlighted selection instead of guessing another coordinate.
 
 `guest probe` tells you what will actually work. Prefer real text over pixels;
 read the PNG when a screen is the truth. **A guest whose display is the serial

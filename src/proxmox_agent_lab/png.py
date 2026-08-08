@@ -26,6 +26,55 @@ _GLYPHS = {
 }
 
 
+def highlight_changes(width: int, height: int, current: bytes, previous: bytes,
+                      threshold: int = 24) -> tuple[bytes, int]:
+    """Dim stable pixels and outline regions changed since the prior frame.
+
+    This image is model guidance only.  The untouched current frame remains
+    the audit checkpoint.  A small per-channel threshold ignores compression
+    noise and cursor antialiasing; changed pixels stay full-bright while their
+    one-pixel boundary is coloured magenta.
+    """
+    expected = width * height * 3
+    if len(current) != expected or len(previous) != expected:
+        raise ValueError("current and previous RGB buffers must match the canvas")
+    if not 0 <= threshold <= 255:
+        raise ValueError("threshold must be between 0 and 255")
+    mask = bytearray(width * height)
+    changed = 0
+    for pixel_index in range(width * height):
+        offset = pixel_index * 3
+        if max(abs(current[offset + channel] - previous[offset + channel])
+               for channel in range(3)) >= threshold:
+            mask[pixel_index] = 1
+            changed += 1
+    out = bytearray(len(current))
+    for pixel_index, is_changed in enumerate(mask):
+        offset = pixel_index * 3
+        if is_changed:
+            out[offset:offset + 3] = current[offset:offset + 3]
+        else:
+            for channel in range(3):
+                out[offset + channel] = current[offset + channel] * 35 // 100
+    # Outline stable pixels immediately adjacent to a changed region.  This
+    # makes tiny controls and progress deltas visible without filling them in.
+    for y in range(height):
+        for x in range(width):
+            index = y * width + x
+            if mask[index]:
+                continue
+            neighbours = (
+                (x > 0 and mask[index - 1])
+                or (x + 1 < width and mask[index + 1])
+                or (y > 0 and mask[index - width])
+                or (y + 1 < height and mask[index + width])
+            )
+            if neighbours:
+                offset = index * 3
+                out[offset:offset + 3] = b"\xff\x00\xff"
+    return bytes(out), changed
+
+
 def _chunk(tag: bytes, payload: bytes) -> bytes:
     return (
         struct.pack(">I", len(payload))

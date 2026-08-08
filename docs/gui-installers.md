@@ -34,8 +34,9 @@ proxmox-lab console inspect --lease "$L" --vmid "$VMID"
 
 It keeps one untouched full PNG locally and sends a separate, same-size copy
 with labelled 100-pixel X/Y axes to NVIDIA, the named OpenRouter Nemotron Omni
-free endpoint, then OpenRouter's free router. Grid coordinates map directly to
-the original framebuffer. Treat its
+free endpoint, and OpenRouter's free router concurrently. On later frames,
+unchanged pixels are dimmed while changed regions stay bright and outlined.
+Grid coordinates map directly to the original framebuffer. Treat its
 recommended action as a proposal, not permission. Ordinary screenshots stay
 local. Do not send
 confidential or personal screens to free providers.
@@ -46,6 +47,10 @@ full checkpoint, and asks cloud vision to independently match the named control
 and coordinate. It clicks only after that positive verdict. Failure, timeout,
 ambiguity, or disagreement returns `clicked: false`; stop instead of retrying.
 There is no self-confirmation flag.
+
+For a popup menu or combobox opened by a verified click, use arrow keys and
+`enter` to choose the visibly highlighted item. Haiku's menus preserve
+keyboard selection more reliably than a second coordinate click.
 
 Do not crop, sharpen, recolour, or run external OCR over a graphical installer.
 Those transformations discard context and turn one uncertain observation into

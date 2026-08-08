@@ -218,6 +218,44 @@ class DestroyTests(unittest.TestCase):
         lab.shutdown_host.assert_called_once()
         self.assertTrue(json.loads(printed.call_args[0][0])["host_powered_off"])
 
+    def test_release_preserves_resources_and_closes_the_pin(self) -> None:
+        lease = make_lease(kind="long-term", expires_at=None, resources=[
+            {"kind": "qemu", "vmid": 9001, "name": "template",
+             "policy": "retain"},
+        ])
+        lab = self._lab(lease)
+        api = mock.Mock()
+        api.reachable.return_value = True
+        lab.ProxmoxAPI.return_value = api
+        observed = {}
+        def finalize(_api, value):
+            observed.update(value)
+            return []
+        lab.finalize_lease.side_effect = finalize
+        with mock.patch.object(longterm, "set_protection") as protection, \
+             mock.patch("builtins.print") as printed:
+            longterm.cmd_release(
+                lab, mock.Mock(lease=lease["id"], confirm=True)
+            )
+        self.assertEqual(observed["kind"], "session")
+        self.assertEqual(observed["resources"][0]["policy"], "retain")
+        protection.assert_called_once_with(lab, api, "qemu", 9001, False)
+        payload = json.loads(printed.call_args.args[0])
+        self.assertEqual(payload["retained_guests"], ["qemu/9001 (template)"])
+        self.assertTrue(payload["host_powered_off"])
+
+    def test_release_without_confirm_is_non_mutating(self) -> None:
+        lease = make_lease(kind="long-term", expires_at=None, resources=[
+            {"kind": "qemu", "vmid": 9001, "name": "template"},
+        ])
+        lab = self._lab(lease)
+        with self.assertRaises(RuntimeError) as caught:
+            longterm.cmd_release(
+                lab, mock.Mock(lease=lease["id"], confirm=False)
+            )
+        self.assertIn("--confirm", str(caught.exception))
+        lab.finalize_lease.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

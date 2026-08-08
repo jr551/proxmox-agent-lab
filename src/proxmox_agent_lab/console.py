@@ -356,6 +356,41 @@ def _capture_after_action(lab: Any, api: Any, args: Any,
     )
 
 
+def _model_frame(lab: Any, lease_id: str, vmid: int, rgb: bytes, width: int,
+                 height: int) -> tuple[bytes, dict[str, Any]]:
+    """Build temporal model guidance while retaining the untouched frame."""
+    state = Path(lab.STATE_ROOT) / "vision-previous"
+    state.mkdir(parents=True, exist_ok=True)
+    safe_lease = "".join(c for c in lease_id if c.isalnum() or c in "-_")
+    target = state / f"{safe_lease}-vm{vmid}-{width}x{height}.rgb"
+    previous = b""
+    try:
+        previous = target.read_bytes()
+    except OSError:
+        pass
+    temporary = target.with_suffix(".tmp")
+    temporary.write_bytes(rgb)
+    temporary.replace(target)
+    if len(previous) != len(rgb):
+        return rgb, {"mode": "full", "baseline": False, "changed_pixels": None}
+    highlighted, changed = png_module.highlight_changes(
+        width, height, rgb, previous
+    )
+    ratio = changed / (width * height)
+    # Nearly identical frames and wholesale screen transitions are clearer in
+    # full. Temporal emphasis is for cursor, dialog and progress changes.
+    if ratio < 0.0001 or ratio > 0.35:
+        return rgb, {
+            "mode": "full", "baseline": True, "changed_pixels": changed,
+            "changed_ratio": round(ratio, 6),
+        }
+    return highlighted, {
+        "mode": "changed-highlight", "baseline": True,
+        "changed_pixels": changed, "changed_ratio": round(ratio, 6),
+        "unchanged_brightness_percent": 35, "outline": "magenta",
+    }
+
+
 def cmd_screenshot(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     with VncSession(lab, api, args.vmid) as session:
@@ -398,8 +433,11 @@ def cmd_inspect(lab: Any, args: Any) -> None:
         width, height = session.client.width, session.client.height
     screenshot = _save_screenshot(args.vmid, rgb, width, height, args.out)
     grid_step = 100
+    guided, temporal = _model_frame(
+        lab, args.lease, args.vmid, rgb, width, height
+    )
     gridded = png_module.overlay_coordinate_grid(
-        width, height, rgb, step=grid_step
+        width, height, guided, step=grid_step
     )
     original_path = Path(screenshot["path"])
     grid_path = original_path.with_name(
@@ -416,6 +454,7 @@ def cmd_inspect(lab: Any, args: Any) -> None:
         "origin": "top-left",
         "x_direction": "right",
         "y_direction": "down",
+        "temporal": temporal,
     }
     grid_prompt = (args.prompt or vision.DEFAULT_PROMPT) + (
         "\nA coordinate grid is overlaid every 100 pixels. The labels are "
@@ -523,7 +562,12 @@ def cmd_click(lab: Any, args: Any) -> None:
         checkpoint = _save_screenshot(
             args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
         )
-        gridded = png_module.overlay_coordinate_grid(width, height, rgb, step=100)
+        guided, temporal = _model_frame(
+            lab, args.lease, args.vmid, rgb, width, height
+        )
+        gridded = png_module.overlay_coordinate_grid(
+            width, height, guided, step=100
+        )
         grid_png = png_module.encode_png(width, height, gridded)
         prompt = f"""Verify one cursor checkpoint. Return only JSON:
 {{
@@ -559,6 +603,7 @@ recommended_action kind=stop. Never infer from coordinates alone."""
             print(json.dumps({
                 "vmid": args.vmid, "clicked": False, "target": target,
                 "cursor_moved_to": [args.x, args.y], "checkpoint": checkpoint,
+                "temporal": temporal,
                 "verification": {"accepted": False, "reason": reason},
                 "next_step": "Stop. Take a fresh inspection; do not retry or reboot.",
             }, indent=2, sort_keys=True))
@@ -570,6 +615,7 @@ recommended_action kind=stop. Never infer from coordinates alone."""
     result = {
         "vmid": args.vmid, "clicked": [args.x, args.y], "target": target,
         "verification": {"accepted": True, "reason": reason},
+        "temporal": temporal,
     }
     if screenshot is not None:
         result["screenshot_after"] = screenshot

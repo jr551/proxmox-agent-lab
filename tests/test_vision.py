@@ -35,7 +35,8 @@ class VisionApiTests(unittest.TestCase):
              mock.patch.object(vision.request, "urlopen",
                                return_value=response) as opened:
             result = vision.analyze_png(
-                mock.Mock(), self.PNG, width=800, height=600, timeout=10
+                mock.Mock(), self.PNG, width=800, height=600, timeout=10,
+                provider="nvidia",
             )
 
         req = opened.call_args.args[0]
@@ -95,7 +96,8 @@ class VisionApiTests(unittest.TestCase):
              ]) as http, \
              mock.patch.object(vision.time, "sleep"):
             result = vision.analyze_png(
-                mock.Mock(), self.PNG, width=2, height=2, timeout=10
+                mock.Mock(), self.PNG, width=2, height=2, timeout=10,
+                provider="nvidia",
             )
 
         poll = http.call_args_list[1].args[0]
@@ -105,31 +107,33 @@ class VisionApiTests(unittest.TestCase):
         self.assertEqual(result["analysis"]["screen"], "visible screen")
         self.assertTrue(result["structured"])
 
-    def test_fallback_order_is_nvidia_specific_openrouter_then_free_router(self) -> None:
+    def test_auto_races_all_providers_and_selects_first_valid(self) -> None:
         valid = {
             "provider": "openrouter", "requested_model": vision.OPENROUTER_FREE_MODEL,
             "model": "some/free-vision-model", "structured": True,
             "analysis": {"screen": "installer"},
             "validation": {"structurally_valid": True},
         }
+        called = []
+        def openrouter(*args, model, **kwargs):
+            called.append(model)
+            if model == vision.OPENROUTER_MODEL:
+                raise vision.VisionError("rate limited")
+            return valid
         with mock.patch.object(vision, "_nvidia",
                                side_effect=vision.VisionError("offline")), \
-             mock.patch.object(vision, "_openrouter", side_effect=[
-                 vision.VisionError("rate limited"), valid,
-             ]) as openrouter:
+             mock.patch.object(vision, "_openrouter",
+                               side_effect=openrouter):
             result = vision.analyze_png(
                 mock.Mock(), self.PNG, width=2, height=2, timeout=10
             )
 
-        self.assertEqual(
-            [call.kwargs["model"] for call in openrouter.call_args_list],
-            [vision.OPENROUTER_MODEL, vision.OPENROUTER_FREE_MODEL],
-        )
-        self.assertEqual(
-            [item["provider"] for item in result["provider_chain"]],
-            ["nvidia", "openrouter-nemotron", "openrouter-free"],
-        )
+        self.assertEqual(set(called), {
+            vision.OPENROUTER_MODEL, vision.OPENROUTER_FREE_MODEL,
+        })
         self.assertEqual(result["provider_chain"][-1]["status"], "selected")
+        self.assertEqual(result["strategy"], "parallel-first-valid")
+        self.assertIn("elapsed_ms", result)
 
     def test_structurally_invalid_result_falls_through(self) -> None:
         invalid = {
@@ -145,8 +149,9 @@ class VisionApiTests(unittest.TestCase):
             result = vision.analyze_png(
                 mock.Mock(), self.PNG, width=2, height=2, timeout=10
             )
-        self.assertEqual(result["provider_chain"][0]["status"], "rejected")
-        self.assertEqual(fallback.call_args.kwargs["model"], vision.OPENROUTER_MODEL)
+        self.assertTrue(any(item["status"] == "rejected"
+                            for item in result["provider_chain"]))
+        self.assertGreaterEqual(fallback.call_count, 1)
 
     def test_project_openrouter_secret_wins_over_stale_shell_value(self) -> None:
         with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "stale-shell"}), \

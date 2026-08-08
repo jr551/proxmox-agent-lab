@@ -14,7 +14,7 @@ Read it as a statement of confidence, not a feature list. Anything marked
 | Leases | Power-on by WoL, heartbeat, `lease-end` reporting `host_powered_off=true`, refusal to delete a guest the lease did not create |
 | Audit ledger | Every mutating call recorded; secrets redacted (see below) |
 | VNC console | Screenshots of a graphical desktop, `keys`, `click` and `type` driving a real Windows installer |
-| Guarded GUI vision | An untouched 1280x800 Haiku capture and a same-size labelled grid were produced; OpenRouter free vision returned structured controls; a new target moved the visible cursor and returned `clicked=false` despite an older resolution-level approval |
+| Guarded GUI vision | On Haiku VM 9060, automatic parallel vision returned a valid OpenRouter Nemotron result in 2.7-4.5s provider time; temporal inputs highlighted measured local deltas while preserving the untouched capture; repeated cursor checkpoints independently accepted each named control before clicking |
 | Serial console | Text read back from a Linux guest without VNC |
 | S3 scratch | `health`, `put`, `list`, `get` — byte-identical round trip |
 | File transfer | 200 KB pushed into a guest and verified by SHA-256 inside it, then pulled back byte-identical |

@@ -11,7 +11,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import queue
 import re
+import threading
 import time
 from typing import Any
 from urllib import error, request
@@ -410,23 +412,99 @@ def analyze_png(config: Any, image: bytes, *, width: int, height: int,
     if provider != "auto" and provider not in providers:
         raise VisionError(f"unknown vision provider {provider!r}")
     order = list(providers) if provider == "auto" else [provider]
+    if provider == "auto":
+        return _race_providers(providers, timeout)
     attempts: list[dict[str, Any]] = []
     for name in order:
+        started = time.monotonic()
         try:
             result = providers[name]()
         except (VisionError, secrets_store.SecretError) as exc:
-            attempts.append({"provider": name, "status": "failed", "error": str(exc)})
+            attempts.append({
+                "provider": name, "status": "failed", "error": str(exc),
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+            })
             continue
         if not _accepted(result):
             attempts.append({
                 "provider": name,
                 "status": "rejected",
                 "validation": result.get("validation"),
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
             })
             continue
-        attempts.append({"provider": name, "status": "selected"})
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        attempts.append({
+            "provider": name, "status": "selected",
+            "elapsed_ms": elapsed_ms,
+        })
+        result["strategy"] = "single-provider"
+        result["elapsed_ms"] = elapsed_ms
         result["provider_chain"] = attempts
         return result
+    summary = "; ".join(
+        f"{item['provider']}: {item['status']}"
+        + (f" ({item['error']})" if item.get("error") else "")
+        for item in attempts
+    )
+    raise VisionError(f"no vision provider returned a valid analysis: {summary}")
+
+
+def _race_providers(providers: dict[str, Any], timeout: int) -> dict[str, Any]:
+    """Return the first valid provider result from one bounded parallel race."""
+    finished: queue.Queue[tuple[str, dict[str, Any] | None, Exception | None,
+                                float]] = queue.Queue()
+    started = time.monotonic()
+
+    def run(name: str, call: Any) -> None:
+        try:
+            finished.put((name, call(), None, time.monotonic() - started))
+        except Exception as exc:  # provider workers must always report completion
+            finished.put((name, None, exc, time.monotonic() - started))
+
+    for name, call in providers.items():
+        threading.Thread(target=run, args=(name, call), daemon=True).start()
+
+    attempts: list[dict[str, Any]] = []
+    deadline = started + timeout
+    remaining = len(providers)
+    while remaining:
+        wait = deadline - time.monotonic()
+        if wait <= 0:
+            break
+        try:
+            name, result, exc, elapsed = finished.get(timeout=wait)
+        except queue.Empty:
+            break
+        remaining -= 1
+        elapsed_ms = round(elapsed * 1000)
+        if exc is not None:
+            attempts.append({
+                "provider": name, "status": "failed", "error": str(exc),
+                "elapsed_ms": elapsed_ms,
+            })
+            continue
+        assert result is not None
+        if not _accepted(result):
+            attempts.append({
+                "provider": name, "status": "rejected",
+                "validation": result.get("validation"),
+                "elapsed_ms": elapsed_ms,
+            })
+            continue
+        attempts.append({
+            "provider": name, "status": "selected", "elapsed_ms": elapsed_ms,
+        })
+        result["provider_chain"] = attempts
+        result["strategy"] = "parallel-first-valid"
+        result["elapsed_ms"] = elapsed_ms
+        return result
+    for name in providers:
+        if not any(item["provider"] == name for item in attempts):
+            attempts.append({
+                "provider": name, "status": "timed_out",
+                "elapsed_ms": round(timeout * 1000),
+            })
     summary = "; ".join(
         f"{item['provider']}: {item['status']}"
         + (f" ({item['error']})" if item.get("error") else "")

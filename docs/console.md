@@ -35,10 +35,13 @@ decoding into a PNG written with `zlib` alone. No Pillow, numpy, or noVNC.
 proxmox-lab console inspect --lease "$L" --vmid 9001
 ```
 
-This stores the untouched PNG locally, overlays a labelled 100-pixel X/Y grid
-on a separate same-size model-input PNG, and tries NVIDIA Nemotron Nano 12B v2 VL, the named
-OpenRouter Nemotron Omni free endpoint, and finally `openrouter/free`, in that
-order. Use `--provider` to test one stage. The guest must be registered to the
+This stores the untouched PNG locally and overlays a labelled 100-pixel X/Y
+grid on a separate same-size model-input PNG. Later frames dim unchanged pixels
+while changed regions stay bright with a magenta boundary. Automatic mode
+races NVIDIA Nemotron Nano 12B v2 VL, the named OpenRouter Nemotron Omni free
+endpoint, and `openrouter/free`, returning the first structurally valid answer.
+Use `--provider` to test one stage. Automatic mode sends the screen to every
+configured route concurrently. The guest must be registered to the
 given lease. The command audits the selected provider/model but never the
 image, prompt, or key. Free OpenRouter providers may log prompts for service
 improvement, so do not submit confidential or personal screens.
@@ -84,6 +87,10 @@ proxmox-lab console click --lease "$L" --vmid 9001 \
 
 Failure, timeout, ambiguity, or disagreement leaves `clicked: false`. Stop and
 inspect; there is no self-confirmation option.
+
+When a click opens a popup menu or combobox, prefer arrow keys plus `enter` for
+the visible selection. This preserves menu state and avoids guessing a second
+coordinate.
 
 See [gui-installers.md](gui-installers.md) for the bounded state loop agents
 should use with installers, including Haiku. A model without image vision

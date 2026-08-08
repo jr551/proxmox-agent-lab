@@ -61,6 +61,17 @@ are also registered with policy `retain`, so ordinary cleanup skips them.
 You cannot end a long-term lease with `lease-end`; it refuses and points you
 at `lease-destroy`. Two different intentions deserve two different commands.
 
+To close the lease while preserving every guest registered with policy
+`retain`, use the distinct release operation:
+
+```bash
+proxmox-lab lease-release --lease <id> --confirm
+```
+
+It removes protection, finalizes the lease, leaves retained guests stopped,
+and powers off the host when no other lease is active. It does not weaken the
+destructive semantics of `lease-destroy`.
+
 ## 💾 Weekly backups
 
 Every seven days, each guest is backed up with `vzdump` in **snapshot** mode —

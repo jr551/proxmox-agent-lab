@@ -21,6 +21,35 @@ from proxmox_agent_lab import cli as LAB  # noqa: E402
 
 
 class ProxmoxLabTests(unittest.TestCase):
+    def test_github_update_check_runs_at_most_once_per_day(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = b'{"tag_name":"v99.0.0"}'
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(LAB, "STATE_ROOT", Path(tmp)), \
+             mock.patch.object(LAB.request, "urlopen", return_value=response) as open_url:
+            first = LAB.check_for_updates(now=100_000)
+            second = LAB.check_for_updates(now=100_001)
+            third = LAB.check_for_updates(now=186_401)
+
+        self.assertTrue(first["update_available"])
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertFalse(third["cached"])
+        self.assertEqual(open_url.call_count, 2)
+
+    def test_failed_update_check_is_cached_and_non_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(LAB, "STATE_ROOT", Path(tmp)), \
+             mock.patch.object(LAB.request, "urlopen", side_effect=OSError("offline")) as open_url:
+            first = LAB.check_for_updates(now=100_000)
+            second = LAB.check_for_updates(now=100_100)
+
+        self.assertEqual(first["error"], "github update check unavailable")
+        self.assertTrue(second["cached"])
+        open_url.assert_called_once()
+
     def test_cold_boot_timeout_uses_config_and_rejects_impatient_override(self) -> None:
         api = mock.Mock()
         api.reachable.return_value = False

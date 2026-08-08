@@ -28,6 +28,7 @@ from typing import Any
 from urllib import error, parse, request
 
 
+from . import __version__
 from . import config as config_module
 from . import power as power_module
 from . import journal as journal_module
@@ -87,6 +88,10 @@ HOST_CHANGE_MARKERS = (
     "/hardware",
     "/ceph",
 )
+UPDATE_CHECK_URL = (
+    "https://api.github.com/repos/jr551/proxmox-agent-lab/releases/latest"
+)
+UPDATE_CHECK_INTERVAL_SECONDS = 86400
 
 
 class LabError(RuntimeError):
@@ -106,6 +111,59 @@ def json_dump(path: Path, value: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     os.replace(temporary, path)
+
+
+def check_for_updates(*, now: float | None = None) -> dict[str, Any]:
+    """Check GitHub at most daily; network failure must never block the lab."""
+    checked_at = time.time() if now is None else now
+    cache = STATE_ROOT / "github-update-check.json"
+    try:
+        previous = json.loads(cache.read_text())
+    except (OSError, ValueError, TypeError):
+        previous = {}
+    last = previous.get("checked_at", 0)
+    if isinstance(last, (int, float)) and checked_at - last < UPDATE_CHECK_INTERVAL_SECONDS:
+        return {**previous, "cached": True}
+
+    result: dict[str, Any] = {
+        "checked_at": checked_at,
+        "current": __version__,
+        "latest": None,
+        "update_available": False,
+        "cached": False,
+    }
+    try:
+        req = request.Request(
+            UPDATE_CHECK_URL,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": f"proxmox-agent-lab/{__version__}"},
+        )
+        with request.urlopen(req, timeout=3) as response:
+            payload = json.load(response)
+        tag = str(payload.get("tag_name", "")).strip()
+        latest = tag.removeprefix("v")
+        if re.fullmatch(r"\d+(?:\.\d+){1,3}", latest):
+            result["latest"] = latest
+            current_parts = tuple(int(x) for x in __version__.split("."))
+            latest_parts = tuple(int(x) for x in latest.split("."))
+            result["update_available"] = latest_parts > current_parts
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        result["error"] = "github update check unavailable"
+    try:
+        json_dump(cache, result)
+    except OSError:
+        pass
+    return result
+
+
+def update_notice() -> None:
+    result = check_for_updates()
+    if result.get("update_available"):
+        print(
+            f"notice: proxmox-agent-lab {result['latest']} is available on "
+            "GitHub; update before starting new work when practical",
+            file=sys.stderr,
+        )
 
 
 def redact(value: Any, key: str = "") -> Any:
@@ -1365,6 +1423,7 @@ _EXPECTED_ERRORS = _expected_errors()
 def main() -> int:
     try:
         args = parser().parse_args()
+        update_notice()
         args.func(args)
         return 0
     except _EXPECTED_ERRORS as exc:

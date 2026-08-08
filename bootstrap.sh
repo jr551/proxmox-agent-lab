@@ -49,14 +49,56 @@ done
 
 VENV="${TMPDIR:-/tmp}/proxmox-agent-lab-env"
 BIN="$VENV/bin/proxmox-lab"
+CHECK_STAMP="$VENV/.github-checked-at"
+LATEST_TAG=""
+CHECK_DUE=1
+if [ -f "$CHECK_STAMP" ] && "$PYTHON" - "$CHECK_STAMP" <<'PY' 2>/dev/null
+import os, sys, time
+raise SystemExit(0 if time.time() - os.path.getmtime(sys.argv[1]) < 86400 else 1)
+PY
+then CHECK_DUE=0; fi
+
+if [ "$CHECK_DUE" -eq 1 ]; then
+    # One GitHub request at most per 24 hours. Failure is deliberately cached:
+    # an offline update service must never block access to the lab.
+    mkdir -p "$VENV"
+    if command -v curl >/dev/null 2>&1; then
+        LATEST_TAG=$(curl -fsSL --max-time 4 \
+            -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/jr551/proxmox-agent-lab/releases/latest \
+            2>/dev/null | "$PYTHON" -c \
+            'import json,sys; print(json.load(sys.stdin).get("tag_name", ""))' \
+            2>/dev/null || true)
+    fi
+    : >"$CHECK_STAMP"
+fi
 
 if [ -x "$BIN" ]; then
-    log "proxmox-lab: reusing $VENV"
+    CURRENT=$($VENV/bin/python -c \
+        'import proxmox_agent_lab; print("v" + proxmox_agent_lab.__version__)' \
+        2>/dev/null || true)
+    if [ -n "$LATEST_TAG" ] && "$PYTHON" - "$CURRENT" "$LATEST_TAG" <<'PY'
+import sys
+def version(value):
+    try: return tuple(int(x) for x in value.lstrip("v").split("."))
+    except ValueError: return ()
+raise SystemExit(0 if version(sys.argv[2]) > version(sys.argv[1]) else 1)
+PY
+    then
+        log "proxmox-lab: updating cached environment $CURRENT -> $LATEST_TAG"
+        "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check \
+            --upgrade "https://github.com/jr551/proxmox-agent-lab/archive/refs/tags/$LATEST_TAG.tar.gz" >&2
+    else
+        log "proxmox-lab: reusing $VENV"
+    fi
     printf '%s\n' "$BIN"
     exit 0
 fi
 
 SOURCE="${PROXMOX_AGENT_LAB_SOURCE:-proxmox-agent-lab}"
+if [ -z "${PROXMOX_AGENT_LAB_SOURCE:-}" ] && [ -n "$LATEST_TAG" ]; then
+    SOURCE="https://github.com/jr551/proxmox-agent-lab/archive/refs/tags/$LATEST_TAG.tar.gz"
+fi
 log "proxmox-lab: not installed; building a temporary environment in $VENV"
 "$PYTHON" -m venv "$VENV" >&2
 "$VENV/bin/python" -m pip install --quiet --upgrade pip >&2 2>/dev/null || true

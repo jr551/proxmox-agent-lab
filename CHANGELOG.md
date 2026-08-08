@@ -4,6 +4,16 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.3.1 - 2026-08-09
+
+### Fixed
+
+- Startup checks GitHub for a newer release at most once per 24 hours. Cached
+  bootstrap environments self-update, while network failures are cached and
+  never block lab work.
+- Skill guidance distinguishes a configured but powered-off host from a
+  genuinely missing setup, preventing needless requests for existing secrets.
+
 ## 0.3.0 - 2026-08-08
 
 ### Added

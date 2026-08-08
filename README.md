@@ -153,6 +153,10 @@ skill file:
 PXL=$(curl -fsSL .../bootstrap.sh | sh) && "$PXL" doctor
 ```
 
+The cached bootstrap environment checks GitHub at most once per 24 hours and
+upgrades itself when a newer release exists. The CLI uses the same daily,
+non-blocking check; failed checks are cached so offline startup remains fast.
+
 **Blank Proxmox machine?** Run this on it, as root — it creates the API token,
 grants the right privileges, and arms Wake-on-LAN:
 

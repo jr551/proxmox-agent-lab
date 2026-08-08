@@ -21,12 +21,20 @@ PXL=$(curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/
 ```
 
 Use `"$PXL"` wherever the examples say `proxmox-lab`. The environment is
-cached, so later runs are instant. Config and lease state still go to their
-normal locations, which is what lets the watchdog clean up after you.
+cached, so later runs are instant. Before the first command, the bootstrap and
+CLI check the latest GitHub release, but never more than once per 24 hours.
+The check is fail-open and a GitHub outage must not block lab work. Config and
+lease state still go to their normal locations, which is what lets the
+watchdog clean up after you.
 
 Run `proxmox-lab doctor` first if anything about the setup is unclear — it
 reports the config in use, whether the host answers, and any missing
 privileges.
+
+An unreachable host with `ok: true`, a populated `config_file`, and
+`proxmox_token_stored: true` usually means the spare PC is simply powered off;
+continue with `lease-begin` so the configured power path can wake it. Do not
+ask the user to re-enter configuration that `doctor` already found.
 
 ## 🔑 Every task follows this shape
 

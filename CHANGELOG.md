@@ -6,6 +6,10 @@ All notable changes to this project will be documented here. The format follows
 
 ## Unreleased
 
+## 0.1.0 - 2026-08-08
+
+First public beta release of the leased, auditable Proxmox lab controller.
+
 ### Added
 
 - “Old Computer → AI Lab” public-facing identity for authorized research.
@@ -18,7 +22,3 @@ All notable changes to this project will be documented here. The format follows
 - Windows 2022 installs now select the `2k22` VirtIO driver directory by
   default instead of inheriting the Windows 2025 default.
 - Console-share tests now close HTTP responses and server sockets cleanly.
-
-## 0.1.0 - 2026-08-02
-
-Initial beta release of the leased, auditable Proxmox lab controller.

@@ -37,6 +37,7 @@ jobs:
         run: |
           python scripts/check-secrets.py .
           python scripts/check-public.py .
+          python scripts/check-release.py
       - name: Check shell syntax
         run: |
           for file in \

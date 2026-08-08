@@ -11,6 +11,7 @@ os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(
 )
 
 import sys  # noqa: E402
+import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
 from unittest import mock  # noqa: E402
@@ -218,6 +219,62 @@ class JournalTests(unittest.TestCase):
             written = list(root.glob("*.jsonl"))
             self.assertEqual(len(written), 1)
             self.assertIn("lease-begin", written[0].read_text())
+
+    def test_git_sync_pushes_only_the_daily_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            repo = root / "logs"
+            subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                           stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "init", "-b", "logs", str(repo)], check=True,
+                           stdout=subprocess.DEVNULL)
+            for key, value in (("user.name", "Test"),
+                               ("user.email", "test@example.invalid")):
+                subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            (repo / "README.md").write_text("private audit logs\n")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"],
+                           check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
+                           check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "push", "-u", "origin", "logs"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+
+            journal_module.sync_git(
+                repo, self._event("lease-begin", vmid=9001), "lease-begin"
+            )
+            logged = subprocess.run(
+                ["git", "--git-dir", str(remote), "show",
+                 "logs:journal/2026-01-01.jsonl"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout
+            self.assertIn('"event": "lease-begin"', logged)
+            changed = subprocess.run(
+                ["git", "--git-dir", str(remote), "diff-tree", "--no-commit-id",
+                 "--name-only", "-r", "logs"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.splitlines()
+            self.assertEqual(changed, ["journal/2026-01-01.jsonl"])
+
+    def test_git_sync_refuses_a_mixed_purpose_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init", "-b", "logs", str(repo)], check=True,
+                           stdout=subprocess.DEVNULL)
+            (repo / "source.py").write_text("do_not_commit = True\n")
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                journal_module.sync_git(
+                    repo, self._event("lease-begin"), "lease-begin"
+                )
+            self.assertFalse((repo / "journal").exists())
 
     def test_legacy_jsonl_can_be_imported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

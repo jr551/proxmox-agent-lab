@@ -228,17 +228,22 @@ a single install at a different lab for one command.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `journal_dir` | `<state>/journal` | Where JSONL audit events are written |
-| `git_sync` | `false` | Commit and push the journal after each event |
-| `git_repo` | `journal_dir` | Repository to push |
+| `backend` | `sqlite` | Local audit backend: `sqlite` or `jsonl` |
+| `journal_dir` | `<state>/journal` | Local audit ledger directory |
+| `git_sync` | `false` | Copy each redacted event to a private git log |
+| `git_repo` | — | Dedicated private logging checkout |
+| `git_branch` | `logs` | Remote branch receiving logging commits |
 
 Every action appends a redacted event: what happened, to which VMID, under
 which lease. Passwords, tokens, typed text and presigned URLs are never
 recorded — only counts, exit codes and object keys.
 
 `git_sync` is off by default. Most people do not want their lab's audit trail
-pushed anywhere. If you enable it, point it at a **private** repository: the
-journal records your host addresses and VMIDs.
+pushed anywhere. If you enable it, point `git_repo` at the root of a clean,
+**private, logging-only checkout**: the journal records host addresses and
+VMIDs. The local backend can remain `sqlite`; the logging checkout receives
+one JSONL file per day. Sync fails closed if that checkout contains any other
+uncommitted file, and only `journal/YYYY-MM-DD.jsonl` is ever staged.
 
 ---
 

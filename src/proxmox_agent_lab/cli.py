@@ -129,46 +129,31 @@ def controller_lock() -> Any:
         yield
 
 
-def sync_repo(suffix: str) -> None:
-    """Optionally commit and push the journal to a git remote.
+def sync_repo(record: dict[str, Any], suffix: str) -> None:
+    """Optionally copy one audit record to a private git log repository.
 
     Off by default: most people do not want their lab's audit trail pushed
     anywhere. Enable with [audit] git_sync = true and git_repo = "<path>".
     """
     if not CONFIG.audit.get("git_sync"):
         return
-    if AUDIT_BACKEND != "jsonl":
+    configured = CONFIG.audit.get("git_repo")
+    if not configured:
         print(
-            "warning: [audit] git_sync only applies to the jsonl backend; "
-            f"backend is {AUDIT_BACKEND!r}",
+            "warning: [audit] git_sync is on but git_repo is empty; "
+            "journal not pushed",
             file=sys.stderr,
         )
         return
-    repo = Path(CONFIG.audit.get("git_repo") or JOURNAL_ROOT)
-    if not (repo / ".git").is_dir():
-        print(
-            f"warning: [audit] git_sync is on but {repo} is not a git "
-            "repository; journal not pushed",
-            file=sys.stderr,
+    try:
+        journal_module.sync_git(
+            Path(configured),
+            record,
+            suffix,
+            str(CONFIG.audit.get("git_branch") or "logs"),
         )
-        return
-    commands = (
-        ["git", "-C", str(repo), "add", "--all"],
-        ["git", "-C", str(repo), "commit", "-m", f"lab: {suffix}"],
-        ["git", "-C", str(repo), "push"],
-    )
-    for command in commands:
-        result = subprocess.run(
-            command, text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, timeout=90, check=False,
-        )
-        # A no-op commit is normal and not worth reporting.
-        if result.returncode and "nothing to commit" not in result.stdout:
-            print(
-                f"warning: journal sync failed: {result.stdout.strip()[:300]}",
-                file=sys.stderr,
-            )
-            return
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"warning: journal sync failed: {str(exc)[:300]}", file=sys.stderr)
 
 
 def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
@@ -180,7 +165,7 @@ def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
     }
     journal_module.append(JOURNAL_ROOT, AUDIT_BACKEND, record)
     if sync:
-        sync_repo(event)
+        sync_repo(record, event)
 
 
 _TOKEN_CACHE: str | None = None

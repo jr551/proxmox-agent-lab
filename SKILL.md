@@ -244,10 +244,13 @@ machine-readable, checksum-pinned release facts, compatible QEMU hardware, and
 the bounded cleanup sequence. Follow it directly: do not rediscover SourceForge
 metadata, print downloads into the model context, or use standalone `power-on`.
 
-For DragonFlyBSD or Haiku, use `proxmox-lab recipe dragonfly` or
-`proxmox-lab recipe haiku` the same way. These recipes pin verified media,
-separate ISO storage from VM-disk storage, require shell-safe quoted boot
-orders, and keep console operations after guest creation.
+For DragonFlyBSD, Haiku, OpenBSD, or Windows ME, use `proxmox-lab recipe
+dragonfly`, `recipe haiku`, `recipe openbsd`, or `recipe windows-me` the same
+way. The freely downloadable OS recipes pin verified media and exact storage
+and guest-creation semantics. The Windows ME recipe instead requires
+user-supplied licensed media and describes the legacy QEMU hardware; the
+Server-only `windows install` helper is not the only way to create a Windows
+guest.
 
 ## 🔬 Introspection (advanced, opt-in)
 

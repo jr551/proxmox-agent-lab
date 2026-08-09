@@ -17,6 +17,7 @@ lab token does not hold by default.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 # Everything a directory storage can hold. A slow bulk disk is a good home for
@@ -26,6 +27,21 @@ from . import config as _config
 _DEFAULT_BULK = _config.get().storage.bulk_storage
 DEFAULT_CONTENT = "images,iso,vztmpl,import,backup,snippets"
 FILESYSTEMS = ("ext4", "xfs")
+CHECKSUM_RE = re.compile(r"^(sha256|sha512|md5)\s*[:=]\s*([0-9a-f]+)$", re.I)
+
+
+def _normalise_checksum(value: str, algorithm: str | None) -> tuple[str, str]:
+    """Accept a bare digest or the common ``algorithm:digest`` spelling."""
+    match = CHECKSUM_RE.fullmatch(value.strip())
+    if match:
+        prefixed_algorithm = match.group(1).lower()
+        if algorithm and algorithm != prefixed_algorithm:
+            raise ValueError(
+                f"checksum prefix says {prefixed_algorithm}, but "
+                f"--checksum-algorithm says {algorithm}"
+            )
+        return match.group(2).lower(), prefixed_algorithm
+    return value.strip().lower(), algorithm or "sha512"
 
 
 def _disks(lab: Any, api: Any) -> list[dict[str, Any]]:
@@ -209,9 +225,17 @@ def cmd_download(lab: Any, args: Any) -> None:
         "content": args.content,
         "filename": args.filename,
     }
-    if args.checksum:
-        payload["checksum"] = args.checksum
-        payload["checksum-algorithm"] = args.checksum_algorithm
+    checksum = args.checksum
+    checksum_algorithm = args.checksum_algorithm
+    if checksum:
+        try:
+            checksum, checksum_algorithm = _normalise_checksum(
+                checksum, checksum_algorithm
+            )
+        except ValueError as exc:
+            raise lab.LabError(str(exc)) from exc
+        payload["checksum"] = checksum
+        payload["checksum-algorithm"] = checksum_algorithm
     upid = api.call(
         "POST", f"/nodes/{lab.NODE}/storage/{args.storage}/download-url", payload
     )
@@ -223,12 +247,12 @@ def cmd_download(lab: Any, args: Any) -> None:
         storage=args.storage,
         filename=args.filename,
         url=args.url,
-        checksum=args.checksum,
-        checksum_algorithm=args.checksum_algorithm if args.checksum else None,
-        verified=bool(args.checksum),
+        checksum=checksum,
+        checksum_algorithm=checksum_algorithm if checksum else None,
+        verified=bool(checksum),
     )
     print(json.dumps(
-        {"volume": volume, "verified": bool(args.checksum), "status": status},
+        {"volume": volume, "verified": bool(checksum), "status": status},
         indent=2,
         sort_keys=True,
     ))
@@ -295,9 +319,12 @@ def register(sub: Any, lab: Any) -> None:
     download.add_argument("--storage", default=_DEFAULT_BULK)
     download.add_argument("--content", choices=("import", "iso", "vztmpl"),
                           default="import")
-    download.add_argument("--checksum")
+    download.add_argument(
+        "--checksum",
+        help="digest, optionally prefixed with its algorithm (for example sha256:abc...)",
+    )
     download.add_argument("--checksum-algorithm",
-                          choices=("sha256", "sha512", "md5"), default="sha512")
+                          choices=("sha256", "sha512", "md5"))
     download.add_argument("--allow-unverified", action="store_true",
                           help="skip checksum verification (discouraged)")
     download.add_argument("--timeout", type=int, default=3600)

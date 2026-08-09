@@ -56,6 +56,13 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("tag 'v1.2.4' does not match 'v1.2.3'", result.stderr)
 
+    def test_rejects_mismatched_bootstrap_version(self):
+        root = self.make_tree()
+        (root / "bootstrap.sh").write_text('REQUIRED_VERSION="1.2.2"\n')
+        result = self.run_check(root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bootstrap required version", result.stderr)
+
     def test_rejects_missing_release_notes(self):
         root = self.make_tree()
         (root / "CHANGELOG.md").write_text("# Changelog\n\n## Unreleased\n")

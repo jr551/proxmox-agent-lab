@@ -4,6 +4,21 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.3.5 - 2026-08-09
+
+### Added
+
+- Deterministic OpenBSD 7.9 and user-media Windows ME recipes prevent small
+  models from confusing clone/create fields, storage content, legacy hardware,
+  and Server-only helpers.
+
+### Fixed
+
+- Bootstrap now refreshes a cached CLI older than the bootstrap script itself,
+  even when the once-daily GitHub release check is not due.
+- Storage downloads accept `sha256:<digest>` and similar checksum prefixes,
+  selecting the matching Proxmox checksum algorithm automatically.
+
 ## 0.3.4 - 2026-08-09
 
 ### Added

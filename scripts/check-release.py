@@ -24,6 +24,19 @@ def release_metadata(root: Path, tag: str | None = None) -> tuple[str, str]:
             f"pyproject.toml version {version!r}"
         )
 
+    bootstrap_path = root / "bootstrap.sh"
+    if bootstrap_path.exists():
+        bootstrap_text = bootstrap_path.read_text()
+        bootstrap_match = re.search(
+            r'^REQUIRED_VERSION="([^"]+)"$', bootstrap_text, re.MULTILINE
+        )
+        if bootstrap_match is None or bootstrap_match.group(1) != version:
+            found = bootstrap_match.group(1) if bootstrap_match else None
+            raise ValueError(
+                f"bootstrap required version {found!r} does not match "
+                f"pyproject.toml version {version!r}"
+            )
+
     expected_tag = f"v{version}"
     if tag is not None and tag != expected_tag:
         raise ValueError(f"tag {tag!r} does not match {expected_tag!r}")

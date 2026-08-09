@@ -96,7 +96,10 @@ class ProxmoxLabTests(unittest.TestCase):
         import io
         import json
 
-        for name, filesystem in (("dragonfly", "HAMMER"), ("haiku", "BFS")):
+        for name, filesystem in (
+            ("dragonfly", "HAMMER"),
+            ("haiku", "BFS"),
+        ):
             args = LAB.parser().parse_args(["recipe", name])
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
@@ -108,6 +111,47 @@ class ProxmoxLabTests(unittest.TestCase):
                 recipe["phase_order"].index("api-create-qemu-and-register"),
                 recipe["phase_order"].index("console-screenshot-or-inspect"),
             )
+
+    def test_openbsd_recipe_prevents_transcript_command_errors(self) -> None:
+        import contextlib
+        import io
+        import json
+
+        args = LAB.parser().parse_args(["recipe", "openbsd"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            args.func(args)
+        recipe = json.loads(output.getvalue())
+        self.assertEqual(recipe["release"], "7.9")
+        self.assertEqual(recipe["image"]["content"], "iso")
+        self.assertEqual(recipe["qemu"]["vmid_field"], "vmid")
+        self.assertIn("console text", " ".join(recipe["invalid_shortcuts"]))
+
+    def test_windows_me_recipe_requires_user_media_and_legacy_hardware(self) -> None:
+        import contextlib
+        import io
+        import json
+
+        args = LAB.parser().parse_args(["recipe", "windows-me"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            args.func(args)
+        recipe = json.loads(output.getvalue())
+        self.assertTrue(recipe["media"]["user_supplied"])
+        self.assertIsNone(recipe["media"]["download"])
+        self.assertEqual(recipe["qemu"]["firmware"], "SeaBIOS")
+        self.assertEqual(recipe["qemu"]["disk"].split("=", 1)[0], "ide0")
+
+    def test_checksum_prefix_selects_algorithm(self) -> None:
+        from proxmox_agent_lab import storage
+
+        digest = "ab" * 32
+        self.assertEqual(
+            storage._normalise_checksum(f"SHA256:{digest}", None),
+            (digest, "sha256"),
+        )
+        with self.assertRaisesRegex(ValueError, "prefix says sha256"):
+            storage._normalise_checksum(f"sha256:{digest}", "sha512")
 
     def test_api_method_is_case_insensitive(self) -> None:
         self.assertEqual(

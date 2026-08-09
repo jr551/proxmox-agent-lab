@@ -244,6 +244,11 @@ machine-readable, checksum-pinned release facts, compatible QEMU hardware, and
 the bounded cleanup sequence. Follow it directly: do not rediscover SourceForge
 metadata, print downloads into the model context, or use standalone `power-on`.
 
+For DragonFlyBSD or Haiku, use `proxmox-lab recipe dragonfly` or
+`proxmox-lab recipe haiku` the same way. These recipes pin verified media,
+separate ISO storage from VM-disk storage, require shell-safe quoted boot
+orders, and keep console operations after guest creation.
+
 ## 🔬 Introspection (advanced, opt-in)
 
 To see what a running guest is *really* doing from underneath it — malware

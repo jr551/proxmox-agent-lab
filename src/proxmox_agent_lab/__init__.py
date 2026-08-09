@@ -4,4 +4,4 @@ Turn a spare PC into an AI lab that powers itself on for work and, crucially,
 always powers itself off again.
 """
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"

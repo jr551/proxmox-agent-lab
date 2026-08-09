@@ -1332,7 +1332,11 @@ def parser() -> argparse.ArgumentParser:
 
     api = sub.add_parser("api")
     api.add_argument("--lease")
-    api.add_argument("--method", choices=("GET", "POST", "PUT", "DELETE"), required=True)
+    api.add_argument(
+        "--method", type=str.upper,
+        choices=("GET", "POST", "PUT", "DELETE"), required=True,
+        help="HTTP method (case-insensitive)",
+    )
     api.add_argument("--path", required=True)
     api.add_argument("--data", action="append", default=[])
     api.add_argument("--policy", choices=("delete", "retain"), default="delete")
@@ -1419,7 +1423,10 @@ def _expected_errors() -> tuple[type[BaseException], ...]:
         LabError, ConfigError, secrets_store.SecretError,
         power_module.PowerError, ValueError, json.JSONDecodeError,
     ]
-    for name in ("android", "console", "guest", "s3", "netgw", "share"):
+    for name in (
+        "android", "console", "guest", "rfb", "s3", "netgw", "share",
+        "vision", "ws",
+    ):
         try:
             module = __import__(f"{__package__}.{name}", fromlist=[name])
         except ImportError:  # pragma: no cover

@@ -42,16 +42,47 @@ REACTOS = {
         "sha256": "2be97d87fd43c93185aa841c1742fe9265c58aba0e517e20122df19d9add1935",
         "member": "ReactOS-0.4.15-release-1-gdbb43bbaeb2-x86.iso",
     },
+    "qemu": {
+        "firmware": "seabios",
+        "machine": "pc-i440fx",
+        "memory_mib": 1024,
+        "disk_bus": "ide",
+        "cdrom_bus": "ide2",
+        "boot": "order=ide2;ide0",
+        "vga": "std",
+        "network_model": "e1000",
+        "serial": "socket",
+        "guest_agent": False,
+    },
+    "installation": {
+        "media": "boot-cd",
+        "architecture": "x86",
+        "stages": [
+            "text-mode-setup",
+            "gui-setup",
+            "first-desktop-boot",
+        ],
+        "final_check": [
+            "Detach the ISO after setup and boot the installed IDE disk.",
+            "Use VNC screenshot or inspect for GUI state; serial0 is for debug output when needed.",
+        ],
+    },
     "rules": COMMON_RULES[:1] + [
         "Download without printing it, verify SHA-256, extract only the named ISO, then upload it as ISO content.",
-        "Create one lease-owned QEMU guest with SeaBIOS, i440fx, IDE disk and CD-ROM, std VGA, and rtl8139 or e1000.",
+        "Create one lease-owned QEMU guest with legacy SeaBIOS, i440fx, IDE disk and CD-ROM, std VGA, e1000 networking, serial0, and no assumed guest agent.",
     ] + COMMON_RULES[2:],
     "phase_order": COMMON_PHASES[:1] + [
         "download-verify-extract-locally",
         "upload-extracted-iso",
-    ] + COMMON_PHASES[2:],
+    ] + COMMON_PHASES[2:4] + [
+        "installer-text-mode",
+        "installer-gui",
+    ] + COMMON_PHASES[4:],
     "invalid_shortcuts": COMMON_INVALID + [
         "Do not upload the ZIP as ISO content; upload only the extracted .iso member.",
+        "Do not use UEFI/OVMF, SATA, or VirtIO storage for the legacy compatibility path; keep SeaBIOS and IDE unless a separately verified experiment requires otherwise.",
+        "Do not assume a ReactOS guest agent or shell channel; use VNC and, when configured, serial output.",
+        "Do not treat a successful boot as stability evidence; ReactOS documents the 0.4.15 line as alpha software.",
     ],
 }
 

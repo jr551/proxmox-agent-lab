@@ -244,6 +244,14 @@ machine-readable, checksum-pinned release facts, compatible QEMU hardware, and
 the bounded cleanup sequence. Follow it directly: do not rediscover SourceForge
 metadata, print downloads into the model context, or use standalone `power-on`.
 
+The pinned 0.4.15 media is a legacy-BIOS install. Use SeaBIOS/i440fx, IDE
+disk and CD-ROM, std VGA, and e1000 networking; keep serial0 attached for
+debug output. ReactOS setup has text-mode, GUI, and first-desktop stages, so
+keep VNC available and do not claim completion until the installed IDE disk
+boots with the ISO detached. Do not assume a guest agent or shell channel.
+ReactOS documents this release line as alpha software, so report a successful
+boot as a compatibility observation, not a stability claim.
+
 For DragonFlyBSD, Haiku, OpenBSD, or Windows ME, use `proxmox-lab recipe
 dragonfly`, `recipe haiku`, `recipe openbsd`, or `recipe windows-me` the same
 way. The freely downloadable OS recipes pin verified media and exact storage

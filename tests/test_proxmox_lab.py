@@ -84,12 +84,24 @@ class ProxmoxLabTests(unittest.TestCase):
         recipe = json.loads(output.getvalue())
         self.assertEqual(recipe["release"], "0.4.15")
         self.assertEqual(len(recipe["archive"]["sha256"]), 64)
-        self.assertIn("lease-begin", recipe["rules"][0])
+        self.assertEqual(recipe["qemu"]["firmware"], "seabios")
+        self.assertEqual(recipe["qemu"]["machine"], "pc-i440fx")
+        self.assertEqual(recipe["qemu"]["disk_bus"], "ide")
+        self.assertEqual(recipe["qemu"]["network_model"], "e1000")
+        self.assertFalse(recipe["qemu"]["guest_agent"])
+        self.assertLess(
+            recipe["phase_order"].index("installer-text-mode"),
+            recipe["phase_order"].index("installer-gui"),
+        )
         self.assertLess(
             recipe["phase_order"].index("api-create-qemu-and-register"),
             recipe["phase_order"].index("console-screenshot-or-inspect"),
         )
+        self.assertIn("lease-begin", recipe["rules"][0])
         self.assertIn("Do not use console exec", recipe["invalid_shortcuts"][0])
+        self.assertTrue(
+            any("UEFI/OVMF" in shortcut for shortcut in recipe["invalid_shortcuts"])
+        )
 
     def test_obscure_os_recipes_pin_media_and_keep_console_after_vm(self) -> None:
         import contextlib

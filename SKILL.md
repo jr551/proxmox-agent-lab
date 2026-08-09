@@ -38,6 +38,10 @@ ask the user to re-enter configuration that `doctor` already found.
 
 ## 🔑 Every task follows this shape
 
+Never call standalone `power-on` for agent work. It deliberately refuses
+without `--standalone-authorized` because it has no lease finalizer; start with
+`lease-begin`, which both wakes the host and establishes cleanup ownership.
+
 ```bash
 L=$(proxmox-lab lease-begin --purpose "<sanitized purpose>" \
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
@@ -232,6 +236,13 @@ proxmox-lab windows finish --lease "$L" --vmid <id>
 
 Default is an interactive install you drive over VNC — screenshot, click,
 type. `--unattended` generates and attaches an answer ISO instead.
+
+## ⚛️ ReactOS
+
+Before planning or browsing, run `proxmox-lab recipe reactos`. It returns
+machine-readable, checksum-pinned release facts, compatible QEMU hardware, and
+the bounded cleanup sequence. Follow it directly: do not rediscover SourceForge
+metadata, print downloads into the model context, or use standalone `power-on`.
 
 ## 🔬 Introspection (advanced, opt-in)
 

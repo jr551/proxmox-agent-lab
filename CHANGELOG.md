@@ -4,6 +4,20 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.3.4 - 2026-08-09
+
+### Added
+
+- Checksum-pinned DragonFlyBSD/HAMMER and Haiku/BFS recipes give small models
+  correct storage roles, quoted boot-order values, and strict phase ordering.
+
+### Fixed
+
+- API methods are case-insensitive, avoiding needless retries for `get` versus
+  `GET`.
+- RFB and WebSocket failures are rendered as concise CLI errors instead of raw
+  Python tracebacks.
+
 ## 0.3.3 - 2026-08-09
 
 ### Added

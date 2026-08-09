@@ -91,6 +91,38 @@ class ProxmoxLabTests(unittest.TestCase):
         )
         self.assertIn("Do not use console exec", recipe["invalid_shortcuts"][0])
 
+    def test_obscure_os_recipes_pin_media_and_keep_console_after_vm(self) -> None:
+        import contextlib
+        import io
+        import json
+
+        for name, filesystem in (("dragonfly", "HAMMER"), ("haiku", "BFS")):
+            args = LAB.parser().parse_args(["recipe", name])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                args.func(args)
+            recipe = json.loads(output.getvalue())
+            self.assertEqual(recipe["filesystem"], filesystem)
+            self.assertTrue(recipe["image"]["checksum"])
+            self.assertLess(
+                recipe["phase_order"].index("api-create-qemu-and-register"),
+                recipe["phase_order"].index("console-screenshot-or-inspect"),
+            )
+
+    def test_api_method_is_case_insensitive(self) -> None:
+        self.assertEqual(
+            LAB.parser().parse_args([
+                "api", "--method", "get", "--path", "/version",
+            ]).method,
+            "GET",
+        )
+
+    def test_protocol_errors_are_rendered_without_tracebacks(self) -> None:
+        from proxmox_agent_lab import rfb, ws
+
+        self.assertIn(rfb.RFBError, LAB._EXPECTED_ERRORS)
+        self.assertIn(ws.WebSocketError, LAB._EXPECTED_ERRORS)
+
     def test_sqlite_audit_can_export_redacted_jsonl_to_git(self) -> None:
         """The local query backend and remote logging transport are separate."""
         record = {"timestamp": "2026-08-08T12:00:00Z", "event": "test"}

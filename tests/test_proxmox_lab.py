@@ -64,6 +64,33 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertIsNone(begin.timeout)
         self.assertIsNone(power.timeout)
 
+    def test_standalone_power_on_requires_explicit_human_authorization(self) -> None:
+        args = LAB.parser().parse_args(["power-on"])
+        with mock.patch.object(LAB, "ensure_on") as ensure_on:
+            with self.assertRaises(LAB.LabError) as caught:
+                LAB.cmd_power_on(args)
+        self.assertIn("Use lease-begin", str(caught.exception))
+        ensure_on.assert_not_called()
+
+    def test_reactos_recipe_is_machine_readable_and_lease_first(self) -> None:
+        import contextlib
+        import io
+        import json
+
+        args = LAB.parser().parse_args(["recipe", "reactos"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            args.func(args)
+        recipe = json.loads(output.getvalue())
+        self.assertEqual(recipe["release"], "0.4.15")
+        self.assertEqual(len(recipe["archive"]["sha256"]), 64)
+        self.assertIn("lease-begin", recipe["rules"][0])
+        self.assertLess(
+            recipe["phase_order"].index("api-create-qemu-and-register"),
+            recipe["phase_order"].index("console-screenshot-or-inspect"),
+        )
+        self.assertIn("Do not use console exec", recipe["invalid_shortcuts"][0])
+
     def test_sqlite_audit_can_export_redacted_jsonl_to_git(self) -> None:
         """The local query backend and remote logging transport are separate."""
         record = {"timestamp": "2026-08-08T12:00:00Z", "event": "test"}

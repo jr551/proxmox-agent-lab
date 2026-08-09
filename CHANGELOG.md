@@ -4,6 +4,19 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.3.3 - 2026-08-09
+
+### Added
+
+- `recipe reactos` gives small models a checksum-pinned, machine-readable
+  install runbook with enforced phase ordering and explicit invalid shortcuts,
+  avoiding SourceForge discovery, binary output, and pre-VM console commands.
+
+### Changed
+
+- Standalone `power-on` now requires `--standalone-authorized`; ordinary agent
+  work must use `lease-begin` so every wake-up has a cleanup owner.
+
 ## 0.3.2 - 2026-08-09
 
 ### Fixed

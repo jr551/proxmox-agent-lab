@@ -581,6 +581,12 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def cmd_power_on(args: argparse.Namespace) -> None:
+    if not args.standalone_authorized:
+        raise LabError(
+            "Standalone power-on has no lease finalizer and is refused by default. "
+            "Use lease-begin for normal work, or pass --standalone-authorized "
+            "only when a person will manage shutdown."
+        )
     changed = ensure_on(ProxmoxAPI(), timeout=args.timeout)
     print(json.dumps({"reachable": True, "power_on_requested": changed}))
 
@@ -1283,10 +1289,17 @@ def parser() -> argparse.ArgumentParser:
                         help="load legacy per-day JSONL files into the database")
     ledger.set_defaults(func=cmd_journal)
 
-    power = sub.add_parser("power-on")
+    power = sub.add_parser(
+        "power-on",
+        help="wake without a lease (manual operations only; authorization required)",
+    )
     power.add_argument(
         "--timeout", type=int,
         help="cold-boot wait (default: power.boot_timeout_seconds; minimum: 90)",
+    )
+    power.add_argument(
+        "--standalone-authorized", action="store_true",
+        help="confirm that a person, not the lease finalizer, owns shutdown",
     )
     power.set_defaults(func=cmd_power_on)
 
@@ -1365,6 +1378,7 @@ def parser() -> argparse.ArgumentParser:
     from . import memflow
     from . import netcap
     from . import netgw
+    from . import recipes
     from . import share
     from . import storage
     from . import usb
@@ -1377,6 +1391,7 @@ def parser() -> argparse.ArgumentParser:
     memflow.register(sub, _module())
     netcap.register(sub, _module())
     netgw.register(sub, _module())
+    recipes.register(sub, _module())
     share.register(sub, _module())
     storage.register(sub, _module())
     usb.register(sub, _module())

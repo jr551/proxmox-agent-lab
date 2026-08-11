@@ -788,8 +788,14 @@ def _spawn_dnsmasq_server(lab: Any, api: Any, args: Any, *, role: str,
             "memory": args.memory,
             "ciuser": cloud_user,
             "cipassword": password,
-            "net0": f"virtio,bridge={LAB_BRIDGE}",
-            "ipconfig0": f"ip={server_ip}/{prefix},gw={LAB_GATEWAY_IP}",
+            # net0 on the home bridge gives the server egress for its own
+            # provisioning (apt); net1 on the lab bridge is where it serves.
+            # dnsmasq binds only the lab-side interface, so it never answers
+            # on the egress NIC.
+            "net0": "virtio,bridge=vmbr0,firewall=1",
+            "net1": f"virtio,bridge={LAB_BRIDGE}",
+            "ipconfig0": "ip=dhcp",
+            "ipconfig1": f"ip={server_ip}/{prefix},gw={LAB_GATEWAY_IP}",
             "agent": "enabled=1",
             "onboot": 0,
             "tags": f"codex-lab;lease-{args.lease};{role}",

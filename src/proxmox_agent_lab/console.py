@@ -685,6 +685,21 @@ supplied coordinates alone; judge from the image."""
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def _bridge_send_all(client: Any, data: bytes) -> bool:
+    """Send all bytes to a non-blocking client; False when the client is gone."""
+    import select
+
+    while data:
+        try:
+            sent = client.send(data)
+            data = data[sent:]
+        except BlockingIOError:
+            select.select([], [client], [], 0.2)
+        except OSError:
+            return False
+    return True
+
+
 def _bridge_serve(lab: Any, api: Any, kind: str, vmid: int,
                   client: Any) -> None:
     """Pipe one TCP client to the guest serial and back.
@@ -697,21 +712,25 @@ def _bridge_serve(lab: Any, api: Any, kind: str, vmid: int,
 
     with TermSession(lab, api, kind, vmid) as term:
         # The terminal handshake acknowledges auth with a bare "OK" that is
-        # protocol noise, not serial output; drop it once.
+        # protocol noise, not serial output; drop it once (with its newline
+        # when present).
         first = term.socket.read_available(0.2)
         if first.startswith(b"OK"):
-            first = first[2:] if first.startswith(b"OK\n") else first[2:]
-        if first:
-            client.sendall(first)
+            first = first[3:] if first.startswith(b"OK\n") else first[2:]
+        if first and not _bridge_send_all(client, first):
+            return
         client.setblocking(False)
         while True:
             data = term.socket.read_available(0.2)
-            if data:
-                client.sendall(data)
+            if data and not _bridge_send_all(client, data):
+                return
             readable, _, _ = select.select([client], [], [], 0.2)
             if not readable:
                 continue
-            chunk = client.recv(65536)
+            try:
+                chunk = client.recv(65536)
+            except OSError:
+                return
             if not chunk:
                 return
             term.socket.send(

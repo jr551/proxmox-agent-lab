@@ -389,14 +389,29 @@ def cmd_log(lab: Any, args: Any) -> None:
     deadline = time.monotonic() + (args.timeout if args.follow else 0)
     exited = False
     while True:
+        # The guest reports the byte count of what it emitted so the cursor
+        # stays byte-aligned even when the log contains non-ASCII output.
+        token = secrets.token_hex(4)
+        marker = f"__logb{token}__"
         run = _agent_sh(
             lab, api, args.vmid,
-            f"tail -c +{cursor + 1} {shlex.quote(log)} 2>/dev/null || true",
+            f"LC_ALL=C out=$(tail -c +{cursor + 1} {shlex.quote(log)} "
+            f"2>/dev/null); printf '%s' \"$out\"; "
+            f"printf '\\n{marker}:%s\\n' \"${{#out}}\"",
         )
         output = run.get("stdout", "")
+        count = 0
         if output:
-            print(output, end="", flush=True)
-            cursor += len(output)
+            split = output.rsplit(f"\n{marker}:", 1)
+            if len(split) == 2:
+                data, count_text = split
+                if count_text.isdigit():
+                    count = int(count_text)
+            else:
+                data = output
+            if data:
+                print(data, end="", flush=True)
+            cursor += count if count else len(data.encode("utf-8", "replace"))
         alive = _pid_alive(lab, api, args.vmid, args.pid)
         if not alive:
             exited = True

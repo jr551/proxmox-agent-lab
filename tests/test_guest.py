@@ -178,6 +178,28 @@ class DetachedRunTests(unittest.TestCase):
                                               "--pid", "12345",
                                               "--timeout", "10"))
 
+    def test_log_uses_byte_marker_for_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = _lab(tmp)
+            self._record(tmp)
+
+            def fake_exec(lab, api, vmid, command, timeout=30):
+                script = command[2]
+                if "out=$(tail" in script:
+                    return {"exitcode": 0,
+                            "stdout": "data\n__logb1234__:5\n",
+                            "stderr": ""}
+                if "kill -0" in script:
+                    return {"exitcode": 0, "stdout": "1", "stderr": ""}
+                return {"exitcode": 0, "stdout": "", "stderr": ""}
+
+            with mock.patch.object(lab_console, "agent_exec",
+                                   side_effect=fake_exec):
+                lab_guest.cmd_log(lab, _args(lab, "guest", "log",
+                                             "--lease", "L1",
+                                             "--vmid", "7",
+                                             "--pid", "12345"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -685,6 +685,78 @@ supplied coordinates alone; judge from the image."""
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def _bridge_serve(lab: Any, api: Any, kind: str, vmid: int,
+                  client: Any) -> None:
+    """Pipe one TCP client to the guest serial and back.
+
+    Guest output is raw terminal bytes; client bytes are re-framed as Proxmox
+    terminal input (`0:<len>:<data>`). One client at a time; the listener
+    accepts the next after this one disconnects.
+    """
+    import select
+
+    with TermSession(lab, api, kind, vmid) as term:
+        # The terminal handshake acknowledges auth with a bare "OK" that is
+        # protocol noise, not serial output; drop it once.
+        first = term.socket.read_available(0.2)
+        if first.startswith(b"OK"):
+            first = first[2:] if first.startswith(b"OK\n") else first[2:]
+        if first:
+            client.sendall(first)
+        client.setblocking(False)
+        while True:
+            data = term.socket.read_available(0.2)
+            if data:
+                client.sendall(data)
+            readable, _, _ = select.select([client], [], [], 0.2)
+            if not readable:
+                continue
+            chunk = client.recv(65536)
+            if not chunk:
+                return
+            term.socket.send(
+                b"0:" + str(len(chunk)).encode() + b":" + chunk
+            )
+
+
+def cmd_bridge(lab: Any, args: Any) -> None:
+    """Expose a guest serial console as a local TCP port for debuggers."""
+    import socket
+
+    api = lab.ProxmoxAPI()
+    lease = lab.load_lease(args.lease)
+    owned = any(
+        item.get("kind") == args.kind and int(item.get("vmid", -1)) == args.vmid
+        for item in lease.get("resources", [])
+    )
+    if not owned:
+        raise _api_error(
+            lab, f"VMID {args.vmid} is not a {args.kind} guest registered to "
+            "this lease"
+        )
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((args.host, args.port))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    lab.audit("console-bridge", lease=args.lease, vmid=args.vmid,
+              kind=args.kind, port=port, sync=False)
+    print(
+        f"bridge ready: {args.host}:{port} -> {args.kind}/{args.vmid} serial. "
+        f"Connect with e.g. 'nc {args.host} {port}' (or a kernel debugger such "
+        "as rosdbg). Ctrl+C to stop."
+    )
+    try:
+        while True:
+            client, _ = listener.accept()
+            try:
+                _bridge_serve(lab, api, args.kind, args.vmid, client)
+            finally:
+                client.close()
+    finally:
+        listener.close()
+
+
 def cmd_text(lab: Any, args: Any) -> None:
     """Read the real terminal stream -- exact text, no OCR involved."""
     api = lab.ProxmoxAPI()
@@ -1160,6 +1232,18 @@ def register(sub: Any, lab: Any) -> None:
                       help="send a bare newline to redraw the prompt")
     text.add_argument("--lease")
     text.set_defaults(func=bind(cmd_text))
+
+    bridge = console_sub.add_parser(
+        "bridge",
+        help="expose a guest serial console on a local TCP port (debuggers)",
+    )
+    bridge.add_argument("--lease", required=True)
+    bridge.add_argument("--vmid", type=int, required=True)
+    bridge.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
+    bridge.add_argument("--host", default="127.0.0.1")
+    bridge.add_argument("--port", type=int, default=0,
+                        help="local TCP port (0 = pick a free one)")
+    bridge.set_defaults(func=bind(cmd_bridge))
 
     execute = console_sub.add_parser("exec", help="run a command via guest agent")
     execute.add_argument("--lease", required=True)

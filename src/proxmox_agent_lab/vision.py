@@ -444,6 +444,26 @@ def verifies_target(result: dict[str, Any], target: str, x: int, y: int,
     return True, "independent vision matched the named target and coordinate"
 
 
+def _rejection_reason(result: dict[str, Any]) -> str:
+    """A compact reason a vision result was rejected, for error summaries."""
+    issues: list[str] = []
+    validation = result.get("validation")
+    if isinstance(validation, dict) and validation.get("warnings"):
+        issues = [str(warning) for warning in validation["warnings"]]
+    if not issues:
+        issues = ["structurally invalid"]
+    model = result.get("model")
+    prefix = f"{model}: " if isinstance(model, str) and model else ""
+    return (prefix + "; ".join(issues))[:200]
+
+
+def _attempt_summary(item: dict[str, Any]) -> str:
+    detail = item.get("error") or item.get("reason") or ""
+    if not detail:
+        return f"{item['provider']}: {item['status']}"
+    return f"{item['provider']}: {item['status']} ({detail})"
+
+
 def analyze_png(config: Any, image: bytes, *, width: int, height: int,
                 prompt: str | None = None, timeout: int = 120,
                 max_tokens: int = 1024, provider: str = "auto") -> dict[str, Any]:
@@ -489,6 +509,7 @@ def analyze_png(config: Any, image: bytes, *, width: int, height: int,
                 "provider": name,
                 "status": "rejected",
                 "validation": result.get("validation"),
+                "reason": _rejection_reason(result),
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
             })
             continue
@@ -501,11 +522,7 @@ def analyze_png(config: Any, image: bytes, *, width: int, height: int,
         result["elapsed_ms"] = elapsed_ms
         result["provider_chain"] = attempts
         return result
-    summary = "; ".join(
-        f"{item['provider']}: {item['status']}"
-        + (f" ({item['error']})" if item.get("error") else "")
-        for item in attempts
-    )
+    summary = "; ".join(_attempt_summary(item) for item in attempts)
     raise VisionError(f"no vision provider returned a valid analysis: {summary}")
 
 
@@ -548,6 +565,7 @@ def _race_providers(providers: dict[str, Any], timeout: int) -> dict[str, Any]:
             attempts.append({
                 "provider": name, "status": "rejected",
                 "validation": result.get("validation"),
+                "reason": _rejection_reason(result),
                 "elapsed_ms": elapsed_ms,
             })
             continue
@@ -564,9 +582,5 @@ def _race_providers(providers: dict[str, Any], timeout: int) -> dict[str, Any]:
                 "provider": name, "status": "timed_out",
                 "elapsed_ms": round(timeout * 1000),
             })
-    summary = "; ".join(
-        f"{item['provider']}: {item['status']}"
-        + (f" ({item['error']})" if item.get("error") else "")
-        for item in attempts
-    )
+    summary = "; ".join(_attempt_summary(item) for item in attempts)
     raise VisionError(f"no vision provider returned a valid analysis: {summary}")

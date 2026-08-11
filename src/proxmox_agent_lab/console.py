@@ -511,6 +511,10 @@ def cmd_inspect(lab: Any, args: Any) -> None:
             provider=args.provider,
         )
     except (vision.VisionError, secrets_store.SecretError) as exc:
+        lab.audit(
+            "console-vision-inspect-failed", lease=args.lease, vmid=args.vmid,
+            error=str(exc)[:200], provider=args.provider or "auto", sync=False,
+        )
         raise _api_error(lab, str(exc)) from None
     lab.audit(
         "console-vision-inspect", lease=args.lease, vmid=args.vmid,

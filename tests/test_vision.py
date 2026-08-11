@@ -270,6 +270,25 @@ class VisionApiTests(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertIn("2 controls", reason)
 
+    def test_rejection_summary_includes_validation_reason(self) -> None:
+        invalid = {
+            "provider": "nvidia", "model": "some/vision-model",
+            "structured": True,
+            "validation": {
+                "structurally_valid": False,
+                "warnings": ["screen is not a non-empty string"],
+            },
+        }
+        with mock.patch.object(vision, "_nvidia", return_value=invalid):
+            with self.assertRaises(vision.VisionError) as caught:
+                vision.analyze_png(
+                    mock.Mock(), self.PNG, width=2, height=2, timeout=10,
+                    provider="nvidia",
+                )
+        message = str(caught.exception)
+        self.assertIn("some/vision-model", message)
+        self.assertIn("screen is not a non-empty string", message)
+
 
 if __name__ == "__main__":
     unittest.main()

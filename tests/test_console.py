@@ -859,3 +859,44 @@ class ScreenshotCommandTests(unittest.TestCase):
             self.assertEqual(payload["screenshot_after"]["path"], str(out))
             self.assertTrue(payload["verification"]["accepted"])
             self.assertEqual(payload["control_bbox"], [0, 0, 2, 2])
+
+    def test_inspect_audits_vision_failure(self) -> None:
+        """A rejected vision analysis must leave a journal trail."""
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.load_lease.return_value = {
+            "resources": [{"kind": "qemu", "vmid": 7}]
+        }
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 2, 2
+        session.client.capture.return_value = b"\x00\x00\x00" * 4
+        message = (
+            "no vision provider returned a valid analysis: "
+            "nvidia: rejected (some/vision-model: screen is not a non-empty string)"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
+            args = mock.Mock(
+                lease="lease-12345678", vmid=7, settle=2.0,
+                out=str(Path(tmp) / "inspect.png"), prompt=None, timeout=120,
+                max_tokens=1024, provider="nvidia",
+            )
+            with mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch.object(lab_console.vision, "analyze_png",
+                                   side_effect=lab_console.vision.VisionError(
+                                       message
+                                   )):
+                with self.assertRaises(RuntimeError) as caught:
+                    lab_console.cmd_inspect(lab, args)
+
+        self.assertEqual(str(caught.exception), message)
+        lab.audit.assert_called_once_with(
+            "console-vision-inspect-failed", lease=args.lease, vmid=7,
+            error=message[:200], provider="nvidia", sync=False,
+        )

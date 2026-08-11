@@ -830,3 +830,4 @@ class ScreenshotCommandTests(unittest.TestCase):
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
             self.assertEqual(payload["screenshot_after"]["path"], str(out))
             self.assertTrue(payload["verification"]["accepted"])
+            self.assertEqual(payload["control_bbox"], [0, 0, 2, 2])

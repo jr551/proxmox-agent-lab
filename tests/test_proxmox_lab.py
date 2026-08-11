@@ -311,6 +311,59 @@ class ProxmoxLabTests(unittest.TestCase):
             finally:
                 LAB.LEASE_ROOT = old_root
 
+    def test_cmd_api_create_registers_under_lock_with_reloaded_lease(self) -> None:
+        """A registration racing the create must survive: cmd_api reloads the
+        lease inside controller_lock instead of saving the stale snapshot."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            old_state_root = LAB.STATE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.STATE_ROOT = Path(tmp) / "state"
+            try:
+                lease_id = "20260811120000-race01"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "standard",
+                    "resources": [],
+                    "initial_vmids": [],
+                })
+
+                api = mock.Mock()
+
+                def create_and_concurrent_register(method, path, data=None):
+                    # While the create request is in flight, another process
+                    # registers a guest; the stale-snapshot save used to
+                    # clobber this entry.
+                    concurrent = LAB.load_lease(lease_id)
+                    concurrent["resources"].append(
+                        {"kind": "qemu", "vmid": 9100,
+                         "policy": "delete", "name": "other"}
+                    )
+                    LAB.save_lease(concurrent)
+                    return {"vmid": 9090}
+
+                api.call.side_effect = create_and_concurrent_register
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease_id, "--method", "POST",
+                    "--path", f"/nodes/{LAB.NODE}/qemu",
+                    "--data", "vmid=9090", "--data", "name=created",
+                ])
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "audit"):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        LAB.cmd_api(args)
+
+                final = LAB.load_lease(lease_id)
+                vmids = sorted(int(r["vmid"]) for r in final["resources"])
+                self.assertEqual(vmids, [9090, 9100])
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
+                LAB.STATE_ROOT = old_state_root
+
 
 if __name__ == "__main__":
     unittest.main()

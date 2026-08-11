@@ -721,13 +721,17 @@ def path_resource(path: str) -> tuple[str, int] | None:
 
 
 def _boot_order_devices(value: str) -> list[str]:
-    """Normalized device list of a PVE `order=dev;dev` boot value."""
+    """Normalized device list of a PVE `boot` value.
+
+    PVE documents ``boot`` as ``[order=]dev;dev`` — the ``order=`` prefix is
+    optional, so a bare ``boot=ide2;ide0`` is valid and must parse the same.
+    """
     order = value.strip()
-    if not order.startswith("order="):
-        return []
+    if order.startswith("order="):
+        order = order[len("order="):]
     return [
         device.strip().lower()
-        for device in order[len("order="):].split(";")
+        for device in order.split(";")
         if device.strip()
     ]
 
@@ -842,9 +846,10 @@ def cmd_api(args: argparse.Namespace) -> None:
                 )
             except LabError:
                 persisted = None
-            if persisted is not None and persisted != requested:
+            if persisted is not None and requested and persisted != requested:
+                persisted_text = ";".join(persisted) or "(none)"
                 print(
-                    f"warning: PVE persisted boot order '{';'.join(persisted)}' "
+                    f"warning: PVE persisted boot order '{persisted_text}' "
                     f"instead of requested '{';'.join(requested)}' — set ide2/disk "
                     "attach and boot order in separate calls",
                     file=sys.stderr,

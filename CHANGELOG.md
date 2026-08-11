@@ -4,6 +4,46 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.4.0 - 2026-08-10
+
+### Added
+
+- `console screenshot --ocr` works out of the box: an embedded public-domain
+  VGA 8x16 font is installed on first use when no table has been imported,
+  so legacy-only guests (Windows 2000 setup, DOS, BIOS screens) no longer
+  need a Linux guest to pull a PSF from (#32).
+- `storage download-url` accepts `sha1` checksums (digest prefixes, `SHA1=`,
+  and bare 40-hex digests) — archive.org media publishes sha1 but not sha256
+  (#28).
+- `console click` verification now requires a vision-reported control bounding
+  box containing the click point, instead of accepting a model-echoed point;
+  verified clicks report the matched `control_bbox` (#27).
+- Screenshots (and `--screenshot-after` captures) flag pixel-identical repeat
+  frames as possibly stale, so a QEMU VNC dirty-tracking glitch cannot pass
+  an old page to a vision read unnoticed (#29).
+- `console inspect` vision failures surface per-provider diagnostics and are
+  recorded as `console-vision-inspect-failed` audit events (#30).
+- The api wrapper warns when PVE persists a different boot order than the
+  requested one (e.g. `ide2;ide0` stored as `ide0;ide2` when the CD attach
+  and boot order are set in one call) (#26).
+
+### Fixed
+
+- Guest creation now registers the new guest under `controller_lock()` with a
+  reloaded lease, so concurrent creations no longer clobber each other's
+  lease registrations and `console inspect` no longer refuses a freshly
+  created guest (#25).
+- Journal git sync retries a non-fast-forward push (refetch, rebase, push)
+  instead of failing every command under concurrent CLI processes (#31).
+
+### Docs
+
+- GUI-installer memory floors and the recovery path for interrupted
+  OpenIndiana/illumos installs (bootfs, `bootadm install-bootloader`) (#23).
+- Note that some legacy ISOs (Ubuntu 14.10 server isolinux) ignore Tab and
+  typed keys at the boot menu, blocking the serial-console kernel-cmdline
+  shortcut; the installer then runs on VGA (#24).
+
 ## 0.3.5 - 2026-08-09
 
 ### Added

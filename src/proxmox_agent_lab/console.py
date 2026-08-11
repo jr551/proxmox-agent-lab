@@ -1011,8 +1011,25 @@ def cmd_push(lab: Any, args: Any) -> None:
 
 def cmd_pull(lab: Any, args: Any) -> None:
     """Copy a file out of a guest via the S3 scratch bucket."""
+    import hashlib
+
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
+    name = Path(args.remote).name
+    out = Path(args.out).expanduser() if args.out else Path(name)
+    # Resume: when the local file already matches the expected hash there is
+    # nothing to do, so make no guest or S3 traffic at all.
+    if args.sha256 and out.is_file():
+        if hashlib.sha256(out.read_bytes()).hexdigest() == args.sha256:
+            lab.audit("guest-pull", lease=args.lease, vmid=args.vmid,
+                      bytes=out.stat().st_size, sha256=args.sha256,
+                      already_verified=True, sync=False)
+            print(json.dumps({
+                "vmid": args.vmid, "path": str(out),
+                "bytes": out.stat().st_size, "sha256": args.sha256,
+                "already_verified": True,
+            }, indent=2, sort_keys=True))
+            return
     if not args.windows:
         probe = agent_exec(
             lab, api, args.vmid,
@@ -1024,7 +1041,6 @@ def cmd_pull(lab: Any, args: Any) -> None:
         except ValueError:
             remote_size = 0
         if remote_size > SINGLE_OBJECT_MAX_MB * 1024 * 1024:
-            name = Path(args.remote).name
             result = _pull_chunked(lab, api, args, name)
             lab.audit("guest-pull", lease=args.lease, vmid=args.vmid,
                       s3_key=result.get("s3_key", ""), bytes=result["bytes"],

@@ -30,6 +30,7 @@ sys.path.insert(0, str(SRC))
 SCRIPTS = SRC / "proxmox_agent_lab"
 
 from proxmox_agent_lab import des as lab_des  # noqa: E402
+from proxmox_agent_lab import console as lab_console  # noqa: E402
 from proxmox_agent_lab import netgw as lab_netgw  # noqa: E402
 from proxmox_agent_lab import png as lab_png  # noqa: E402
 from proxmox_agent_lab import rfb as lab_rfb  # noqa: E402
@@ -946,3 +947,154 @@ class ScreenshotCommandTests(unittest.TestCase):
             "console-vision-inspect-failed", lease=args.lease, vmid=7,
             error=message[:200], provider="nvidia", sync=False,
         )
+
+
+class ChunkedTransferTests(unittest.TestCase):
+    """Chunked push/pull: part keys, reassembly, and hash verification."""
+
+    def _lab(self) -> mock.Mock:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        lab.STATE_ROOT = "/tmp/pb-state"
+        lab.load_lease.return_value = {"resources": []}
+        lab.iso_now = lambda: "2026-08-11T00:00:00Z"
+        return lab
+
+    def _args(self, lab: mock.Mock, *argv: str) -> object:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        lab_console.register(parser.add_subparsers(), lab)
+        return parser.parse_args(list(argv))
+
+    def test_fetch_parts_command_has_all_urls_and_hash(self) -> None:
+        command = lab_console._fetch_parts_command(
+            ["https://s3/part-0", "https://s3/part-1"], "/tmp/out.bin"
+        )
+        self.assertEqual(command[0], "/bin/sh")
+        script = command[2]
+        self.assertIn("https://s3/part-0", script)
+        self.assertIn("https://s3/part-1", script)
+        self.assertIn("cat /tmp/pp-* > /tmp/out.bin", script)
+        self.assertIn("sha256sum /tmp/out.bin", script)
+
+    def test_push_chunked_uploads_parts_and_verifies(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab()
+            source = Path(tmp) / "payload.bin"
+            payload = b"a" * (2 * 1024 * 1024 + 13)  # 2 parts at 1 MiB
+            source.write_bytes(payload)
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            fake_s3 = mock.Mock()
+            fake_s3.put_bytes.return_value = "push/abc/payload.bin"
+            fake_s3.presign.return_value = "https://s3/part"
+            with mock.patch.object(lab_console, "SINGLE_OBJECT_MAX_MB", 0), \
+                 mock.patch.object(lab_console, "s3", fake_s3), \
+                 mock.patch.object(
+                     lab_console, "agent_exec",
+                     return_value={
+                         "exitcode": 0,
+                         "stdout": hashlib.sha256(payload).hexdigest(),
+                         "stderr": "",
+                     },
+                 ):
+                args = self._args(
+                    lab, "push", "--lease", "L1", "--vmid", "7",
+                    "--file", str(source), "--chunk-size", "1",
+                )
+                lab_console.cmd_push(lab, args)
+            keys = [c.args[0] for c in fake_s3.put_bytes.call_args_list]
+            self.assertEqual(len(keys), 3)
+            self.assertTrue(all(
+                k.endswith(("/part-0000", "/part-0001", "/part-0002"))
+                for k in keys
+            ))
+
+    def test_push_chunked_raises_on_guest_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab()
+            source = Path(tmp) / "payload.bin"
+            source.write_bytes(b"a" * (2 * 1024 * 1024 + 1))
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            fake_s3 = mock.Mock()
+            fake_s3.put_bytes.return_value = "push/abc/payload.bin"
+            fake_s3.presign.return_value = "https://s3/part"
+            with mock.patch.object(lab_console, "SINGLE_OBJECT_MAX_MB", 0), \
+                 mock.patch.object(lab_console, "s3", fake_s3), \
+                 mock.patch.object(
+                     lab_console, "agent_exec",
+                     return_value={"exitcode": 0, "stdout": "deadbeef",
+                                   "stderr": ""},
+                 ):
+                args = self._args(
+                    lab, "push", "--lease", "L1", "--vmid", "7",
+                    "--file", str(source), "--chunk-size", "1",
+                    "--sha256", "0" * 64,
+                )
+                with self.assertRaises(RuntimeError) as caught:
+                    lab_console.cmd_push(lab, args)
+            self.assertIn("sha256 mismatch", str(caught.exception))
+
+    def test_pull_skips_when_local_file_already_matches(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab()
+            out = Path(tmp) / "artifact.iso"
+            payload = b"x" * (2 * 1024 * 1024 + 7)
+            out.write_bytes(payload)
+            expected = hashlib.sha256(payload).hexdigest()
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            with mock.patch.object(lab_console, "s3", mock.Mock()), \
+                 mock.patch.object(lab_console, "agent_exec") as execute:
+                args = self._args(
+                    lab, "pull", "--lease", "L1", "--vmid", "7",
+                    "--remote", "/tmp/artifact.iso", "--out", str(out),
+                    "--sha256", expected,
+                )
+                lab_console.cmd_pull(lab, args)
+            execute.assert_not_called()
+
+    def test_pull_assembles_parts_and_checks_guest_hash(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab()
+            out = Path(tmp) / "artifact.iso"
+            payload = b"y" * (1024 * 1024 + 1)  # two 1 MiB parts
+            expected = hashlib.sha256(payload).hexdigest()
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            fake_s3 = mock.Mock()
+            fake_s3.list_objects.return_value = []
+            half = len(payload) // 2
+            fake_s3.get_bytes.side_effect = [payload[:half],
+                                             payload[half:]]
+            fake_s3.presign.return_value = "https://s3/put"
+            with mock.patch.object(lab_console, "SINGLE_OBJECT_MAX_MB", 0), \
+                 mock.patch.object(lab_console, "s3", fake_s3), \
+                 mock.patch.object(
+                     lab_console, "agent_exec",
+                     side_effect=[
+                         {"exitcode": 0, "stdout": str(len(payload)),
+                          "stderr": ""},
+                         {"exitcode": 0, "stdout": str(len(payload)),
+                          "stderr": ""},
+                         {"exitcode": 0, "stdout": expected, "stderr": ""},
+                     ],
+                 ):
+                args = self._args(
+                    lab, "pull", "--lease", "L1", "--vmid", "7",
+                    "--remote", "/tmp/artifact.iso", "--out", str(out),
+                    "--chunk-size", "1",
+                )
+                lab_console.cmd_pull(lab, args)
+            self.assertEqual(out.read_bytes(), payload)
+            self.assertEqual(fake_s3.get_bytes.call_count, 2)
+            self.assertEqual(fake_s3.delete_object.call_count, 2)

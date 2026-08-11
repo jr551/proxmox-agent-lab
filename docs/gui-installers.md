@@ -95,6 +95,36 @@ or installer.
     --data 'boot=order=scsi0;ide2'
   ```
 
+## Memory and sizing for GUI installers
+
+Legacy GUI installers have hard memory floors; undersized VMs die mid-install
+with no error surface. Minimums that have been validated:
+
+- Windows 2000 / ME: at least 512 MB
+- Ubuntu 14.10 or newer desktop: at least 1 GB
+- OpenIndiana / illumos GUI (Caiman) installer: at least 4 GB — the
+  installer's own recommendation; the live session plus installer exceed 2 GB
+
+The failure mode on an undersized VM is silent: the GUI session dies under
+memory pressure mid-`Transferring Contents`, leaving a partial ZFS pool and a
+non-bootable loader, with nothing on screen to say what happened.
+
+To recover an interrupted OpenIndiana install:
+
+1. Boot the live DVD.
+2. Import the pool: `zpool import -f rpool`
+3. Verify what made it onto disk: `zpool status` and `zfs list -r rpool/ROOT`
+4. Point the pool at the ROOT dataset that survived:
+   `zpool set bootfs=rpool/ROOT/<dataset> rpool`
+5. Reinstall the loader (this illumos takes no device argument):
+   `sudo bootadm install-bootloader -f -P rpool`
+6. Shut down and boot from disk.
+
+If finalization was interrupted, the loader usually aborts with
+`No rootfs module provided, aborting` at the `ok` prompt — the rootfs was never
+made resolvable. Re-running the full install on a correctly sized VM is the
+reliable option then.
+
 ## Haiku checkpoint map
 
 Haiku has no qemu-guest-agent, so its graphical console is the source of truth.

@@ -264,6 +264,8 @@ def cmd_template(lab: Any, args: Any) -> None:
     result = api.call(
         "POST", f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/template"
     )
+    if isinstance(result, str) and result.startswith("UPID:"):
+        lab.wait_task(api, result, timeout=args.task_timeout)
     lab.audit("guest-template", lease=args.lease, kind=args.kind,
               vmid=args.vmid, sync=False)
     print(json.dumps(
@@ -288,6 +290,10 @@ def cmd_clone(lab: Any, args: Any) -> None:
     result = api.call(
         "POST", f"/nodes/{lab.NODE}/{args.kind}/{args.template}/clone", data
     )
+    # Wait for the clone task so the new config exists before it is
+    # registered; cloning a freshly-converted template races otherwise.
+    if isinstance(result, str) and result.startswith("UPID:"):
+        lab.wait_task(api, result, timeout=args.task_timeout)
     # The clone endpoint is not the guest-creation path, so it does not
     # auto-register; do that under the same lock every other lease mutator
     # uses so concurrent creations cannot clobber the entry.
@@ -578,6 +584,7 @@ def register(sub: Any, lab: Any) -> None:
     template_cmd.add_argument("--lease", required=True)
     template_cmd.add_argument("--vmid", type=int, required=True)
     template_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
+    template_cmd.add_argument("--task-timeout", type=int, default=300)
     template_cmd.set_defaults(func=bind(cmd_template))
 
     clone_cmd = guest_sub.add_parser(
@@ -588,4 +595,5 @@ def register(sub: Any, lab: Any) -> None:
     clone_cmd.add_argument("--newid", type=int, required=True)
     clone_cmd.add_argument("--name")
     clone_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
+    clone_cmd.add_argument("--task-timeout", type=int, default=600)
     clone_cmd.set_defaults(func=bind(cmd_clone))

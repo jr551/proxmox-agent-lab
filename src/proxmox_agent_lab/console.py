@@ -763,7 +763,8 @@ def cmd_bridge(lab: Any, args: Any) -> None:
     print(
         f"bridge ready: {args.host}:{port} -> {args.kind}/{args.vmid} serial. "
         f"Connect with e.g. 'nc {args.host} {port}' (or a kernel debugger such "
-        "as rosdbg). Ctrl+C to stop."
+        "as rosdbg). Ctrl+C to stop.",
+        flush=True,
     )
     try:
         while True:

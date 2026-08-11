@@ -722,6 +722,7 @@ if [ -z "$IFACE" ]; then
 fi
 sed "s/__LAB_IF__/$IFACE/g" /tmp/lab-server.conf > /etc/dnsmasq.d/lab-server.conf
 chmod 0644 /etc/dnsmasq.d/lab-server.conf
+__PRE_START__
 systemctl enable --now dnsmasq
 systemctl restart dnsmasq
 sleep 2
@@ -758,7 +759,7 @@ def _clear_bootstrap_password(lab: Any, api: Any, vmid: int) -> bool:
 
 def _spawn_dnsmasq_server(lab: Any, api: Any, args: Any, *, role: str,
                           conf: str, verify: str, server_ip: str,
-                          name: str) -> tuple[str, bool]:
+                          name: str, pre_start: str = "") -> tuple[str, bool]:
     """Clone a template, install dnsmasq, apply conf, verify, return (name, ok)."""
     lease = lab.load_lease(args.lease)
     if args.vmid in lease["initial_vmids"]:
@@ -810,7 +811,7 @@ def _spawn_dnsmasq_server(lab: Any, api: Any, args: Any, *, role: str,
     _write_guest_file(lab, api, args.vmid, "/tmp/lab-server.conf", conf)
     provision = SERVER_PROVISION.replace(
         "__SERVER_IP__", server_ip
-    ).replace("__VERIFY__", verify)
+    ).replace("__PRE_START__", pre_start).replace("__VERIFY__", verify)
     _write_guest_file(lab, api, args.vmid, "/tmp/lab-server-provision.sh",
                       provision)
     result = _exec(lab, api, args.vmid, "bash /tmp/lab-server-provision.sh",
@@ -910,13 +911,13 @@ def cmd_tftp_create(lab: Any, args: Any) -> None:
         f"tftp-root={root}\n"
     )
     verify = (
-        f"mkdir -p {root}\n"
         "ss -ulnp | grep -q ':69 ' || "
         "{ echo 'dnsmasq not listening on :69' >&2; exit 1; }"
     )
     name, cleared = _spawn_dnsmasq_server(
         lab, api, args, role="tftp", conf=conf, verify=verify,
         server_ip=server_ip, name=name,
+        pre_start=f"mkdir -p {root}",
     )
     lab.audit("tftp-server-created", lease=args.lease, vmid=args.vmid,
               server_ip=server_ip, root=root, sync=False)

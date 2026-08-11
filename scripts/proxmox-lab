@@ -1,6 +1,19 @@
 #!/bin/sh
 # Run from a checkout without installing. Once installed (pip install .), the
 # `proxmox-lab` entry point on PATH does the same thing.
+#
+# The interpreter is pinned on purpose: the config loader needs `tomllib`
+# (Python 3.11+), and under a minimal PATH (supervised processes, cron,
+# launchd) `python3` can resolve to the macOS system 3.9, which silently
+# degrades the config to defaults and breaks every API call. Pick the newest
+# available 3.11+ explicitly.
 set -eu
 here="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m proxmox_agent_lab "$@"
+PY=python3
+for candidate in python3.14 python3.13 python3.12 python3.11; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    PY=$candidate
+    break
+  fi
+done
+PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}" exec "$PY" -m proxmox_agent_lab "$@"

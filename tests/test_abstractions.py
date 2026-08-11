@@ -264,6 +264,95 @@ class JournalTests(unittest.TestCase):
             ).stdout.splitlines()
             self.assertEqual(changed, ["journal/2026-01-01.jsonl"])
 
+    def test_git_sync_retries_a_rejected_non_fast_forward_push(self) -> None:
+        # A competing writer that pushes between our fetch and our push leaves
+        # the rebase against a stale origin; the push is then rejected as
+        # non-fast-forward and sync_git must refetch, rebase and retry.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            repo = root / "logs"
+            subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                           stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "init", "-b", "logs", str(repo)], check=True,
+                           stdout=subprocess.DEVNULL)
+            for key, value in (("user.name", "Test"),
+                               ("user.email", "test@example.invalid")):
+                subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            (repo / "README.md").write_text("private audit logs\n")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"],
+                           check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
+                           check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "push", "-u", "origin", "logs"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+
+            competing = root / "competing"
+            subprocess.run(["git", "clone", "-q", str(remote), str(competing)],
+                           check=True, stdout=subprocess.DEVNULL)
+            for key, value in (("user.name", "Test"),
+                               ("user.email", "test@example.invalid")):
+                subprocess.run(
+                    ["git", "-C", str(competing), "config", key, value],
+                    check=True,
+                )
+            subprocess.run(
+                ["git", "-C", str(competing), "checkout", "-b", "logs",
+                 "origin/logs"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+
+            real_run = subprocess.run
+            injected = {"done": False}
+
+            def push_with_competing_writer(command, **kwargs):
+                # On sync_git's first push attempt, land a conflicting commit
+                # on origin first so the push is rejected as non-fast-forward.
+                if not injected["done"] and command[:2] == ["git", "-C"] \
+                        and command[3:4] == ["push"]:
+                    injected["done"] = True
+                    log = competing / "journal" / "2026-01-02.jsonl"
+                    log.parent.mkdir(parents=True, exist_ok=True)
+                    log.write_text('{"event": "competing"}\n')
+                    real_run(["git", "-C", str(competing), "add",
+                              "journal/2026-01-02.jsonl"], check=True,
+                             stdout=subprocess.DEVNULL)
+                    real_run(["git", "-C", str(competing), "commit",
+                              "-m", "competing"], check=True,
+                             stdout=subprocess.DEVNULL)
+                    real_run(["git", "-C", str(competing), "push",
+                              "origin", "logs"], check=True,
+                             stdout=subprocess.DEVNULL)
+                return real_run(command, **kwargs)
+
+            with mock.patch.object(journal_module.subprocess, "run",
+                                   side_effect=push_with_competing_writer), \
+                 mock.patch.object(journal_module, "SYNC_GIT_RETRY_DELAY", 0):
+                journal_module.sync_git(
+                    repo, self._event("lease-begin", vmid=9001), "lease-begin"
+                )
+            self.assertTrue(injected["done"], "the competing push never ran")
+            logged = subprocess.run(
+                ["git", "--git-dir", str(remote), "show",
+                 "logs:journal/2026-01-01.jsonl"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout
+            self.assertIn('"event": "lease-begin"', logged)
+            competing_log = subprocess.run(
+                ["git", "--git-dir", str(remote), "show",
+                 "logs:journal/2026-01-02.jsonl"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout
+            self.assertIn('"event": "competing"', competing_log)
+
     def test_git_sync_refuses_a_mixed_purpose_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

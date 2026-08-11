@@ -304,7 +304,8 @@ def _screenshot_path(vmid: int, override: str | None) -> Path:
 
 
 def _save_screenshot(vmid: int, rgb: bytes, width: int, height: int,
-                     override: str | None = None) -> dict[str, Any]:
+                     override: str | None = None,
+                     state_root: Path | None = None) -> dict[str, Any]:
     """Write one captured framebuffer and return its machine-readable facts."""
     encoded = png_module.encode_png(width, height, rgb)
     target = _screenshot_path(vmid, override)
@@ -331,7 +332,44 @@ def _save_screenshot(vmid: int, rgb: bytes, width: int, height: int,
             "the single-screen decision to a vision-capable model; do not use "
             "Tesseract, OCR, crops, or image filters."
         )
+    identical = _mark_stale_frame(
+        vmid, rgb, width, height, state_root or DEFAULT_SCREENSHOT_DIR.parent
+    )
+    result["identical_to_previous_capture"] = identical
+    if identical:
+        result["stale_possible"] = (
+            "screen unchanged since last capture; if input was sent in "
+            "between, the framebuffer may be stale \u2014 recapture before acting"
+        )
     return result
+
+
+def _mark_stale_frame(vmid: int, rgb: bytes, width: int, height: int,
+                      state_root: Path) -> bool:
+    """Compare a capture with the previous one for the same VM+resolution.
+
+    QEMU's VNC dirty tracking can hand back the pre-action frame right after
+    rapid input.  Keeping one raw frame per VM lets callers notice a
+    pixel-identical repeat instead of acting on a stale screen.  This is
+    best-effort: any store failure degrades to "not identical" rather than
+    failing the capture.
+    """
+    previous_dir = Path(state_root) / "vision-previous"
+    key = previous_dir / f"screenshot-vm{vmid}-{width}x{height}.rgb"
+    previous = b""
+    try:
+        previous = key.read_bytes()
+    except OSError:
+        pass
+    identical = len(previous) == len(rgb) and previous == rgb
+    try:
+        previous_dir.mkdir(parents=True, exist_ok=True)
+        temporary = key.with_suffix(".tmp")
+        temporary.write_bytes(rgb)
+        temporary.replace(key)
+    except OSError:
+        return False
+    return identical
 
 
 def _capture_after_action(lab: Any, api: Any, args: Any,
@@ -352,7 +390,8 @@ def _capture_after_action(lab: Any, api: Any, args: Any,
         rgb = session.client.capture(timeout=25.0, settle=settle)
         width, height = session.client.width, session.client.height
     return _save_screenshot(
-        args.vmid, rgb, width, height, getattr(args, "screenshot_out", None)
+        args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
+        state_root=lab.STATE_ROOT,
     )
 
 
@@ -396,7 +435,9 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
     with VncSession(lab, api, args.vmid) as session:
         rgb = session.client.capture(timeout=args.timeout, settle=args.settle)
         width, height = session.client.width, session.client.height
-    result = _save_screenshot(args.vmid, rgb, width, height, args.out)
+    result = _save_screenshot(
+        args.vmid, rgb, width, height, args.out, state_root=lab.STATE_ROOT
+    )
     target = Path(result["path"])
     png = target.read_bytes()
     analysis = textmode.analyse(rgb, width, height)
@@ -431,7 +472,9 @@ def cmd_inspect(lab: Any, args: Any) -> None:
     with VncSession(lab, api, args.vmid) as session:
         rgb = session.client.capture(timeout=25.0, settle=args.settle)
         width, height = session.client.width, session.client.height
-    screenshot = _save_screenshot(args.vmid, rgb, width, height, args.out)
+    screenshot = _save_screenshot(
+        args.vmid, rgb, width, height, args.out, state_root=lab.STATE_ROOT
+    )
     grid_step = 100
     guided, temporal = _model_frame(
         lab, args.lease, args.vmid, rgb, width, height
@@ -561,6 +604,7 @@ def cmd_click(lab: Any, args: Any) -> None:
         rgb = session.client.capture(timeout=25.0, settle=args.calibration_settle)
         checkpoint = _save_screenshot(
             args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
+            state_root=lab.STATE_ROOT,
         )
         guided, temporal = _model_frame(
             lab, args.lease, args.vmid, rgb, width, height

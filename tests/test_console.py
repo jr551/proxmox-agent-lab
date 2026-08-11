@@ -764,6 +764,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         session.client.width, session.client.height = 2, 2
 
         with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
             out = Path(tmp) / "shot.png"
             args = mock.Mock(vmid=1, out=str(out), settle=0, timeout=5,
                              upload=False, url_expiry=60, ocr=False)
@@ -774,6 +775,33 @@ class ScreenshotCommandTests(unittest.TestCase):
                 lab_console.cmd_screenshot(lab, args)
             self.assertTrue(out.exists())
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+
+    def test_save_screenshot_flags_identical_repeat_frames(self) -> None:
+        """A pixel-identical repeat capture is reported as possibly stale."""
+        from proxmox_agent_lab import console as lab_console
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            first = lab_console._save_screenshot(
+                7, b"\x00\x00\x00" * 4, 2, 2,
+                override=str(Path(tmp) / "a.png"), state_root=state,
+            )
+            repeat = lab_console._save_screenshot(
+                7, b"\x00\x00\x00" * 4, 2, 2,
+                override=str(Path(tmp) / "b.png"), state_root=state,
+            )
+            changed = lab_console._save_screenshot(
+                7, b"\xff\xff\xff" * 4, 2, 2,
+                override=str(Path(tmp) / "c.png"), state_root=state,
+            )
+
+        self.assertFalse(first["identical_to_previous_capture"])
+        self.assertNotIn("stale_possible", first)
+        self.assertTrue(repeat["identical_to_previous_capture"])
+        self.assertIn("stale_possible", repeat)
+        self.assertIn("recapture before acting", repeat["stale_possible"])
+        self.assertFalse(changed["identical_to_previous_capture"])
+        self.assertNotIn("stale_possible", changed)
 
     def test_click_requires_independent_target_verification(self) -> None:
         from proxmox_agent_lab import console as lab_console

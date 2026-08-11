@@ -534,5 +534,41 @@ class ProxmoxLabTests(unittest.TestCase):
 
 
 
+    def test_lease_end_hints_on_rapid_reuse(self) -> None:
+        """A lease ended seconds after it began gets a reuse hint."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260811120000-short01"
+                LAB.save_lease({
+                    "id": lease_id, "state": "active", "kind": "standard",
+                    "created_at": LAB.iso_now(), "resources": [],
+                    "initial_vmids": [],
+                })
+                args = LAB.parser().parse_args(
+                    ["lease-end", "--lease", lease_id]
+                )
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI"), \
+                        mock.patch.object(LAB, "finalize_lease",
+                                          return_value=[]), \
+                        mock.patch.object(LAB, "active_leases",
+                                          return_value=[]), \
+                        mock.patch.object(LAB, "shutdown_host",
+                                          return_value=True), \
+                        mock.patch.object(LAB, "audit"), \
+                        contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(stderr):
+                    LAB.cmd_lease_end(args)
+                self.assertIn("hint: lease", stderr.getvalue())
+                self.assertIn("ended after", stderr.getvalue())
+                self.assertIn("lease-heartbeat", stderr.getvalue())
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
+
 if __name__ == "__main__":
     unittest.main()

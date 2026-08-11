@@ -236,6 +236,15 @@ def get_bytes(key: str) -> bytes:
     return _call("GET", f"/{_quote(BUCKET)}/{_quote(key.lstrip('/'))}")
 
 
+def object_exists(key: str) -> bool:
+    """True when the object exists (HEAD request)."""
+    try:
+        _call("HEAD", f"/{_quote(BUCKET)}/{_quote(key.lstrip('/'))}")
+        return True
+    except S3Error:
+        return False
+
+
 def delete_object(key: str) -> None:
     _call("DELETE", f"/{_quote(BUCKET)}/{_quote(key.lstrip('/'))}")
 

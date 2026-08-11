@@ -22,6 +22,10 @@ callers -- and agents -- can say "run this in the guest" and get a result.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+import secrets
+import shlex
+import time
 from typing import Any
 
 from . import console
@@ -232,6 +236,76 @@ class GuestSession:
 # --- commands ------------------------------------------------------------
 
 
+def _lease_owns(lab: Any, lease_id: str, kind: str, vmid: int) -> bool:
+    lease = lab.load_lease(lease_id)
+    return any(
+        item.get("kind") == kind and int(item.get("vmid", -1)) == vmid
+        for item in lease.get("resources", [])
+    )
+
+
+def cmd_template(lab: Any, args: Any) -> None:
+    """Convert a stopped, lease-owned guest into a cloneable template."""
+    import json
+
+    api = lab.ProxmoxAPI()
+    if not _lease_owns(lab, args.lease, args.kind, args.vmid):
+        raise lab.LabError(
+            f"VMID {args.vmid} is not a {args.kind} guest registered to this lease"
+        )
+    status = api.call(
+        "GET", f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/status/current"
+    )
+    if status.get("status") != "stopped":
+        raise lab.LabError(
+            f"VMID {args.vmid} must be stopped before template conversion "
+            f"(status={status.get('status')})"
+        )
+    result = api.call(
+        "POST", f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/template"
+    )
+    lab.audit("guest-template", lease=args.lease, kind=args.kind,
+              vmid=args.vmid, sync=False)
+    print(json.dumps(
+        {"vmid": args.vmid, "kind": args.kind, "result": result},
+        indent=2, sort_keys=True,
+    ))
+
+
+def cmd_clone(lab: Any, args: Any) -> None:
+    """Clone a lease-owned template into a new guest, registering it."""
+    import json
+
+    api = lab.ProxmoxAPI()
+    if not _lease_owns(lab, args.lease, args.kind, args.template):
+        raise lab.LabError(
+            f"VMID {args.template} is not a {args.kind} guest registered to "
+            "this lease"
+        )
+    data: dict[str, Any] = {"newid": args.newid}
+    if args.name:
+        data["name"] = args.name
+    result = api.call(
+        "POST", f"/nodes/{lab.NODE}/{args.kind}/{args.template}/clone", data
+    )
+    # The clone endpoint is not the guest-creation path, so it does not
+    # auto-register; do that under the same lock every other lease mutator
+    # uses so concurrent creations cannot clobber the entry.
+    with lab.controller_lock():
+        fresh = lab.load_lease(args.lease)
+        lab.register_resource(
+            fresh, args.kind, args.newid, "delete",
+            args.name or f"clone-{args.newid}",
+        )
+    lab.audit("guest-clone", lease=args.lease, kind=args.kind,
+              template=args.template, vmid=args.newid, sync=False)
+    print(json.dumps(
+        {"vmid": args.newid, "kind": args.kind, "template": args.template,
+         "result": result},
+        indent=2, sort_keys=True,
+    ))
+
+
 def cmd_probe(lab: Any, args: Any) -> None:
     import json
 
@@ -251,6 +325,147 @@ def cmd_probe(lab: Any, args: Any) -> None:
                      sort_keys=True))
 
 
+# --- detached runs -------------------------------------------------------
+
+_RUNS_DIR = "guest-runs"
+GRUN_EXIT_MARK = "grun-exit"
+
+
+def _runs_dir(lab: Any) -> Path:
+    directory = Path(lab.STATE_ROOT) / _RUNS_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _record_run(lab: Any, vmid: int, pid: str, log: str,
+                command: str) -> Path:
+    import json
+
+    path = _runs_dir(lab) / f"vm{vmid}-{pid}.json"
+    path.write_text(json.dumps({
+        "vmid": vmid, "pid": pid, "log": log, "command": command,
+        "started_at": lab.iso_now(),
+    }, indent=2))
+    return path
+
+
+def _find_run(lab: Any, vmid: int, pid: str) -> dict[str, Any]:
+    import json
+
+    path = _runs_dir(lab) / f"vm{vmid}-{pid}.json"
+    if not path.is_file():
+        raise GuestError(
+            f"no detached run recorded for VMID {vmid} pid {pid} on this "
+            "controller; run it with 'guest run --detach' first"
+        )
+    return json.loads(path.read_text())
+
+
+def _agent_sh(lab: Any, api: Any, vmid: int, script: str) -> dict[str, Any]:
+    return console.agent_exec(
+        lab, api, vmid, ["/bin/sh", "-c", script], timeout=30,
+    )
+
+
+def _pid_alive(lab: Any, api: Any, vmid: int, pid: str) -> bool:
+    run = _agent_sh(lab, api, vmid, f"kill -0 {pid} 2>/dev/null; echo $?")
+    return run.get("exitcode") == 0 and run.get("stdout", "").strip() == "0"
+
+
+def cmd_log(lab: Any, args: Any) -> None:
+    """Print or follow the log of a detached guest run."""
+    import json
+
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
+    record = _find_run(lab, args.vmid, args.pid)
+    log = record["log"]
+    cursor = 0
+    if args.tail:
+        run = _agent_sh(lab, api, args.vmid,
+                        f"wc -c < {shlex.quote(log)} 2>/dev/null || echo 0")
+        total = int(run.get("stdout", "0").strip() or 0)
+        cursor = max(0, total - args.tail)
+    deadline = time.monotonic() + (args.timeout if args.follow else 0)
+    exited = False
+    while True:
+        # The guest reports the byte count of what it emitted so the cursor
+        # stays byte-aligned even when the log contains non-ASCII output.
+        token = secrets.token_hex(4)
+        marker = f"__logb{token}__"
+        run = _agent_sh(
+            lab, api, args.vmid,
+            f"LC_ALL=C out=$(tail -c +{cursor + 1} {shlex.quote(log)} "
+            f"2>/dev/null); printf '%s' \"$out\"; "
+            f"printf '\\n{marker}:%s\\n' \"${{#out}}\"",
+        )
+        output = run.get("stdout", "")
+        count = 0
+        if output:
+            split = output.rsplit(f"\n{marker}:", 1)
+            if len(split) == 2:
+                data, count_text = split
+                count_text = count_text.strip()
+                if count_text.isdigit():
+                    count = int(count_text)
+            else:
+                data = output
+            if data:
+                print(data, end="", flush=True)
+            cursor += count if count else len(data.encode("utf-8", "replace"))
+        alive = _pid_alive(lab, api, args.vmid, args.pid)
+        if not alive:
+            exited = True
+            break
+        if not args.follow:
+            break
+        if args.timeout and time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    payload = {
+        "vmid": args.vmid, "pid": args.pid, "log": log,
+        "cursor": cursor, "exited": exited,
+    }
+    print("\n" + json.dumps(payload, indent=2, sort_keys=True))
+
+
+def cmd_wait(lab: Any, args: Any) -> None:
+    """Wait for a detached guest run to exit, then report its tail."""
+    import json
+
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
+    record = _find_run(lab, args.vmid, args.pid)
+    log = record["log"]
+    started = time.monotonic()
+    deadline = started + args.timeout
+    while time.monotonic() < deadline:
+        if not _pid_alive(lab, api, args.vmid, args.pid):
+            break
+        time.sleep(5)
+    elapsed = round(time.monotonic() - started)
+    exited = not _pid_alive(lab, api, args.vmid, args.pid)
+    tail = ""
+    exit_code = None
+    if exited:
+        run = _agent_sh(lab, api, args.vmid,
+                        f"tail -c 65536 {shlex.quote(log)} 2>/dev/null || true")
+        tail = run.get("stdout", "")
+        for line in reversed(tail.splitlines()):
+            marker = line.strip()
+            if marker.startswith(f"{GRUN_EXIT_MARK}:"):
+                value = marker.split(":", 1)[1].strip()
+                if value.isdigit():
+                    exit_code = int(value)
+                break
+    payload = {
+        "vmid": args.vmid, "pid": args.pid, "log": log,
+        "exited": exited, "elapsed_seconds": elapsed,
+        "exit_code": exit_code, "tail": tail[-2000:],
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def cmd_run(lab: Any, args: Any) -> None:
     import json
     import sys
@@ -258,6 +473,37 @@ def cmd_run(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     password = sys.stdin.readline().rstrip("\r\n") if args.password_stdin else None
+    if args.detach:
+        command = " ".join(args.command)
+        token = secrets.token_hex(4)
+        log = f"/tmp/grun-{token}.log"
+        # nohup so the process survives agent/console disconnects; the inner
+        # sh records its own exit code into the log for 'guest wait'.
+        script = (
+            f"nohup sh -c '({command}) > {shlex.quote(log)} 2>&1; "
+            f"echo {GRUN_EXIT_MARK}:$? >> {shlex.quote(log)}' "
+            ">/dev/null 2>&1 & echo $!"
+        )
+        result = console.agent_exec(
+            lab, api, args.vmid, ["/bin/sh", "-c", script],
+            timeout=args.timeout,
+        )
+        if result["exitcode"] not in (0, None):
+            raise lab.LabError(
+                f"could not start detached run: {result['stderr'][:400]}"
+            )
+        pid = result.get("stdout", "").strip()
+        if not pid.isdigit():
+            raise lab.LabError(f"detached run did not report a pid: {pid!r}")
+        _record_run(lab, args.vmid, pid, log, command)
+        lab.audit("guest-run-detached", lease=args.lease, vmid=args.vmid,
+                  pid=pid, sync=False)
+        print(json.dumps({
+            "vmid": args.vmid, "pid": pid, "log": log, "command": command,
+            "next": f"proxmox-lab guest log --lease {args.lease} "
+                    f"--vmid {args.vmid} --pid {pid} --follow",
+        }, indent=2, sort_keys=True))
+        return
     try:
         with GuestSession(lab, api, args.vmid, user=args.user,
                           password=password, prefer=args.prefer) as guest:
@@ -296,5 +542,50 @@ def register(sub: Any, lab: Any) -> None:
     run_cmd.add_argument("--prefer", choices=("agent", "serial"),
                          default="agent")
     run_cmd.add_argument("--timeout", type=int, default=300)
+    run_cmd.add_argument("--detach", action="store_true",
+                         help="start in the background and return immediately "
+                              "(agent channel; Linux guests)")
     run_cmd.add_argument("command", nargs="+")
     run_cmd.set_defaults(func=bind(cmd_run))
+
+    log_cmd = guest_sub.add_parser(
+        "log", help="print or stream the log of a detached guest run"
+    )
+    log_cmd.add_argument("--lease", required=True)
+    log_cmd.add_argument("--vmid", type=int, required=True)
+    log_cmd.add_argument("--pid", required=True)
+    log_cmd.add_argument("--tail", type=int,
+                         help="start from the last N bytes of the log")
+    log_cmd.add_argument("--follow", action="store_true",
+                         help="stream new output until the run exits or timeout")
+    log_cmd.add_argument("--timeout", type=int, default=60,
+                         help="seconds to follow (default 60)")
+    log_cmd.set_defaults(func=bind(cmd_log))
+
+    wait_cmd = guest_sub.add_parser(
+        "wait", help="wait for a detached guest run to exit and report its tail"
+    )
+    wait_cmd.add_argument("--lease", required=True)
+    wait_cmd.add_argument("--vmid", type=int, required=True)
+    wait_cmd.add_argument("--pid", required=True)
+    wait_cmd.add_argument("--timeout", type=int, default=3600)
+    wait_cmd.set_defaults(func=bind(cmd_wait))
+
+    template_cmd = guest_sub.add_parser(
+        "template",
+        help="convert a stopped lease-owned guest into a cloneable template",
+    )
+    template_cmd.add_argument("--lease", required=True)
+    template_cmd.add_argument("--vmid", type=int, required=True)
+    template_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
+    template_cmd.set_defaults(func=bind(cmd_template))
+
+    clone_cmd = guest_sub.add_parser(
+        "clone", help="clone a lease-owned template into a new guest"
+    )
+    clone_cmd.add_argument("--lease", required=True)
+    clone_cmd.add_argument("--template", type=int, required=True)
+    clone_cmd.add_argument("--newid", type=int, required=True)
+    clone_cmd.add_argument("--name")
+    clone_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
+    clone_cmd.set_defaults(func=bind(cmd_clone))

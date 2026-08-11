@@ -200,6 +200,59 @@ class DetachedRunTests(unittest.TestCase):
                                              "--vmid", "7",
                                              "--pid", "12345"))
 
+    def test_snapshot_create_lists_and_rollback(self) -> None:
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = _lab(tmp)
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            lab.wait_task = mock.Mock()
+
+            # create
+            api.call.return_value = "UPID:aipve:00000001:00000001:1:qmsnapshot:7:"
+            lab_guest.cmd_snapshot(lab, _args(lab, "guest", "snapshot",
+                                             "--lease", "L1", "--vmid", "7",
+                                             "--mode", "create",
+                                             "--name", "before-kernel"))
+            api.call.assert_any_call(
+                "POST", "/nodes/aipve/qemu/7/snapshot",
+                {"snapname": "before-kernel", "description": ""},
+            )
+            lab.wait_task.assert_called_once()
+
+            # rollback requires stopped
+            api.call.side_effect = None
+            api.call.return_value = {"status": "running"}
+            with self.assertRaises(RuntimeError) as caught:
+                lab_guest.cmd_snapshot(lab, _args(lab, "guest", "snapshot",
+                                                 "--lease", "L1", "--vmid", "7",
+                                                 "--mode", "rollback",
+                                                 "--name", "before-kernel"))
+            self.assertIn("must be stopped", str(caught.exception))
+
+            # rollback on stopped guest posts to the right path
+            api.call.side_effect = None
+            api.call.return_value = "UPID:aipve:00000001:00000002:1:qmsnapshot:7:"
+            status_calls = {"count": 0}
+            def rollback_call(method, path, data=None):
+                if path.endswith("/status/current"):
+                    return {"status": "stopped"}
+                return "UPID:aipve:00000001:00000003:1:qmsnapshot:7:"
+            api.call.side_effect = rollback_call
+            lab.wait_task.reset_mock()
+            lab_guest.cmd_snapshot(lab, _args(lab, "guest", "snapshot",
+                                             "--lease", "L1", "--vmid", "7",
+                                             "--mode", "rollback",
+                                             "--name", "before-kernel"))
+            api.call.assert_any_call(
+                "POST", "/nodes/aipve/qemu/7/snapshot/before-kernel/rollback"
+            )
+            lab.audit.assert_any_call(
+                "guest-snapshot-rollback", lease="L1", kind="qemu", vmid=7,
+                name="before-kernel", sync=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -312,6 +312,83 @@ def cmd_clone(lab: Any, args: Any) -> None:
     ))
 
 
+def cmd_snapshot(lab: Any, args: Any) -> None:
+    """Create, list, roll back or delete Proxmox snapshots of a lease guest."""
+    import json
+
+    api = lab.ProxmoxAPI()
+    if not _lease_owns(lab, args.lease, args.kind, args.vmid):
+        raise lab.LabError(
+            f"VMID {args.vmid} is not a {args.kind} guest registered to this lease"
+        )
+    base = f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/snapshot"
+    if args.mode == "list":
+        result = api.call("GET", base) or []
+        snapshots = [
+            {
+                "name": s.get("snapname"),
+                "type": s.get("snaptype"),
+                "created": s.get("snaptime"),
+                "description": s.get("description"),
+            }
+            for s in result
+            if isinstance(s, dict)
+        ]
+        print(json.dumps(
+            {"vmid": args.vmid, "snapshots": snapshots},
+            indent=2, sort_keys=True,
+        ))
+        return
+    if args.mode == "create":
+        if not args.name:
+            raise lab.LabError("snapshot create requires --name")
+        upid = api.call(
+            "POST", base, {"snapname": args.name, "description": args.description or ""}
+        )
+        if isinstance(upid, str) and upid.startswith("UPID:"):
+            lab.wait_task(api, upid, timeout=args.task_timeout)
+        lab.audit("guest-snapshot", lease=args.lease, kind=args.kind,
+                  vmid=args.vmid, name=args.name, sync=False)
+        print(json.dumps(
+            {"vmid": args.vmid, "snapshot": args.name, "created": True},
+            indent=2, sort_keys=True,
+        ))
+        return
+    if args.mode == "delete":
+        if not args.name:
+            raise lab.LabError("snapshot delete requires --name")
+        upid = api.call("DELETE", f"{base}/{args.name}")
+        if isinstance(upid, str) and upid.startswith("UPID:"):
+            lab.wait_task(api, upid, timeout=args.task_timeout)
+        lab.audit("guest-snapshot-delete", lease=args.lease, kind=args.kind,
+                  vmid=args.vmid, name=args.name, sync=False)
+        print(json.dumps(
+            {"vmid": args.vmid, "snapshot": args.name, "deleted": True},
+            indent=2, sort_keys=True,
+        ))
+        return
+    if args.mode == "rollback":
+        if not args.name:
+            raise lab.LabError("snapshot rollback requires --name")
+        status = api.call(
+            "GET", f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/status/current"
+        )
+        if status.get("status") != "stopped":
+            raise lab.LabError(
+                f"VMID {args.vmid} must be stopped before rollback "
+                f"(status={status.get('status')}); stop it first"
+            )
+        upid = api.call("POST", f"{base}/{args.name}/rollback")
+        if isinstance(upid, str) and upid.startswith("UPID:"):
+            lab.wait_task(api, upid, timeout=args.task_timeout)
+        lab.audit("guest-snapshot-rollback", lease=args.lease, kind=args.kind,
+                  vmid=args.vmid, name=args.name, sync=False)
+        print(json.dumps(
+            {"vmid": args.vmid, "snapshot": args.name, "rolled_back": True},
+            indent=2, sort_keys=True,
+        ))
+
+
 def cmd_probe(lab: Any, args: Any) -> None:
     import json
 
@@ -597,3 +674,17 @@ def register(sub: Any, lab: Any) -> None:
     clone_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
     clone_cmd.add_argument("--task-timeout", type=int, default=600)
     clone_cmd.set_defaults(func=bind(cmd_clone))
+
+    snap = guest_sub.add_parser(
+        "snapshot",
+        help="create/list/rollback/delete Proxmox snapshots (kernel iteration)",
+    )
+    snap.add_argument("--lease", required=True)
+    snap.add_argument("--vmid", type=int, required=True)
+    snap.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
+    snap.add_argument("--mode", choices=("create", "list", "rollback", "delete"),
+                      required=True)
+    snap.add_argument("--name", help="snapshot name (create/rollback/delete)")
+    snap.add_argument("--description")
+    snap.add_argument("--task-timeout", type=int, default=600)
+    snap.set_defaults(func=bind(cmd_snapshot))

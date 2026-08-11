@@ -781,6 +781,23 @@ def cmd_text(lab: Any, args: Any) -> None:
     """Read the real terminal stream -- exact text, no OCR involved."""
     api = lab.ProxmoxAPI()
     kind = args.kind or _kind_of(lab, api, args.vmid)
+    if args.follow:
+        # Continuous capture (kernel boot logs, panic traces): read until the
+        # timeout or Ctrl+C, printing each chunk as it arrives.
+        import time as _time
+
+        deadline = _time.monotonic() + (args.timeout if args.timeout else 3600)
+        with TermSession(lab, api, kind, args.vmid) as session:
+            while _time.monotonic() < deadline:
+                chunk = session.socket.read_available(1.0)
+                if chunk:
+                    text = chunk.decode("utf-8", "replace")
+                    if text.startswith("OK\n"):
+                        text = text[3:]
+                    elif text.startswith("OK"):
+                        text = text[2:]
+                    print(text, end="", flush=True)
+        return
     with TermSession(lab, api, kind, args.vmid) as session:
         if args.send:
             # Typing into a guest console is guest mutation, so it needs an
@@ -1263,6 +1280,10 @@ def register(sub: Any, lab: Any) -> None:
     text.add_argument("--vmid", type=int, required=True)
     text.add_argument("--kind", choices=("qemu", "lxc"))
     text.add_argument("--seconds", type=float, default=3.0)
+    text.add_argument("--timeout", type=int,
+                      help="seconds to follow (default: until Ctrl+C)")
+    text.add_argument("--follow", action="store_true",
+                      help="stream serial output continuously (boot/panic logs)")
     text.add_argument("--send", help="send this line first, then read the reply")
     text.add_argument("--nudge", action="store_true",
                       help="send a bare newline to redraw the prompt")

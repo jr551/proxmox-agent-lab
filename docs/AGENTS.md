@@ -213,3 +213,28 @@ boot and provisioning. Begin once, keep it alive with
   protocol client (ReactOS KDBG speaks the WinDbg KD protocol — attach
   WinDbg from a Windows host via a TCP-to-COM shim, or gdb/`nc` for raw
   serial) to that port.
+
+## 🧠 Kernel debugging playbook
+
+When a guest kernel misbehaves, pick the right tool for the layer:
+
+- **Boot logs / panic traces** — capture the serial stream continuously:
+  `console text --vmid <id> --follow --timeout 300` (serial must exist;
+  `console screenshot` if the panic is on the display).
+- **Attach a kernel debugger** — ReactOS KDBG and Windows KD speak the WinDbg
+  KD protocol over serial. `console bridge --lease "$L" --vmid <id> --port 4000`
+  then attach WinDbg (from a Windows host, via a TCP-to-COM shim) or gdb/`nc`
+  for raw serial.
+- **Live memory introspection** (no guest agent, no patched kernel) —
+  `memflow processes|scan|read|phys-write` against the running guest; vCPU
+  state via `memflow registers`.
+- **Live CPU stepping** — `memflow trace --steps N` / `memflow break --addr`
+  drive QEMU's built-in gdbstub (RSP) for single-step and breakpoints.
+- **Iterate without reinstalling** — before testing a new kernel build,
+  `guest snapshot --lease "$L" --vmid <id> --mode create --name before-kernel`;
+  after a bugcheck, stop the guest and
+  `guest snapshot --mode rollback --name before-kernel` to return to the known
+  good state. List/delete with `--mode list|delete`.
+- **Collect the dump** — after a crash, `pull` the guest's dump file
+  (Windows `C:\Windows\MEMORY.DMP`, ReactOS/BSD equivalent) for offline
+  analysis with the Ghidra LXC (`memflow analyze` for live buffers).

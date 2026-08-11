@@ -176,3 +176,38 @@ proxmox-lab guest run --lease "$L" --vmid 9001 systemd-analyze critical-chain
 ```
 
 The `trap` is the important line. Everything else is detail.
+
+## ⚡ Builders, templates, and long jobs
+
+For repeated compile/test loops against a disposable builder, do not end a
+lease between attempts — each `lease-begin`/`lease-end` cycle costs a host
+boot and provisioning. Begin once, keep it alive with
+`lease-heartbeat --lease "$L"` (every ≤20 min), and reuse it:
+
+- **Promote a provisioned builder to a template** once it has your toolchain
+  and caches (`guest template --lease "$L" --vmid <id>`, guest must be
+  stopped). Later iterations clone it in seconds
+  (`guest clone --lease "$L" --template <id> --newid <id>`), and the clone is
+  registered to the lease automatically.
+- **Long builds** should not block on an agent exec timeout. Start them
+  detached: `guest run --lease "$L" --vmid <id> --detach <command…>` returns a
+  pid immediately; stream output with
+  `guest log --lease "$L" --vmid <id> --pid <pid> --follow` and block on
+  completion with `guest wait --lease "$L" --vmid <id> --pid <pid>`. The exit
+  code is recorded as a `grun-exit:N` marker in the log.
+- **Large artifacts** (ISOs, qcow2 overlays) transfer in chunks with
+  end-to-end SHA-256 verification: `push`/`pull` automatically chunk files
+  above 32 MiB on Linux guests (`--chunk-size MB` to tune). A `pull` with
+  `--sha256` skips the transfer entirely when the local copy already matches,
+  so retries are cheap and idempotent.
+- **Optional network services**: spawn a lease-owned DHCP server
+  (`net dhcp-create`, optional PXE via `--bootfile` + `--next-server`), a TFTP
+  server for boot files (`net tftp-create`, stage files with `net tftp-push`),
+  or see who got an address (`net dhcp-leases`). Together they form a minimal
+  PXE stack on the lab bridge for netbooting installers. They are optional:
+  nothing spawns them unless you ask.
+- **Kernel debugging**: when a guest waits on a serial debugger
+  (e.g. ReactOS `connect a debugger on port COM1`), attach through the serial
+  bridge instead of treating it as a wall:
+  `console bridge --lease "$L" --vmid <id> --port 4000`, then point rosdbg,
+  windbg, gdb or `nc 127.0.0.1 4000` at that port.

@@ -4,6 +4,31 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `push`/`pull` move files above 32 MiB in chunks with end-to-end SHA-256
+  verification on Linux guests; `--chunk-size` tunes the part size and a
+  `pull --sha256` that already matches skips the transfer entirely
+  (resumable, idempotent retries).
+- `guest template` / `guest clone` promote a stopped lease-owned guest to a
+  template and clone it back (auto-registered), so a provisioned builder is
+  reusable across leases in seconds.
+- `guest run --detach` starts long builds in the background and returns a pid;
+  `guest log --follow` streams their output and `guest wait` blocks until
+  exit, reporting the recorded exit code.
+- `console bridge` exposes a guest serial console on a local TCP port so
+  kernel debuggers (rosdbg, windbg, gdb) can attach instead of hitting the
+  "connect a debugger" wall.
+- Optional lease-owned DHCP and TFTP servers: `net dhcp-create` (with PXE
+  `--bootfile`/`--next-server`), `net tftp-create`, `net tftp-push`, and
+  `net dhcp-leases` — a minimal PXE stack on the lab bridge, spawned only on
+  demand.
+- `lease-end` prints a hint when a lease is ended seconds after it began,
+  nudging agents to reuse one lease per work session instead of paying a boot
+  cycle each attempt.
+
 ## 0.4.0 - 2026-08-10
 
 ### Added

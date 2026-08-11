@@ -77,10 +77,14 @@ class DhcpTftpTests(unittest.TestCase):
                 api.call.call_args_list[-1].args[2],
                 {"delete": "cipassword"},
             )
-            self.assertEqual(
-                api.call.call_args_list[-2].args[2]["tags"],
-                "codex-lab;lease-L1;dhcp",
-            )
+            tagged = [
+                c.args[2] for c in api.call.call_args_list
+                if len(c.args) > 2 and isinstance(c.args[2], dict)
+                and "tags" in c.args[2]
+            ]
+            self.assertTrue(tagged)
+            self.assertEqual(tagged[0]["tags"], "codex-lab;lease-L1;dhcp")
+            self.assertIn("ipconfig0", tagged[0])
             lab.register_resource.assert_called_once()
             lab.audit.assert_called_once()
 

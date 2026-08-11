@@ -1026,6 +1026,14 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
         result["to_power_off"] = "destroy them with 'lease-destroy', or "\
             "stop the host yourself"
     print(json.dumps(result, indent=2, sort_keys=True))
+    lifetime = (utc_now() - parse_expiry(lease["created_at"])).total_seconds()
+    if lifetime < 300:
+        print(
+            f"hint: lease {args.lease} ended after {int(lifetime)}s. For a work "
+            "session, prefer ONE lease kept alive with lease-heartbeat every "
+            "<=20 min; each begin/end cycle costs a host boot and provisioning.",
+            file=sys.stderr,
+        )
     if failures or (not others and not host_powered_off):
         raise LabError("Lease cleanup or host power-off did not complete")
 

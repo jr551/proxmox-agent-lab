@@ -788,10 +788,15 @@ def cmd_api(args: argparse.Namespace) -> None:
             kind_created = create_match.group(1)
             created_vmid = int(data["vmid"])
             policy = "retain" if is_long_term(lease) else args.policy
-            register_resource(
-                lease, kind_created, created_vmid, policy,
-                data.get("name") or data.get("hostname"),
-            )
+            # Reload inside the lock: the snapshot taken before api.call is
+            # stale, and an unlocked save clobbers concurrent creations'
+            # registrations. Every other lease mutator serializes here too.
+            with controller_lock():
+                fresh = load_lease(args.lease)
+                register_resource(
+                    fresh, kind_created, created_vmid, policy,
+                    data.get("name") or data.get("hostname"),
+                )
             if is_long_term(lease):
                 from . import longterm
                 try:

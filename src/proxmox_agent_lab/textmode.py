@@ -8,11 +8,13 @@ This module exists for the one case those two miss: a VGA text-mode screen
 reachable only over VNC -- a boot menu, a BIOS setup screen, the Windows setup
 text phase, a kernel panic. Such screens are a strict grid of fixed-size glyphs
 in a tiny palette, so decoding is exact glyph lookup, not fuzzy recognition,
-provided a font table has been imported.
+using a font table (an embedded public-domain VGA font is installed on first
+use if none has been imported).
 """
 
 from __future__ import annotations
 
+import base64
 import gzip
 import json
 from pathlib import Path
@@ -27,6 +29,96 @@ TEXT_MODE_MAX_COLOURS = 24
 
 def font_table_path() -> Path:
     return Path(__file__).resolve().parents[1] / "assets" / "console-font.json"
+
+
+# Embedded default console font, so `console screenshot --ocr` works out of
+# the box on legacy guests (Windows 2000 setup, DOS, BIOS screens) that have
+# no Linux install to pull a PSF from via `import-font --from-vmid`.
+#
+# Source: SeaBIOS vgasrc/vgafonts.c, `vgafont16` array (the classic IBM VGA
+# ROM 8x16 font in CP437 order, exactly what QEMU/Proxmox guests render):
+#   https://github.com/coreboot/seabios/blob/master/vgasrc/vgafonts.c
+# License: the file header states the fonts are public domain (originally
+# from Joseph Gil's fntcol16.zip, ftp://ftp.simtel.net/pub/simtelnet/
+# msdos/screen/fntcol16.zip); MIT-compatible.
+#
+# Stored as a base64-encoded PSF1 payload (magic 0x36 0x04, mode 0 = 256
+# glyphs without a unicode table, charsize 16, then 256 * 16 glyph bytes)
+# so the existing parse_psf / build_font_table path is reused unchanged.
+DEFAULT_FONT_B64 = (
+    "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"
+    "GDBgAHgMfMzMzHYAAAAAAAwYMAA4GBgYGBg8AAAAAAAYMGAAfMbGxsbGfAAAAAAAGDBgAMzMzMzM"
+    "zHYAAAAAAAB23ADcZmZmZmZmAAAAAHbcAMbm9v7ezsbGxgAAAAAAPGxsPgB+AAAAAAAAAAAAADhs"
+    "bDgAfAAAAAAAAAAAAAAAMDAAMDBgwMbGfAAAAAAAAAAAAAD+wMDAwAAAAAAAAAAAAAAA/gYGBgYA"
+    "AAAAAADAwMLGzBgwYM6bBgwfAAAAwMDCxswYMGbOlj4GBgAAAAAYGAAYGBg8PDwYAAAAAAAAAAAA"
+    "NmzYbDYAAAAAAAAAAAAAANhsNmzYAAAAAAAAEUQRRBFEEUQRRBFEEUQRRFWqVapVqlWqVapVqlWq"
+    "Vardd9133Xfdd9133Xfdd913GBgYGBgYGBgYGBgYGBgYGBgYGBgYGBj4GBgYGBgYGBgYGBgYGPgY"
+    "+BgYGBgYGBgYNjY2NjY2NvY2NjY2NjY2NgAAAAAAAAD+NjY2NjY2NjYAAAAAAPgY+BgYGBgYGBgY"
+    "NjY2Njb2BvY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYAAAAAAP4G9jY2NjY2NjY2NjY2Njb2Bv4A"
+    "AAAAAAAAADY2NjY2Njb+AAAAAAAAAAAYGBgYGPgY+AAAAAAAAAAAAAAAAAAAAPgYGBgYGBgYGBgY"
+    "GBgYGBgfAAAAAAAAAAAYGBgYGBgY/wAAAAAAAAAAAAAAAAAAAP8YGBgYGBgYGBgYGBgYGBgfGBgY"
+    "GBgYGBgAAAAAAAAA/wAAAAAAAAAAGBgYGBgYGP8YGBgYGBgYGBgYGBgYHxgfGBgYGBgYGBg2NjY2"
+    "NjY2NzY2NjY2NjY2NjY2NjY3MD8AAAAAAAAAAAAAAAAAPzA3NjY2NjY2NjY2NjY2NvcA/wAAAAAA"
+    "AAAAAAAAAAD/APc2NjY2NjY2NjY2NjY2NzA3NjY2NjY2NjYAAAAAAP8A/wAAAAAAAAAANjY2Njb3"
+    "APc2NjY2NjY2NhgYGBgY/wD/AAAAAAAAAAA2NjY2NjY2/wAAAAAAAAAAAAAAAAD/AP8YGBgYGBgY"
+    "GAAAAAAAAAD/NjY2NjY2NjY2NjY2NjY2PwAAAAAAAAAAGBgYGBgfGB8AAAAAAAAAAAAAAAAAHxgf"
+    "GBgYGBgYGBgAAAAAAAAAPzY2NjY2NjY2NjY2NjY2Nv82NjY2NjY2NhgYGBgY/xj/GBgYGBgYGBgY"
+    "GBgYGBgY+AAAAAAAAAAAAAAAAAAAAB8YGBgYGBgYGP////////////////////8AAAAAAAAA////"
+    "////////8PDw8PDw8PDw8PDw8PDw8A8PDw8PDw8PDw8PDw8PDw//////////AAAAAAAAAAAAAAAA"
+    "AAB23NjY2Nx2AAAAAAAAeMzMzNjMxsbGzAAAAAAAAP7GxsDAwMDAwMAAAAAAAAAAAP5sbGxsbGxs"
+    "AAAAAAAAAP7GYDAYMGDG/gAAAAAAAAAAAH7Y2NjY2HAAAAAAAAAAAGZmZmZmfGBgwAAAAAAAAAB2"
+    "3BgYGBgYGAAAAAAAAAB+GDxmZmY8GH4AAAAAAAAAOGzGxv7Gxmw4AAAAAAAAOGzGxsZsbGxs7gAA"
+    "AAAAAB4wGAw+ZmZmZjwAAAAAAAAAAAB+29vbfgAAAAAAAAAAAAMGftvb835gwAAAAAAAABwwYGB8"
+    "YGBgMBwAAAAAAAAAfMbGxsbGxsbGAAAAAAAAAAD+AAD+AAD+AAAAAAAAAAAAGBh+GBgAAP8AAAAA"
+    "AAAAMBgMBgwYMAB+AAAAAAAAAAwYMGAwGAwAfgAAAAAAAA4bGxgYGBgYGBgYGBgYGBgYGBgYGBjY"
+    "2NhwAAAAAAAAAAAYGAB+ABgYAAAAAAAAAAAAAHbcAHbcAAAAAAAAADhsbDgAAAAAAAAAAAAAAAAA"
+    "AAAAAAAYGAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAA8MDAwMDOxsbDwcAAAAAADYbGxsbGwAAAAA"
+    "AAAAAAAAcNgwYMj4AAAAAAAAAAAAAAAAAHx8fHx8fHwAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+)
 
 
 def strip_ansi(text: str) -> str:
@@ -108,6 +200,30 @@ def load_font_table() -> dict[str, Any] | None:
     if not path.exists():
         return None
     return json.loads(path.read_text())
+
+
+def builtin_font_table() -> dict[str, Any]:
+    """Build the embedded public-domain VGA font table without installing it."""
+    return build_font_table(parse_psf(base64.b64decode(DEFAULT_FONT_B64)))
+
+
+def _write_font_table(table: dict[str, Any]) -> Path:
+    """Persist a font table to the standard location."""
+    path = font_table_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(table, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def install_builtin_font() -> dict[str, Any]:
+    """Build and save the embedded default font, like ``cmd_import_font``.
+
+    Lets ``console screenshot --ocr`` work on legacy guests with no Linux
+    install to import a PSF from.
+    """
+    table = builtin_font_table()
+    _write_font_table(table)
+    return table
 
 
 # --- screen analysis -----------------------------------------------------
@@ -199,16 +315,28 @@ def _cell_bitmap(
 
 
 def decode_screen(rgb: bytes, width: int, height: int) -> dict[str, Any]:
-    """Decode a text-mode screen into lines using the imported font table."""
+    """Decode a text-mode screen into lines using a font table.
+
+    A missing font table is not an error: the embedded public-domain VGA
+    font is installed automatically, so ``--ocr`` works out of the box on
+    legacy guests with no Linux install to import a PSF from. The result
+    records which font was used under ``ocr_font``.
+    """
     table = load_font_table()
+    font_source = "imported"
     if not table:
-        return {
-            "error": (
-                "no console font table installed; run "
-                "'proxmox-lab console import-font --file <psf>' or prefer "
-                "'proxmox-lab console text' for exact terminal output"
-            )
-        }
+        try:
+            table = install_builtin_font()
+        except OSError as exc:
+            return {
+                "error": (
+                    f"no console font table installed and the builtin VGA "
+                    f"font could not be installed ({exc}); run 'proxmox-lab "
+                    "console import-font --file <psf>' or prefer 'proxmox-lab "
+                    "console text' for exact terminal output"
+                )
+            }
+        font_source = "builtin"
     glyphs: dict[str, str] = table["glyphs"]
     glyph_width = int(table["width"])
     glyph_height = int(table["height"])
@@ -264,12 +392,16 @@ def decode_screen(rgb: bytes, width: int, height: int) -> dict[str, Any]:
         if best is None or candidate["confidence"] > best["confidence"]:
             best = candidate
     if best is None:
-        return {"error": f"no {glyph_height}px cell grid fits {width}x{height}"}
+        return {
+            "error": f"no {glyph_height}px cell grid fits {width}x{height}",
+            "ocr_font": font_source,
+        }
     if best["confidence"] < 0.5:
         best["warning"] = (
-            "low glyph match rate; the guest is probably not using the imported "
+            "low glyph match rate; the guest is probably not using the installed "
             "font, or the screen is not text mode"
         )
+    best["ocr_font"] = font_source
     return best
 
 
@@ -301,9 +433,7 @@ def cmd_import_font(lab: Any, args: Any) -> None:
     else:
         raise lab.LabError("provide --file or --from-vmid with --guest-path")
     table = build_font_table(parse_psf(data))
-    path = font_table_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(table, indent=2, sort_keys=True) + "\n")
+    path = _write_font_table(table)
     lab.audit(
         "console-font-imported",
         source=source,

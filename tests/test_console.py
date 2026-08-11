@@ -285,16 +285,62 @@ class TextModeTests(unittest.TestCase):
                 decoded = lab_textmode.decode_screen(bytes(screen), width, height)
         self.assertEqual(decoded["text"], "A")
         self.assertEqual(decoded["confidence"], 1.0)
+        self.assertEqual(decoded["ocr_font"], "imported")
 
-    def test_decode_without_font_table_explains_itself(self) -> None:
+    def test_decode_without_a_table_installs_the_builtin_font(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "absent.json"
             with mock.patch.object(
                 lab_textmode, "font_table_path", return_value=missing
             ):
-                result = lab_textmode.decode_screen(b"\x00" * (8 * 16 * 3), 8, 16)
-        self.assertIn("no console font table", result["error"])
-        self.assertIn("console text", result["error"])
+                result = lab_textmode.decode_screen(
+                    b"\x00" * (8 * 16 * 3), 8, 16
+                )
+            table = json.loads(missing.read_text())
+        self.assertNotIn("error", result)
+        self.assertEqual(result["ocr_font"], "builtin")
+        self.assertEqual((table["width"], table["height"]), (8, 16))
+
+    def test_builtin_font_round_trip_decodes_ascii(self) -> None:
+        # Paint one 8x16 cell of 'A' from the embedded font and check the
+        # exact glyph is recovered when no user table exists yet.
+        table = lab_textmode.builtin_font_table()
+        glyph = bytes.fromhex(
+            next(key for key, value in table["glyphs"].items() if value == "A")
+        )
+        width, height = 8, 16
+        screen = bytearray(b"\x00\x00\x00" * width * height)
+        for row in range(height):
+            for column in range(width):
+                if glyph[row] & (1 << (7 - column)):
+                    offset = (row * width + column) * 3
+                    screen[offset : offset + 3] = b"\xff\xff\xff"
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "absent.json"
+            with mock.patch.object(
+                lab_textmode, "font_table_path", return_value=missing
+            ):
+                decoded = lab_textmode.decode_screen(
+                    bytes(screen), width, height
+                )
+        self.assertEqual(decoded["text"], "A")
+        self.assertEqual(decoded["confidence"], 1.0)
+        self.assertEqual(decoded["ocr_font"], "builtin")
+
+    def test_decode_reports_when_the_builtin_font_cannot_be_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "absent.json"
+            with mock.patch.object(
+                lab_textmode, "font_table_path", return_value=missing
+            ), mock.patch.object(
+                lab_textmode, "_write_font_table",
+                side_effect=OSError("read-only filesystem"),
+            ):
+                result = lab_textmode.decode_screen(
+                    b"\x00" * (8 * 16 * 3), 8, 16
+                )
+        self.assertIn("builtin", result["error"])
+        self.assertIn("import-font", result["error"])
 
 
 class S3Tests(unittest.TestCase):

@@ -65,6 +65,17 @@ PS/2 keyboard, which that VM does not present.
 `guest probe` reports this as `"keyboard_input": false`. If you are typing at a
 guest and nothing happens, that is why. Use the serial channel instead.
 
+### ISOs that ignore the keyboard at the boot menu
+
+Some legacy install ISOs ignore Tab and typed characters at their boot menu
+while Enter and arrow keys still work (observed: Ubuntu 14.10 server,
+isolinux/vesamenu). The "append `console=ttyS0` via Tab" shortcut is unusable
+on that media, so the installer boots onto VGA; drive it with the bounded
+screenshot/keyboard loop instead (see
+[gui-installers.md](gui-installers.md)). Serial access can still be enabled
+after install — for example an upstart getty plus `console=ttyS0` on the
+kernel line — for later text access.
+
 ## 🔤 OCR
 
 Off by default, and it should usually stay off:

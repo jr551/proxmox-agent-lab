@@ -137,6 +137,7 @@ def _validate_analysis(value: dict[str, Any], width: int,
     if not isinstance(value.get("screen"), str) or not value["screen"].strip():
         warnings.append("screen is not a non-empty string")
     positions: dict[tuple[int, int], list[str]] = {}
+    boxes: list[tuple[tuple[int, int, int, int], str]] = []
     controls = value.get("controls")
     if not isinstance(controls, list):
         controls = []
@@ -145,8 +146,24 @@ def _validate_analysis(value: dict[str, Any], width: int,
         if not isinstance(control, dict):
             warnings.append("control is not an object")
             continue
-        x, y = control.get("x"), control.get("y")
         label = str(control.get("label") or "unlabelled")
+        bbox = control.get("bbox")
+        if bbox is not None:
+            if (not isinstance(bbox, list) or len(bbox) != 4
+                    or not all(isinstance(v, int) for v in bbox)):
+                warnings.append(f"{label}: bounding box is not [x0, y0, x1, y1]")
+                continue
+            x0, y0, x1, y1 = bbox
+            if not (x0 < x1 and y0 < y1):
+                warnings.append(f"{label}: bounding box is degenerate")
+                continue
+            if not (0 <= x0 and 0 <= y0 and x1 <= width and y1 <= height):
+                warnings.append(f"{label}: bounding box is outside the framebuffer")
+                continue
+            boxes.append(((x0, y0, x1, y1), label))
+            positions.setdefault(((x0 + x1) // 2, (y0 + y1) // 2), []).append(label)
+            continue
+        x, y = control.get("x"), control.get("y")
         if not isinstance(x, int) or not isinstance(y, int):
             warnings.append(f"{label}: coordinates are not integers")
             continue
@@ -177,10 +194,16 @@ def _validate_analysis(value: dict[str, Any], width: int,
             point = (int(match.group(1)), int(match.group(2)))
             if not (0 <= point[0] < width and 0 <= point[1] < height):
                 warnings.append("recommended click is outside the framebuffer")
-            elif len(positions.get(point, [])) != 1:
-                warnings.append(
-                    "recommended click does not identify exactly one control"
-                )
+            else:
+                containing = [
+                    label for (x0, y0, x1, y1), label in boxes
+                    if x0 < point[0] < x1 and y0 < point[1] < y1
+                ]
+                identified = positions.get(point, []) + containing
+                if len(set(identified)) != 1:
+                    warnings.append(
+                        "recommended click does not identify exactly one control"
+                    )
     return {
         "structurally_valid": not warnings,
         "actionable": not warnings and not click,
@@ -225,6 +248,8 @@ def _result(value: dict[str, Any], *, provider: str, requested_model: str,
         "model": model if isinstance(model, str) and model else requested_model,
         "analysis": parsed if parsed is not None else content,
         "structured": parsed is not None,
+        "width": width,
+        "height": height,
     }
     if parsed is not None:
         result["validation"] = _validate_analysis(parsed, width, height)
@@ -338,21 +363,10 @@ def _accepted(result: dict[str, Any]) -> bool:
     )
 
 
-def verifies_target(result: dict[str, Any], target: str, x: int, y: int,
-                    tolerance: int = 48) -> tuple[bool, str]:
-    """Accept a click only when vision independently names the same target.
-
-    Structural validity alone is deliberately insufficient: the provider must
-    identify exactly one labelled control matching ``target`` and recommend a
-    click close to the proposed coordinate.  This turns calibration into a
-    machine-enforced checkpoint instead of a model self-attestation flag.
-    """
-    validation = result.get("validation")
-    analysis = result.get("analysis")
-    if not isinstance(validation, dict) or not validation.get("structurally_valid"):
-        return False, "vision response was not structurally valid"
+def _matching_controls(analysis: Any, target: str) -> list[dict[str, Any]]:
+    """Every control whose label matches ``target``, in response order."""
     if not isinstance(analysis, dict):
-        return False, "vision response contained no structured analysis"
+        return []
     wanted = " ".join(target.casefold().split())
     matches = []
     for control in analysis.get("controls", []):
@@ -361,6 +375,33 @@ def verifies_target(result: dict[str, Any], target: str, x: int, y: int,
         label = " ".join(str(control.get("label", "")).casefold().split())
         if wanted and (wanted in label or label in wanted):
             matches.append(control)
+    return matches
+
+
+def matched_control(result: dict[str, Any], target: str) -> dict[str, Any] | None:
+    """The single control labelled ``target``, or None when ambiguous/absent."""
+    matches = _matching_controls(result.get("analysis"), target)
+    return matches[0] if len(matches) == 1 else None
+
+
+def verifies_target(result: dict[str, Any], target: str, x: int, y: int,
+                    tolerance: int = 48) -> tuple[bool, str]:
+    """Accept a click only when vision independently names the same target.
+
+    Structural validity alone is deliberately insufficient: the provider must
+    identify exactly one labelled control matching ``target``, bound it with a
+    sane bounding box, recommend a click close to the proposed coordinate, and
+    have the actual click point land strictly inside that bounding box.  This
+    turns calibration into a machine-enforced checkpoint instead of a model
+    self-attestation flag.
+    """
+    validation = result.get("validation")
+    analysis = result.get("analysis")
+    if not isinstance(validation, dict) or not validation.get("structurally_valid"):
+        return False, "vision response was not structurally valid"
+    if not isinstance(analysis, dict):
+        return False, "vision response contained no structured analysis"
+    matches = _matching_controls(analysis, target)
     if len(matches) != 1:
         return False, f"vision identified {len(matches)} controls matching {target!r}"
     action = analysis.get("recommended_action")
@@ -370,12 +411,30 @@ def verifies_target(result: dict[str, Any], target: str, x: int, y: int,
     if not match:
         return False, "vision did not return a click coordinate"
     proposed = (int(match.group(1)), int(match.group(2)))
-    control = matches[0]
-    control_point = (control.get("x"), control.get("y"))
-    if control_point != proposed:
+    bbox = matches[0].get("bbox")
+    if (not isinstance(bbox, list) or len(bbox) != 4
+            or not all(isinstance(v, int) for v in bbox)):
         return False, (
-            f"recommended coordinate {proposed} does not match the named "
-            f"control coordinate {control_point}"
+            f"matched control has no valid bounding box "
+            f"(expected [x0, y0, x1, y1])"
+        )
+    x0, y0, x1, y1 = bbox
+    if not (x0 < x1 and y0 < y1):
+        return False, f"matched control bounding box is degenerate: {bbox}"
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return False, (
+            f"matched control bounding box is too small to click reliably: "
+            f"{x1 - x0}x{y1 - y0} (min 8x8)"
+        )
+    screen_area = (result.get("width") or 0) * (result.get("height") or 0)
+    if screen_area and (x1 - x0) * (y1 - y0) > 0.6 * screen_area:
+        return False, (
+            f"matched control bounding box covers more than 60% of the screen"
+        )
+    if not (x0 < x < x1 and y0 < y < y1):
+        return False, (
+            f"click point ({x}, {y}) is outside the matched control bounding "
+            f"box {bbox}"
         )
     if abs(proposed[0] - x) > tolerance or abs(proposed[1] - y) > tolerance:
         return False, (

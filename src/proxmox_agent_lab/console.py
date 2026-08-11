@@ -573,17 +573,21 @@ def cmd_click(lab: Any, args: Any) -> None:
 {{
   "screen": "short checkpoint name",
   "summary": "what is visibly happening",
-  "controls": [{{"label": {target_json}, "x": {args.x}, "y": {args.y}, "confidence": 0.0}}],
+  "controls": [{{"label": {target_json}, "bbox": [x0, y0, x1, y1], "confidence": 0.0}}],
   "recommended_action": {{"kind": "click", "value": "{args.x},{args.y}", "reason": "cursor visibly overlaps the named control"}},
   "expected_change": "the named control opens",
   "warnings": []
 }}
-The harness has already moved the visible cursor to ({args.x},{args.y}). Decide
-only whether that cursor visibly overlaps the one control named {target!r}. Do
-not estimate or change coordinates: if it overlaps, copy the supplied
-coordinates exactly into both coordinate fields. If it does not overlap, is
-ambiguous, or the named control is absent, return controls=[] and
-recommended_action kind=stop. Never infer from coordinates alone."""
+The harness has already moved the visible cursor to ({args.x},{args.y}) and will
+click exactly there. Locate the one control named {target!r} in the image and
+report its bounding box as "bbox": [x0, y0, x1, y1] in framebuffer pixels
+(origin top-left, x increases right, y increases down, x0 < x1 and y0 < y1);
+the bbox must cover the visible control body, not a single guessed point. Then
+decide only whether the cursor visibly overlaps that control's body: if it
+does, recommended_action is kind=click with value "{args.x},{args.y}"; if it
+does not overlap, is ambiguous, or the named control is absent, return
+controls=[] and recommended_action kind=stop. Never infer overlap from the
+supplied coordinates alone; judge from the image."""
         try:
             analysis = vision.analyze_png(
                 lab.CONFIG, grid_png, width=width, height=height, prompt=prompt,
@@ -617,6 +621,9 @@ recommended_action kind=stop. Never infer from coordinates alone."""
         "verification": {"accepted": True, "reason": reason},
         "temporal": temporal,
     }
+    control = vision.matched_control(analysis, target)
+    if control is not None and isinstance(control.get("bbox"), list):
+        result["control_bbox"] = control["bbox"]
     if screenshot is not None:
         result["screenshot_after"] = screenshot
     print(json.dumps(result, indent=2, sort_keys=True))

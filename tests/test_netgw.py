@@ -56,7 +56,10 @@ class DhcpTftpTests(unittest.TestCase):
                                "--lease", "L1", "--vmid", "9100")
                 )
             paths = [c.args[1] for c in api.call.call_args_list]
-            self.assertIn("/nodes/aipve/qemu/102/clone", paths)
+            self.assertIn(
+                f"/nodes/aipve/qemu/{lab_netgw.GATEWAY_TEMPLATE_VMID}/clone",
+                paths,
+            )
             written = {
                 c.args[2].get("file", ""): c.args[2].get("content", "")
                 for c in api.call.call_args_list

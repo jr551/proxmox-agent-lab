@@ -4,7 +4,7 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.5.0 - 2026-08-11
 
 ### Added
 
@@ -28,6 +28,19 @@ All notable changes to this project will be documented here. The format follows
 - `lease-end` prints a hint when a lease is ended seconds after it began,
   nudging agents to reuse one lease per work session instead of paying a boot
   cycle each attempt.
+
+### Fixed
+
+- The checkout wrapper now pins a Python 3.11+ interpreter: under a minimal
+  PATH (supervised processes, cron) `python3` could resolve to the macOS
+  system 3.9, which silently degraded the config to defaults and broke every
+  API call with "This install is not configured yet".
+- DHCP/TFTP spawns get an egress NIC on the home bridge so `apt` provisioning
+  works from the isolated lab bridge, and the TFTP root is created before
+  dnsmasq starts (dnsmasq refuses to start when `tftp-root` is missing).
+- `guest template` / `guest clone` wait for their async Proxmox tasks, so
+  cloning immediately after a conversion no longer races the template
+  config.
 
 ## 0.4.0 - 2026-08-10
 

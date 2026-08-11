@@ -405,6 +405,7 @@ def cmd_log(lab: Any, args: Any) -> None:
             split = output.rsplit(f"\n{marker}:", 1)
             if len(split) == 2:
                 data, count_text = split
+                count_text = count_text.strip()
                 if count_text.isdigit():
                     count = int(count_text)
             else:

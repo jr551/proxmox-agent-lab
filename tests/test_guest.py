@@ -187,7 +187,7 @@ class DetachedRunTests(unittest.TestCase):
                 script = command[2]
                 if "out=$(tail" in script:
                     return {"exitcode": 0,
-                            "stdout": "data\n__logb1234__:5\n",
+                            "stdout": "data\n__logb1234__:5\n\n",
                             "stderr": ""}
                 if "kill -0" in script:
                     return {"exitcode": 0, "stdout": "1", "stderr": ""}

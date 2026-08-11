@@ -798,7 +798,18 @@ class ScreenshotCommandTests(unittest.TestCase):
                                    return_value=session), \
                  mock.patch.object(lab, "ProxmoxAPI"), \
                  mock.patch.object(lab_console.vision, "analyze_png",
-                                   return_value={"provider": "nvidia"}), \
+                                   return_value={
+                                       "provider": "nvidia",
+                                       "analysis": {
+                                           "controls": [
+                                               {"label": "OK",
+                                                "bbox": [0, 0, 2, 2]},
+                                           ],
+                                           "recommended_action": {
+                                               "kind": "click", "value": "0,0",
+                                           },
+                                       },
+                                   }), \
                  mock.patch.object(lab_console.vision, "verifies_target",
                                    side_effect=[(False, "wrong target"),
                                                 (True, "matched")]), \
@@ -819,3 +830,4 @@ class ScreenshotCommandTests(unittest.TestCase):
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
             self.assertEqual(payload["screenshot_after"]["path"], str(out))
             self.assertTrue(payload["verification"]["accepted"])
+            self.assertEqual(payload["control_bbox"], [0, 0, 2, 2])

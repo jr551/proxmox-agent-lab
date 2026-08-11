@@ -348,6 +348,25 @@ proxmox-lab journal --summary
 Every action appends a redacted event. Secrets, typed text and presigned URLs
 are never recorded.
 
+## 🔧 Workflow shortcuts
+
+- **Reusable builders**: promote a stopped lease-owned guest with
+  `guest template --lease "$L" --vmid <id>`, clone it back in seconds with
+  `guest clone --lease "$L" --template <id> --newid <id>` (auto-registered).
+- **Long jobs**: `guest run --lease "$L" --vmid <id> --detach <cmd…>` returns
+  a pid; stream output with `guest log … --pid <pid> --follow`, block with
+  `guest wait … --pid <pid>` (exit code is recorded as a `grun-exit:N` marker).
+- **Big files**: `push`/`pull` auto-chunk above 32 MiB on Linux guests with
+  end-to-end SHA-256; `pull --sha256 <digest>` skips when the local copy
+  already matches.
+- **Kernel debugging**: `console bridge --lease "$L" --vmid <id> --port <p>`
+  exposes the guest serial on a local TCP port for rosdbg/windbg/gdb.
+- **Optional network services** (spawned only on demand): `net dhcp-create`
+  (PXE via `--bootfile`/`--next-server`), `net tftp-create`,
+  `net tftp-push`, `net dhcp-leases` — a minimal PXE stack on the lab bridge.
+- `lease-end` hints when a lease is ended seconds after it began; prefer one
+  lease per session, kept alive with `lease-heartbeat` every ≤20 min.
+
 ## 🛑 Boundaries
 
 - Refuse host changes — networking, storage, disks, permissions, cluster, SDN,

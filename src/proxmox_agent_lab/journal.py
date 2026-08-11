@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import time
 from typing import Any
 
 SCHEMA = """
@@ -39,6 +40,12 @@ CREATE INDEX IF NOT EXISTS events_event     ON events (event);
 """
 
 SAFE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+
+# Concurrent CLI processes can push to the audit repository at the same
+# moment. A push rejected as non-fast-forward (the rebase ran against a
+# stale origin) is retried: refetch, rebase again and push once more.
+SYNC_GIT_ATTEMPTS = 3
+SYNC_GIT_RETRY_DELAY = 1.0
 
 
 def database_path(journal_dir: Path) -> Path:
@@ -130,10 +137,20 @@ def sync_git(
     safe_message = re.sub(r"[^A-Za-z0-9_.:-]+", "-", message)[:120]
     git("commit", "-m", f"lab: {safe_message}", "--", relative.as_posix())
 
-    fetched = git("fetch", "origin", branch, check=False)
-    if fetched.returncode == 0:
-        git("rebase", f"origin/{branch}")
-    git("push", "origin", f"HEAD:refs/heads/{branch}")
+    for attempt in range(SYNC_GIT_ATTEMPTS):
+        try:
+            fetched = git("fetch", "origin", branch, check=False)
+            if fetched.returncode == 0:
+                git("rebase", f"origin/{branch}")
+            git("push", "origin", f"HEAD:refs/heads/{branch}")
+            return
+        except RuntimeError:
+            if attempt == SYNC_GIT_ATTEMPTS - 1:
+                raise
+            # A concurrent process pushed between our fetch and our push, so
+            # the rebase ran against a stale origin and the push was rejected
+            # as non-fast-forward. Refetch, rebase onto the new head, retry.
+            time.sleep(SYNC_GIT_RETRY_DELAY)
 
 
 def query(

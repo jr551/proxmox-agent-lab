@@ -392,6 +392,147 @@ class ProxmoxLabTests(unittest.TestCase):
                 LAB.LEASE_ROOT = old_lease_root
                 LAB.STATE_ROOT = old_state_root
 
+    def test_cmd_api_warns_when_pve_reorders_requested_boot(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260811120000-boot01"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "standard",
+                    "resources": [],
+                    "initial_vmids": [],
+                })
+                api = mock.Mock()
+                api.call.side_effect = lambda method, path, data=None: (
+                    None if method == "PUT" else {"boot": "order=ide0;ide2"}
+                )
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease_id, "--method", "PUT",
+                    "--path", f"/nodes/{LAB.NODE}/qemu/9092/config",
+                    "--data", "ide2=usb-bulk:iso/x.iso,media=cdrom",
+                    "--data", "boot=order=ide2;ide0",
+                ])
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "audit"), \
+                     contextlib.redirect_stdout(stdout), \
+                     contextlib.redirect_stderr(stderr):
+                    LAB.cmd_api(args)
+                self.assertEqual(
+                    LAB.json.loads(stdout.getvalue()),
+                    {"data": None, "task_status": None},
+                )
+                self.assertIn(
+                    "PVE persisted boot order 'ide0;ide2' instead of "
+                    "requested 'ide2;ide0'",
+                    stderr.getvalue(),
+                )
+                self.assertIn("separate calls", stderr.getvalue())
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
+
+
+    def test_cmd_api_boot_readback_is_silent_when_matching_or_unreadable(self) -> None:
+        import contextlib
+        import io
+
+        for persisted_boot, expect_warning in (
+            ("order=IDE2;ide0", False),  # same order, different case
+            ("order=ide0;ide2", True),   # PVE reordered the devices
+            (None, False),               # read-back failed -> skip warning
+        ):
+            with self.subTest(persisted=persisted_boot):
+                with tempfile.TemporaryDirectory() as tmp:
+                    old_lease_root = LAB.LEASE_ROOT
+                    LAB.LEASE_ROOT = Path(tmp) / "leases"
+                    try:
+                        lease_id = "20260811120000-boot02"
+                        LAB.save_lease({
+                            "id": lease_id,
+                            "state": "active",
+                            "kind": "standard",
+                            "resources": [],
+                            "initial_vmids": [],
+                        })
+                        api = mock.Mock()
+
+                        def api_call(method, path, data=None):
+                            if method == "PUT":
+                                return None
+                            if persisted_boot is None:
+                                raise LAB.LabError("read-back failed")
+                            return {"boot": persisted_boot}
+
+                        api.call.side_effect = api_call
+                        args = LAB.parser().parse_args([
+                            "api", "--lease", lease_id, "--method", "PUT",
+                            "--path", f"/nodes/{LAB.NODE}/qemu/9092/config",
+                            "--data", "boot=order=ide2;ide0",
+                        ])
+                        stdout, stderr = io.StringIO(), io.StringIO()
+                        with mock.patch.object(
+                            LAB, "ProxmoxAPI", return_value=api
+                        ), mock.patch.object(LAB, "audit"), \
+                                contextlib.redirect_stdout(stdout), \
+                                contextlib.redirect_stderr(stderr):
+                            LAB.cmd_api(args)
+                        if expect_warning:
+                            self.assertIn(
+                                "PVE persisted boot order", stderr.getvalue()
+                            )
+                        else:
+                            self.assertEqual(stderr.getvalue(), "")
+                        self.assertEqual(
+                            LAB.json.loads(stdout.getvalue()),
+                            {"data": None, "task_status": None},
+                        )
+                    finally:
+                        LAB.LEASE_ROOT = old_lease_root
+
+
+    def test_cmd_api_boot_accepts_bare_form_without_order_prefix(self) -> None:
+        """PVE documents boot as [order=]dev;dev — a bare value must not warn."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260811120000-boot03"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "standard",
+                    "resources": [],
+                    "initial_vmids": [],
+                })
+                api = mock.Mock()
+                api.call.side_effect = lambda method, path, data=None: (
+                    None if method == "PUT" else {"boot": "order=ide2;ide0"}
+                )
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease_id, "--method", "PUT",
+                    "--path", f"/nodes/{LAB.NODE}/qemu/9092/config",
+                    "--data", "boot=ide2;ide0",
+                ])
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "audit"), \
+                     contextlib.redirect_stdout(stdout), \
+                     contextlib.redirect_stderr(stderr):
+                    LAB.cmd_api(args)
+                self.assertEqual(stderr.getvalue(), "")
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
+
+
 
 if __name__ == "__main__":
     unittest.main()

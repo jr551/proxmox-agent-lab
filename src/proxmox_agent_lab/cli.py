@@ -720,6 +720,18 @@ def path_resource(path: str) -> tuple[str, int] | None:
     return match.group(1), int(match.group(2))
 
 
+def _boot_order_devices(value: str) -> list[str]:
+    """Normalized device list of a PVE `order=dev;dev` boot value."""
+    order = value.strip()
+    if not order.startswith("order="):
+        return []
+    return [
+        device.strip().lower()
+        for device in order[len("order="):].split(";")
+        if device.strip()
+    ]
+
+
 def cmd_api(args: argparse.Namespace) -> None:
     api = ProxmoxAPI()
     method = args.method.upper()
@@ -815,6 +827,28 @@ def cmd_api(args: argparse.Namespace) -> None:
             result=result,
             task_status=task_status,
         )
+    if write and method == "PUT" and "boot" in data:
+        config_match = re.fullmatch(
+            rf"/nodes/{re.escape(NODE)}/qemu/(\d+)/config", args.path
+        )
+        if config_match:
+            vmid = config_match.group(1)
+            requested = _boot_order_devices(data["boot"])
+            try:
+                persisted = _boot_order_devices(
+                    api.call("GET", f"/nodes/{NODE}/qemu/{vmid}/config").get(
+                        "boot", ""
+                    )
+                )
+            except LabError:
+                persisted = None
+            if persisted is not None and persisted != requested:
+                print(
+                    f"warning: PVE persisted boot order '{';'.join(persisted)}' "
+                    f"instead of requested '{';'.join(requested)}' — set ide2/disk "
+                    "attach and boot order in separate calls",
+                    file=sys.stderr,
+                )
     print(
         json.dumps(
             redact({"data": result, "task_status": task_status}),

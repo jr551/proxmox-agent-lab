@@ -165,6 +165,34 @@ class ProxmoxLabTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prefix says sha256"):
             storage._normalise_checksum(f"sha256:{digest}", "sha512")
 
+    def test_checksum_accepts_sha1(self) -> None:
+        from proxmox_agent_lab import storage
+
+        digest = "ab" * 20  # a full 40-hex-character SHA-1 digest
+        self.assertEqual(
+            storage._normalise_checksum(f"sha1:{digest}", None),
+            (digest, "sha1"),
+        )
+        self.assertEqual(
+            storage._normalise_checksum(f"SHA1={digest}", None),
+            (digest, "sha1"),
+        )
+        # A bare digest keeps the explicitly requested algorithm.
+        self.assertEqual(
+            storage._normalise_checksum(digest, "sha1"),
+            (digest, "sha1"),
+        )
+        # The download-url parser accepts sha1 as an explicit choice too.
+        args = LAB.parser().parse_args([
+            "storage", "download-url",
+            "--lease", "L1",
+            "--url", "http://example.invalid/image.iso",
+            "--filename", "image.iso",
+            "--checksum", f"sha1:{digest}",
+            "--checksum-algorithm", "sha1",
+        ])
+        self.assertEqual(args.checksum_algorithm, "sha1")
+
     def test_api_method_is_case_insensitive(self) -> None:
         self.assertEqual(
             LAB.parser().parse_args([

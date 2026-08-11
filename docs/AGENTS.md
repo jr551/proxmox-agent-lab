@@ -207,7 +207,9 @@ boot and provisioning. Begin once, keep it alive with
   PXE stack on the lab bridge for netbooting installers. They are optional:
   nothing spawns them unless you ask.
 - **Kernel debugging**: when a guest waits on a serial debugger
-  (e.g. ReactOS `connect a debugger on port COM1`), attach through the serial
-  bridge instead of treating it as a wall:
-  `console bridge --lease "$L" --vmid <id> --port 4000`, then point rosdbg,
-  windbg, gdb or `nc 127.0.0.1 4000` at that port.
+  (e.g. ReactOS KDBG `connect a debugger on port COM1`), attach through the
+  serial bridge instead of treating it as a wall:
+  `console bridge --lease "$L" --vmid <id> --port 4000`, then connect a KD
+  protocol client (ReactOS KDBG speaks the WinDbg KD protocol — attach
+  WinDbg from a Windows host via a TCP-to-COM shim, or gdb/`nc` for raw
+  serial) to that port.

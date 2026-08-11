@@ -360,7 +360,7 @@ are never recorded.
   end-to-end SHA-256; `pull --sha256 <digest>` skips when the local copy
   already matches.
 - **Kernel debugging**: `console bridge --lease "$L" --vmid <id> --port <p>`
-  exposes the guest serial on a local TCP port for rosdbg/windbg/gdb.
+  exposes the guest serial on a local TCP port for a KD-protocol client (WinDbg, gdb, nc).
 - **Optional network services** (spawned only on demand): `net dhcp-create`
   (PXE via `--bootfile`/`--next-server`), `net tftp-create`,
   `net tftp-push`, `net dhcp-leases` — a minimal PXE stack on the lab bridge.

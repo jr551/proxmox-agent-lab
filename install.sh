@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # One-touch installer for proxmox-agent-lab.
 #
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
 #
-# Installs the package, writes a config, stores your API token in the OS
-# keyring, and runs the health check. Everything it asks for is optional --
-# skip a prompt with Enter and edit the config later.
+# Installs the package, asks the one-time setup questions, writes a config,
+# stores secrets in the OS keyring, and runs the health check. Everything it
+# asks for is optional -- skip a prompt with Enter and edit the config later.
 #
 # Non-interactive:
 #   PXL_HOST=192.168.1.50 PXL_NODE=pve PXL_TOKEN_USER=agent@pve \
 #   PXL_TOKEN_NAME=lab PXL_TOKEN_SECRET=... PXL_MAC=aa:bb:.. ./install.sh --yes
+#   PXL_AUDIT_BACKEND=pocketbase PXL_PB_URL=https://pb.example \
+#   PXL_PB_TOKEN_SECRET=... ./install.sh --yes
 
 set -euo pipefail
 
@@ -24,7 +26,14 @@ warn() { printf '%s!%s  %s\n' "$YELLOW" "$RESET" "$*"; }
 die()  { printf '%sx%s  %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 
 ASSUME_YES=0
-[ "${1:-}" = "--yes" ] && ASSUME_YES=1
+CONFIGURE_EXISTING=0
+for argument in "$@"; do
+    case "$argument" in
+        --yes) ASSUME_YES=1 ;;
+        --configure) CONFIGURE_EXISTING=1 ;;
+        *) die "unknown option: $argument (expected --yes or --configure)" ;;
+    esac
+done
 
 ask() { # ask VAR "prompt" "default"
     local __var=$1 __prompt=$2 __default=${3:-} __reply=""
@@ -38,6 +47,26 @@ ask() { # ask VAR "prompt" "default"
         fi
     fi
     printf -v "$__var" '%s' "${__reply:-$__default}"
+}
+
+ask_choice() { # ask_choice VAR "prompt" "default" choices...
+    local __var=$1 __prompt=$2 __default=$3 __reply="" __choice
+    shift 3
+    ask "$__var" "$__prompt" "$__default"
+    __reply="${!__var}"
+    for __choice in "$@"; do
+        [ "$__reply" = "$__choice" ] && return
+    done
+    die "$__prompt must be one of: $*"
+}
+
+confirm() { # confirm "prompt"; true only for an explicit yes
+    local __prompt=$1 __reply="${PXL_RECONFIGURE:-}"
+    if [ -z "$__reply" ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+        read -r -p "  $__prompt [y/N]: " __reply || true
+    fi
+    [ "$__reply" = "y" ] || [ "$__reply" = "Y" ] \
+        || [ "$__reply" = "yes" ] || [ "$__reply" = "YES" ]
 }
 
 # ---------------------------------------------------------------- python ---
@@ -84,19 +113,50 @@ else
 fi
 say "  ${GREEN}installed${RESET} $("$BIN" --version 2>/dev/null || echo "proxmox-lab")"
 
-# ---------------------------------------------------------------- config ---
 CONFIG="${PROXMOX_AGENT_LAB_CONFIG:-$HOME/.config/proxmox-agent-lab/config.toml}"
 step "Configuring"
-if [ -f "$CONFIG" ]; then
-    say "  ${DIM}$CONFIG already exists, keeping it${RESET}"
-else
-    say "  ${DIM}Answer what you know; press Enter to skip and edit later.${RESET}"
+CONFIGURE=1
+if [ -f "$CONFIG" ] && [ "$CONFIGURE_EXISTING" -eq 0 ]; then
+    if confirm "$CONFIG already exists. Reconfigure it now?"; then
+        CONFIGURE=1
+    else
+        CONFIGURE=0
+        say "  ${DIM}keeping $CONFIG${RESET}"
+    fi
+fi
+if [ "$CONFIGURE" -eq 1 ]; then
+    say "  ${DIM}Answer what you know; press Enter to keep defaults or skip optional features.${RESET}"
     say ""
     ask HOST       "Proxmox IP address" ""
     ask NODE       "Proxmox node name (its hostname)" "pve"
     ask TOKEN_USER "API token user" "agent@pve"
     ask TOKEN_NAME "API token name" "lab"
     ask MAC        "Wired NIC MAC, for Wake-on-LAN" ""
+    ask_choice AUDIT_BACKEND \
+        "Audit backend (sqlite, jsonl, or pocketbase)" "sqlite" \
+        sqlite jsonl pocketbase
+    PB_URL=""
+    PB_COLLECTION="proxmox_lab_events"
+    PB_TOKEN_NAME="audit-token"
+    if [ "$AUDIT_BACKEND" = "pocketbase" ]; then
+        ask_choice PB_LOCATION \
+            "PocketBase location (existing or proxmox)" "existing" \
+            existing proxmox
+        if [ "$PB_LOCATION" = "proxmox" ]; then
+            say ""
+            say "  Run this once as root on the Proxmox host. It creates an"
+            say "  unprivileged PocketBase LXC, service account, port, and"
+            say "  first superuser; it prints the API URL when finished:"
+            say ""
+            say "  curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocketbase-host-setup.sh | bash"
+            say ""
+            die "re-run this controller setup with the printed PocketBase API URL"
+        fi
+        ask PB_URL "PocketBase URL (HTTPS, or trusted-LAN HTTP)" ""
+        [ -n "$PB_URL" ] || die "PocketBase URL is required when audit backend is pocketbase"
+        ask PB_COLLECTION "PocketBase audit collection" "proxmox_lab_events"
+        ask PB_TOKEN_NAME "Secret-store name for the PocketBase token" "audit-token"
+    fi
 
     BROADCAST="255.255.255.255"
     if [ -n "$HOST" ]; then
@@ -105,24 +165,41 @@ else
     fi
 
     mkdir -p "$(dirname "$CONFIG")"
-    "$BIN" init --path "$CONFIG" >/dev/null
-    "$PYTHON" - "$CONFIG" "$HOST" "$NODE" "$TOKEN_USER" "$TOKEN_NAME" "$MAC" "$BROADCAST" <<'PY'
-import pathlib, re, sys
-path, host, node, tuser, tname, mac, bcast = sys.argv[1:8]
+    [ -f "$CONFIG" ] || "$BIN" init --path "$CONFIG" >/dev/null
+    "$PYTHON" - "$CONFIG" "$HOST" "$NODE" "$TOKEN_USER" "$TOKEN_NAME" "$MAC" \
+        "$BROADCAST" "$AUDIT_BACKEND" "$PB_URL" "$PB_COLLECTION" "$PB_TOKEN_NAME" <<'PY'
+import json, pathlib, re, sys
+path, host, node, tuser, tname, mac, bcast, backend, pb_url, pb_collection, pb_secret = sys.argv[1:12]
 text = pathlib.Path(path).read_text()
-def setkey(text, key, value):
-    # Replace only the quoted value: these lines carry trailing comments, and
-    # anchoring to end-of-line would silently match nothing.
-    if not value:
+
+def setkey(text, section, key, value, required=False):
+    if not value and not required:
         return text
-    return re.sub(rf'(?m)^({re.escape(key)} = ")[^"]*(")',
-                  lambda m: m.group(1) + value + m.group(2), text, count=1)
-text = setkey(text, "host", host)
-text = setkey(text, "node", node)
-text = setkey(text, "token_user", tuser)
-text = setkey(text, "token_name", tname)
-text = setkey(text, "mac", mac)
-text = setkey(text, "broadcast", bcast)
+    section_pattern = rf"(?ms)(^\[{re.escape(section)}\]\n.*?)(?=^\[|\Z)"
+    section_match = re.search(section_pattern, text)
+    if section_match is None:
+        raise ValueError(f"configuration template has no [{section}] section")
+    body = section_match.group(1)
+    updated, count = re.subn(
+        rf"(?m)^({re.escape(key)}\s*=\s*)[^\n]*$",
+        lambda match: match.group(1) + json.dumps(value),
+        body,
+        count=1,
+    )
+    if count != 1:
+        raise ValueError(f"configuration template has no [{section}] {key}")
+    return text[:section_match.start(1)] + updated + text[section_match.end(1):]
+
+for key, value in (("host", host), ("node", node), ("token_user", tuser),
+                   ("token_name", tname)):
+    text = setkey(text, "proxmox", key, value)
+for key, value in (("mac", mac), ("broadcast", bcast)):
+    text = setkey(text, "power", key, value)
+text = setkey(text, "audit", "backend", backend, required=True)
+if backend == "pocketbase":
+    text = setkey(text, "audit", "pocketbase_url", pb_url, required=True)
+    text = setkey(text, "audit", "pocketbase_collection", pb_collection, required=True)
+    text = setkey(text, "audit", "pocketbase_token_secret", pb_secret, required=True)
 pathlib.Path(path).write_text(text)
 PY
     chmod 600 "$CONFIG"
@@ -131,13 +208,13 @@ fi
 
 # --------------------------------------------------------------- secrets ---
 keyring_unavailable() {
+    local secret_name=${1:-proxmox-token}
     warn "could not write to the OS keyring."
     say  "     ${DIM}Headless box or no keyring? Choose another backend:${RESET}"
     say  "       [secrets] backend = \"file\"   # a 0600 file, in $CONFIG"
-    say  "       [secrets] backend = \"env\"    # export PROXMOX_AGENT_LAB_PROXMOX_TOKEN"
-    say  "     ${DIM}then: proxmox-lab secrets set proxmox-token${RESET}"
+    say  "       [secrets] backend = \"env\"    # export the corresponding PROXMOX_AGENT_LAB_* variable"
+    say  "     ${DIM}then: proxmox-lab secrets set $secret_name${RESET}"
 }
-
 step "API token"
 if "$BIN" secrets list 2>/dev/null | grep -q '"proxmox-token": true'; then
     say "  ${DIM}already stored in your keyring${RESET}"
@@ -160,6 +237,31 @@ elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
     fi
 else
     warn "no token provided -- run 'proxmox-lab secrets set proxmox-token'"
+fi
+
+# ---------------------------------------------------------- audit backend ---
+if [ "${AUDIT_BACKEND:-}" = "pocketbase" ]; then
+    step "PocketBase audit token"
+    PB_TOKEN_VALUE="${PXL_PB_TOKEN_SECRET:-}"
+    if "$BIN" secrets list 2>/dev/null | grep -q "\"$PB_TOKEN_NAME\": true"; then
+        say "  ${DIM}already stored in your keyring${RESET}"
+    elif [ -n "$PB_TOKEN_VALUE" ]; then
+        if printf '%s\n' "$PB_TOKEN_VALUE" \
+             | "$BIN" secrets set "$PB_TOKEN_NAME" --stdin >/dev/null 2>&1; then
+            say "  ${GREEN}stored${RESET}"
+        else
+            keyring_unavailable "$PB_TOKEN_NAME"
+        fi
+    elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+        say "  ${DIM}Use a PocketBase superuser/API token; it is stored only in your OS keyring.${RESET}"
+        if "$BIN" secrets set "$PB_TOKEN_NAME"; then
+            say "  ${GREEN}stored${RESET}"
+        else
+            keyring_unavailable "$PB_TOKEN_NAME"
+        fi
+    else
+        warn "no PocketBase token provided -- run 'proxmox-lab secrets set $PB_TOKEN_NAME'"
+    fi
 fi
 
 # ---------------------------------------------------------------- doctor ---

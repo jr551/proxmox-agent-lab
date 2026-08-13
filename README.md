@@ -164,6 +164,17 @@ grants the right privileges, and arms Wake-on-LAN:
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/proxmox-host-setup.sh | bash
 ```
 
+**Optional PocketBase audit host?** Run this as root on Proxmox. It creates a
+persistent unprivileged LXC, asks for networking and port settings, and prints
+the API URL and initial administrator details:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocketbase-host-setup.sh | bash
+```
+
+Keep the default HTTP service on a trusted LAN; place it behind TLS before
+access from an untrusted network.
+
 **You need:** a spare PC running [Proxmox VE](https://www.proxmox.com) 8 or 9,
 and Python 3.11+ to drive it from. Wake-on-LAN is the default power-on and
 needs only the NIC's MAC address.

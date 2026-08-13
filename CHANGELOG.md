@@ -4,6 +4,19 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.5.1 - 2026-08-13
+
+### Added
+
+- Optional PocketBase audit backend. Configure `[audit] backend = "pocketbase"`
+  with a URL, private collection, and Keychain/secret-store token; `doctor`
+  verifies token availability and collection reachability.
+- `journal --provision-pocketbase` creates or validates the private audit
+  collection without altering an existing schema. `journal
+  --migrate-sqlite-to-pocketbase` performs an idempotent, read-only SQLite
+  ledger import using deterministic event IDs and reports count, time range,
+  and SHA-256 digest before the explicit backend cutover.
+
 ## 0.5.0 - 2026-08-11
 
 ### Added

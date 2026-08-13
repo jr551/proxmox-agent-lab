@@ -132,11 +132,16 @@ DEFAULTS: dict[str, Any] = {
         "file_path": "",
     },
     "audit": {
-        "backend": "sqlite",   # sqlite | jsonl
+        "backend": "sqlite",   # sqlite | jsonl | pocketbase
         "journal_dir": "",     # defaults to <state>/journal
         "git_sync": False,     # copy redacted events to a private git repo
         "git_repo": "",
         "git_branch": "logs",
+        "controller_id": "",
+        "pocketbase_url": "",
+        "pocketbase_collection": "proxmox_lab_events",
+        "pocketbase_token_secret": "audit-token",
+        "pocketbase_timeout_seconds": 10,
     },
 }
 
@@ -399,8 +404,13 @@ template_2022_vmid = 0
 backend = "auto"             # auto | keychain | secret-tool | env | file
 
 [audit]
-backend = "sqlite"           # sqlite (queryable) | jsonl (git-friendly)
+backend = "sqlite"           # sqlite | jsonl | pocketbase
 git_sync = false             # copy redacted events to a private git repo
 git_repo = ""                # dedicated private logging checkout
 git_branch = "logs"
+controller_id = ""           # defaults to the controller hostname
+pocketbase_url = ""          # e.g. https://rowedb.example
+pocketbase_collection = "proxmox_lab_events"
+pocketbase_token_secret = "audit-token"
+pocketbase_timeout_seconds = 10
 """

@@ -56,7 +56,7 @@ Agent dies → a watchdog cleans up anyway.
 | 💿 | Fetch cloud images, checksum-verified | `storage download-url` |
 | 🔒 | Force all traffic through a VPN | `net gateway-create` |
 | 🕵️ | Prove there is no leak | `net leak-test` |
-| 📓 | Audit everything (SQLite) | `journal` |
+| 📓 | Audit everything (SQLite or PocketBase) | `journal` |
 | 🔌 | Power on, power off, verified | `lease-begin` / `lease-end` |
 | 📌 | Keep machines alive (host stays on) | `lease-begin --long-term` |
 | 💾 | Weekly backups of what you keep | `backup` |

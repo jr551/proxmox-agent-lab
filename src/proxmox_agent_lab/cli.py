@@ -18,6 +18,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
+import uuid
 import ssl
 import subprocess
 import sys
@@ -32,6 +34,7 @@ from . import __version__
 from . import config as config_module
 from . import power as power_module
 from . import journal as journal_module
+from . import pocketbase as pocketbase_module
 from . import secrets_store
 from .config import ConfigError
 
@@ -215,6 +218,34 @@ def sync_repo(record: dict[str, Any], suffix: str) -> None:
         print(f"warning: journal sync failed: {str(exc)[:300]}", file=sys.stderr)
 
 
+
+
+def pocketbase_client() -> pocketbase_module.Client:
+    url = str(CONFIG.audit.get("pocketbase_url") or "").strip()
+    collection = str(
+        CONFIG.audit.get("pocketbase_collection") or "proxmox_lab_events"
+    ).strip()
+    secret_name = str(
+        CONFIG.audit.get("pocketbase_token_secret") or "audit-token"
+    ).strip()
+    try:
+        timeout = float(CONFIG.audit.get("pocketbase_timeout_seconds", 10))
+    except (TypeError, ValueError):
+        raise LabError(
+            "[audit] pocketbase_timeout_seconds must be a positive number"
+        ) from None
+    if not url:
+        raise LabError("[audit] pocketbase_url is not set")
+    try:
+        token = secrets_store.get(CONFIG, secret_name)
+    except secrets_store.SecretError as exc:
+        raise LabError(str(exc)) from None
+    try:
+        return pocketbase_module.Client(
+            url, token, collection, timeout=timeout
+        )
+    except ValueError as exc:
+        raise LabError(str(exc)) from None
 def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
     now = utc_now()
     record = {
@@ -222,7 +253,16 @@ def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
         "event": event,
         **redact(fields),
     }
-    journal_module.append(JOURNAL_ROOT, AUDIT_BACKEND, record)
+    client: pocketbase_module.Client | None = None
+    if AUDIT_BACKEND == "pocketbase":
+        record["event_id"] = uuid.uuid4().hex
+        record["controller"] = str(
+            CONFIG.audit.get("controller_id") or socket.gethostname()
+        )
+        client = pocketbase_client()
+    journal_module.append(
+        JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
+    )
     if sync:
         sync_repo(record, event)
 
@@ -1208,6 +1248,20 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             ),
         },
     }
+    if AUDIT_BACKEND not in {"sqlite", "jsonl", "pocketbase"}:
+        problems.append(f"[audit] unsupported backend: {AUDIT_BACKEND}")
+    if AUDIT_BACKEND == "pocketbase":
+        report["audit"]["pocketbase"] = {
+            "url": str(CONFIG.audit.get("pocketbase_url") or ""),
+            "collection": str(
+                CONFIG.audit.get("pocketbase_collection")
+                or "proxmox_lab_events"
+            ),
+            "token_secret": str(
+                CONFIG.audit.get("pocketbase_token_secret")
+                or "audit-token"
+            ),
+        }
     if CONFIG.unknown_sections:
         report["unknown_sections"] = CONFIG.unknown_sections
         problems.append(
@@ -1239,6 +1293,34 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         problems.append("Proxmox API token not stored; run "
                         "'proxmox-lab secrets set proxmox-token'")
 
+    if AUDIT_BACKEND == "pocketbase":
+        try:
+            secrets_store.get(
+                CONFIG,
+                str(
+                    CONFIG.audit.get("pocketbase_token_secret")
+                    or "audit-token"
+                ),
+            )
+            report["pocketbase_token_stored"] = True
+        except secrets_store.SecretError:
+            report["pocketbase_token_stored"] = False
+            problems.append(
+                "PocketBase token not stored; run "
+                "'proxmox-lab secrets set audit-token'"
+            )
+        if not CONFIG.audit.get("pocketbase_url"):
+            problems.append("[audit] pocketbase_url is not set")
+        elif report.get("pocketbase_token_stored"):
+            try:
+                client = pocketbase_client()
+                client.get_collection()
+                report["pocketbase_collection_reachable"] = True
+            except (LabError, pocketbase_module.PocketBaseError) as exc:
+                report["pocketbase_collection_reachable"] = False
+                problems.append(
+                    f"PocketBase audit collection check failed: {exc}"
+                )
     mode = CONFIG.power.get("mode")
     report["power"] = {
         "mode": mode,
@@ -1287,10 +1369,48 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 
 def cmd_journal(args: argparse.Namespace) -> None:
-    """Read the audit ledger."""
+    """Read, migrate, or provision the audit ledger."""
+    needs_pocketbase = (
+        AUDIT_BACKEND == "pocketbase"
+        or args.provision_pocketbase
+        or args.migrate_sqlite_to_pocketbase
+    )
+    client = pocketbase_client() if needs_pocketbase else None
+    if args.provision_pocketbase:
+        if client is None:
+            raise LabError("PocketBase client is not configured")
+        result = client.provision()
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if args.migrate_sqlite_to_pocketbase:
+        if client is None:
+            raise LabError("PocketBase client is not configured")
+        with controller_lock():
+            provision = client.provision()
+            source_dir = (
+                Path(args.sqlite_journal_dir).expanduser()
+                if args.sqlite_journal_dir
+                else JOURNAL_ROOT
+            )
+            result = journal_module.migrate_sqlite_to_pocketbase(
+                source_dir,
+                client,
+                controller=str(
+                    CONFIG.audit.get("controller_id") or socket.gethostname()
+                ),
+            )
+        result["collection"] = client.collection_name
+        result["collection_created"] = provision["created"]
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     if args.summary:
-        print(json.dumps(journal_module.summary(JOURNAL_ROOT), indent=2,
-                         sort_keys=True))
+        print(json.dumps(
+            journal_module.summary(
+                JOURNAL_ROOT, backend=AUDIT_BACKEND, pocketbase=client
+            ),
+            indent=2,
+            sort_keys=True,
+        ))
         return
     if args.import_jsonl:
         count = journal_module.import_jsonl(JOURNAL_ROOT)
@@ -1299,6 +1419,7 @@ def cmd_journal(args: argparse.Namespace) -> None:
     events = journal_module.query(
         JOURNAL_ROOT, limit=args.limit, lease=args.lease,
         event=args.event, since=args.since,
+        backend=AUDIT_BACKEND, pocketbase=client,
     )
     print(json.dumps(events, indent=2, sort_keys=True))
 
@@ -1340,8 +1461,22 @@ def parser() -> argparse.ArgumentParser:
     ledger.add_argument("--event", help="exact name, or a * wildcard")
     ledger.add_argument("--since", help="ISO timestamp lower bound")
     ledger.add_argument("--summary", action="store_true")
+    ledger.add_argument(
+        "--provision-pocketbase",
+        action="store_true",
+        help="create or validate the configured PocketBase audit collection",
+    )
     ledger.add_argument("--import-jsonl", action="store_true",
                         help="load legacy per-day JSONL files into the database")
+    ledger.add_argument(
+        "--migrate-sqlite-to-pocketbase",
+        action="store_true",
+        help="copy the SQLite audit ledger to the configured PocketBase collection",
+    )
+    ledger.add_argument(
+        "--sqlite-journal-dir",
+        help="source journal directory (default: configured journal_dir)",
+    )
     ledger.set_defaults(func=cmd_journal)
 
     power = sub.add_parser(
@@ -1476,7 +1611,8 @@ def _expected_errors() -> tuple[type[BaseException], ...]:
     """
     errors: list[type[BaseException]] = [
         LabError, ConfigError, secrets_store.SecretError,
-        power_module.PowerError, ValueError, json.JSONDecodeError,
+        pocketbase_module.PocketBaseError, power_module.PowerError, ValueError,
+        json.JSONDecodeError,
     ]
     for name in (
         "android", "console", "guest", "rfb", "s3", "netgw", "share",

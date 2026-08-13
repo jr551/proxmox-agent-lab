@@ -17,6 +17,7 @@ Both are append-only in practice: nothing here updates or deletes.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -24,6 +25,7 @@ import sqlite3
 import subprocess
 import time
 from typing import Any
+from .pocketbase import Client as PocketBaseClient
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -61,14 +63,27 @@ def _connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def append(journal_dir: Path, backend: str, record: dict[str, Any]) -> None:
+def append(
+    journal_dir: Path,
+    backend: str,
+    record: dict[str, Any],
+    *,
+    pocketbase: PocketBaseClient | None = None,
+) -> None:
     """Write one already-redacted event."""
+    if backend == "pocketbase":
+        if pocketbase is None:
+            raise ValueError("PocketBase backend has no configured client")
+        pocketbase.create_event(record)
+        return
     if backend == "jsonl":
         path = journal_dir / f"{record['timestamp'][:10]}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
         return
+    if backend != "sqlite":
+        raise ValueError(f"unsupported journal backend: {backend}")
     connection = _connect(database_path(journal_dir))
     try:
         with connection:
@@ -85,6 +100,87 @@ def append(journal_dir: Path, backend: str, record: dict[str, Any]) -> None:
             )
     finally:
         connection.close()
+
+
+def migrate_sqlite_to_pocketbase(
+    journal_dir: Path,
+    client: PocketBaseClient,
+    *,
+    controller: str,
+) -> dict[str, Any]:
+    """Copy the SQLite ledger to PocketBase in source order."""
+    source_path = database_path(journal_dir)
+    if not source_path.is_file():
+        raise ValueError(f"SQLite audit database does not exist: {source_path}")
+    if not controller:
+        raise ValueError("PocketBase import controller is empty")
+    connection = sqlite3.connect(
+        source_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10
+    )
+    source_events = imported = already_present = 0
+    digest = hashlib.sha256()
+    first_timestamp: str | None = None
+    last_timestamp: str | None = None
+    try:
+        connection.execute("BEGIN")
+        rows = connection.execute(
+            "SELECT id, timestamp, event, lease, vmid, data "
+            "FROM events ORDER BY id ASC"
+        )
+        for source_id, timestamp, event, lease, vmid, raw_data in rows:
+            try:
+                record = json.loads(raw_data)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"SQLite audit row {source_id} has invalid JSON"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"SQLite audit row {source_id} JSON must be an object"
+                )
+            if record.get("timestamp") != timestamp or record.get("event") != event:
+                raise ValueError(
+                    f"SQLite audit row {source_id} metadata disagrees with JSON"
+                )
+            canonical = json.dumps(
+                record, sort_keys=True, separators=(",", ":")
+            ).encode()
+            event_id = hashlib.sha256(
+                b"proxmox-agent-lab/sqlite-audit/v1\0"
+                + str(source_id).encode()
+                + b"\0"
+                + canonical
+            ).hexdigest()
+            digest.update(canonical)
+            digest.update(b"\n")
+            source_events += 1
+            if first_timestamp is None:
+                first_timestamp = timestamp
+            last_timestamp = timestamp
+            if client.event_exists(event_id):
+                already_present += 1
+                continue
+            client.create_imported_event(
+                record,
+                event_id=event_id,
+                controller=controller,
+                lease=lease,
+                vmid=vmid,
+            )
+            imported += 1
+    except sqlite3.Error as exc:
+        raise ValueError(f"could not read SQLite audit database: {exc}") from exc
+    finally:
+        connection.close()
+    return {
+        "source_database": str(source_path),
+        "source_events": source_events,
+        "imported": imported,
+        "already_present": already_present,
+        "first_timestamp": first_timestamp,
+        "last_timestamp": last_timestamp,
+        "source_sha256": digest.hexdigest(),
+    }
 
 
 def sync_git(
@@ -160,8 +256,18 @@ def query(
     lease: str | None = None,
     event: str | None = None,
     since: str | None = None,
+    backend: str = "sqlite",
+    pocketbase: PocketBaseClient | None = None,
 ) -> list[dict[str, Any]]:
     """Recent events, newest first."""
+    if backend == "pocketbase":
+        if pocketbase is None:
+            raise ValueError("PocketBase backend has no configured client")
+        return pocketbase.query(
+            limit=limit, lease=lease, event=event, since=since
+        )
+    if backend not in {"sqlite", "jsonl"}:
+        raise ValueError(f"unsupported journal backend: {backend}")
     path = database_path(journal_dir)
     if not path.exists():
         return []
@@ -188,7 +294,18 @@ def query(
     return [json.loads(row[0]) for row in rows]
 
 
-def summary(journal_dir: Path) -> dict[str, Any]:
+def summary(
+    journal_dir: Path,
+    *,
+    backend: str = "sqlite",
+    pocketbase: PocketBaseClient | None = None,
+) -> dict[str, Any]:
+    if backend == "pocketbase":
+        if pocketbase is None:
+            raise ValueError("PocketBase backend has no configured client")
+        return pocketbase.summary()
+    if backend not in {"sqlite", "jsonl"}:
+        raise ValueError(f"unsupported journal backend: {backend}")
     path = database_path(journal_dir)
     if not path.exists():
         return {"database": str(path), "exists": False, "events": 0}

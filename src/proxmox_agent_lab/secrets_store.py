@@ -25,6 +25,7 @@ from .config import APP_NAME, Config
 KNOWN_SECRETS = {
     "proxmox-token": "Proxmox API token secret (the UUID shown once on creation)",
     "home-assistant-token": "Home Assistant long-lived token (power mode only)",
+    "audit-token": "PocketBase API token for audit storage",
     "s3-key-id": "S3 access key id (scratch bucket)",
     "s3-secret-key": "S3 secret access key (scratch bucket)",
     "wg-private-key": "WireGuard client private key",

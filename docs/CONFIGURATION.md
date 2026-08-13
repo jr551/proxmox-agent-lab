@@ -254,15 +254,60 @@ a single install at a different lab for one command.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `backend` | `sqlite` | Local audit backend: `sqlite` or `jsonl` |
+| `backend` | `sqlite` | Audit backend: `sqlite`, `jsonl`, or `pocketbase` |
 | `journal_dir` | `<state>/journal` | Local audit ledger directory |
 | `git_sync` | `false` | Copy each redacted event to a private git log |
 | `git_repo` | — | Dedicated private logging checkout |
 | `git_branch` | `logs` | Remote branch receiving logging commits |
+| `controller_id` | hostname | Stable identifier written by the PocketBase backend |
+| `pocketbase_url` | — | Absolute HTTP(S) URL of the PocketBase service |
+| `pocketbase_collection` | `proxmox_lab_events` | Private collection for audit records |
+| `pocketbase_token_secret` | `audit-token` | Secret-store name containing the API token |
+| `pocketbase_timeout_seconds` | `10` | Per-request timeout |
 
 Every action appends a redacted event: what happened, to which VMID, under
 which lease. Passwords, tokens, typed text and presigned URLs are never
 recorded — only counts, exit codes and object keys.
+
+The `pocketbase` backend sends the same redacted event to a private
+PocketBase collection and does not silently fall back to a local ledger. Keep
+the token in the configured secret store:
+
+```toml
+[audit]
+backend = "pocketbase"
+pocketbase_url = "https://pocketbase.example"
+pocketbase_collection = "proxmox_lab_events"
+pocketbase_token_secret = "audit-token"
+```
+
+```bash
+proxmox-lab secrets set audit-token
+proxmox-lab journal --provision-pocketbase
+proxmox-lab doctor
+```
+
+`journal --provision-pocketbase` creates the collection when absent and
+validates an existing schema without altering it. Collection rules remain
+private; only the configured API token can read or write records.
+
+### SQLite migration and rollback
+
+The backend switch is a clean cutover, not a live dual-write migration:
+
+1. Stop all controllers that can write the audit ledger and copy the SQLite
+   database from `journal_dir` to an offline backup.
+2. Add the PocketBase settings and token, leaving `backend = "sqlite"`.
+3. Run `proxmox-lab journal --migrate-sqlite-to-pocketbase`. It validates or
+   creates the collection, preserves each redacted JSON record, and prints the
+   source count, time range, and deterministic SHA-256 digest.
+4. Restarts are safe: deterministic event IDs skip already imported records;
+   the SQLite database is read-only throughout.
+5. Set `backend = "pocketbase"` and run `proxmox-lab doctor` before resuming
+   leases.
+
+Rollback is fail-safe: stop writers, restore `backend = "sqlite"`, and retain
+the untouched SQLite backup. PocketBase records are not deleted on rollback.
 
 `git_sync` is off by default. Most people do not want their lab's audit trail
 pushed anywhere. If you enable it, point `git_repo` at the root of a clean,

@@ -148,6 +148,10 @@ Treat these as checkpoints, not coordinates; labels and layout may change.
 7. A Haiku desktop reached from the guest disk is install proof. Record the
    final screenshot. It is not guest-agent or command-execution proof.
 
+ReactOS Setup is a special case of this loop, because the guest also has a
+serial debugging channel worth capturing alongside every screenshot. See
+[reactos.md](reactos.md).
+
 For a retained development machine, use a long-term lease only because the
 user asked for persistence and report that the host remains powered on. For a
 disposable install test, end the lease and require `host_powered_off=true`.

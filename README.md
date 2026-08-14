@@ -227,6 +227,7 @@ traps that cost real debugging time.
 | 📦 [storage.md](docs/storage.md) | Disks, images, file transfer |
 | 🔒 [network.md](docs/network.md) | VPN egress and leak testing |
 | 🪟 [windows.md](docs/windows.md) | Installing Windows |
+| 🧩 [reactos.md](docs/reactos.md) | Debugging ReactOS guests over serial and KDB |
 | ✅ [VERIFICATION.md](docs/VERIFICATION.md) | What has been run on real hardware, and what has not |
 | 📌 [long-term-leases.md](docs/long-term-leases.md) | Machines that stay |
 | 🔗 [share.md](docs/share.md) | Disposable console links |

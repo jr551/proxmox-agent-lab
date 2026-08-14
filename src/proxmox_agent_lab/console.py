@@ -657,14 +657,20 @@ def cmd_type(lab: Any, args: Any) -> None:
 def cmd_click(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
+    empty_space = args.empty_space
     target = str(getattr(args, "target", "") or "").strip()
-    if len(target) < 2:
-        raise _api_error(
-            lab, "--target must describe the visible control in at least 2 characters"
-        )
-    if len(target) > 80 or any(ord(char) < 32 for char in target):
-        raise _api_error(lab, "--target must be a single printable label of at most 80 characters")
-    target_json = json.dumps(target, ensure_ascii=False)
+    if empty_space:
+        if target:
+            raise _api_error(lab, "--empty-space cannot be combined with --target")
+    else:
+        if len(target) < 2:
+            raise _api_error(
+                lab, "--target must describe the visible control in at least 2 characters"
+            )
+        if len(target) > 80 or any(ord(char) < 32 for char in target):
+            raise _api_error(
+                lab, "--target must be a single printable label of at most 80 characters"
+            )
     with VncSession(lab, api, args.vmid) as session:
         if not (0 <= args.x < session.client.width
                 and 0 <= args.y < session.client.height):
@@ -673,21 +679,26 @@ def cmd_click(lab: Any, args: Any) -> None:
                 f"({args.x},{args.y}) is outside the "
                 f"{session.client.width}x{session.client.height} screen",
             )
-        width, height = session.client.width, session.client.height
-        session.client.pointer(args.x, args.y, 0)
-        rgb = session.client.capture(timeout=25.0, settle=args.calibration_settle)
-        checkpoint = _save_screenshot(
-            args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
-            state_root=lab.STATE_ROOT,
-        )
-        guided, temporal = _model_frame(
-            lab, args.lease, args.vmid, rgb, width, height
-        )
-        gridded = png_module.overlay_coordinate_grid(
-            width, height, guided, step=100
-        )
-        grid_png = png_module.encode_png(width, height, gridded)
-        prompt = f"""Verify one cursor checkpoint. Return only JSON:
+        if empty_space:
+            session.client.click(args.x, args.y, button=args.button, double=args.double)
+            screenshot = _capture_after_action(lab, api, args, session)
+        else:
+            width, height = session.client.width, session.client.height
+            target_json = json.dumps(target, ensure_ascii=False)
+            session.client.pointer(args.x, args.y, 0)
+            rgb = session.client.capture(timeout=25.0, settle=args.calibration_settle)
+            checkpoint = _save_screenshot(
+                args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
+                state_root=lab.STATE_ROOT,
+            )
+            guided, temporal = _model_frame(
+                lab, args.lease, args.vmid, rgb, width, height
+            )
+            gridded = png_module.overlay_coordinate_grid(
+                width, height, guided, step=100
+            )
+            grid_png = png_module.encode_png(width, height, gridded)
+            prompt = f"""Verify one cursor checkpoint. Return only JSON:
 {{
   "screen": "short checkpoint name",
   "summary": "what is visibly happening",
@@ -706,32 +717,50 @@ does, recommended_action is kind=click with value "{args.x},{args.y}"; if it
 does not overlap, is ambiguous, or the named control is absent, return
 controls=[] and recommended_action kind=stop. Never infer overlap from the
 supplied coordinates alone; judge from the image."""
-        try:
-            analysis = vision.analyze_png(
-                lab.CONFIG, grid_png, width=width, height=height, prompt=prompt,
-                timeout=args.vision_timeout, provider=args.provider,
+            try:
+                analysis = vision.analyze_png(
+                    lab.CONFIG, grid_png, width=width, height=height, prompt=prompt,
+                    timeout=args.vision_timeout, provider=args.provider,
+                )
+            except (vision.VisionError, secrets_store.SecretError) as exc:
+                raise _api_error(
+                    lab, f"click blocked: vision checkpoint failed: {exc}"
+                ) from None
+            verified, reason = vision.verifies_target(
+                analysis, target, args.x, args.y
             )
-        except (vision.VisionError, secrets_store.SecretError) as exc:
-            raise _api_error(lab, f"click blocked: vision checkpoint failed: {exc}") from None
-        verified, reason = vision.verifies_target(
-            analysis, target, args.x, args.y
-        )
+            lab.audit(
+                "console-click-calibration", lease=args.lease, vmid=args.vmid,
+                width=width, height=height, target=target, verified=verified,
+                provider=analysis.get("provider"), sync=False,
+            )
+            if not verified:
+                print(json.dumps({
+                    "vmid": args.vmid, "clicked": False, "target": target,
+                    "cursor_moved_to": [args.x, args.y], "checkpoint": checkpoint,
+                    "temporal": temporal,
+                    "verification": {"accepted": False, "reason": reason},
+                    "next_step": "Stop. Take a fresh inspection; do not retry or reboot.",
+                }, indent=2, sort_keys=True))
+                return
+            session.client.click(args.x, args.y, button=args.button, double=args.double)
+            screenshot = _capture_after_action(lab, api, args, session)
+    if empty_space:
         lab.audit(
-            "console-click-calibration", lease=args.lease, vmid=args.vmid,
-            width=width, height=height, target=target, verified=verified,
-            provider=analysis.get("provider"), sync=False,
+            "console-click-unverified", lease=args.lease, vmid=args.vmid,
+            x=args.x, y=args.y, button=args.button, sync=False,
         )
-        if not verified:
-            print(json.dumps({
-                "vmid": args.vmid, "clicked": False, "target": target,
-                "cursor_moved_to": [args.x, args.y], "checkpoint": checkpoint,
-                "temporal": temporal,
-                "verification": {"accepted": False, "reason": reason},
-                "next_step": "Stop. Take a fresh inspection; do not retry or reboot.",
-            }, indent=2, sort_keys=True))
-            return
-        session.client.click(args.x, args.y, button=args.button, double=args.double)
-        screenshot = _capture_after_action(lab, api, args, session)
+        result = {
+            "vmid": args.vmid, "clicked": [args.x, args.y], "empty_space": True,
+            "verification": {
+                "accepted": True,
+                "reason": "explicit empty-space opt-out; coordinate unverified",
+            },
+        }
+        if screenshot is not None:
+            result["screenshot_after"] = screenshot
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     lab.audit("console-click", lease=args.lease, vmid=args.vmid,
               x=args.x, y=args.y, button=args.button, sync=False)
     result = {
@@ -1435,8 +1464,12 @@ def register(sub: Any, lab: Any) -> None:
     click.add_argument("--vmid", type=int, required=True)
     click.add_argument("--x", type=int, required=True)
     click.add_argument("--y", type=int, required=True)
-    click.add_argument("--target", required=True,
+    click.add_argument("--target",
                        help="short visible label of the intended control")
+    click.add_argument(
+        "--empty-space", action="store_true",
+        help="click a known empty coordinate without target verification",
+    )
     click.add_argument("--button", type=int, choices=(1, 2, 3), default=1)
     click.add_argument("--double", action="store_true")
     click.add_argument(

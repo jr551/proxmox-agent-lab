@@ -335,6 +335,12 @@ class ProxmoxAPI:
             with request.urlopen(req, context=self._ssl, timeout=timeout) as response:
                 body = json.load(response)
         except error.HTTPError as exc:
+            if exc.code == 596:
+                raise LabError(
+                    f"Proxmox HTTP 596 for {method} {path}: guest agent is not "
+                    "responding; the guest may be hung or its storage offline. "
+                    "Try console screenshot or serial instead."
+                ) from None
             detail = exc.read().decode(errors="replace")[:1000]
             raise LabError(f"Proxmox HTTP {exc.code} for {method} {path}: {detail}")
         except (error.URLError, TimeoutError, OSError) as exc:

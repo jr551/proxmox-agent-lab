@@ -50,6 +50,30 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertTrue(second["cached"])
         open_url.assert_called_once()
 
+    def test_guest_agent_http_596_explains_recovery_options(self) -> None:
+        import io
+
+        failure = LAB.error.HTTPError(
+            "https://proxmox.invalid/api2/json/nodes/test/qemu/100/agent/exec",
+            596,
+            "guest agent unavailable",
+            None,
+            io.BytesIO(b"guest agent unavailable"),
+        )
+        api = LAB.ProxmoxAPI()
+        try:
+            with mock.patch.object(LAB, "keychain_secret", return_value="token"), \
+                 mock.patch.object(LAB.request, "urlopen", side_effect=failure):
+                with self.assertRaises(LAB.LabError) as caught:
+                    api.call("POST", "/nodes/test/qemu/100/agent/exec")
+        finally:
+            failure.close()
+
+        message = str(caught.exception)
+        self.assertIn("guest agent is not responding", message)
+        self.assertIn("guest may be hung or its storage offline", message)
+        self.assertIn("console screenshot or serial", message)
+
     def test_cold_boot_timeout_uses_config_and_rejects_impatient_override(self) -> None:
         api = mock.Mock()
         api.reachable.return_value = False

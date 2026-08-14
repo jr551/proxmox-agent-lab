@@ -273,6 +273,42 @@ class ProxmoxLabTests(unittest.TestCase):
         )
         self.assertIsNone(LAB.path_resource("/nodes/somewhere-else/qemu/9000"))
 
+    def test_cmd_api_refuses_power_actions_for_unregistered_preexisting_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260814120000-guard35"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "standard",
+                    "resources": [],
+                    "initial_vmids": [9000, 9001],
+                })
+                api = mock.Mock()
+                operations = [
+                    ("qemu", 9000, action)
+                    for action in ("start", "stop", "shutdown", "reset", "suspend")
+                ]
+                operations.append(("lxc", 9001, "start"))
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api):
+                    for kind, vmid, action in operations:
+                        with self.subTest(kind=kind, action=action):
+                            args = LAB.parser().parse_args([
+                                "api", "--lease", lease_id, "--method", "POST",
+                                "--path",
+                                f"/nodes/{LAB.NODE}/{kind}/{vmid}/status/{action}",
+                            ])
+                            with self.assertRaisesRegex(
+                                LAB.LabError,
+                                rf"VMID {vmid} existed before this lease",
+                            ):
+                                LAB.cmd_api(args)
+                            api.call.assert_not_called()
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
+
     def test_lease_requires_cleanup(self) -> None:
         self.assertTrue(
             LAB.lease_requires_cleanup(

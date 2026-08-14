@@ -870,16 +870,23 @@ def cmd_api(args: argparse.Namespace) -> None:
         ):
             raise LabError(f"Write path is outside the leased guest surface: {args.path}")
         resource = path_resource(args.path)
-        if method == "DELETE" and resource:
+        if resource:
             kind, vmid = resource
             owned = any(
                 item["kind"] == kind and int(item["vmid"]) == vmid
                 for item in lease["resources"]
             )
-            if not owned:
+            if method == "DELETE" and not owned:
                 raise LabError(
                     f"Refusing deletion of unregistered {kind} VMID {vmid}"
                 )
+            power_action = re.fullmatch(
+                rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/\d+/status/"
+                r"(?:start|stop|shutdown|reset|suspend)",
+                args.path,
+            )
+            if power_action and not owned and vmid in lease["initial_vmids"]:
+                raise LabError(f"VMID {vmid} existed before this lease")
         create_match = re.fullmatch(
             rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
         )

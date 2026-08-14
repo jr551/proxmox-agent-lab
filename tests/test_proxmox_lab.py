@@ -154,6 +154,29 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertEqual(recipe["qemu"]["firmware"], "SeaBIOS")
         self.assertEqual(recipe["qemu"]["disk"].split("=", 1)[0], "ide0")
 
+    def test_android_x86_recipe_pins_media_and_avoids_the_isolated_bridge(self) -> None:
+        import contextlib
+        import io
+        import json
+
+        args = LAB.parser().parse_args(["recipe", "android-x86"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            args.func(args)
+        recipe = json.loads(output.getvalue())
+        self.assertEqual(recipe["release"], "9.0-r2")
+        self.assertEqual(recipe["image"]["checksum_algorithm"], "md5")
+        self.assertEqual(len(recipe["image"]["checksum"]), 32)
+        self.assertFalse(recipe["qemu"]["guest_agent"])
+        self.assertIn("vmbr0", recipe["qemu"]["network_bridge"])
+        self.assertTrue(
+            any("isolated" in shortcut for shortcut in recipe["invalid_shortcuts"])
+        )
+        self.assertTrue(
+            any("Burp" in shortcut for shortcut in recipe["invalid_shortcuts"])
+        )
+        self.assertIn("http_proxy", recipe["proxying"]["set_proxy"])
+
     def test_checksum_prefix_selects_algorithm(self) -> None:
         from proxmox_agent_lab import storage
 

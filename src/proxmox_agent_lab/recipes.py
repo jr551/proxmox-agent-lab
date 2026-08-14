@@ -190,9 +190,140 @@ WINDOWS_ME = {
     ],
 }
 
+ANDROID_X86 = {
+    "name": "android-x86",
+    "release": "9.0-r2",
+    "verified_at": "2026-08-14",
+    "source": "https://www.android-x86.org/",
+    "note": "A real Android-x86 boot-to-metal OS install in a QEMU VM -- "
+            "distinct from 'android create', which runs the Google SDK "
+            "emulator inside a Debian VM. Use this when a genuine device "
+            "network stack matters, e.g. driving Android's own proxy "
+            "settings from an external tool.",
+    "image": {
+        "url": "https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2-k49.iso/download",
+        "filename": "android-x86_64-9.0-r2-k49.iso",
+        "content": "iso",
+        "storage": "local",
+        "checksum_algorithm": "md5",
+        "checksum": "024d05fea10cdbc896e72d53f259a367",
+    },
+    "qemu": {
+        "firmware": "seabios",
+        "memory_mib": 1536,
+        "disk": "scsi0=local-lvm:16",
+        "scsihw": "virtio-scsi-single",
+        "cdrom": "ide2=local:iso/android-x86_64-9.0-r2-k49.iso,media=cdrom",
+        "boot": "order=ide2;scsi0",
+        "vga": "std",
+        "network_model": "virtio",
+        "network_bridge": "the bridge your OWN workstation or proxy tool can "
+                           "reach directly -- usually the same bridge the "
+                           "Proxmox host's management IP is on, e.g. vmbr0. "
+                           "NOT the isolated lab-only bridge: verified live "
+                           "that adb/HTTP from an external machine cannot "
+                           "reach a guest placed there.",
+        "guest_agent": False,
+    },
+    "installation": {
+        "media": "boot-cd",
+        "stages": [
+            "grub-menu-choose-installation",
+            "cfdisk-create-one-bootable-primary-partition-write",
+            "format-ext4",
+            "install-grub-yes",
+            "system-partition-read-write-yes",
+            "eject-iso-boot-from-disk",
+            "setup-wizard",
+        ],
+        "setup_wizard": {
+            "network": "the Wi-Fi picker lists the virtio NIC as an AP "
+                       "named 'VirtWifi'; connect to it like any network",
+            "known_quirk": "on 9.0-r2 the wizard can loop back to 'Copy "
+                           "apps & data' after reaching Google Services "
+                           "Accept, repeatedly, rather than completing. "
+                           "Verified live. Do not keep retrying the wizard "
+                           "UI -- switch to the on-device root shell "
+                           "(Alt+F1 from the graphical console) and run: "
+                           "settings put secure user_setup_complete 1 && "
+                           "settings put global device_provisioned 1, then "
+                           "power-cycle (stop/start, not just reset, to "
+                           "reinitialize the virtio NIC cleanly) to land "
+                           "directly on the home screen.",
+            "keyboard_navigable": "every screen observed responded to tab/"
+                                  "shift-tab/arrows plus enter for its "
+                                  "focused control -- prefer this over "
+                                  "console click on this OS. Its calibrated "
+                                  "vision-click verification rejected small "
+                                  "text links ('SKIP', 'ACCEPT') on this UI "
+                                  "repeatedly across multiple providers; "
+                                  "keyboard focus navigation was reliable "
+                                  "every time it was tried instead.",
+        },
+        "final_check": [
+            "adb connect <device-ip>:5555 from the machine that will run "
+            "the proxy succeeds (enable first: setprop "
+            "service.adb.tcp.port 5555 && stop adbd && start adbd, from "
+            "the root shell or a prior adb session).",
+        ],
+    },
+    "proxying": {
+        "set_proxy": "adb shell settings put global http_proxy "
+                     "<proxy-host>:<proxy-port> -- verified live with a "
+                     "plain listener: the device's own browser traffic "
+                     "(a CONNECT to a real HTTPS host) arrived at the "
+                     "configured host:port. Any HTTP(S)-capable proxy "
+                     "works; this recipe does not wire up or assume one.",
+        "clear_proxy": "adb shell settings put global http_proxy :0",
+        "install_ca_cert": "push the proxy's CA cert (in .0 hash form, "
+                           "or any format Android's certificate installer "
+                           "accepts) to the device with 'proxmox-lab push', "
+                           "then Settings > Security > Encryption & "
+                           "credentials > Install a certificate. Not "
+                           "verified live in this pass -- the mechanism is "
+                           "standard Android, not android-x86-specific.",
+    },
+    "rules": COMMON_RULES[:1] + [
+        "Download without printing it, verify the checksum, then upload as "
+        "ISO content; keep the guest disk on fast storage.",
+        "Create one lease-owned QEMU guest with SeaBIOS, virtio-scsi disk, "
+        "virtio network on a bridge reachable from wherever the proxy "
+        "runs, std VGA, and no assumed guest agent.",
+        "Drive the setup wizard with keyboard focus navigation "
+        "(tab/shift-tab/arrows, enter), not console click.",
+        "If the setup wizard loops after Google Services, use the "
+        "on-device root shell (Alt+F1) to mark provisioning complete "
+        "instead of retrying the UI.",
+    ] + COMMON_RULES[2:],
+    "phase_order": COMMON_PHASES[:1] + [
+        "download-verify-extract-locally",
+        "upload-verified-iso",
+    ] + COMMON_PHASES[2:4] + [
+        "installer-partition-format-grub",
+        "boot-from-disk",
+        "setup-wizard-or-root-shell-bypass",
+        "configure-proxy",
+    ] + COMMON_PHASES[7:],
+    "invalid_shortcuts": COMMON_INVALID + [
+        "Do not place the guest's network on an isolated/VPN-only lab "
+        "bridge if an external proxy or adb client needs to reach it "
+        "directly -- verified live that it is not routable from outside.",
+        "Do not assume the in-guest 'Reboot' menu action actually power-"
+        "cycled the VM; verify via the VM's uptime or force a reset/stop-"
+        "start if the boot screen looks unchanged.",
+        "Do not keep retrying a rejected console click more than the "
+        "documented limit on this UI; switch to keyboard navigation or "
+        "the root shell instead of manufacturing new click labels.",
+        "Do not wire this recipe to any specific proxy tool (Burp or "
+        "otherwise) or to this project's own netcap/MITM relay -- it only "
+        "gets the device to a state where 'adb shell settings put global "
+        "http_proxy' points it at whatever the user runs.",
+    ],
+}
+
 RECIPES = {
     item["name"]: item
-    for item in (REACTOS, DRAGONFLY, HAIKU, OPENBSD, WINDOWS_ME)
+    for item in (REACTOS, DRAGONFLY, HAIKU, OPENBSD, WINDOWS_ME, ANDROID_X86)
 }
 
 

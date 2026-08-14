@@ -29,6 +29,23 @@ The capture path is a self-contained RFB client: Proxmox `vncproxy`, a
 WebSocket upgrade, RFB 3.8 with VNC authentication, and Raw/Zlib/CopyRect
 decoding into a PNG written with `zlib` alone. No Pillow, numpy, or noVNC.
 
+### Watching something slow: `screenshot-burst`
+
+```bash
+proxmox-lab console screenshot-burst --vmid 9001 --count 6 --interval 10
+```
+
+For a progress bar, an installer's copy step, or a boot animation — anything
+that changes slowly enough that one screenshot can't tell you whether it's
+progressing or stuck. One VNC session stays open and captures `--count`
+frames (default 6) spaced `--interval` seconds apart (default 10, so the
+default run spans about a minute), then stitches them left to right into a
+single PNG with each frame's elapsed seconds stamped in its corner. Frames
+are never scaled or cropped to match, so a resolution change mid-sequence
+(a boot menu switching to a desktop, for instance) is preserved rather than
+distorted. Takes `--out` and `--upload` like `screenshot`. Prefer this over a
+manual sleep-then-screenshot loop.
+
 ## Optional cloud vision fallback
 
 ```bash

@@ -158,6 +158,41 @@ class PngTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             lab_png.highlight_changes(2, 1, b"\x00" * 6, b"\x00" * 3)
 
+    def test_stitch_horizontal_places_frames_left_to_right(self) -> None:
+        red = bytes((255, 0, 0)) * (2 * 2)
+        blue = bytes((0, 0, 255)) * (3 * 2)
+        width, height, stitched = lab_png.stitch_horizontal(
+            [(2, 2, red, ""), (3, 2, blue, "")], gap=1
+        )
+        self.assertEqual((width, height), (2 + 1 + 3, 2))
+        # row 0: red pixel, red pixel, gap (black), blue, blue, blue
+        self.assertEqual(stitched[0:3], b"\xff\x00\x00")
+        self.assertEqual(stitched[6:9], b"\x00\x00\x00")
+        self.assertEqual(stitched[9:12], b"\x00\x00\xff")
+
+    def test_stitch_horizontal_handles_frames_of_different_heights(self) -> None:
+        short = bytes((1, 2, 3)) * (2 * 1)
+        tall = bytes((4, 5, 6)) * (2 * 3)
+        width, height, stitched = lab_png.stitch_horizontal(
+            [(2, 1, short, ""), (2, 3, tall, "")], gap=0
+        )
+        self.assertEqual((width, height), (4, 3))
+        self.assertEqual(len(stitched), width * height * 3)
+        # the short frame's second row (row 1 of the canvas) is unfilled/black
+        second_row_short_side = (1 * width + 0) * 3
+        self.assertEqual(
+            stitched[second_row_short_side:second_row_short_side + 3],
+            b"\x00\x00\x00",
+        )
+
+    def test_stitch_horizontal_rejects_empty_input(self) -> None:
+        with self.assertRaises(ValueError):
+            lab_png.stitch_horizontal([])
+
+    def test_stitch_horizontal_rejects_mismatched_frame_buffer(self) -> None:
+        with self.assertRaises(ValueError):
+            lab_png.stitch_horizontal([(2, 2, b"\x00" * 3, "")])
+
 
 class RfbTests(unittest.TestCase):
     def test_capture_decodes_raw_rectangle(self) -> None:
@@ -845,6 +880,47 @@ class ScreenshotCommandTests(unittest.TestCase):
                 lab_console.cmd_screenshot(lab, args)
             self.assertTrue(out.exists())
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+
+    def test_cmd_screenshot_burst_stitches_captures_over_time(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.capture.return_value = b"\x00\x00\x00" * 4
+        session.client.width, session.client.height = 2, 2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
+            out = Path(tmp) / "burst.png"
+            args = mock.Mock(vmid=1, out=str(out), count=3, interval=10.0,
+                             timeout=5, upload=False, url_expiry=60)
+            with mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch.object(lab_console.time, "sleep") as sleep, \
+                 mock.patch("builtins.print") as printed:
+                lab_console.cmd_screenshot_burst(lab, args)
+            payload = json.loads(printed.call_args.args[0])
+
+            self.assertEqual(session.client.capture.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)  # never sleeps after the last
+            sleep.assert_called_with(10.0)
+            self.assertEqual(payload["frame_count"], 3)
+            self.assertEqual(payload["width"], 2 * 3 + 4 * 2)  # 3 frames + 2 gaps
+            self.assertTrue(out.exists())
+            self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+
+    def test_cmd_screenshot_burst_rejects_a_bad_count(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        args = mock.Mock(vmid=1, count=0, interval=10.0)
+        with self.assertRaises(RuntimeError) as caught:
+            lab_console.cmd_screenshot_burst(lab, args)
+        self.assertIn("--count", str(caught.exception))
 
     def test_save_screenshot_flags_identical_repeat_frames(self) -> None:
         """A pixel-identical repeat capture is reported as possibly stale."""

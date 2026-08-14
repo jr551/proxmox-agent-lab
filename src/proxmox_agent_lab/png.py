@@ -102,6 +102,77 @@ def encode_png(width: int, height: int, rgb: bytes) -> bytes:
     )
 
 
+def _draw_label(out: bytearray, width: int, height: int, value: str,
+                x: int, y: int, scale: int = 2) -> None:
+    """Stamp a short digit label into a mutable RGB buffer, in place."""
+
+    def pixel(px: int, py: int, colour: tuple[int, int, int],
+              alpha: int = 255) -> None:
+        if not (0 <= px < width and 0 <= py < height):
+            return
+        offset = (py * width + px) * 3
+        inverse = 255 - alpha
+        for channel, target in enumerate(colour):
+            out[offset + channel] = (
+                out[offset + channel] * inverse + target * alpha
+            ) // 255
+
+    cursor = x
+    for character in value:
+        glyph = _GLYPHS.get(character)
+        if glyph is None:
+            cursor += 4 * scale
+            continue
+        for py in range(y - 1, y + 5 * scale + 1):
+            for px in range(cursor - 1, cursor + 3 * scale + 1):
+                pixel(px, py, (0, 0, 0), 190)
+        for row, bits in enumerate(glyph):
+            for column, bit in enumerate(bits):
+                if bit == "1":
+                    for dy in range(scale):
+                        for dx in range(scale):
+                            pixel(cursor + column * scale + dx,
+                                  y + row * scale + dy, (255, 255, 255))
+        cursor += 4 * scale
+
+
+def stitch_horizontal(
+    frames: list[tuple[int, int, bytes, str]], gap: int = 4,
+) -> tuple[int, int, bytes]:
+    """Combine same-session captures side by side into one wider canvas.
+
+    Built for watching something slow -- a progress bar, an installer copy
+    step, a boot animation -- as one image instead of a manual sleep-then-
+    screenshot loop. A VM's resolution can change between captures (a boot
+    menu switching to the desktop, for instance), so frames are never scaled
+    or cropped to match: each is placed top-left on a shared black canvas
+    sized to the widest sum and the tallest single frame, separated by `gap`
+    pixels, with its label (typically elapsed seconds) stamped in its
+    top-left corner.
+    """
+    if not frames:
+        raise ValueError("stitch_horizontal needs at least one frame")
+    max_height = max(height for _, height, _, _ in frames)
+    total_width = (
+        sum(width for width, _, _, _ in frames) + gap * (len(frames) - 1)
+    )
+    out = bytearray(total_width * max_height * 3)
+    x_offset = 0
+    for width, height, rgb, label in frames:
+        expected = width * height * 3
+        if len(rgb) != expected:
+            raise ValueError(f"expected {expected} RGB bytes, got {len(rgb)}")
+        stride = width * 3
+        for row in range(height):
+            src = row * stride
+            dst = (row * total_width + x_offset) * 3
+            out[dst:dst + stride] = rgb[src:src + stride]
+        if label:
+            _draw_label(out, total_width, max_height, label, x_offset + 4, 4)
+        x_offset += width + gap
+    return total_width, max_height, bytes(out)
+
+
 def overlay_coordinate_grid(width: int, height: int, rgb: bytes,
                             step: int = 100) -> bytes:
     """Return RGB with a labelled coordinate grid over the original pixels.

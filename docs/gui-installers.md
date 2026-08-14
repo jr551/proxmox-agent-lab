@@ -77,6 +77,10 @@ or installer.
   clones, or disk creation unless current state proves they failed.
 - Send a progress update at each major screen or at least every five minutes.
   Heartbeat the lease when work reaches 30 minutes.
+- On a long copy or progress screen, prefer `console screenshot-burst` over a
+  manual sleep-then-screenshot loop: it captures several frames over a
+  minute and returns one stitched image showing whether things are actually
+  moving.
 
 ## Before touching the installer
 

@@ -315,12 +315,12 @@ def agent_ready(lab: Any, api: Any, vmid: int) -> bool:
 # --- command handlers ----------------------------------------------------
 
 
-def _screenshot_path(vmid: int, override: str | None) -> Path:
+def _screenshot_path(vmid: int, override: str | None, suffix: str = "") -> Path:
     if override:
         return Path(override).expanduser()
     DEFAULT_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return DEFAULT_SCREENSHOT_DIR / f"vm{vmid}-{stamp}.png"
+    return DEFAULT_SCREENSHOT_DIR / f"vm{vmid}-{stamp}{suffix}.png"
 
 
 def _save_screenshot(vmid: int, rgb: bytes, width: int, height: int,
@@ -474,6 +474,56 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
             )
         else:
             result["ocr"] = textmode.decode_screen(rgb, width, height)
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_screenshot_burst(lab: Any, args: Any) -> None:
+    """Capture several screenshots over time as one stitched image.
+
+    For watching something that changes slowly -- a progress bar, an
+    installer's copy step, a boot animation -- without a manual sleep-then-
+    screenshot loop. One VNC session stays open for the whole burst.
+    """
+    if args.count < 1:
+        raise lab.LabError("--count must be at least 1")
+    if args.interval < 0:
+        raise lab.LabError("--interval must not be negative")
+    api = lab.ProxmoxAPI()
+    frames: list[tuple[int, int, bytes, str]] = []
+    started = time.monotonic()
+    with VncSession(lab, api, args.vmid) as session:
+        for index in range(args.count):
+            rgb = session.client.capture(timeout=args.timeout, settle=0)
+            width, height = session.client.width, session.client.height
+            elapsed = int(time.monotonic() - started)
+            frames.append((width, height, rgb, str(elapsed)))
+            if index < args.count - 1:
+                time.sleep(args.interval)
+    total_width, total_height, stitched = png_module.stitch_horizontal(frames)
+    encoded = png_module.encode_png(total_width, total_height, stitched)
+    target = _screenshot_path(args.vmid, args.out, suffix="-burst")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(encoded)
+    result: dict[str, Any] = {
+        "vmid": args.vmid,
+        "path": str(target),
+        "width": total_width,
+        "height": total_height,
+        "bytes": len(encoded),
+        "frame_count": len(frames),
+        "interval_seconds": args.interval,
+        "elapsed_seconds": [int(label) for _, _, _, label in frames],
+        "agent_hint": (
+            "Frames run left to right in capture order, each labelled with "
+            "its elapsed seconds in its top-left corner. Read this PNG with "
+            "vision to see what changed across the sequence."
+        ),
+    }
+    if args.upload:
+        key = f"screens/vm{args.vmid}-{int(time.time())}-burst.png"
+        s3.put_bytes(key, encoded, "image/png")
+        result["s3_key"] = key
+        result["s3_url"] = s3.presign(key, expires=args.url_expiry)
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -1225,6 +1275,22 @@ def register(sub: Any, lab: Any) -> None:
     shot.add_argument("--ocr", action="store_true",
                       help="decode text-mode screens; refused on graphical screens")
     shot.set_defaults(func=bind(cmd_screenshot))
+
+    burst = console_sub.add_parser(
+        "screenshot-burst",
+        help="capture several screenshots over time as one stitched PNG",
+    )
+    burst.add_argument("--vmid", type=int, required=True)
+    burst.add_argument("--out")
+    burst.add_argument("--count", type=int, default=6,
+                       help="number of captures (default 6)")
+    burst.add_argument("--interval", type=float, default=10.0,
+                       help="seconds between captures (default 10)")
+    burst.add_argument("--timeout", type=float, default=25.0)
+    burst.add_argument("--upload", action="store_true",
+                       help="also store the PNG in the S3 scratch bucket")
+    burst.add_argument("--url-expiry", type=int, default=3600)
+    burst.set_defaults(func=bind(cmd_screenshot_burst))
 
     inspect = console_sub.add_parser(
         "inspect", help="inspect one lease-owned screenshot with cloud vision"

@@ -747,6 +747,106 @@ supplied coordinates alone; judge from the image."""
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def cmd_has_gui_locked_up(lab: Any, args: Any) -> None:
+    """Best-effort GUI liveness probe: moves the pointer, checks for change.
+
+    This client declares no support for RFB's Cursor pseudo-encoding (see
+    `_set_encodings`), so a compliant server -- QEMU's among them -- falls
+    back to drawing the pointer into the framebuffer itself rather than
+    handing it to the client to composite. `console click`'s own vision
+    verification already depends on this: it moves the cursor and expects
+    vision to see it overlapping a control. A real pointer move should
+    therefore be visible here too.
+
+    Two probes to two different points guard against an unlucky move that
+    coincidentally lands where the cursor already was. A screen that never
+    changes despite both is good evidence of a hang, but not proof: an app
+    that paints no hover/focus feedback would look the same. The verdict
+    and the raw per-probe pixel deltas are both reported so a caller can
+    judge for itself rather than trust a bare bool.
+    """
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
+    with VncSession(lab, api, args.vmid) as session:
+        width, height = session.client.width, session.client.height
+        probes = [(width // 4, height // 4), (3 * width // 4, 3 * height // 4)]
+        previous = session.client.capture(timeout=args.timeout, settle=args.settle)
+        deltas: list[int] = []
+        for x, y in probes:
+            session.client.pointer(x, y)
+            time.sleep(args.settle)
+            current = session.client.capture(timeout=args.timeout, settle=0)
+            _, changed = png_module.highlight_changes(
+                width, height, current, previous, threshold=args.threshold
+            )
+            deltas.append(changed)
+            previous = current
+    locked_up = all(delta == 0 for delta in deltas)
+    lab.audit("console-has-gui-locked-up", lease=args.lease, vmid=args.vmid,
+              locked_up=locked_up, sync=False)
+    result: dict[str, Any] = {
+        "vmid": args.vmid,
+        "locked_up": locked_up,
+        "probe_points": probes,
+        "changed_pixels_per_probe": deltas,
+    }
+    if locked_up:
+        result["caveat"] = (
+            "no pixels changed after either pointer move -- likely a hang, "
+            "but an app painting no hover/focus feedback would look the "
+            "same; treat this as one signal, not certain proof"
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_has_terminal_locked_up(lab: Any, args: Any) -> None:
+    """Best-effort text-console liveness probe: samples for a while, checks
+    for any change at all.
+
+    A live text console's cursor normally blinks on its own, so this sends
+    no input -- it just watches. Refuses a screen `console screenshot`
+    would not call text-mode, since an idle GUI with nothing blinking would
+    look identical to a hang here. A static result over the sampling window
+    is good evidence of a freeze, but not proof: some consoles run with
+    cursor blink disabled and would look the same either way.
+    """
+    if args.samples < 2:
+        raise lab.LabError("--samples must be at least 2")
+    api = lab.ProxmoxAPI()
+    frames: list[bytes] = []
+    with VncSession(lab, api, args.vmid) as session:
+        width, height = session.client.width, session.client.height
+        for index in range(args.samples):
+            frames.append(session.client.capture(timeout=args.timeout, settle=0))
+            if index < args.samples - 1:
+                time.sleep(args.interval)
+    analysis = textmode.analyse(frames[0], width, height)
+    if not analysis["looks_like_text_console"]:
+        raise lab.LabError(
+            "screen is not a text console; use 'console has-gui-locked-up' instead"
+        )
+    deltas = [
+        png_module.highlight_changes(width, height, current, previous,
+                                     threshold=args.threshold)[1]
+        for previous, current in zip(frames, frames[1:])
+    ]
+    locked_up = all(delta == 0 for delta in deltas)
+    result: dict[str, Any] = {
+        "vmid": args.vmid,
+        "locked_up": locked_up,
+        "samples": args.samples,
+        "interval_seconds": args.interval,
+        "changed_pixels_per_sample": deltas,
+    }
+    if locked_up:
+        result["caveat"] = (
+            "no pixels changed across the sampling window -- likely "
+            "frozen, but some consoles run with cursor blink disabled and "
+            "would look the same; treat this as one signal, not certain proof"
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def _bridge_send_all(client: Any, data: bytes) -> bool:
     """Send all bytes to a non-blocking client; False when the client is gone."""
     import select
@@ -1351,6 +1451,33 @@ def register(sub: Any, lab: Any) -> None:
     )
     add_after_screenshot(click)
     click.set_defaults(func=bind(cmd_click))
+
+    gui_lockup = console_sub.add_parser(
+        "has-gui-locked-up",
+        help="probe a graphical screen for a hang by moving the pointer",
+    )
+    gui_lockup.add_argument("--lease", required=True)
+    gui_lockup.add_argument("--vmid", type=int, required=True)
+    gui_lockup.add_argument("--settle", type=float, default=0.3,
+                            help="seconds to wait after each pointer move")
+    gui_lockup.add_argument("--timeout", type=float, default=25.0)
+    gui_lockup.add_argument("--threshold", type=int, default=24,
+                            help="per-channel change to count a pixel as different")
+    gui_lockup.set_defaults(func=bind(cmd_has_gui_locked_up))
+
+    terminal_lockup = console_sub.add_parser(
+        "has-terminal-locked-up",
+        help="probe a text console for a hang by watching for any change",
+    )
+    terminal_lockup.add_argument("--vmid", type=int, required=True)
+    terminal_lockup.add_argument("--samples", type=int, default=4,
+                                 help="number of passive captures (default 4)")
+    terminal_lockup.add_argument("--interval", type=float, default=0.6,
+                                 help="seconds between captures (default 0.6)")
+    terminal_lockup.add_argument("--timeout", type=float, default=25.0)
+    terminal_lockup.add_argument("--threshold", type=int, default=24,
+                                 help="per-channel change to count a pixel as different")
+    terminal_lockup.set_defaults(func=bind(cmd_has_terminal_locked_up))
 
     text = console_sub.add_parser(
         "text", help="read the real terminal stream (preferred over OCR)"

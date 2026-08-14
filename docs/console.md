@@ -114,6 +114,34 @@ should use with installers, including Haiku. A model without image vision
 should delegate the current full-screen decision to a vision-capable model,
 not run Tesseract over crops.
 
+## Is it actually frozen?
+
+Two best-effort liveness probes, for when a screen has looked the same for a
+while and you need to know whether it's genuinely stuck or just quiet:
+
+```bash
+proxmox-lab console has-gui-locked-up --lease "$L" --vmid 9001
+proxmox-lab console has-terminal-locked-up --vmid 9001
+```
+
+`has-gui-locked-up` moves the pointer to two different points a moment apart
+and checks whether the screen changed either time, using the same pixel-diff
+this project already uses for change highlighting — no cloud vision call.
+This client declares no support for RFB's Cursor pseudo-encoding, so a
+compliant server (QEMU's among them) draws the pointer into the framebuffer
+itself rather than compositing it client-side; `console click`'s own
+verification already depends on this same fact. `has-terminal-locked-up`
+sends no input at all — it samples a text console several times over about
+two seconds and checks whether anything changed, since a live console's
+cursor normally blinks on its own; it refuses a screen `console screenshot`
+would not call text-mode.
+
+Both return `"locked_up"` as a bool alongside the raw per-sample pixel
+deltas, plus a `"caveat"` when the verdict is `true`: a static screen is good
+evidence of a hang but not proof — an app that paints no hover feedback, or a
+console run with cursor blink disabled, looks the same. Treat this as one
+signal, not a certain diagnosis.
+
 ### Keyboard input needs a VGA display
 
 Verified on the live host: RFB key events go to the emulated PS/2 keyboard, so

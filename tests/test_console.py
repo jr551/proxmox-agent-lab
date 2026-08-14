@@ -1006,6 +1006,107 @@ class ScreenshotCommandTests(unittest.TestCase):
             self.assertTrue(payload["verification"]["accepted"])
             self.assertEqual(payload["control_bbox"], [0, 0, 2, 2])
 
+    def test_has_gui_locked_up_true_when_nothing_changes(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 4, 4
+        session.client.capture.return_value = b"\x00\x00\x00" * 16
+        args = mock.Mock(lease="lease-1", vmid=1, settle=0.0,
+                         timeout=5, threshold=24)
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"), \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_has_gui_locked_up(lab, args)
+        payload = json.loads(printed.call_args.args[0])
+
+        self.assertEqual(session.client.pointer.call_count, 2)
+        self.assertTrue(payload["locked_up"])
+        self.assertEqual(payload["changed_pixels_per_probe"], [0, 0])
+        self.assertIn("caveat", payload)
+        lab.audit.assert_called_once_with(
+            "console-has-gui-locked-up", lease="lease-1", vmid=1,
+            locked_up=True, sync=False,
+        )
+
+    def test_has_gui_locked_up_false_when_a_probe_sees_change(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 4, 4
+        blank = b"\x00\x00\x00" * 16
+        changed = b"\xff\xff\xff" * 16
+        session.client.capture.side_effect = [blank, changed, changed]
+        args = mock.Mock(lease="lease-1", vmid=1, settle=0.0,
+                         timeout=5, threshold=24)
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"), \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_has_gui_locked_up(lab, args)
+        payload = json.loads(printed.call_args.args[0])
+
+        self.assertFalse(payload["locked_up"])
+        self.assertNotIn("caveat", payload)
+
+    def test_has_terminal_locked_up_refuses_a_graphical_screen(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 8, 8
+        # Many distinct colours: textmode.analyse should call this graphical.
+        session.client.capture.return_value = bytes(range(192))
+        args = mock.Mock(vmid=1, samples=2, interval=0.0, timeout=5, threshold=24)
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"):
+            with self.assertRaises(RuntimeError) as caught:
+                lab_console.cmd_has_terminal_locked_up(lab, args)
+        self.assertIn("not a text console", str(caught.exception))
+
+    def test_has_terminal_locked_up_true_when_static(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 8, 8
+        # A handful of colours reads as a text console to textmode.analyse.
+        frame = (b"\x00\x00\x00" * 60) + (b"\xff\xff\xff" * 4)
+        session.client.capture.return_value = frame
+        args = mock.Mock(vmid=1, samples=3, interval=0.0, timeout=5, threshold=24)
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"), \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_has_terminal_locked_up(lab, args)
+        payload = json.loads(printed.call_args.args[0])
+
+        self.assertTrue(payload["locked_up"])
+        self.assertEqual(payload["changed_pixels_per_sample"], [0, 0])
+        self.assertIn("caveat", payload)
+
+    def test_has_terminal_locked_up_rejects_too_few_samples(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        args = mock.Mock(vmid=1, samples=1, interval=0.0)
+        with self.assertRaises(RuntimeError) as caught:
+            lab_console.cmd_has_terminal_locked_up(lab, args)
+        self.assertIn("--samples", str(caught.exception))
+
     def test_inspect_audits_vision_failure(self) -> None:
         """A rejected vision analysis must leave a journal trail."""
         from proxmox_agent_lab import console as lab_console

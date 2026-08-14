@@ -1203,6 +1203,97 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
         raise LabError("Lease cleanup or host power-off did not complete")
 
 
+def cmd_lease_abandon(args: argparse.Namespace) -> None:
+    """Close a stopped ordinary lease without touching its guests or host."""
+    with controller_lock():
+        lease = load_lease(args.lease, active=False)
+        if lease.get("state") not in ("active", "cleanup_failed"):
+            raise LabError(
+                f"Lease {args.lease} cannot be abandoned from state "
+                f"{lease.get('state')}"
+            )
+        if is_long_term(lease):
+            raise LabError(
+                f"Lease {args.lease} is long-term and cannot be abandoned. "
+                "Use 'proxmox-lab lease-release --lease "
+                f"{args.lease} --confirm' or 'proxmox-lab lease-destroy "
+                f"--lease {args.lease} --confirm'."
+            )
+        if not args.confirm:
+            raise LabError(
+                "lease-abandon leaves every registered guest and the host "
+                "untouched. Re-run with --confirm after they are stopped."
+            )
+        api = ProxmoxAPI()
+        if not api.reachable():
+            raise LabError(
+                "Cannot safely abandon this lease while Proxmox is "
+                "unreachable; registered guests cannot be verified stopped."
+            )
+        stopped: list[str] = []
+        missing: list[str] = []
+        for resource in lease.get("resources", []):
+            kind = resource["kind"]
+            vmid = int(resource["vmid"])
+            resource_id = f"{kind}/{vmid}"
+            try:
+                status = guest_status(api, kind, vmid)
+            except LabError as exc:
+                if "HTTP 404" in str(exc):
+                    missing.append(resource_id)
+                    continue
+                raise LabError(
+                    f"Cannot safely abandon lease {args.lease}: could not "
+                    f"verify {resource_id} is stopped: {exc}"
+                ) from None
+            if status != "stopped":
+                raise LabError(
+                    f"Cannot safely abandon lease {args.lease}: {resource_id} "
+                    f"is {status}, not stopped"
+                )
+            stopped.append(resource_id)
+        lease["state"] = "closed"
+        lease["closed_at"] = iso_now()
+        lease["abandoned_at"] = lease["closed_at"]
+        lease["abandoned_reason"] = (
+            "registered guests verified stopped; no guest or host mutation"
+        )
+        save_lease(lease)
+        audit_error: str | None = None
+        try:
+            audit(
+                "lease-abandon",
+                lease=args.lease,
+                stopped=stopped,
+                missing=missing,
+                reason=lease["abandoned_reason"],
+            )
+        except (
+            LabError,
+            OSError,
+            ValueError,
+            pocketbase_module.PocketBaseError,
+        ) as exc:
+            audit_error = str(exc)
+            print(
+                "warning: lease was closed but its audit event could not be "
+                f"recorded: {audit_error}",
+                file=sys.stderr,
+            )
+    result: dict[str, Any] = {
+        "lease": args.lease,
+        "state": "closed",
+        "guests_verified_stopped": stopped,
+        "guests_already_missing": missing,
+        "guest_mutation": False,
+        "host_mutation": False,
+        "audit_recorded": audit_error is None,
+    }
+    if audit_error is not None:
+        result["audit_error"] = audit_error
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def cmd_cleanup_expired(args: argparse.Namespace) -> None:
     api = ProxmoxAPI()
     cleaned: list[str] = []
@@ -1680,6 +1771,14 @@ def parser() -> argparse.ArgumentParser:
     end = sub.add_parser("lease-end")
     end.add_argument("--lease", required=True)
     end.set_defaults(func=cmd_lease_end)
+
+    abandon = sub.add_parser(
+        "lease-abandon",
+        help="close a stopped ordinary lease without mutating guests or host",
+    )
+    abandon.add_argument("--lease", required=True)
+    abandon.add_argument("--confirm", action="store_true")
+    abandon.set_defaults(func=cmd_lease_abandon)
 
     cleanup = sub.add_parser("cleanup-expired")
     cleanup.add_argument("--all", action="store_true")

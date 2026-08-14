@@ -682,6 +682,143 @@ class ProxmoxLabTests(unittest.TestCase):
             finally:
                 LAB.LEASE_ROOT = old_lease_root
 
+    def test_lease_abandon_closes_stopped_ordinary_lease_without_mutation(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root, old_lock = LAB.LEASE_ROOT, LAB.LOCK_PATH
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            try:
+                lease_id = "20260811120000-stale01"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "session",
+                    "resources": [
+                        {"kind": "qemu", "vmid": 9201, "policy": "delete"},
+                    ],
+                })
+                api = mock.Mock()
+                api.reachable.return_value = True
+                api.call.return_value = {"status": "stopped"}
+                args = LAB.parser().parse_args([
+                    "lease-abandon", "--lease", lease_id, "--confirm",
+                ])
+                stdout = io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                        mock.patch.object(LAB, "audit") as audit, \
+                        contextlib.redirect_stdout(stdout):
+                    LAB.cmd_lease_abandon(args)
+                final = LAB.load_lease(lease_id, active=False)
+                self.assertEqual(final["state"], "closed")
+                self.assertEqual(
+                    final["abandoned_reason"],
+                    "registered guests verified stopped; no guest or host mutation",
+                )
+                self.assertEqual(
+                    api.call.call_args_list,
+                    [mock.call(
+                        "GET",
+                        f"/nodes/{LAB.NODE}/qemu/9201/status/current",
+                    )],
+                )
+                audit.assert_called_once_with(
+                    "lease-abandon",
+                    lease=lease_id,
+                    stopped=["qemu/9201"],
+                    missing=[],
+                    reason=final["abandoned_reason"],
+                )
+                result = LAB.json.loads(stdout.getvalue())
+                self.assertEqual(result["guests_verified_stopped"], ["qemu/9201"])
+                self.assertFalse(result["guest_mutation"])
+                self.assertFalse(result["host_mutation"])
+                self.assertTrue(result["audit_recorded"])
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH = old_root, old_lock
+
+    def test_lease_abandon_refuses_long_term_or_running_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root, old_lock = LAB.LEASE_ROOT, LAB.LOCK_PATH
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            try:
+                for kind, status in (("long-term", None), ("session", "running")):
+                    with self.subTest(kind=kind, status=status):
+                        lease_id = (
+                            "20260811120000-longterm"
+                            if kind == "long-term"
+                            else "20260811120000-running1"
+                        )
+                        LAB.save_lease({
+                            "id": lease_id,
+                            "state": "active",
+                            "kind": kind,
+                            "resources": [
+                                {"kind": "qemu", "vmid": 9202, "policy": "delete"},
+                            ],
+                        })
+                        api = mock.Mock()
+                        api.reachable.return_value = True
+                        api.call.return_value = {"status": status}
+                        args = LAB.parser().parse_args([
+                            "lease-abandon", "--lease", lease_id, "--confirm",
+                        ])
+                        with mock.patch.object(
+                            LAB, "ProxmoxAPI", return_value=api
+                        ), self.assertRaises(LAB.LabError):
+                            LAB.cmd_lease_abandon(args)
+                        self.assertEqual(
+                            LAB.load_lease(lease_id, active=False)["state"],
+                            "active",
+                        )
+                        if kind == "long-term":
+                            api.reachable.assert_not_called()
+                        else:
+                            api.call.assert_called_once()
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH = old_root, old_lock
+
+    def test_lease_abandon_reports_audit_failure_after_closing_lease(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root, old_lock = LAB.LEASE_ROOT, LAB.LOCK_PATH
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            try:
+                lease_id = "20260811120000-audit001"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "session",
+                    "resources": [],
+                })
+                api = mock.Mock()
+                api.reachable.return_value = True
+                args = LAB.parser().parse_args([
+                    "lease-abandon", "--lease", lease_id, "--confirm",
+                ])
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                        mock.patch.object(
+                            LAB, "audit", side_effect=LAB.LabError("audit denied")
+                        ), contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(stderr):
+                    LAB.cmd_lease_abandon(args)
+                self.assertEqual(
+                    LAB.load_lease(lease_id, active=False)["state"], "closed"
+                )
+                result = LAB.json.loads(stdout.getvalue())
+                self.assertFalse(result["audit_recorded"])
+                self.assertEqual(result["audit_error"], "audit denied")
+                self.assertIn("could not be recorded: audit denied", stderr.getvalue())
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH = old_root, old_lock
+
     def test_delete_guest_treats_already_gone_as_success(self) -> None:
         api = mock.Mock()
         api.call.side_effect = LAB.LabError(

@@ -25,6 +25,7 @@ FORBIDDEN_PATHS = {
 }
 FORBIDDEN_PREFIXES = ("journal/", "runtime/")
 HOME_PATH = re.compile(r"/(?:Users|home)/[^/\s]+/")
+LOW_SPECIFICITY_NODE = re.compile(r"[a-z]+")
 SITE_FIELDS = {
     "proxmox": ("host", "node"),
     "power": ("mac", "home_assistant_url"),
@@ -56,6 +57,15 @@ def config_candidates(root: Path) -> list[Path]:
     return candidates
 
 
+def is_low_specificity_node(section: str, key: str, value: str) -> bool:
+    """Return whether a node value is too generic to identify a local site."""
+    return (
+        section == "proxmox"
+        and key == "node"
+        and LOW_SPECIFICITY_NODE.fullmatch(value) is not None
+    )
+
+
 def site_markers(root: Path) -> list[tuple[str, str]]:
     for path in config_candidates(root):
         if not path.is_file():
@@ -72,7 +82,11 @@ def site_markers(root: Path) -> list[tuple[str, str]]:
                 continue
             for key in keys:
                 value = table.get(key)
-                if isinstance(value, str) and len(value.strip()) >= 5:
+                if (
+                    isinstance(value, str)
+                    and len(value.strip()) >= 5
+                    and not is_low_specificity_node(section, key, value.strip())
+                ):
                     markers.append((f"[{section}] {key}", value.strip()))
         return markers
     return []

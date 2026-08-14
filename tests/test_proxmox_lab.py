@@ -450,6 +450,71 @@ class ProxmoxLabTests(unittest.TestCase):
                 api.call.assert_called_once_with(
                     "GET", "/cluster/resources", {"type": "vm"}
                 )
+    def test_pocketbase_audit_token_rejection_names_secret_refresh(self) -> None:
+        rejected = LAB.pocketbase_module.PocketBaseError(
+            "PocketBase HTTP 403: Only superusers can perform this action.",
+            status=403,
+        )
+        audit_config = LAB.config_module.Section(
+            "audit",
+            {
+                **LAB.CONFIG.audit.as_dict(),
+                "pocketbase_token_secret": "audit-refresh",
+            },
+        )
+        with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
+             mock.patch.object(LAB.CONFIG, "audit", audit_config), \
+             mock.patch.object(LAB, "pocketbase_client"), \
+             mock.patch.object(
+                 LAB.journal_module, "append", side_effect=rejected,
+             ):
+            with self.assertRaises(LAB.LabError) as caught:
+                LAB.audit("lease-begin")
+
+        self.assertEqual(
+            str(caught.exception),
+            "audit ledger rejected the event: PocketBase HTTP 403 (the stored "
+            "audit token is invalid or expired). Refresh it with: "
+            "proxmox-lab secrets set audit-refresh",
+        )
+
+    def test_cmd_api_reports_success_when_its_audit_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260811120000-audit01"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "standard",
+                    "resources": [],
+                    "initial_vmids": [],
+                })
+                path = f"/nodes/{LAB.NODE}/qemu/9090/status/start"
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease_id, "--method", "POST",
+                    "--path", path,
+                ])
+                api = mock.Mock()
+                audit_error = LAB.LabError(
+                    "audit ledger rejected the event: PocketBase HTTP 401 "
+                    "(the stored audit token is invalid or expired). Refresh "
+                    "it with: proxmox-lab secrets set audit-token"
+                )
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "audit", side_effect=audit_error):
+                    with self.assertRaises(LAB.LabError) as caught:
+                        LAB.cmd_api(args)
+
+                api.call.assert_called_once_with("POST", path, {})
+                self.assertEqual(
+                    str(caught.exception),
+                    "Proxmox write succeeded, but its audit event was not "
+                    f"recorded: {audit_error}",
+                )
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
 
     def test_cmd_api_create_registers_under_lock_with_reloaded_lease(self) -> None:
         """A registration racing the create must survive: cmd_api reloads the

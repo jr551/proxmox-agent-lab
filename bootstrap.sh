@@ -49,7 +49,7 @@ done
 
 VENV="${TMPDIR:-/tmp}/proxmox-agent-lab-env"
 BIN="$VENV/bin/proxmox-lab"
-REQUIRED_VERSION="0.5.2"
+REQUIRED_VERSION="0.5.3"
 CHECK_STAMP="${XDG_STATE_HOME:-$HOME/.local/state}/proxmox-agent-lab/github-update-check.json"
 LATEST_TAG=""
 CHECK_DUE=1

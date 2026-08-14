@@ -4,6 +4,39 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.5.3 - 2026-08-14
+
+### Added
+
+- `android-x86` recipe (`proxmox-lab recipe android-x86`): installs the
+  android-x86 project's own OS as a real QEMU guest, distinct from `android
+  create`'s SDK emulator, for testing that need a genuine device network
+  stack -- most commonly, driving Android's own proxy settings from an
+  external tool. Verified live end-to-end, including
+  `adb shell settings put global http_proxy` actually redirecting device
+  traffic to an external listener.
+- `console screenshot-burst`: captures several screenshots over time
+  (default 6 over about a minute) and stitches them into one labeled PNG,
+  for watching a progress bar, installer copy step, or boot animation
+  without a manual sleep-then-screenshot loop.
+- `console has-gui-locked-up` / `console has-terminal-locked-up`: best-effort
+  liveness probes. The GUI check moves the pointer and diffs the screen
+  before/after; the terminal check samples a text console over ~2 seconds
+  and checks for any change (a live cursor normally blinks on its own).
+  Both use the existing pixel-diff helper -- no cloud vision call -- and
+  report a caveat alongside the verdict rather than a bare bool.
+
+### Fixed
+
+- `pocketbase-host-setup.sh` and `minio-host-setup.sh` now set `--onboot 1`
+  on the LXC they create, so an audit backend or S3 bucket hosted on the
+  lab host itself comes back after the host powers off between leases --
+  previously nothing would restart it.
+- `ensure_on()` now tolerates its own audit backend being briefly
+  unreachable right after waking the host (an onboot LXC starting
+  alongside it), retrying for up to 30s before warning and continuing,
+  instead of failing the power-on itself.
+
 ## 0.5.2 - 2026-08-14
 
 ### Added

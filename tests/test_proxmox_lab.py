@@ -682,6 +682,55 @@ class ProxmoxLabTests(unittest.TestCase):
         with self.assertRaises(LAB.LabError):
             LAB.delete_guest(api, "qemu", 9101)
 
+    def test_lease_end_retries_without_unreferenced_disks_on_storage_io_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260814120000-storage38"
+                LAB.save_lease({
+                    "id": lease_id, "state": "active", "kind": "session",
+                    "created_at": LAB.iso_now(),
+                    "resources": [{"kind": "qemu", "vmid": 9038}],
+                    "initial_vmids": [],
+                })
+                delete_data: list[dict[str, int]] = []
+                api = mock.Mock()
+                api.reachable.return_value = True
+
+                def call(method, path, data=None):
+                    if path.endswith("/status/current"):
+                        return {"status": "stopped"}
+                    if method == "DELETE":
+                        delete_data.append(data)
+                        if data.get("destroy-unreferenced-disks"):
+                            raise LAB.LabError(
+                                "failed to create content directory "
+                                "'/mnt/pve/offline/dump': Input/output error"
+                            )
+                        return "UPID:delete-without-unreferenced-disks"
+                    self.fail(f"unexpected Proxmox API call: {method} {path}")
+
+                api.call.side_effect = call
+                args = LAB.parser().parse_args(["lease-end", "--lease", lease_id])
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "wait_task"), \
+                     mock.patch.object(LAB, "shutdown_host", return_value=True) as shutdown, \
+                     mock.patch.object(LAB, "audit"):
+                    LAB.cmd_lease_end(args)
+
+                self.assertEqual(
+                    delete_data,
+                    [
+                        {"purge": 1, "destroy-unreferenced-disks": 1},
+                        {"purge": 1},
+                    ],
+                )
+                self.assertEqual(LAB.load_lease(lease_id, active=False)["state"], "closed")
+                shutdown.assert_called_once_with(api)
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
+
     def test_running_guest_vmids_filters_to_running_status(self) -> None:
         api = mock.Mock()
         api.call.return_value = [

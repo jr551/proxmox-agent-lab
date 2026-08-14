@@ -64,6 +64,12 @@ normally.
 
 ## S3 scratch bucket
 
+Don't have an S3-compatible bucket yet? `install.sh` can provision one for
+you: choose the `lxc` S3 backend and it prints a root-only
+`minio-host-setup.sh` command that creates a minimal, unprivileged MinIO LXC
+(S3 API only, no browser console) on the Proxmox host, along with the
+bucket and an access key. See [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox).
+
 ## Bucket
 
 | Item | Value |

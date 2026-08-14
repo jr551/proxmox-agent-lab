@@ -140,7 +140,9 @@ scanner can flag all of them without exceptions.
 ## `[s3]`
 
 Optional scratch bucket for moving files in and out of guests. Any
-S3-compatible service works — MinIO, Garage, Backblaze, AWS.
+S3-compatible service works — MinIO, Garage, Backblaze, AWS. No bucket yet?
+`install.sh`'s `lxc` S3 backend provisions a minimal MinIO LXC on the Proxmox
+host for you — see [storage.md](storage.md#s3-scratch-bucket).
 
 | Key | Meaning |
 |---|---|

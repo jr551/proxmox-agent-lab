@@ -117,8 +117,9 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/instal
 ```
 
 It installs the isolated CLI where `pipx` is available, asks for the Proxmox
-address, node, API-token identity, power details, and audit backend, stores
-secrets in the OS keyring, writes a mode-600 config, and runs `doctor`.
+address, node, API-token identity, power details, audit backend, and S3
+scratch bucket, stores secrets in the OS keyring, writes a mode-600 config,
+and runs `doctor`.
 Re-run it with `--configure` to safely replace configuration answers:
 
 ```sh
@@ -151,17 +152,43 @@ impersonation token for each controller. Re-run controller setup, select
 `existing`, enter the printed API URL, and enter that controller's token at
 the hidden local prompt.
 
+### Optional: host MinIO on Proxmox
+
+The S3 scratch bucket (see [storage.md](storage.md#s3-scratch-bucket)) moves
+files in and out of guests. If you don't already run an S3-compatible
+service, the installer can point you at one it creates for you. When it asks
+for the S3 backend, choose `lxc`. It prints this command to run **as root on
+the Proxmox host**:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-host-setup.sh | bash
+```
+
+The host script asks for an LXC ID, storage, bridge, IP configuration, disk
+size, bucket name, and access key. It creates a persistent unprivileged
+Debian LXC, installs a single-binary MinIO server as a restricted systemd
+service (S3 API only — the browser console is disabled), creates the bucket,
+and prints the endpoint, bucket, region, and credentials.
+
+The service is HTTP for a trusted LAN; do not port-forward it. Put a TLS
+reverse proxy in front of it before access from an untrusted network. Re-run
+controller setup, select `existing`, enter the printed endpoint, bucket and
+region, and enter the printed access key and secret key at their hidden
+local prompts.
+
 ### Copy this as the first message to your installation agent
 
 ```text
 Install proxmox-agent-lab as a first-stage task. First ask me only for the
 non-secret setup choices: Proxmox address, node, API-token user and name,
-power method, and whether audit storage should be SQLite, JSONL, an existing
-PocketBase service, or a new PocketBase LXC on the Proxmox host. Never ask me
-to paste a token or password into chat, config, command arguments, or an
-environment variable. Run the project’s guided install.sh locally so its
-hidden prompts store secrets only in the OS keyring, then run
-`proxmox-lab doctor` and report every remaining issue exactly.
+power method, whether audit storage should be SQLite, JSONL, an existing
+PocketBase service, or a new PocketBase LXC on the Proxmox host, and whether
+the S3 scratch bucket should be skipped, an existing bucket, or a new MinIO
+LXC on the Proxmox host. Never ask me to paste a token or password into chat,
+config, command arguments, or an environment variable. Run the project’s
+guided install.sh locally so its hidden prompts store secrets only in the OS
+keyring, then run `proxmox-lab doctor` and report every remaining issue
+exactly.
 
 If I choose a new PocketBase LXC, show me the root-only
 `pocketbase-host-setup.sh` command and wait for me to run it on the Proxmox
@@ -171,6 +198,13 @@ controller setup, create/validate the private audit collection, and report
 the connection details another controller needs: API URL, collection name,
 and the instruction to create a separate nonrenewable PocketBase
 impersonation token for that controller.
+
+If I choose a new MinIO LXC, show me the root-only `minio-host-setup.sh`
+command and wait for me to run it on the Proxmox host. Do not expose the S3
+port to the Internet or change host firewall rules. After I provide the
+resulting trusted-LAN endpoint, bucket, region, access key, and secret key,
+finish the controller setup and confirm both secrets landed in the OS
+keyring, never in chat, config, or command arguments.
 ```
 
 

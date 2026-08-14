@@ -175,6 +175,16 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocket
 Keep the default HTTP service on a trusted LAN; place it behind TLS before
 access from an untrusted network.
 
+**No S3 bucket for guest file transfer?** Run this as root on Proxmox. It
+creates a persistent unprivileged LXC running a minimal MinIO server
+(S3 API only, no browser console), a bucket, and an access key:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-host-setup.sh | bash
+```
+
+Same rule applies: trusted LAN only, TLS in front for anything else.
+
 **You need:** a spare PC running [Proxmox VE](https://www.proxmox.com) 8 or 9,
 and Python 3.11+ to drive it from. Wake-on-LAN is the default power-on and
 needs only the NIC's MAC address.

@@ -12,6 +12,9 @@
 #   PXL_TOKEN_NAME=lab PXL_TOKEN_SECRET=... PXL_MAC=aa:bb:.. ./install.sh --yes
 #   PXL_AUDIT_BACKEND=pocketbase PXL_PB_URL=https://pb.example \
 #   PXL_PB_TOKEN_SECRET=... ./install.sh --yes
+#   PXL_S3_BACKEND=existing PXL_S3_ENDPOINT=https://s3.example \
+#   PXL_S3_BUCKET=lab-scratch PXL_S3_KEY_ID_SECRET=... \
+#   PXL_S3_SECRET_KEY_SECRET=... ./install.sh --yes
 
 set -euo pipefail
 
@@ -157,6 +160,29 @@ if [ "$CONFIGURE" -eq 1 ]; then
         ask PB_COLLECTION "PocketBase audit collection" "proxmox_lab_events"
         ask PB_TOKEN_NAME "Secret-store name for the PocketBase token" "audit-token"
     fi
+    ask_choice S3_BACKEND \
+        "S3 scratch bucket for guest file transfer (none, existing, or lxc)" "none" \
+        none existing lxc
+    S3_ENDPOINT=""
+    S3_BUCKET=""
+    S3_REGION="us-east-1"
+    if [ "$S3_BACKEND" = "lxc" ]; then
+        say ""
+        say "  Run this once as root on the Proxmox host. It creates an"
+        say "  unprivileged MinIO LXC (S3 API only, no browser console),"
+        say "  a bucket, and an access key; it prints the endpoint when"
+        say "  finished:"
+        say ""
+        say "  curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-host-setup.sh | bash"
+        say ""
+        die "re-run this controller setup with the printed MinIO endpoint and bucket"
+    elif [ "$S3_BACKEND" = "existing" ]; then
+        ask S3_ENDPOINT "S3 endpoint (https://...)" ""
+        [ -n "$S3_ENDPOINT" ] || die "an S3 endpoint is required for the existing backend"
+        ask S3_BUCKET "Bucket name" ""
+        [ -n "$S3_BUCKET" ] || die "a bucket name is required for the existing backend"
+        ask S3_REGION "Region" "us-east-1"
+    fi
 
     BROADCAST="255.255.255.255"
     if [ -n "$HOST" ]; then
@@ -167,9 +193,11 @@ if [ "$CONFIGURE" -eq 1 ]; then
     mkdir -p "$(dirname "$CONFIG")"
     [ -f "$CONFIG" ] || "$BIN" init --path "$CONFIG" >/dev/null
     "$PYTHON" - "$CONFIG" "$HOST" "$NODE" "$TOKEN_USER" "$TOKEN_NAME" "$MAC" \
-        "$BROADCAST" "$AUDIT_BACKEND" "$PB_URL" "$PB_COLLECTION" "$PB_TOKEN_NAME" <<'PY'
+        "$BROADCAST" "$AUDIT_BACKEND" "$PB_URL" "$PB_COLLECTION" "$PB_TOKEN_NAME" \
+        "$S3_ENDPOINT" "$S3_BUCKET" "$S3_REGION" <<'PY'
 import json, pathlib, re, sys
-path, host, node, tuser, tname, mac, bcast, backend, pb_url, pb_collection, pb_secret = sys.argv[1:12]
+(path, host, node, tuser, tname, mac, bcast, backend, pb_url, pb_collection,
+ pb_secret, s3_endpoint, s3_bucket, s3_region) = sys.argv[1:15]
 text = pathlib.Path(path).read_text()
 
 def setkey(text, section, key, value, required=False):
@@ -200,6 +228,11 @@ if backend == "pocketbase":
     text = setkey(text, "audit", "pocketbase_url", pb_url, required=True)
     text = setkey(text, "audit", "pocketbase_collection", pb_collection, required=True)
     text = setkey(text, "audit", "pocketbase_token_secret", pb_secret, required=True)
+if s3_endpoint:
+    text = setkey(text, "s3", "enabled", True, required=True)
+    text = setkey(text, "s3", "endpoint", s3_endpoint, required=True)
+    text = setkey(text, "s3", "bucket", s3_bucket, required=True)
+    text = setkey(text, "s3", "region", s3_region, required=True)
 pathlib.Path(path).write_text(text)
 PY
     chmod 600 "$CONFIG"
@@ -261,6 +294,52 @@ if [ "${AUDIT_BACKEND:-}" = "pocketbase" ]; then
         fi
     else
         warn "no PocketBase token provided -- run 'proxmox-lab secrets set $PB_TOKEN_NAME'"
+    fi
+fi
+
+# ---------------------------------------------------------------- s3 bucket ---
+if [ "${S3_BACKEND:-}" = "existing" ]; then
+    step "S3 credentials"
+    S3_KEY_ID_VALUE="${PXL_S3_KEY_ID_SECRET:-}"
+    if "$BIN" secrets list 2>/dev/null | grep -q '"s3-key-id": true'; then
+        say "  ${DIM}already stored in your keyring${RESET}"
+    elif [ -n "$S3_KEY_ID_VALUE" ]; then
+        if printf '%s\n' "$S3_KEY_ID_VALUE" \
+             | "$BIN" secrets set s3-key-id --stdin >/dev/null 2>&1; then
+            say "  ${GREEN}stored${RESET}"
+        else
+            keyring_unavailable s3-key-id
+        fi
+    elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+        say "  ${DIM}The access key ID for your S3-compatible bucket.${RESET}"
+        if "$BIN" secrets set s3-key-id; then
+            say "  ${GREEN}stored${RESET}"
+        else
+            keyring_unavailable s3-key-id
+        fi
+    else
+        warn "no S3 key ID provided -- run 'proxmox-lab secrets set s3-key-id'"
+    fi
+
+    S3_SECRET_KEY_VALUE="${PXL_S3_SECRET_KEY_SECRET:-}"
+    if "$BIN" secrets list 2>/dev/null | grep -q '"s3-secret-key": true'; then
+        say "  ${DIM}already stored in your keyring${RESET}"
+    elif [ -n "$S3_SECRET_KEY_VALUE" ]; then
+        if printf '%s\n' "$S3_SECRET_KEY_VALUE" \
+             | "$BIN" secrets set s3-secret-key --stdin >/dev/null 2>&1; then
+            say "  ${GREEN}stored${RESET}"
+        else
+            keyring_unavailable s3-secret-key
+        fi
+    elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+        say "  ${DIM}The secret key for your S3-compatible bucket; kept only in your OS keyring.${RESET}"
+        if "$BIN" secrets set s3-secret-key; then
+            say "  ${GREEN}stored${RESET}"
+        else
+            keyring_unavailable s3-secret-key
+        fi
+    else
+        warn "no S3 secret key provided -- run 'proxmox-lab secrets set s3-secret-key'"
     fi
 fi
 

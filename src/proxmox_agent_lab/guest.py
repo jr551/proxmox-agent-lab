@@ -224,6 +224,18 @@ class GuestSession:
         output, code = self._terminal().run_status(command, timeout=timeout)
         return CommandResult(stdout=output, exit_code=code, channel="serial")
 
+    def run_argv(self, command: list[str], timeout: int = 300) -> CommandResult:
+        """Run an argv vector without re-parsing it on the agent channel."""
+        if self.channel == "agent":
+            result = console.agent_exec(
+                self.lab, self.api, self.vmid, command, timeout=timeout,
+            )
+            return CommandResult(
+                stdout=result["stdout"], stderr=result["stderr"],
+                exit_code=result["exitcode"], channel="agent",
+            )
+        return self.run(shlex.join(command), timeout=timeout)
+
     def read_screen(self) -> dict[str, Any]:
         """Capture the screen. Works even when no command channel does."""
         if not self.capabilities.graphical_console:
@@ -569,18 +581,19 @@ def cmd_run(lab: Any, args: Any) -> None:
     lab.load_lease(args.lease)
     password = sys.stdin.readline().rstrip("\r\n") if args.password_stdin else None
     if args.detach:
-        command = " ".join(args.command)
+        command = shlex.join(args.command)
         token = secrets.token_hex(4)
         log = f"/tmp/grun-{token}.log"
-        # nohup so the process survives agent/console disconnects; the inner
-        # sh records its own exit code into the log for 'guest wait'.
+        # Keep the operator's argv as positional parameters. This lets nohup
+        # execute it directly instead of re-parsing a reconstructed shell line.
         script = (
-            f"nohup sh -c '({command}) > {shlex.quote(log)} 2>&1; "
-            f"echo {GRUN_EXIT_MARK}:$? >> {shlex.quote(log)}' "
+            f"(nohup \"$@\" > {shlex.quote(log)} 2>&1; "
+            f"echo {GRUN_EXIT_MARK}:$? >> {shlex.quote(log)}) "
             ">/dev/null 2>&1 & echo $!"
         )
         result = console.agent_exec(
-            lab, api, args.vmid, ["/bin/sh", "-c", script],
+            lab, api, args.vmid, ["/bin/sh", "-c", script, "guest-run",
+                                  *args.command],
             timeout=args.timeout,
         )
         if result["exitcode"] not in (0, None):
@@ -602,7 +615,7 @@ def cmd_run(lab: Any, args: Any) -> None:
     try:
         with GuestSession(lab, api, args.vmid, user=args.user,
                           password=password, prefer=args.prefer) as guest:
-            result = guest.run(" ".join(args.command), timeout=args.timeout)
+            result = guest.run_argv(args.command, timeout=args.timeout)
             payload = {"vmid": args.vmid, **result.as_dict()}
     except GuestError as exc:
         raise lab.LabError(str(exc)) from None

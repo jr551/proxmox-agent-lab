@@ -398,6 +398,35 @@ class ProxmoxLabTests(unittest.TestCase):
             finally:
                 LAB.LEASE_ROOT = old_root
 
+    def test_lease_begin_rolls_back_saved_lease_when_audit_fails(self) -> None:
+        import contextlib
+        import io
+
+        args = LAB.parser().parse_args(["lease-begin", "--purpose", "rollback"])
+        audit_error = LAB.LabError("audit backend rejected the event")
+        api = mock.Mock()
+        api.call.return_value = []
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            lease_root = state_root / "leases"
+            with mock.patch.object(LAB, "STATE_ROOT", state_root), \
+                 mock.patch.object(LAB, "LEASE_ROOT", lease_root), \
+                 mock.patch.object(LAB, "LOCK_PATH", state_root / "controller.lock"), \
+                 mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                 mock.patch.object(LAB, "ensure_on", return_value=False), \
+                 mock.patch.object(LAB.secrets, "token_hex", return_value="deadbeef"), \
+                 mock.patch.object(LAB, "audit", side_effect=audit_error), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(LAB.LabError) as caught:
+                    LAB.cmd_lease_begin(args)
+
+                self.assertIs(caught.exception, audit_error)
+                self.assertEqual(LAB.active_leases(), [])
+                self.assertEqual(list(lease_root.glob("*.json")), [])
+                api.call.assert_called_once_with(
+                    "GET", "/cluster/resources", {"type": "vm"}
+                )
+
     def test_cmd_api_create_registers_under_lock_with_reloaded_lease(self) -> None:
         """A registration racing the create must survive: cmd_api reloads the
         lease inside controller_lock instead of saving the stale snapshot."""

@@ -280,8 +280,20 @@ def agent_exec(lab: Any, api: Any, vmid: int, command: list[str], *,
                 raw = status.get(field, "")
                 return raw if isinstance(raw, str) else ""
 
+            exitcode = status.get("exitcode")
+            signal = status.get("signal")
+            if exitcode is None and signal is not None:
+                # qemu-guest-agent reports either exitcode or signal, never
+                # both. Every caller checks `exitcode not in (0, None)` to
+                # decide success -- leaving this as None would make a
+                # signal-killed process (OOM, crash, an external kill) look
+                # like the "no code available" case serial legitimately
+                # has, instead of the failure it actually is. 128+signal is
+                # the standard shell convention for "killed by signal N".
+                exitcode = 128 + int(signal)
             return {
-                "exitcode": status.get("exitcode"),
+                "exitcode": exitcode,
+                "signal": signal,
                 "stdout": decode("out-data"),
                 "stderr": decode("err-data"),
                 "truncated": bool(

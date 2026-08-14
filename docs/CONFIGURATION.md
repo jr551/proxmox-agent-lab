@@ -77,6 +77,24 @@ For a smart plug or a KVM that presses the power button.
 
 Store the token: `proxmox-lab secrets set home-assistant-token`.
 
+### `wake-on-lan+home-assistant`
+
+Sends the magic packet and triggers the Home Assistant script together on
+every power-on — useful when WoL alone isn't reliable enough to trust by
+itself (a NIC that occasionally drops the setting, a flaky BIOS) but a
+smart-plug/KVM fallback is also available. Takes every key from both modes
+above. Force-off still goes through Home Assistant, since WoL cannot cut
+power.
+
+```toml
+mode = "wake-on-lan+home-assistant"
+mac = "aa:bb:cc:dd:ee:ff"
+broadcast = "192.168.1.255"
+home_assistant_url = "https://homeassistant.example"
+entity_on = "script.lab_power_on"
+entity_off = "script.lab_force_off"
+```
+
 ### `command`
 
 Anything with a CLI — IPMI, a PDU, a cloud API.

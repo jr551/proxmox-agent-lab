@@ -91,6 +91,50 @@ class PocketBaseTests(unittest.TestCase):
         self.assertEqual([record for record, _ in imported], source_records)
         self.assertNotEqual(imported[0][1], imported[1][1])
 
+    def test_summary_reports_edge_timestamps_and_a_labeled_sample(self) -> None:
+        calls: list[str] = []
+
+        def opener(req: object, *, timeout: float) -> _Response:
+            url = req.full_url  # type: ignore[attr-defined]
+            calls.append(url)
+            query = parse_qs(urlparse(url).query)
+            sort = query.get("sort", [""])[0]
+            per_page = query.get("perPage", [""])[0]
+            if query.get("skipTotal") == ["false"]:
+                return _Response({"items": [], "totalItems": 3})
+            if per_page == "1" and sort == "timestamp":
+                return _Response({"items": [
+                    {"data": {"timestamp": "2026-08-01T00:00:00Z"}},
+                ]})
+            if per_page == "1" and sort == "-timestamp":
+                return _Response({"items": [
+                    {"data": {"timestamp": "2026-08-14T00:00:00Z"}},
+                ]})
+            # the recent-sample query (perPage == sample size) for most_common
+            return _Response({"items": [
+                {"data": {"event": "lease-begin"}},
+                {"data": {"event": "lease-begin"}},
+                {"data": {"event": "lease-end"}},
+            ]})
+
+        client = pocketbase.Client("https://pb.example", "test-token", "events", opener=opener)
+        result = client.summary()
+        self.assertEqual(result["events"], 3)
+        self.assertEqual(result["first_event"], "2026-08-01T00:00:00Z")
+        self.assertEqual(result["last_event"], "2026-08-14T00:00:00Z")
+        self.assertEqual(result["most_common_sample_size"], 3)
+        self.assertEqual(result["most_common"], {"lease-begin": 2, "lease-end": 1})
+
+    def test_summary_on_an_empty_collection_skips_the_edge_queries(self) -> None:
+        def opener(req: object, *, timeout: float) -> _Response:
+            return _Response({"items": [], "totalItems": 0})
+
+        client = pocketbase.Client("https://pb.example", "test-token", "events", opener=opener)
+        result = client.summary()
+        self.assertEqual(result, {
+            "backend": "pocketbase", "collection": "events", "events": 0,
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

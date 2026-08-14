@@ -581,6 +581,29 @@ class SerialSessionTests(unittest.TestCase):
         self.assertEqual(result["stdout"], "1786125185\n")
         self.assertEqual(result["exitcode"], 0)
 
+    def test_a_signal_killed_process_is_never_reported_as_exitcode_none(self) -> None:
+        """qemu-guest-agent reports either exitcode or signal, never both.
+
+        Every caller decides success with `exitcode not in (0, None)`. If a
+        signal-killed process (OOM, crash, an external kill) came back as
+        exitcode None, it would look exactly like the "no code available"
+        case the serial channel legitimately has, instead of the failure it
+        actually is.
+        """
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.NODE = "testnode"
+        api = mock.Mock()
+        api.call.side_effect = [
+            {"pid": 1},
+            {"exited": 1, "signal": 9, "out-data": "", "err-data": ""},
+        ]
+        result = lab_console.agent_exec(lab, api, 9000, ["sleep", "300"])
+        self.assertEqual(result["signal"], 9)
+        self.assertNotIn(result["exitcode"], (0, None))
+        self.assertEqual(result["exitcode"], 137)
+
     def test_send_line_declares_byte_length_not_character_length(self) -> None:
         from proxmox_agent_lab import console as lab_console
 

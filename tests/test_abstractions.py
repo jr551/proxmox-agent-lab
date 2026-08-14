@@ -117,6 +117,60 @@ class PowerTests(unittest.TestCase):
             power_module.power_on(config)
         self.assertIn("switch the machine on yourself", str(caught.exception))
 
+    def _composite_config(self, tmp: str) -> "config_module.Config":
+        path = Path(tmp) / "c.toml"
+        path.write_text(
+            '[power]\nmode = "wake-on-lan+home-assistant"\n'
+            'mac = "aa:bb:cc:dd:ee:ff"\nbroadcast = "192.168.1.255"\n'
+            'home_assistant_url = "https://ha.example"\n'
+            'entity_on = "script.lab_power_on"\n'
+            'entity_off = "script.lab_force_off"\n'
+        )
+        return config_module.load(path)
+
+    def test_composite_mode_sends_both_wol_and_home_assistant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+        with mock.patch.object(power_module, "wake_on_lan") as wol, \
+             mock.patch.object(power_module, "_home_assistant") as ha:
+            result = power_module.power_on(config)
+        wol.assert_called_once_with("aa:bb:cc:dd:ee:ff", "192.168.1.255", 9)
+        ha.assert_called_once_with(config, "script.lab_power_on")
+        self.assertEqual(result["mode"], "wake-on-lan+home-assistant")
+        self.assertIsNone(result["errors"])
+
+    def test_composite_mode_survives_one_path_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+        with mock.patch.object(power_module, "wake_on_lan",
+                                side_effect=power_module.PowerError("boom")), \
+             mock.patch.object(power_module, "_home_assistant") as ha:
+            result = power_module.power_on(config)
+        ha.assert_called_once()
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("wake-on-lan: boom", result["errors"][0])
+
+    def test_composite_mode_raises_only_if_both_paths_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+        with mock.patch.object(power_module, "wake_on_lan",
+                                side_effect=power_module.PowerError("wol down")), \
+             mock.patch.object(power_module, "_home_assistant",
+                                side_effect=power_module.PowerError("ha down")):
+            with self.assertRaises(power_module.PowerError) as caught:
+                power_module.power_on(config)
+        self.assertIn("wol down", str(caught.exception))
+        self.assertIn("ha down", str(caught.exception))
+
+    def test_composite_mode_force_off_goes_through_home_assistant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+        self.assertTrue(power_module.can_force_off(config))
+        with mock.patch.object(power_module, "_home_assistant") as ha:
+            result = power_module.force_off(config)
+        ha.assert_called_once_with(config, "script.lab_force_off")
+        self.assertEqual(result["mode"], "wake-on-lan+home-assistant")
+
 
 class SecretsTests(unittest.TestCase):
     def test_env_backend_reads_the_namespaced_variable(self) -> None:

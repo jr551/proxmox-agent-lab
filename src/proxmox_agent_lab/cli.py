@@ -498,11 +498,22 @@ def stop_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
 
 
 def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
-    upid = api.call(
-        "DELETE",
-        f"/nodes/{NODE}/{kind}/{vmid}",
-        {"purge": 1, "destroy-unreferenced-disks": 1},
-    )
+    try:
+        upid = api.call(
+            "DELETE",
+            f"/nodes/{NODE}/{kind}/{vmid}",
+            {"purge": 1, "destroy-unreferenced-disks": 1},
+        )
+    except LabError as exc:
+        # Already gone -- a prior run (or a manual removal) beat us to it.
+        # Proxmox reports this as a 404, or as a 500 whose body says the
+        # config file itself does not exist; either way there is nothing
+        # left to delete, so this is success, not a cleanup failure.
+        if "HTTP 404" in str(exc) or (
+            "HTTP 500" in str(exc) and "does not exist" in str(exc)
+        ):
+            return
+        raise
     wait_task(api, upid, timeout=180)
 
 
@@ -534,11 +545,32 @@ def lease_requires_cleanup(lease: dict[str, Any]) -> bool:
     )
 
 
+def running_guest_vmids(api: ProxmoxAPI) -> list[int]:
+    """VMIDs currently running on the node, lease or no lease.
+
+    A guest can exist outside any lease's tracked resources -- a persistent
+    builder kept alive on purpose across sessions (see 'guest template' /
+    'guest clone'), or one a caller drove directly by VMID. The decision to
+    power off the host must not rely on lease bookkeeping alone, or a guest
+    like that gets the host pulled out from under it.
+    """
+    resources = api.call("GET", "/cluster/resources", {"type": "vm"}) or []
+    return sorted(
+        int(item["vmid"]) for item in resources
+        if isinstance(item, dict) and item.get("status") == "running"
+    )
+
+
 def shutdown_host(api: ProxmoxAPI) -> bool:
     """Shut the lab machine down and confirm it actually went off."""
     if not api.reachable():
         audit("lab-power-off-already-verified", host=HOST, node=NODE)
         return True
+    running = running_guest_vmids(api)
+    if running:
+        audit("lab-power-off-blocked-by-running-guest", host=HOST, node=NODE,
+              vmids=running, sync=False)
+        return False
     try:
         task = api.call("POST", f"/nodes/{NODE}/status", {"command": "shutdown"})
         audit("lab-graceful-shutdown-requested", node=NODE, task_id=task,
@@ -1065,6 +1097,20 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
         )
         result["to_power_off"] = "destroy them with 'lease-destroy', or "\
             "stop the host yourself"
+    elif not others and not host_powered_off:
+        running = running_guest_vmids(api) if api.reachable() else []
+        result["host_left_running"] = True
+        if running:
+            result["reason"] = (
+                "guest(s) still running outside any tracked lease: "
+                + ", ".join(str(vmid) for vmid in running)
+            )
+            result["to_power_off"] = (
+                "stop or register those guests, or stop the host yourself"
+            )
+        else:
+            result["reason"] = "host power-off could not be verified"
+            result["to_power_off"] = "check the host and stop it yourself"
     print(json.dumps(result, indent=2, sort_keys=True))
     created_at = lease.get("created_at") or lease.get("created")
     if created_at:

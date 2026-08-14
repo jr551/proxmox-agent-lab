@@ -4,6 +4,45 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.5.2 - 2026-08-14
+
+### Added
+
+- Guided PocketBase setup: `install.sh` asks whether the audit backend should
+  be an existing PocketBase service or a new one, and `pocketbase-host-setup.sh`
+  provisions a persistent unprivileged LXC running it as a restricted systemd
+  service.
+- Guided MinIO setup for the S3 scratch bucket: `install.sh` asks whether it
+  should be skipped, an existing bucket, or a new MinIO LXC, and
+  `minio-host-setup.sh` provisions a minimal, unprivileged LXC running a
+  version-pinned, checksum-verified MinIO server (S3 API only, no browser
+  console), creating the bucket and an access key.
+- `wake-on-lan+home-assistant` power mode: sends the magic packet and
+  triggers a Home Assistant script together on every power-on, for a host
+  where WoL alone isn't reliable enough to trust by itself but a smart-plug
+  or KVM fallback is also available. Force-off still goes through Home
+  Assistant, since WoL cannot cut power.
+- `journal --summary` on the PocketBase backend now reports the first/last
+  event timestamp and a labeled recent-sample event-type breakdown, instead
+  of only a bare count.
+
+### Fixed
+
+- `lease-end`/the watchdog no longer power off the host while any guest is
+  still running, even one outside lease tracking (a persistent builder kept
+  alive across sessions via `guest template`/`guest clone`, or one driven
+  directly by VMID). Previously the decision looked only at whether any
+  lease was still active.
+- Finalizing a lease whose guest was already gone (deleted by a prior run,
+  or by hand) no longer leaves the lease permanently stuck in
+  `cleanup_failed`; deleting an already-gone guest is now treated the same
+  as the existing "already stopped" idempotency `stop_guest` had.
+- A qemu-guest-agent command killed by a signal is no longer reported as a
+  successful run. `exitcode` and `signal` are mutually exclusive in the
+  guest agent's response; a missing `exitcode` was being treated the same
+  as the serial channel's legitimate "no code available," masking real
+  failures on the one channel that normally always reports one.
+
 ## 0.5.1 - 2026-08-13
 
 ### Added

@@ -7,6 +7,7 @@ configuration, records, exception text, or command arguments.
 
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass
 import json
 import re
@@ -219,11 +220,42 @@ class Client:
                 events.append(data)
         return events
 
+    def _edge_timestamp(self, sort: str) -> str | None:
+        result = self._request(
+            "GET", f"{self._collection_path}/records",
+            query={"page": "1", "perPage": "1", "sort": sort, "fields": "data"},
+        )
+        items = result.get("items", [])
+        if not items or not isinstance(items[0], dict):
+            return None
+        data = items[0].get("data", items[0])
+        return data.get("timestamp") if isinstance(data, dict) else None
+
     def summary(self) -> dict[str, Any]:
         result = self._request("GET", f"{self._collection_path}/records",
                                query={"page": "1", "perPage": "1", "skipTotal": "false", "fields": "id"})
-        return {"backend": "pocketbase", "collection": self.collection_name,
-                "events": result.get("totalItems", 0)}
+        total = result.get("totalItems", 0)
+        out: dict[str, Any] = {
+            "backend": "pocketbase", "collection": self.collection_name,
+            "events": total,
+        }
+        if not total:
+            return out
+        out["first_event"] = self._edge_timestamp("timestamp")
+        out["last_event"] = self._edge_timestamp("-timestamp")
+        # PocketBase's records API has no server-side GROUP BY, and scanning
+        # every record just to count event types would not scale on a
+        # collection this size. The most recent events are the ones anyone
+        # asking for a summary actually cares about, so sample those instead
+        # of silently pretending this is an exact, whole-collection count.
+        sample_size = min(total, 500)
+        recent = self.query(limit=sample_size)
+        counts = collections.Counter(
+            event.get("event") for event in recent if isinstance(event, dict)
+        )
+        out["most_common_sample_size"] = sample_size
+        out["most_common"] = dict(counts.most_common(10))
+        return out
 
     def get_collection(self) -> dict[str, Any]:
         return self._request("GET", f"/api/collections/{parse.quote(self.collection_name, safe='')}")

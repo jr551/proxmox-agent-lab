@@ -570,5 +570,95 @@ class ProxmoxLabTests(unittest.TestCase):
             finally:
                 LAB.LEASE_ROOT = old_lease_root
 
+    def test_delete_guest_treats_already_gone_as_success(self) -> None:
+        api = mock.Mock()
+        api.call.side_effect = LAB.LabError(
+            "Proxmox HTTP 500 for DELETE /nodes/pve/qemu/9101: "
+            '{"data":null,"message":"Configuration file '
+            "'nodes/pve/qemu-server/9101.conf' does not exist\\n\"}"
+        )
+        LAB.delete_guest(api, "qemu", 9101)  # must not raise
+
+    def test_delete_guest_treats_404_as_success(self) -> None:
+        api = mock.Mock()
+        api.call.side_effect = LAB.LabError(
+            "Proxmox HTTP 404 for DELETE /nodes/pve/qemu/9101: not found"
+        )
+        LAB.delete_guest(api, "qemu", 9101)  # must not raise
+
+    def test_delete_guest_still_raises_on_a_real_failure(self) -> None:
+        api = mock.Mock()
+        api.call.side_effect = LAB.LabError(
+            "Proxmox HTTP 500 for DELETE /nodes/pve/qemu/9101: storage locked"
+        )
+        with self.assertRaises(LAB.LabError):
+            LAB.delete_guest(api, "qemu", 9101)
+
+    def test_running_guest_vmids_filters_to_running_status(self) -> None:
+        api = mock.Mock()
+        api.call.return_value = [
+            {"vmid": 100, "status": "stopped"},
+            {"vmid": 9112, "status": "running"},
+            {"vmid": 9210, "status": "running"},
+        ]
+        self.assertEqual(LAB.running_guest_vmids(api), [9112, 9210])
+
+    def test_shutdown_host_refuses_while_a_guest_is_running(self) -> None:
+        api = mock.Mock()
+        api.reachable.return_value = True
+        api.call.return_value = [{"vmid": 9112, "status": "running"}]
+        with mock.patch.object(LAB, "audit") as audit:
+            result = LAB.shutdown_host(api)
+        self.assertFalse(result)
+        api.call.assert_called_once_with(
+            "GET", "/cluster/resources", {"type": "vm"}
+        )
+        audit.assert_called_once()
+        self.assertEqual(audit.call_args[0][0],
+                         "lab-power-off-blocked-by-running-guest")
+        self.assertEqual(audit.call_args[1]["vmids"], [9112])
+
+    def test_shutdown_host_proceeds_when_nothing_is_running(self) -> None:
+        api = mock.Mock()
+        api.reachable.side_effect = [True, False, False]
+        api.call.return_value = []
+        with mock.patch.object(LAB, "audit"), \
+             mock.patch.object(LAB, "time") as fake_time:
+            fake_time.monotonic.side_effect = [0, 1, 2, 3]
+            fake_time.sleep.return_value = None
+            result = LAB.shutdown_host(api)
+        self.assertTrue(result)
+
+    def test_lease_end_reports_an_unleased_running_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260811120000-short02"
+                LAB.save_lease({
+                    "id": lease_id, "state": "active", "kind": "standard",
+                    "created_at": LAB.iso_now(), "resources": [],
+                    "initial_vmids": [],
+                })
+                args = LAB.parser().parse_args(
+                    ["lease-end", "--lease", lease_id]
+                )
+                api = mock.Mock()
+                api.reachable.return_value = True
+                api.call.return_value = [{"vmid": 9112, "status": "running"}]
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "finalize_lease", return_value=[]), \
+                     mock.patch.object(LAB, "active_leases", return_value=[]), \
+                     mock.patch.object(LAB, "audit"), \
+                     mock.patch("builtins.print") as printed, \
+                     self.assertRaises(LAB.LabError):
+                    LAB.cmd_lease_end(args)
+                payload = LAB.json.loads(printed.call_args_list[0][0][0])
+                self.assertTrue(payload["host_left_running"])
+                self.assertIn("9112", payload["reason"])
+            finally:
+                LAB.LEASE_ROOT = old_root
+
+
 if __name__ == "__main__":
     unittest.main()

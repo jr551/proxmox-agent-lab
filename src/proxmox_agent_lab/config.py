@@ -48,7 +48,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "power": {
         # how to switch the lab machine on: wake-on-lan | home-assistant
-        # | command | none
+        # | wake-on-lan+home-assistant | command | none
         "mode": "wake-on-lan",
         "mac": "",
         "broadcast": "255.255.255.255",
@@ -334,7 +334,8 @@ long_term_backup_keep = 2
 [power]
 # How to switch the machine on. Wake-on-LAN needs nothing but the NIC's MAC
 # and works on almost any desktop; enable WoL in its BIOS first.
-mode = "wake-on-lan"         # wake-on-lan | home-assistant | command | none
+mode = "wake-on-lan"         # wake-on-lan | home-assistant
+                             # | wake-on-lan+home-assistant | command | none
 mac = "aa:bb:cc:dd:ee:ff"
 broadcast = "192.168.1.255"
 boot_timeout_seconds = 300
@@ -343,6 +344,11 @@ boot_timeout_seconds = 300
 # home_assistant_url = "https://homeassistant.example"
 # entity_on = "script.lab_power_on"
 # entity_off = "script.lab_force_off"
+
+# mode = "wake-on-lan+home-assistant"  # both together on power-on; force-off
+# home_assistant_url = "https://homeassistant.example"  # still needs Home
+# entity_on = "script.lab_power_on"                     # Assistant, since WoL
+# entity_off = "script.lab_force_off"                   # cannot cut power
 
 # mode = "command"
 # on_command = "/usr/local/bin/lab-power-on"

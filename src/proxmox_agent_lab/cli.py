@@ -529,24 +529,51 @@ def stop_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
         wait_task(api, hard_upid, timeout=60)
 
 
+def _guest_is_gone(error: LabError) -> bool:
+    message = str(error)
+    # A prior finalizer run (or manual removal) beat us to it. Proxmox reports
+    # this as a 404, or as a 500 whose body says the config file is absent.
+    return "HTTP 404" in message or (
+        "HTTP 500" in message and "does not exist" in message
+    )
+
+
+def _storage_io_error(error: LabError) -> bool:
+    message = str(error).lower()
+    return "input/output error" in message or "i/o error" in message
+
+
+def _delete_guest(
+    api: ProxmoxAPI, kind: str, vmid: int, *, destroy_unreferenced_disks: bool
+) -> None:
+    data: dict[str, int] = {"purge": 1}
+    if destroy_unreferenced_disks:
+        data["destroy-unreferenced-disks"] = 1
+    upid = api.call("DELETE", f"/nodes/{NODE}/{kind}/{vmid}", data)
+    wait_task(api, upid, timeout=180)
+
+
 def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
     try:
-        upid = api.call(
-            "DELETE",
-            f"/nodes/{NODE}/{kind}/{vmid}",
-            {"purge": 1, "destroy-unreferenced-disks": 1},
-        )
+        _delete_guest(api, kind, vmid, destroy_unreferenced_disks=True)
     except LabError as exc:
-        # Already gone -- a prior run (or a manual removal) beat us to it.
-        # Proxmox reports this as a 404, or as a 500 whose body says the
-        # config file itself does not exist; either way there is nothing
-        # left to delete, so this is success, not a cleanup failure.
-        if "HTTP 404" in str(exc) or (
-            "HTTP 500" in str(exc) and "does not exist" in str(exc)
-        ):
+        if _guest_is_gone(exc):
             return
-        raise
-    wait_task(api, upid, timeout=180)
+        if not _storage_io_error(exc):
+            raise
+        try:
+            # Destroying unreferenced disks makes Proxmox inspect every
+            # configured storage. An unrelated failed device must not strand
+            # a lease whose guest can otherwise be deleted.
+            _delete_guest(api, kind, vmid, destroy_unreferenced_disks=False)
+        except LabError as retry_exc:
+            if _guest_is_gone(retry_exc):
+                return
+            raise LabError(
+                f"Could not delete {kind}/{vmid} after retrying without "
+                f"unreferenced-disk cleanup: {retry_exc}; initial storage "
+                f"error: {exc}"
+            ) from retry_exc
 
 
 def active_leases(excluding: str | None = None) -> list[dict[str, Any]]:

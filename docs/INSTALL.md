@@ -141,9 +141,18 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocket
 ```
 
 The host script asks for an LXC ID, storage, bridge, IP configuration, HTTP
-port, and first superuser. It creates a persistent unprivileged Debian LXC,
-installs PocketBase as a restricted systemd service, and prints the dashboard
-and API URLs. It does not modify existing guests or the host firewall.
+port, and first superuser. It creates a persistent unprivileged Debian LXC
+set to start automatically whenever the Proxmox host does — this lab powers
+its host off between leases, so nothing else would start the container back
+up — installs PocketBase as a restricted systemd service, and prints the
+dashboard and API URLs. It does not modify existing guests or the host
+firewall.
+
+Hosting the audit backend on the same machine the lab powers on and off
+means a `power-on`/`lease-begin` can briefly race the container's own
+startup: `ensure_on` tolerates the audit write failing for up to 30 seconds
+after the Proxmox API answers before it gives up and just warns, rather than
+failing the power-on itself.
 
 The default service is HTTP for a trusted LAN; do not port-forward it. Put a
 TLS reverse proxy in front of it before access from an untrusted network. In
@@ -166,9 +175,11 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-
 
 The host script asks for an LXC ID, storage, bridge, IP configuration, disk
 size, bucket name, and access key. It creates a persistent unprivileged
-Debian LXC, installs a single-binary MinIO server as a restricted systemd
-service (S3 API only — the browser console is disabled), creates the bucket,
-and prints the endpoint, bucket, region, and credentials.
+Debian LXC set to start automatically whenever the Proxmox host does — this
+lab powers its host off between leases, so nothing else would start the
+container back up — installs a single-binary MinIO server as a restricted
+systemd service (S3 API only — the browser console is disabled), creates
+the bucket, and prints the endpoint, bucket, region, and credentials.
 
 The service is HTTP for a trusted LAN; do not port-forward it. Put a TLS
 reverse proxy in front of it before access from an untrusted network. Re-run

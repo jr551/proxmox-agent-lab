@@ -349,6 +349,38 @@ class ProxmoxAPI:
             return False
 
 
+_AUDIT_THROUGH_BOOT_RETRY_SECONDS = 30
+
+
+def _audit_through_boot(event: str, **fields: Any) -> None:
+    """audit(), tolerant of a just-woken host's own audit backend still
+    starting up.
+
+    The audit backend can itself be hosted on this same lab host (see
+    pocketbase-host-setup.sh) -- an onboot LXC that starts alongside Proxmox
+    but is not necessarily answering the instant the API is. A short bounded
+    retry covers that normal startup race; if the backend is still
+    unreachable after it, the event is dropped with a loud warning rather
+    than failing the power-on itself, since losing one audit line is
+    recoverable and failing to confirm the host is up is not.
+    """
+    deadline = time.monotonic() + _AUDIT_THROUGH_BOOT_RETRY_SECONDS
+    while True:
+        try:
+            audit(event, **fields)
+            return
+        except pocketbase_module.PocketBaseError as exc:
+            if time.monotonic() >= deadline:
+                print(
+                    f"warning: '{event}' was not recorded to the audit "
+                    f"backend (still unreachable {_AUDIT_THROUGH_BOOT_RETRY_SECONDS}s "
+                    f"after power-on): {exc}",
+                    file=sys.stderr,
+                )
+                return
+            time.sleep(3)
+
+
 def ensure_on(api: ProxmoxAPI, timeout: int | None = None) -> bool:
     """Switch the lab machine on if it is not already up. Returns True if we
     had to wake it."""
@@ -365,11 +397,11 @@ def ensure_on(api: ProxmoxAPI, timeout: int | None = None) -> bool:
         detail = power_module.power_on(CONFIG)
     except (power_module.PowerError, ConfigError) as exc:
         raise LabError(f"cannot switch the lab machine on: {exc}") from None
-    audit("lab-power-on-requested", **detail)
+    _audit_through_boot("lab-power-on-requested", **detail)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if api.reachable():
-            audit("lab-power-on-verified", host=HOST, node=NODE)
+            _audit_through_boot("lab-power-on-verified", host=HOST, node=NODE)
             return True
         time.sleep(5)
     raise LabError(

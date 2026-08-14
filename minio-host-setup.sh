@@ -89,10 +89,12 @@ pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -Fq "$TEMPLATE" \
     || pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null
 NET0="name=eth0,bridge=$BRIDGE,ip=$NET_IP"
 [ -n "$GATEWAY" ] && NET0="$NET0,gw=$GATEWAY"
+# --onboot: the lab host powers itself off between leases, so this container
+# must come back on its own when the host does -- nothing else will start it.
 pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE" \
     --hostname "minio-$CTID" --unprivileged 1 --features nesting=0 \
     --cores 1 --memory 512 --swap 512 --rootfs "$ROOTFS_STORAGE:$ROOTFS_SIZE" \
-    --net0 "$NET0" --start 0 >/dev/null
+    --net0 "$NET0" --onboot 1 --start 0 >/dev/null
 pct start "$CTID"
 for _ in $(seq 1 30); do
     pct exec "$CTID" -- true >/dev/null 2>&1 && break

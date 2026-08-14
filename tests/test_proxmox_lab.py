@@ -659,6 +659,40 @@ class ProxmoxLabTests(unittest.TestCase):
             finally:
                 LAB.LEASE_ROOT = old_root
 
+    def test_audit_through_boot_succeeds_immediately_when_backend_is_up(self) -> None:
+        with mock.patch.object(LAB, "audit") as audit:
+            LAB._audit_through_boot("lab-power-on-requested", mode="wake-on-lan")
+        audit.assert_called_once_with(
+            "lab-power-on-requested", mode="wake-on-lan"
+        )
+
+    def test_audit_through_boot_retries_while_the_hosted_backend_wakes_up(self) -> None:
+        audit = mock.Mock(side_effect=[
+            LAB.pocketbase_module.PocketBaseError("connection refused"),
+            LAB.pocketbase_module.PocketBaseError("connection refused"),
+            None,
+        ])
+        with mock.patch.object(LAB, "audit", audit), \
+             mock.patch.object(LAB, "time") as fake_time:
+            fake_time.monotonic.side_effect = [0, 1, 2, 3, 4]
+            fake_time.sleep.return_value = None
+            LAB._audit_through_boot("lab-power-on-verified", host="h", node="n")
+        self.assertEqual(audit.call_count, 3)
+
+    def test_audit_through_boot_warns_and_gives_up_after_the_retry_window(self) -> None:
+        audit = mock.Mock(
+            side_effect=LAB.pocketbase_module.PocketBaseError("still down")
+        )
+        with mock.patch.object(LAB, "audit", audit), \
+             mock.patch.object(LAB, "time") as fake_time, \
+             mock.patch("builtins.print") as printed:
+            fake_time.monotonic.side_effect = [0, 1, 31, 32]
+            fake_time.sleep.return_value = None
+            LAB._audit_through_boot("lab-power-on-requested", mode="wake-on-lan")
+        warning = printed.call_args[0][0]
+        self.assertIn("lab-power-on-requested", warning)
+        self.assertIn("still down", warning)
+
 
 if __name__ == "__main__":
     unittest.main()

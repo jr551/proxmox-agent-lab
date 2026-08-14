@@ -12,6 +12,10 @@
    consecutive checks.
 8. Every operation writes a redacted audit event and attempts a normal
    fast-forward/rebase Forgejo sync.
+   PocketBase authorization failures identify the audit-token secret to refresh.
+   An `api` write may already have reached Proxmox before its audit event fails;
+   it reports that write as succeeded but unrecorded rather than claiming an
+   unrelated Proxmox permission failure.
 9. Every MCP tool call records only its tool name and refreshes the idle clock.
 10. A reachable host with no active leases is shut down after eight hours
     without an MCP tool call.

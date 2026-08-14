@@ -220,14 +220,16 @@ def sync_repo(record: dict[str, Any], suffix: str) -> None:
 
 
 
+def _pocketbase_token_secret_name() -> str:
+    return str(CONFIG.audit.get("pocketbase_token_secret") or "audit-token").strip()
+
+
 def pocketbase_client() -> pocketbase_module.Client:
     url = str(CONFIG.audit.get("pocketbase_url") or "").strip()
     collection = str(
         CONFIG.audit.get("pocketbase_collection") or "proxmox_lab_events"
     ).strip()
-    secret_name = str(
-        CONFIG.audit.get("pocketbase_token_secret") or "audit-token"
-    ).strip()
+    secret_name = _pocketbase_token_secret_name()
     try:
         timeout = float(CONFIG.audit.get("pocketbase_timeout_seconds", 10))
     except (TypeError, ValueError):
@@ -246,6 +248,8 @@ def pocketbase_client() -> pocketbase_module.Client:
         )
     except ValueError as exc:
         raise LabError(str(exc)) from None
+
+
 def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
     now = utc_now()
     record = {
@@ -260,9 +264,19 @@ def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
             CONFIG.audit.get("controller_id") or socket.gethostname()
         )
         client = pocketbase_client()
-    journal_module.append(
-        JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
-    )
+    try:
+        journal_module.append(
+            JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
+        )
+    except pocketbase_module.PocketBaseError as exc:
+        if exc.status in (401, 403):
+            raise LabError(
+                "audit ledger rejected the event: "
+                f"PocketBase HTTP {exc.status} (the stored audit token is "
+                "invalid or expired). Refresh it with: proxmox-lab secrets set "
+                f"{_pocketbase_token_secret_name()}"
+            ) from None
+        raise
     if sync:
         sync_repo(record, event)
 
@@ -970,15 +984,21 @@ def cmd_api(args: argparse.Namespace) -> None:
                 except LabError as exc:
                     print(f"warning: could not protect {created_vmid}: {exc}",
                           file=sys.stderr)
-        audit(
-            "proxmox-api-write",
-            lease=args.lease,
-            method=method,
-            path=args.path,
-            data=data,
-            result=result,
-            task_status=task_status,
-        )
+        try:
+            audit(
+                "proxmox-api-write",
+                lease=args.lease,
+                method=method,
+                path=args.path,
+                data=data,
+                result=result,
+                task_status=task_status,
+            )
+        except (LabError, pocketbase_module.PocketBaseError) as exc:
+            raise LabError(
+                "Proxmox write succeeded, but its audit event was not recorded: "
+                f"{exc}"
+            ) from None
     if write and method == "PUT" and "boot" in data:
         config_match = re.fullmatch(
             rf"/nodes/{re.escape(NODE)}/qemu/(\d+)/config", args.path

@@ -113,8 +113,20 @@ def probe(lab: Any, api: Any, vmid: int) -> GuestCapabilities:
             "display is the serial console: screenshots work, but VNC "
             "keyboard input does not. Drive this guest over serial."
         )
-    caps.agent = console.agent_ready(lab, api, vmid)
-    if not caps.agent and str(config.get("agent") or "").startswith("enabled"):
+    if console.agent_ready(lab, api, vmid):
+        try:
+            result = console.agent_exec(
+                lab, api, vmid, ["/bin/true"], timeout=5,
+            )
+            caps.agent = result.get("exitcode") == 0
+        except lab.LabError:
+            caps.agent = False
+        if not caps.agent:
+            caps.notes.append(
+                "agent pings but cannot complete a command: the guest may be "
+                "hung or its storage offline"
+            )
+    elif str(config.get("agent") or "").startswith("enabled"):
         caps.notes.append(
             "agent is enabled in config but not answering: the guest may "
             "still be booting, or qemu-guest-agent is not installed"

@@ -719,22 +719,26 @@ def cmd_lease_begin(args: argparse.Namespace) -> None:
             "resources": [],
         }
         save_lease(lease)
-        audit(
-            "lease-begin",
-            lease=lease_id,
-            kind=lease["kind"],
-            purpose=lease["purpose"],
-            expires_at=lease["expires_at"],
-            initial_vmids=lease["initial_vmids"],
-        )
-    output = dict(lease)
-    if long_term:
-        output["warning"] = (
-            "This is a long-term lease: the lab machine will stay powered on "
-            "until it is destroyed with 'lease-destroy'. Its guests are "
-            "protected from deletion and backed up weekly."
-        )
-    print(json.dumps(output, indent=2, sort_keys=True))
+        try:
+            audit(
+                "lease-begin",
+                lease=lease_id,
+                kind=lease["kind"],
+                purpose=lease["purpose"],
+                expires_at=lease["expires_at"],
+                initial_vmids=lease["initial_vmids"],
+            )
+            output = dict(lease)
+            if long_term:
+                output["warning"] = (
+                    "This is a long-term lease: the lab machine will stay powered on "
+                    "until it is destroyed with 'lease-destroy'. Its guests are "
+                    "protected from deletion and backed up weekly."
+                )
+            print(json.dumps(output, indent=2, sort_keys=True))
+        except BaseException:
+            lease_path(lease_id).unlink(missing_ok=True)
+            raise
 
 
 def cmd_lease_heartbeat(args: argparse.Namespace) -> None:

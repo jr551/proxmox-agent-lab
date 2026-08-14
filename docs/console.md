@@ -73,7 +73,7 @@ response recommending a click always reports `actionable: false` and
 
 ```bash
 proxmox-lab console keys  --lease "$L" --vmid 9001 enter f2 ctrl-alt-delete
-proxmox-lab console click --lease "$L" --vmid 9001 --x 640 --y 412
+proxmox-lab console click --lease "$L" --vmid 9001 --target "Install" --x 640 --y 412
 proxmox-lab console type  --lease "$L" --vmid 9001 --text-stdin --enter
 ```
 
@@ -93,9 +93,9 @@ proxmox-lab console keys --lease "$L" --vmid 9001 enter --screenshot-after 3
 - `--screenshot-out PATH` (or the shorter `--out PATH`) gives the post-input
   PNG a stable checkpoint name.
 
-Every click names its visible target. The harness moves the cursor, captures a
-full checkpoint, and asks cloud vision to independently match the label and
-coordinate before pressing the button:
+By default, every click names its visible target. The harness moves the cursor,
+captures a full checkpoint, and asks cloud vision to independently match the
+label and coordinate before pressing the button:
 
 ```bash
 proxmox-lab console click --lease "$L" --vmid 9001 \
@@ -103,7 +103,17 @@ proxmox-lab console click --lease "$L" --vmid 9001 \
 ```
 
 Failure, timeout, ambiguity, or disagreement leaves `clicked: false`. Stop and
-inspect; there is no self-confirmation option.
+inspect; there is no self-confirmation option for a named control.
+
+For a deliberate click on background rather than a control, pass
+`--empty-space` and omit `--target`. It bypasses cloud-vision target
+verification, remains bounds-checked, and is audited as an unverified
+coordinate click. Use it only when the intended point is known to be empty:
+
+```bash
+proxmox-lab console click --lease "$L" --vmid 9001 \
+  --empty-space --button 3 --x 640 --y 412 --screenshot-after 3
+```
 
 When a click opens a popup menu or combobox, prefer arrow keys plus `enter` for
 the visible selection. This preserves menu state and avoids guessing a second

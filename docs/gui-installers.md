@@ -41,12 +41,15 @@ recommended action as a proposal, not permission. Ordinary screenshots stay
 local. Do not send
 confidential or personal screens to free providers.
 
-`console click` has one minimal guarded interface: name the visible `--target`
-and provide its proposed coordinates. The harness moves the cursor, captures a
-full checkpoint, and asks cloud vision to independently match the named control
-and coordinate. It clicks only after that positive verdict. Failure, timeout,
-ambiguity, or disagreement returns `clicked: false`; stop instead of retrying.
-There is no self-confirmation flag.
+Ordinary `console click` commands name the visible `--target` and provide its
+proposed coordinates. The harness moves the cursor, captures a full checkpoint,
+and asks cloud vision to independently match the named control and coordinate.
+It clicks only after that positive verdict. Failure, timeout, ambiguity, or
+disagreement returns `clicked: false`; stop instead of retrying.
+
+`--empty-space` is the narrow exception for a known blank background, such as
+dismissing a menu. It deliberately skips that verification and is audited as an
+unverified coordinate click; do not use it to bypass installer control checks.
 
 For a popup menu or combobox opened by a verified click, use arrow keys and
 `enter` to choose the visibly highlighted item. Haiku's menus preserve

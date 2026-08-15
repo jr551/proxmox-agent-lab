@@ -282,8 +282,10 @@ a single install at a different lab for one command.
 | `controller_id` | hostname | Stable identifier written by the PocketBase backend |
 | `pocketbase_url` | — | Absolute HTTP(S) URL of the PocketBase service |
 | `pocketbase_collection` | `proxmox_lab_events` | Private collection for audit records |
-| `pocketbase_token_secret` | `audit-token` | Secret-store name containing the API token |
+| `pocketbase_token_secret` | `audit-token` | Secret-store name containing the active API token |
 | `pocketbase_timeout_seconds` | `10` | Per-request timeout |
+| `pocketbase_auth_refresh_before_seconds` | `300` | Renew a renewable JWT this many seconds before expiry |
+| `pocketbase_agent_collection` | `proxmox_lab_agents` | Restricted password-auth collection for controllers |
 
 Every action appends a redacted event: what happened, to which VMID, under
 which lease. Passwords, tokens, typed text and presigned URLs are never
@@ -302,14 +304,29 @@ pocketbase_token_secret = "audit-token"
 ```
 
 ```bash
-proxmox-lab secrets set audit-token
-proxmox-lab journal --provision-pocketbase
+# One-time bootstrap; these credentials are used only by the explicit
+# provisioning command and are kept in the configured secret store.
+proxmox-lab secrets set pocketbase-superuser-email
+proxmox-lab secrets set pocketbase-superuser-password
+proxmox-lab journal --provision-pocketbase-agent
 proxmox-lab doctor
 ```
 
-`journal --provision-pocketbase` creates the collection when absent and
-validates an existing schema without altering it. Collection rules remain
-private; only the configured API token can read or write records.
+PocketBase JWTs are inherently finite; there is no unlimited token. The
+controller refreshes a renewable `_superusers` or agent token before its
+configured expiry window and atomically replaces the keyring value. The
+provisioning command instead creates a password-authenticated
+`pocketbase_agent_collection` record, stores its generated credentials and
+active token in the secret store, and grants that collection only list, view,
+and create access to the configured audit collection. If a stored agent token
+has already expired, the controller obtains a replacement through that stored
+account password. Update and delete remain superuser-only.
+
+`journal --provision-pocketbase-agent` may change the configured audit
+collection rules to that restricted agent collection. Use it only for the
+controller collection named in the current configuration. The original
+`journal --provision-pocketbase` creates or validates a superuser-only audit
+collection without changing its rules.
 
 ### SQLite migration and rollback
 

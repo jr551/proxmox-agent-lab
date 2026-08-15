@@ -69,6 +69,14 @@ All notable changes to this project will be documented here. The format follows
   alongside it), retrying for up to 30s before warning and continuing,
   instead of failing the power-on itself.
 
+### Changed
+
+- PocketBase audit controllers can refresh renewable superuser and restricted
+  agent JWTs before expiry. `journal --provision-pocketbase-agent` now uses
+  locally stored superuser credentials to create a least-privileged
+  password-authenticated audit account; it persists only the generated agent
+  credentials and active token in the configured secret store.
+
 ## 0.5.2 - 2026-08-14
 
 ### Added

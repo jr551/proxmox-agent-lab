@@ -174,6 +174,10 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocket
 
 Keep the default HTTP service on a trusted LAN; place it behind TLS before
 access from an untrusted network.
+Store the printed superuser credentials in the controller's secret store and
+run `proxmox-lab journal --provision-pocketbase-agent`; it creates a restricted
+renewable audit account instead of leaving the controller on a superuser token.
+
 
 **No S3 bucket for guest file transfer?** Run this as root on Proxmox. It
 creates a persistent unprivileged LXC running a minimal MinIO server

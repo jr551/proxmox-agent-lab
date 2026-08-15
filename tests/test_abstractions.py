@@ -449,8 +449,10 @@ class GuestChannelTests(unittest.TestCase):
         lab.NODE = "testnode"
         api = mock.Mock()
         api.call.return_value = config
-        return lab, api, mock.patch.object(
-            guest_module.console, "agent_ready", return_value=agent
+        return lab, api, mock.patch.multiple(
+            guest_module.console,
+            agent_ready=mock.Mock(return_value=agent),
+            agent_exec=mock.Mock(return_value={"exitcode": 0}),
         )
 
     def test_agent_is_preferred_when_available(self) -> None:
@@ -464,6 +466,30 @@ class GuestChannelTests(unittest.TestCase):
         with patched:
             session = guest_module.GuestSession(lab, api, 100, password="pw")
         self.assertEqual(session.channel, "serial")
+
+    def test_agent_that_only_pings_is_not_a_command_channel(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "testnode"
+        api = mock.Mock()
+        api.call.return_value = {"serial0": "socket", "agent": "enabled=1"}
+        with mock.patch.object(
+            guest_module.console, "agent_ready", return_value=True
+        ), mock.patch.object(
+            guest_module.console,
+            "agent_exec",
+            side_effect=RuntimeError("Proxmox HTTP 596 for POST agent/exec"),
+        ) as execute:
+            caps = guest_module.probe(lab, api, 100)
+
+        self.assertFalse(caps.agent)
+        self.assertTrue(any(
+            "agent pings but cannot complete a command" in note
+            for note in caps.notes
+        ))
+        execute.assert_called_once_with(
+            lab, api, 100, ["/bin/true"], timeout=5,
+        )
 
     def test_serial_needs_a_password_and_says_so(self) -> None:
         lab, api, patched = self._lab({"serial0": "socket"}, False)

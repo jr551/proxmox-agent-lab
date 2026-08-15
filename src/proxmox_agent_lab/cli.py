@@ -228,14 +228,16 @@ _AGENT_CREDENTIAL_KEYS = (
 )
 
 
+def _pocketbase_token_secret_name() -> str:
+    return str(CONFIG.audit.get("pocketbase_token_secret") or "audit-token").strip()
+
+
 def _pocketbase_settings() -> tuple[str, str, str, float, float]:
     url = str(CONFIG.audit.get("pocketbase_url") or "").strip()
     collection = str(
         CONFIG.audit.get("pocketbase_collection") or "proxmox_lab_events"
     ).strip()
-    secret_name = str(
-        CONFIG.audit.get("pocketbase_token_secret") or "audit-token"
-    ).strip()
+    secret_name = _pocketbase_token_secret_name()
     try:
         timeout = float(CONFIG.audit.get("pocketbase_timeout_seconds", 10))
         refresh_before = float(
@@ -335,6 +337,8 @@ def pocketbase_superuser_client() -> pocketbase_module.Client:
         return pocketbase_module.Client(url, token, collection, timeout=timeout)
     except ValueError as exc:
         raise LabError(str(exc)) from None
+
+
 def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
     now = utc_now()
     record = {
@@ -349,9 +353,19 @@ def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
             CONFIG.audit.get("controller_id") or socket.gethostname()
         )
         client = pocketbase_client()
-    journal_module.append(
-        JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
-    )
+    try:
+        journal_module.append(
+            JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
+        )
+    except pocketbase_module.PocketBaseError as exc:
+        if exc.status in (401, 403):
+            raise LabError(
+                "audit ledger rejected the event: "
+                f"PocketBase HTTP {exc.status} (the stored audit token is "
+                "invalid or expired). Refresh it with: proxmox-lab secrets set "
+                f"{_pocketbase_token_secret_name()}"
+            ) from None
+        raise
     if sync:
         sync_repo(record, event)
 
@@ -424,6 +438,12 @@ class ProxmoxAPI:
             with request.urlopen(req, context=self._ssl, timeout=timeout) as response:
                 body = json.load(response)
         except error.HTTPError as exc:
+            if exc.code == 596:
+                raise LabError(
+                    f"Proxmox HTTP 596 for {method} {path}: guest agent is not "
+                    "responding; the guest may be hung or its storage offline. "
+                    "Try console screenshot or serial instead."
+                ) from None
             detail = exc.read().decode(errors="replace")[:1000]
             raise LabError(f"Proxmox HTTP {exc.code} for {method} {path}: {detail}")
         except (error.URLError, TimeoutError, OSError) as exc:
@@ -618,24 +638,51 @@ def stop_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
         wait_task(api, hard_upid, timeout=60)
 
 
+def _guest_is_gone(error: LabError) -> bool:
+    message = str(error)
+    # A prior finalizer run (or manual removal) beat us to it. Proxmox reports
+    # this as a 404, or as a 500 whose body says the config file is absent.
+    return "HTTP 404" in message or (
+        "HTTP 500" in message and "does not exist" in message
+    )
+
+
+def _storage_io_error(error: LabError) -> bool:
+    message = str(error).lower()
+    return "input/output error" in message or "i/o error" in message
+
+
+def _delete_guest(
+    api: ProxmoxAPI, kind: str, vmid: int, *, destroy_unreferenced_disks: bool
+) -> None:
+    data: dict[str, int] = {"purge": 1}
+    if destroy_unreferenced_disks:
+        data["destroy-unreferenced-disks"] = 1
+    upid = api.call("DELETE", f"/nodes/{NODE}/{kind}/{vmid}", data)
+    wait_task(api, upid, timeout=180)
+
+
 def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
     try:
-        upid = api.call(
-            "DELETE",
-            f"/nodes/{NODE}/{kind}/{vmid}",
-            {"purge": 1, "destroy-unreferenced-disks": 1},
-        )
+        _delete_guest(api, kind, vmid, destroy_unreferenced_disks=True)
     except LabError as exc:
-        # Already gone -- a prior run (or a manual removal) beat us to it.
-        # Proxmox reports this as a 404, or as a 500 whose body says the
-        # config file itself does not exist; either way there is nothing
-        # left to delete, so this is success, not a cleanup failure.
-        if "HTTP 404" in str(exc) or (
-            "HTTP 500" in str(exc) and "does not exist" in str(exc)
-        ):
+        if _guest_is_gone(exc):
             return
-        raise
-    wait_task(api, upid, timeout=180)
+        if not _storage_io_error(exc):
+            raise
+        try:
+            # Destroying unreferenced disks makes Proxmox inspect every
+            # configured storage. An unrelated failed device must not strand
+            # a lease whose guest can otherwise be deleted.
+            _delete_guest(api, kind, vmid, destroy_unreferenced_disks=False)
+        except LabError as retry_exc:
+            if _guest_is_gone(retry_exc):
+                return
+            raise LabError(
+                f"Could not delete {kind}/{vmid} after retrying without "
+                f"unreferenced-disk cleanup: {retry_exc}; initial storage "
+                f"error: {exc}"
+            ) from retry_exc
 
 
 def active_leases(excluding: str | None = None) -> list[dict[str, Any]]:
@@ -808,22 +855,26 @@ def cmd_lease_begin(args: argparse.Namespace) -> None:
             "resources": [],
         }
         save_lease(lease)
-        audit(
-            "lease-begin",
-            lease=lease_id,
-            kind=lease["kind"],
-            purpose=lease["purpose"],
-            expires_at=lease["expires_at"],
-            initial_vmids=lease["initial_vmids"],
-        )
-    output = dict(lease)
-    if long_term:
-        output["warning"] = (
-            "This is a long-term lease: the lab machine will stay powered on "
-            "until it is destroyed with 'lease-destroy'. Its guests are "
-            "protected from deletion and backed up weekly."
-        )
-    print(json.dumps(output, indent=2, sort_keys=True))
+        try:
+            audit(
+                "lease-begin",
+                lease=lease_id,
+                kind=lease["kind"],
+                purpose=lease["purpose"],
+                expires_at=lease["expires_at"],
+                initial_vmids=lease["initial_vmids"],
+            )
+            output = dict(lease)
+            if long_term:
+                output["warning"] = (
+                    "This is a long-term lease: the lab machine will stay powered on "
+                    "until it is destroyed with 'lease-destroy'. Its guests are "
+                    "protected from deletion and backed up weekly."
+                )
+            print(json.dumps(output, indent=2, sort_keys=True))
+        except BaseException:
+            lease_path(lease_id).unlink(missing_ok=True)
+            raise
 
 
 def cmd_lease_heartbeat(args: argparse.Namespace) -> None:
@@ -959,16 +1010,23 @@ def cmd_api(args: argparse.Namespace) -> None:
         ):
             raise LabError(f"Write path is outside the leased guest surface: {args.path}")
         resource = path_resource(args.path)
-        if method == "DELETE" and resource:
+        if resource:
             kind, vmid = resource
             owned = any(
                 item["kind"] == kind and int(item["vmid"]) == vmid
                 for item in lease["resources"]
             )
-            if not owned:
+            if method == "DELETE" and not owned:
                 raise LabError(
                     f"Refusing deletion of unregistered {kind} VMID {vmid}"
                 )
+            power_action = re.fullmatch(
+                rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/\d+/status/"
+                r"(?:start|stop|shutdown|reset|suspend)",
+                args.path,
+            )
+            if power_action and not owned and vmid in lease["initial_vmids"]:
+                raise LabError(f"VMID {vmid} existed before this lease")
         create_match = re.fullmatch(
             rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
         )
@@ -1015,15 +1073,21 @@ def cmd_api(args: argparse.Namespace) -> None:
                 except LabError as exc:
                     print(f"warning: could not protect {created_vmid}: {exc}",
                           file=sys.stderr)
-        audit(
-            "proxmox-api-write",
-            lease=args.lease,
-            method=method,
-            path=args.path,
-            data=data,
-            result=result,
-            task_status=task_status,
-        )
+        try:
+            audit(
+                "proxmox-api-write",
+                lease=args.lease,
+                method=method,
+                path=args.path,
+                data=data,
+                result=result,
+                task_status=task_status,
+            )
+        except (LabError, pocketbase_module.PocketBaseError) as exc:
+            raise LabError(
+                "Proxmox write succeeded, but its audit event was not recorded: "
+                f"{exc}"
+            ) from None
     if write and method == "PUT" and "boot" in data:
         config_match = re.fullmatch(
             rf"/nodes/{re.escape(NODE)}/qemu/(\d+)/config", args.path
@@ -1246,6 +1310,97 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
             )
     if failures or (not others and not host_powered_off):
         raise LabError("Lease cleanup or host power-off did not complete")
+
+
+def cmd_lease_abandon(args: argparse.Namespace) -> None:
+    """Close a stopped ordinary lease without touching its guests or host."""
+    with controller_lock():
+        lease = load_lease(args.lease, active=False)
+        if lease.get("state") not in ("active", "cleanup_failed"):
+            raise LabError(
+                f"Lease {args.lease} cannot be abandoned from state "
+                f"{lease.get('state')}"
+            )
+        if is_long_term(lease):
+            raise LabError(
+                f"Lease {args.lease} is long-term and cannot be abandoned. "
+                "Use 'proxmox-lab lease-release --lease "
+                f"{args.lease} --confirm' or 'proxmox-lab lease-destroy "
+                f"--lease {args.lease} --confirm'."
+            )
+        if not args.confirm:
+            raise LabError(
+                "lease-abandon leaves every registered guest and the host "
+                "untouched. Re-run with --confirm after they are stopped."
+            )
+        api = ProxmoxAPI()
+        if not api.reachable():
+            raise LabError(
+                "Cannot safely abandon this lease while Proxmox is "
+                "unreachable; registered guests cannot be verified stopped."
+            )
+        stopped: list[str] = []
+        missing: list[str] = []
+        for resource in lease.get("resources", []):
+            kind = resource["kind"]
+            vmid = int(resource["vmid"])
+            resource_id = f"{kind}/{vmid}"
+            try:
+                status = guest_status(api, kind, vmid)
+            except LabError as exc:
+                if "HTTP 404" in str(exc):
+                    missing.append(resource_id)
+                    continue
+                raise LabError(
+                    f"Cannot safely abandon lease {args.lease}: could not "
+                    f"verify {resource_id} is stopped: {exc}"
+                ) from None
+            if status != "stopped":
+                raise LabError(
+                    f"Cannot safely abandon lease {args.lease}: {resource_id} "
+                    f"is {status}, not stopped"
+                )
+            stopped.append(resource_id)
+        lease["state"] = "closed"
+        lease["closed_at"] = iso_now()
+        lease["abandoned_at"] = lease["closed_at"]
+        lease["abandoned_reason"] = (
+            "registered guests verified stopped; no guest or host mutation"
+        )
+        save_lease(lease)
+        audit_error: str | None = None
+        try:
+            audit(
+                "lease-abandon",
+                lease=args.lease,
+                stopped=stopped,
+                missing=missing,
+                reason=lease["abandoned_reason"],
+            )
+        except (
+            LabError,
+            OSError,
+            ValueError,
+            pocketbase_module.PocketBaseError,
+        ) as exc:
+            audit_error = str(exc)
+            print(
+                "warning: lease was closed but its audit event could not be "
+                f"recorded: {audit_error}",
+                file=sys.stderr,
+            )
+    result: dict[str, Any] = {
+        "lease": args.lease,
+        "state": "closed",
+        "guests_verified_stopped": stopped,
+        "guests_already_missing": missing,
+        "guest_mutation": False,
+        "host_mutation": False,
+        "audit_recorded": audit_error is None,
+    }
+    if audit_error is not None:
+        result["audit_error"] = audit_error
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_cleanup_expired(args: argparse.Namespace) -> None:
@@ -1784,6 +1939,14 @@ def parser() -> argparse.ArgumentParser:
     end = sub.add_parser("lease-end")
     end.add_argument("--lease", required=True)
     end.set_defaults(func=cmd_lease_end)
+
+    abandon = sub.add_parser(
+        "lease-abandon",
+        help="close a stopped ordinary lease without mutating guests or host",
+    )
+    abandon.add_argument("--lease", required=True)
+    abandon.add_argument("--confirm", action="store_true")
+    abandon.set_defaults(func=cmd_lease_abandon)
 
     cleanup = sub.add_parser("cleanup-expired")
     cleanup.add_argument("--all", action="store_true")

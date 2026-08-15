@@ -50,6 +50,30 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertTrue(second["cached"])
         open_url.assert_called_once()
 
+    def test_guest_agent_http_596_explains_recovery_options(self) -> None:
+        import io
+
+        failure = LAB.error.HTTPError(
+            "https://proxmox.invalid/api2/json/nodes/test/qemu/100/agent/exec",
+            596,
+            "guest agent unavailable",
+            None,
+            io.BytesIO(b"guest agent unavailable"),
+        )
+        api = LAB.ProxmoxAPI()
+        try:
+            with mock.patch.object(LAB, "keychain_secret", return_value="token"), \
+                 mock.patch.object(LAB.request, "urlopen", side_effect=failure):
+                with self.assertRaises(LAB.LabError) as caught:
+                    api.call("POST", "/nodes/test/qemu/100/agent/exec")
+        finally:
+            failure.close()
+
+        message = str(caught.exception)
+        self.assertIn("guest agent is not responding", message)
+        self.assertIn("guest may be hung or its storage offline", message)
+        self.assertIn("console screenshot or serial", message)
+
     def test_cold_boot_timeout_uses_config_and_rejects_impatient_override(self) -> None:
         api = mock.Mock()
         api.reachable.return_value = False
@@ -273,6 +297,42 @@ class ProxmoxLabTests(unittest.TestCase):
         )
         self.assertIsNone(LAB.path_resource("/nodes/somewhere-else/qemu/9000"))
 
+    def test_cmd_api_refuses_power_actions_for_unregistered_preexisting_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260814120000-guard35"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "standard",
+                    "resources": [],
+                    "initial_vmids": [9000, 9001],
+                })
+                api = mock.Mock()
+                operations = [
+                    ("qemu", 9000, action)
+                    for action in ("start", "stop", "shutdown", "reset", "suspend")
+                ]
+                operations.append(("lxc", 9001, "start"))
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api):
+                    for kind, vmid, action in operations:
+                        with self.subTest(kind=kind, action=action):
+                            args = LAB.parser().parse_args([
+                                "api", "--lease", lease_id, "--method", "POST",
+                                "--path",
+                                f"/nodes/{LAB.NODE}/{kind}/{vmid}/status/{action}",
+                            ])
+                            with self.assertRaisesRegex(
+                                LAB.LabError,
+                                rf"VMID {vmid} existed before this lease",
+                            ):
+                                LAB.cmd_api(args)
+                            api.call.assert_not_called()
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
+
     def test_lease_requires_cleanup(self) -> None:
         self.assertTrue(
             LAB.lease_requires_cleanup(
@@ -361,6 +421,100 @@ class ProxmoxLabTests(unittest.TestCase):
                 self.assertEqual(LAB.load_lease(lease["id"]), lease)
             finally:
                 LAB.LEASE_ROOT = old_root
+
+    def test_lease_begin_rolls_back_saved_lease_when_audit_fails(self) -> None:
+        import contextlib
+        import io
+
+        args = LAB.parser().parse_args(["lease-begin", "--purpose", "rollback"])
+        audit_error = LAB.LabError("audit backend rejected the event")
+        api = mock.Mock()
+        api.call.return_value = []
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            lease_root = state_root / "leases"
+            with mock.patch.object(LAB, "STATE_ROOT", state_root), \
+                 mock.patch.object(LAB, "LEASE_ROOT", lease_root), \
+                 mock.patch.object(LAB, "LOCK_PATH", state_root / "controller.lock"), \
+                 mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                 mock.patch.object(LAB, "ensure_on", return_value=False), \
+                 mock.patch.object(LAB.secrets, "token_hex", return_value="deadbeef"), \
+                 mock.patch.object(LAB, "audit", side_effect=audit_error), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(LAB.LabError) as caught:
+                    LAB.cmd_lease_begin(args)
+
+                self.assertIs(caught.exception, audit_error)
+                self.assertEqual(LAB.active_leases(), [])
+                self.assertEqual(list(lease_root.glob("*.json")), [])
+                api.call.assert_called_once_with(
+                    "GET", "/cluster/resources", {"type": "vm"}
+                )
+    def test_pocketbase_audit_token_rejection_names_secret_refresh(self) -> None:
+        rejected = LAB.pocketbase_module.PocketBaseError(
+            "PocketBase HTTP 403: Only superusers can perform this action.",
+            status=403,
+        )
+        audit_config = LAB.config_module.Section(
+            "audit",
+            {
+                **LAB.CONFIG.audit.as_dict(),
+                "pocketbase_token_secret": "audit-refresh",
+            },
+        )
+        with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
+             mock.patch.object(LAB.CONFIG, "audit", audit_config), \
+             mock.patch.object(LAB, "pocketbase_client"), \
+             mock.patch.object(
+                 LAB.journal_module, "append", side_effect=rejected,
+             ):
+            with self.assertRaises(LAB.LabError) as caught:
+                LAB.audit("lease-begin")
+
+        self.assertEqual(
+            str(caught.exception),
+            "audit ledger rejected the event: PocketBase HTTP 403 (the stored "
+            "audit token is invalid or expired). Refresh it with: "
+            "proxmox-lab secrets set audit-refresh",
+        )
+
+    def test_cmd_api_reports_success_when_its_audit_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260811120000-audit01"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "standard",
+                    "resources": [],
+                    "initial_vmids": [],
+                })
+                path = f"/nodes/{LAB.NODE}/qemu/9090/status/start"
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease_id, "--method", "POST",
+                    "--path", path,
+                ])
+                api = mock.Mock()
+                audit_error = LAB.LabError(
+                    "audit ledger rejected the event: PocketBase HTTP 401 "
+                    "(the stored audit token is invalid or expired). Refresh "
+                    "it with: proxmox-lab secrets set audit-token"
+                )
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "audit", side_effect=audit_error):
+                    with self.assertRaises(LAB.LabError) as caught:
+                        LAB.cmd_api(args)
+
+                api.call.assert_called_once_with("POST", path, {})
+                self.assertEqual(
+                    str(caught.exception),
+                    "Proxmox write succeeded, but its audit event was not "
+                    f"recorded: {audit_error}",
+                )
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
 
     def test_cmd_api_create_registers_under_lock_with_reloaded_lease(self) -> None:
         """A registration racing the create must survive: cmd_api reloads the
@@ -593,6 +747,143 @@ class ProxmoxLabTests(unittest.TestCase):
             finally:
                 LAB.LEASE_ROOT = old_lease_root
 
+    def test_lease_abandon_closes_stopped_ordinary_lease_without_mutation(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root, old_lock = LAB.LEASE_ROOT, LAB.LOCK_PATH
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            try:
+                lease_id = "20260811120000-stale01"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "session",
+                    "resources": [
+                        {"kind": "qemu", "vmid": 9201, "policy": "delete"},
+                    ],
+                })
+                api = mock.Mock()
+                api.reachable.return_value = True
+                api.call.return_value = {"status": "stopped"}
+                args = LAB.parser().parse_args([
+                    "lease-abandon", "--lease", lease_id, "--confirm",
+                ])
+                stdout = io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                        mock.patch.object(LAB, "audit") as audit, \
+                        contextlib.redirect_stdout(stdout):
+                    LAB.cmd_lease_abandon(args)
+                final = LAB.load_lease(lease_id, active=False)
+                self.assertEqual(final["state"], "closed")
+                self.assertEqual(
+                    final["abandoned_reason"],
+                    "registered guests verified stopped; no guest or host mutation",
+                )
+                self.assertEqual(
+                    api.call.call_args_list,
+                    [mock.call(
+                        "GET",
+                        f"/nodes/{LAB.NODE}/qemu/9201/status/current",
+                    )],
+                )
+                audit.assert_called_once_with(
+                    "lease-abandon",
+                    lease=lease_id,
+                    stopped=["qemu/9201"],
+                    missing=[],
+                    reason=final["abandoned_reason"],
+                )
+                result = LAB.json.loads(stdout.getvalue())
+                self.assertEqual(result["guests_verified_stopped"], ["qemu/9201"])
+                self.assertFalse(result["guest_mutation"])
+                self.assertFalse(result["host_mutation"])
+                self.assertTrue(result["audit_recorded"])
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH = old_root, old_lock
+
+    def test_lease_abandon_refuses_long_term_or_running_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root, old_lock = LAB.LEASE_ROOT, LAB.LOCK_PATH
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            try:
+                for kind, status in (("long-term", None), ("session", "running")):
+                    with self.subTest(kind=kind, status=status):
+                        lease_id = (
+                            "20260811120000-longterm"
+                            if kind == "long-term"
+                            else "20260811120000-running1"
+                        )
+                        LAB.save_lease({
+                            "id": lease_id,
+                            "state": "active",
+                            "kind": kind,
+                            "resources": [
+                                {"kind": "qemu", "vmid": 9202, "policy": "delete"},
+                            ],
+                        })
+                        api = mock.Mock()
+                        api.reachable.return_value = True
+                        api.call.return_value = {"status": status}
+                        args = LAB.parser().parse_args([
+                            "lease-abandon", "--lease", lease_id, "--confirm",
+                        ])
+                        with mock.patch.object(
+                            LAB, "ProxmoxAPI", return_value=api
+                        ), self.assertRaises(LAB.LabError):
+                            LAB.cmd_lease_abandon(args)
+                        self.assertEqual(
+                            LAB.load_lease(lease_id, active=False)["state"],
+                            "active",
+                        )
+                        if kind == "long-term":
+                            api.reachable.assert_not_called()
+                        else:
+                            api.call.assert_called_once()
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH = old_root, old_lock
+
+    def test_lease_abandon_reports_audit_failure_after_closing_lease(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root, old_lock = LAB.LEASE_ROOT, LAB.LOCK_PATH
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            try:
+                lease_id = "20260811120000-audit001"
+                LAB.save_lease({
+                    "id": lease_id,
+                    "state": "active",
+                    "kind": "session",
+                    "resources": [],
+                })
+                api = mock.Mock()
+                api.reachable.return_value = True
+                args = LAB.parser().parse_args([
+                    "lease-abandon", "--lease", lease_id, "--confirm",
+                ])
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                        mock.patch.object(
+                            LAB, "audit", side_effect=LAB.LabError("audit denied")
+                        ), contextlib.redirect_stdout(stdout), \
+                        contextlib.redirect_stderr(stderr):
+                    LAB.cmd_lease_abandon(args)
+                self.assertEqual(
+                    LAB.load_lease(lease_id, active=False)["state"], "closed"
+                )
+                result = LAB.json.loads(stdout.getvalue())
+                self.assertFalse(result["audit_recorded"])
+                self.assertEqual(result["audit_error"], "audit denied")
+                self.assertIn("could not be recorded: audit denied", stderr.getvalue())
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH = old_root, old_lock
+
     def test_delete_guest_treats_already_gone_as_success(self) -> None:
         api = mock.Mock()
         api.call.side_effect = LAB.LabError(
@@ -616,6 +907,55 @@ class ProxmoxLabTests(unittest.TestCase):
         )
         with self.assertRaises(LAB.LabError):
             LAB.delete_guest(api, "qemu", 9101)
+
+    def test_lease_end_retries_without_unreferenced_disks_on_storage_io_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260814120000-storage38"
+                LAB.save_lease({
+                    "id": lease_id, "state": "active", "kind": "session",
+                    "created_at": LAB.iso_now(),
+                    "resources": [{"kind": "qemu", "vmid": 9038}],
+                    "initial_vmids": [],
+                })
+                delete_data: list[dict[str, int]] = []
+                api = mock.Mock()
+                api.reachable.return_value = True
+
+                def call(method, path, data=None):
+                    if path.endswith("/status/current"):
+                        return {"status": "stopped"}
+                    if method == "DELETE":
+                        delete_data.append(data)
+                        if data.get("destroy-unreferenced-disks"):
+                            raise LAB.LabError(
+                                "failed to create content directory "
+                                "'/mnt/pve/offline/dump': Input/output error"
+                            )
+                        return "UPID:delete-without-unreferenced-disks"
+                    self.fail(f"unexpected Proxmox API call: {method} {path}")
+
+                api.call.side_effect = call
+                args = LAB.parser().parse_args(["lease-end", "--lease", lease_id])
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "wait_task"), \
+                     mock.patch.object(LAB, "shutdown_host", return_value=True) as shutdown, \
+                     mock.patch.object(LAB, "audit"):
+                    LAB.cmd_lease_end(args)
+
+                self.assertEqual(
+                    delete_data,
+                    [
+                        {"purge": 1, "destroy-unreferenced-disks": 1},
+                        {"purge": 1},
+                    ],
+                )
+                self.assertEqual(LAB.load_lease(lease_id, active=False)["state"], "closed")
+                shutdown.assert_called_once_with(api)
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
 
     def test_running_guest_vmids_filters_to_running_status(self) -> None:
         api = mock.Mock()

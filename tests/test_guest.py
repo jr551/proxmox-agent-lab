@@ -101,6 +101,45 @@ class GuestTemplateTests(unittest.TestCase):
             )
 
 
+
+class GuestRunArgvTests(unittest.TestCase):
+    def test_agent_runs_exact_argv_without_a_shell_reparse(self) -> None:
+        lab = mock.Mock()
+        api = mock.Mock()
+        session = lab_guest.GuestSession(
+            lab, api, 7,
+            capabilities=lab_guest.GuestCapabilities(7, "qemu", agent=True),
+        )
+        command = [
+            "bash", "-lc", "ls -l /tmp/t1 /tmp/t2 2>&1\nprintf '%s' \"two words\"",
+        ]
+        with mock.patch.object(
+            lab_console, "agent_exec",
+            return_value={"exitcode": 0, "stdout": "", "stderr": ""},
+        ) as execute:
+            result = session.run_argv(command, timeout=120)
+
+        execute.assert_called_once_with(lab, api, 7, command, timeout=120)
+        self.assertTrue(result.ok)
+
+    def test_cmd_run_passes_parser_argv_to_the_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = _lab(tmp)
+            command = ["bash", "-lc", "printf '%s' 'two words'\n"]
+            with mock.patch.object(lab_guest, "GuestSession") as session_class:
+                session = session_class.return_value.__enter__.return_value
+                session.run_argv.return_value = lab_guest.CommandResult(
+                    stdout="", stderr="", exit_code=0, channel="agent",
+                )
+                lab_guest.cmd_run(
+                    lab,
+                    _args(lab, "guest", "run", "--lease", "L1",
+                          "--vmid", "7", "--", *command),
+                )
+
+            session.run_argv.assert_called_once_with(command, timeout=300)
+
+
 class DetachedRunTests(unittest.TestCase):
     def _record(self, tmp: str) -> str:
         run_dir = Path(tmp) / "state" / "guest-runs"
@@ -119,14 +158,18 @@ class DetachedRunTests(unittest.TestCase):
                 return_value={"exitcode": 0, "stdout": "4242\n",
                               "stderr": ""},
             ) as execute:
-                lab_guest.cmd_run(lab, _args(lab, "guest", "run",
-                                             "--lease", "L1",
-                                             "--vmid", "7",
-                                             "--detach", "make", "world"))
-            script = execute.call_args.args[3][2]
-            self.assertIn("nohup sh -c", script)
-            self.assertIn("grun-exit:$?", script)
-            self.assertIn("make world", script)
+                lab_guest.cmd_run(lab, _args(
+                    lab, "guest", "run", "--lease", "L1", "--vmid", "7",
+                    "--detach", "--", "bash", "-lc",
+                    "printf '%s' 'two words'\n",
+                ))
+            agent_command = execute.call_args.args[3]
+            self.assertIn('nohup "$@"', agent_command[2])
+            self.assertIn("grun-exit:$?", agent_command[2])
+            self.assertEqual(
+                agent_command[3:],
+                ["guest-run", "bash", "-lc", "printf '%s' 'two words'\n"],
+            )
             record = Path(tmp) / "state" / "guest-runs" / "vm7-4242.json"
             self.assertTrue(record.is_file())
             lab.audit.assert_called_once_with(

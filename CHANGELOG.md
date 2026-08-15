@@ -4,6 +4,38 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.6.0 - 2026-08-14
+
+### Added
+
+- `lease-abandon --lease <id> --confirm` safely closes an ordinary stale or
+  foreign lease only after every registered guest is verified stopped or
+  absent. It never mutates guests or the host and refuses long-term,
+  unreachable, running, and indeterminate leases.
+- `console click --empty-space` explicitly permits an in-bounds click with no
+  target when the operator intends to click unlabelled screen space. The
+  existing target-verification gate remains the default, and unverified clicks
+  are audited.
+
+### Fixed
+
+- Guest power actions (`start`, `stop`, `shutdown`, `reset`, and `suspend`) now
+  enforce lease ownership before reaching the Proxmox API.
+- `lease-begin` removes a just-persisted lease if a later setup step fails,
+  retaining the original failure instead of stranding an active lease.
+- `lease-end` can retry an owned guest deletion without destroying
+  unreferenced disks after an unrelated storage I/O failure, allowing cleanup
+  and verified host shutdown to proceed.
+- Expired PocketBase audit credentials now identify the audit-token refresh
+  action rather than reporting a misleading superuser failure; completed API
+  writes remain explicitly reported as unrecorded.
+- `guest run` preserves its parsed argv for guest-agent, serial, and detached
+  execution paths instead of lossy command-string reconstruction.
+- Guest probes require a successful guest-agent execution, so Proxmox HTTP 596
+  no longer reports a nonfunctional agent as available.
+- `check-public.py` ignores generic lowercase Proxmox node fixture values while
+  retaining detection of distinctive local-site markers.
+
 ## 0.5.3 - 2026-08-14
 
 ### Added

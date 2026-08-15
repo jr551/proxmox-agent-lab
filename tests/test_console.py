@@ -964,7 +964,7 @@ class ScreenshotCommandTests(unittest.TestCase):
             args = mock.Mock(
                 lease="lease-12345678", vmid=1, x=0, y=0, button=1,
                 double=False, screenshot_after=2.5, screenshot_out=str(out),
-                target="OK", calibration_settle=1.0,
+                target="OK", empty_space=False, calibration_settle=1.0,
                 vision_timeout=10, provider="auto",
             )
             with mock.patch.object(lab, "STATE_ROOT", Path(tmp)), \
@@ -1005,6 +1005,40 @@ class ScreenshotCommandTests(unittest.TestCase):
             self.assertEqual(payload["screenshot_after"]["path"], str(out))
             self.assertTrue(payload["verification"]["accepted"])
             self.assertEqual(payload["control_bbox"], [0, 0, 2, 2])
+
+    def test_click_empty_space_bypasses_target_verification(self) -> None:
+        import argparse
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        parser = argparse.ArgumentParser()
+        lab_console.register(parser.add_subparsers(), lab)
+        args = parser.parse_args([
+            "console", "click", "--lease", "lease-12345678", "--vmid", "1",
+            "--x", "1", "--y", "1", "--button", "3", "--empty-space",
+        ])
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 2, 2
+
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"), \
+             mock.patch.object(lab_console.vision, "analyze_png") as analyze, \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_click(lab, args)
+
+        session.client.click.assert_called_once_with(1, 1, button=3, double=False)
+        session.client.capture.assert_not_called()
+        analyze.assert_not_called()
+        lab.audit.assert_called_once_with(
+            "console-click-unverified", lease="lease-12345678", vmid=1,
+            x=1, y=1, button=3, sync=False,
+        )
+        payload = json.loads(printed.call_args.args[0])
+        self.assertEqual(payload["clicked"], [1, 1])
+        self.assertTrue(payload["empty_space"])
+        self.assertIn("unverified", payload["verification"]["reason"])
 
     def test_has_gui_locked_up_true_when_nothing_changes(self) -> None:
         from proxmox_agent_lab import console as lab_console

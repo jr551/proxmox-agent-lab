@@ -13,8 +13,8 @@ memory, USB traffic and network behaviour; then destroy the experiment and
 switch the physical computer off — verified.
 
 Built for authorized reverse engineering, defensive security research,
-digital forensics, interoperability, debugging and education. The technical
-package and CLI remain **`proxmox-agent-lab`** and **`proxmox-lab`**.
+digital forensics, interoperability, debugging and education. The Python
+package is **`proxmox-agent-lab`**; the CLI is **`proxmox-lab`**.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
@@ -96,7 +96,7 @@ run the same script, compare.
 
 ### Bring the analysis environment you already trust
 
-Old Computer AI Lab is the orchestration and containment layer, not another
+Old Computer → AI Lab is the orchestration and containment layer, not another
 tool-bundle distribution. Use clean OS templates or bring environments such as
 [FLARE-VM](https://github.com/mandiant/flare-vm) and
 [REMnux](https://docs.remnux.org/). The lab handles physical power, disposable
@@ -150,7 +150,7 @@ your temp directory and prints the path — handy for an agent that only has the
 skill file:
 
 ```bash
-PXL=$(curl -fsSL .../bootstrap.sh | sh) && "$PXL" doctor
+PXL=$(curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/bootstrap.sh | sh) && "$PXL" doctor
 ```
 
 The cached bootstrap environment checks GitHub at most once per 24 hours and

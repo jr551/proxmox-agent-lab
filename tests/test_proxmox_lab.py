@@ -716,6 +716,140 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertIn("lab-power-on-requested", warning)
         self.assertIn("still down", warning)
 
+    def test_pocketbase_client_refreshes_a_near_expiry_superuser_token(self) -> None:
+        import base64
+        import json
+
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "collectionId": "_superusers",
+            "exp": 1_000,
+        }).encode()).decode().rstrip("=")
+        token = f"header.{payload}.signature"
+        audit_config = {
+            "pocketbase_url": "https://pb.example",
+            "pocketbase_collection": "events",
+            "pocketbase_token_secret": "audit-token",
+            "pocketbase_timeout_seconds": 10,
+            "pocketbase_auth_refresh_before_seconds": 300,
+        }
+        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
+             mock.patch.object(
+                 LAB.secrets_store, "get", return_value=token
+             ), \
+             mock.patch.object(LAB.secrets_store, "store") as store, \
+             mock.patch.object(
+                 LAB.pocketbase_module.Client,
+                 "refresh_auth_token",
+                 return_value="refreshed-token",
+             ) as refresh, \
+             mock.patch.object(LAB.time, "time", return_value=800):
+            client = LAB.pocketbase_client()
+        refresh.assert_called_once_with("_superusers")
+        store.assert_called_once_with(LAB.CONFIG, "audit-token", "refreshed-token")
+        self.assertEqual(client.token, "refreshed-token")
+
+    def test_pocketbase_client_reauthenticates_an_expired_agent_token(self) -> None:
+        import base64
+        import json
+
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "collectionId": "agents",
+            "exp": 1_000,
+        }).encode()).decode().rstrip("=")
+        token = f"header.{payload}.signature"
+        audit_config = {
+            "pocketbase_url": "https://pb.example",
+            "pocketbase_collection": "events",
+            "pocketbase_token_secret": "audit-token",
+            "pocketbase_timeout_seconds": 10,
+            "pocketbase_auth_refresh_before_seconds": 300,
+        }
+        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
+             mock.patch.object(
+                 LAB.secrets_store,
+                 "get",
+                 side_effect=[token, "agent@lab.invalid", "agent-password"],
+             ), \
+             mock.patch.object(LAB.secrets_store, "store") as store, \
+             mock.patch.object(
+                 LAB.pocketbase_module.Client,
+                 "refresh_auth_token",
+                 side_effect=LAB.pocketbase_module.PocketBaseError(
+                     "expired", status=401
+                 ),
+             ), \
+             mock.patch.object(
+                 LAB.pocketbase_module.Client,
+                 "authenticate_password",
+                 return_value="reauthenticated-token",
+             ) as authenticate, \
+             mock.patch.object(LAB.time, "time", return_value=800):
+            client = LAB.pocketbase_client()
+        authenticate.assert_called_once_with(
+            "https://pb.example",
+            "agents",
+            "agent@lab.invalid",
+            "agent-password",
+            timeout=10,
+        )
+        store.assert_called_once_with(
+            LAB.CONFIG, "audit-token", "reauthenticated-token"
+        )
+        self.assertEqual(client.token, "reauthenticated-token")
+
+    def test_agent_provision_stores_reauth_credentials_and_token(self) -> None:
+        import contextlib
+        import io
+        import json
+
+        args = LAB.parser().parse_args(["journal", "--provision-pocketbase-agent"])
+        provisioner = mock.Mock()
+        provisioner.provision_agent.return_value = {
+            "agent_collection": "agents",
+            "agent_created": True,
+            "audit_collection": {"created": True},
+            "token": "agent-token",
+        }
+        audit_config = {
+            "pocketbase_url": "https://pb.example",
+            "pocketbase_collection": "events",
+            "pocketbase_token_secret": "audit-token",
+            "pocketbase_timeout_seconds": 10,
+            "pocketbase_auth_refresh_before_seconds": 300,
+            "pocketbase_agent_collection": "agents",
+        }
+        output = io.StringIO()
+        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
+             mock.patch.object(
+                 LAB.secrets_store, "get", return_value=""
+             ), \
+             mock.patch.object(
+                 LAB.pocketbase_module.Client,
+                 "new_agent_credentials",
+                 return_value=("agent@lab.invalid", "agent-password"),
+             ), \
+             mock.patch.object(LAB.secrets_store, "store") as store, \
+             mock.patch.object(
+                 LAB, "pocketbase_superuser_client", return_value=provisioner
+             ), \
+             contextlib.redirect_stdout(output):
+            LAB.cmd_journal(args)
+        provisioner.provision_agent.assert_called_once_with(
+            "agents",
+            "agent@lab.invalid",
+            "agent-password",
+            rotate_existing=True,
+        )
+        self.assertEqual(
+            [call.args[1] for call in store.call_args_list],
+            ["pocketbase-agent-email", "pocketbase-agent-password", "audit-token"],
+        )
+        self.assertNotIn("agent-token", output.getvalue())
+        self.assertEqual(
+            json.loads(output.getvalue())["credential_mode"],
+            "password-reauthentication",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

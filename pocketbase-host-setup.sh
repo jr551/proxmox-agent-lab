@@ -157,9 +157,9 @@ else
     say "  Superuser password: the value supplied to this script"
 fi
 say ""
-say "  In the dashboard, create a nonrenewable superuser impersonation token"
-say "  for each controller. On another controller, run install.sh and choose"
-say "  PocketBase, then provide the API URL and that controller's token."
+say "  On each controller, store this superuser's email and password in its"
+say "  secret store, then run:"
+say "  proxmox-lab journal --provision-pocketbase-agent"
 say ""
 warn "This service is HTTP for a trusted LAN only. Do not port-forward $PORT."
 warn "Use a TLS reverse proxy before allowing access from untrusted networks."

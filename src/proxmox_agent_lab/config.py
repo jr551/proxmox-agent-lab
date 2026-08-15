@@ -142,6 +142,8 @@ DEFAULTS: dict[str, Any] = {
         "pocketbase_collection": "proxmox_lab_events",
         "pocketbase_token_secret": "audit-token",
         "pocketbase_timeout_seconds": 10,
+        "pocketbase_auth_refresh_before_seconds": 300,
+        "pocketbase_agent_collection": "proxmox_lab_agents",
     },
 }
 
@@ -419,4 +421,6 @@ pocketbase_url = ""          # e.g. https://rowedb.example
 pocketbase_collection = "proxmox_lab_events"
 pocketbase_token_secret = "audit-token"
 pocketbase_timeout_seconds = 10
+pocketbase_auth_refresh_before_seconds = 300
+pocketbase_agent_collection = "proxmox_lab_agents"
 """

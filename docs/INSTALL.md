@@ -155,11 +155,21 @@ after the Proxmox API answers before it gives up and just warns, rather than
 failing the power-on itself.
 
 The default service is HTTP for a trusted LAN; do not port-forward it. Put a
-TLS reverse proxy in front of it before access from an untrusted network. In
-the PocketBase dashboard create a separate nonrenewable superuser
-impersonation token for each controller. Re-run controller setup, select
-`existing`, enter the printed API URL, and enter that controller's token at
-the hidden local prompt.
+TLS reverse proxy in front of it before access from an untrusted network.
+After the controller has its API URL, store the first PocketBase superuser
+email and password locally, then run:
+
+```sh
+proxmox-lab secrets set pocketbase-superuser-email
+proxmox-lab secrets set pocketbase-superuser-password
+proxmox-lab journal --provision-pocketbase-agent
+```
+
+This creates a controller-only PocketBase auth record and replaces
+`audit-token` with its renewable token. The controller refreshes that token
+before expiry and reauthenticates as the restricted account if needed; the
+superuser remains only for explicit reprovisioning. Do not use a nonrenewable
+impersonation token for a controller that must run indefinitely.
 
 ### Optional: host MinIO on Proxmox
 
@@ -205,10 +215,11 @@ If I choose a new PocketBase LXC, show me the root-only
 `pocketbase-host-setup.sh` command and wait for me to run it on the Proxmox
 host. Do not expose the HTTP port to the Internet or change host firewall
 rules. After I provide the resulting trusted-LAN API URL, finish the
-controller setup, create/validate the private audit collection, and report
-the connection details another controller needs: API URL, collection name,
-and the instruction to create a separate nonrenewable PocketBase
-impersonation token for that controller.
+controller setup. Store the first superuser email and password only through
+hidden local prompts, then run `proxmox-lab journal
+--provision-pocketbase-agent` to create the restricted renewable controller
+account. Report the API URL and collection name another controller needs; do
+not distribute superuser or impersonation tokens.
 
 If I choose a new MinIO LXC, show me the root-only `minio-host-setup.sh`
 command and wait for me to run it on the Proxmox host. Do not expose the S3

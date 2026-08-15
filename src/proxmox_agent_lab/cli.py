@@ -220,7 +220,15 @@ def sync_repo(record: dict[str, Any], suffix: str) -> None:
 
 
 
-def pocketbase_client() -> pocketbase_module.Client:
+_SUPERUSER_CREDENTIAL_KEYS = (
+    "pocketbase-superuser-email", "pocketbase-superuser-password",
+)
+_AGENT_CREDENTIAL_KEYS = (
+    "pocketbase-agent-email", "pocketbase-agent-password",
+)
+
+
+def _pocketbase_settings() -> tuple[str, str, str, float, float]:
     url = str(CONFIG.audit.get("pocketbase_url") or "").strip()
     collection = str(
         CONFIG.audit.get("pocketbase_collection") or "proxmox_lab_events"
@@ -230,20 +238,101 @@ def pocketbase_client() -> pocketbase_module.Client:
     ).strip()
     try:
         timeout = float(CONFIG.audit.get("pocketbase_timeout_seconds", 10))
+        refresh_before = float(
+            CONFIG.audit.get("pocketbase_auth_refresh_before_seconds", 300)
+        )
     except (TypeError, ValueError):
         raise LabError(
-            "[audit] pocketbase_timeout_seconds must be a positive number"
+            "[audit] PocketBase timeout and refresh window must be numbers"
         ) from None
     if not url:
         raise LabError("[audit] pocketbase_url is not set")
+    if timeout <= 0:
+        raise LabError("[audit] pocketbase_timeout_seconds must be positive")
+    if refresh_before < 0:
+        raise LabError(
+            "[audit] pocketbase_auth_refresh_before_seconds cannot be negative"
+        )
+    return url, collection, secret_name, timeout, refresh_before
+
+
+def _pocketbase_password_auth(
+    url: str, auth_collection: str, timeout: float,
+) -> str | None:
+    if auth_collection == "_superusers":
+        identity_key, password_key = _SUPERUSER_CREDENTIAL_KEYS
+    else:
+        identity_key, password_key = _AGENT_CREDENTIAL_KEYS
     try:
-        token = secrets_store.get(CONFIG, secret_name)
+        identity = secrets_store.get(CONFIG, identity_key, required=False)
+        password = secrets_store.get(CONFIG, password_key, required=False)
     except secrets_store.SecretError as exc:
         raise LabError(str(exc)) from None
+    if not identity or not password:
+        return None
     try:
-        return pocketbase_module.Client(
-            url, token, collection, timeout=timeout
+        return pocketbase_module.Client.authenticate_password(
+            url, auth_collection, identity, password, timeout=timeout
         )
+    except (ValueError, pocketbase_module.PocketBaseError) as exc:
+        raise LabError(str(exc)) from None
+
+
+def pocketbase_client() -> pocketbase_module.Client:
+    url, collection, secret_name, timeout, refresh_before = _pocketbase_settings()
+    try:
+        token = secrets_store.get(CONFIG, secret_name)
+        client = pocketbase_module.Client(url, token, collection, timeout=timeout)
+    except (ValueError, secrets_store.SecretError) as exc:
+        raise LabError(str(exc)) from None
+    auth_collection = pocketbase_module.token_auth_collection(token)
+    if (
+        auth_collection is not None
+        and pocketbase_module.token_expires_within(
+            token, refresh_before, now=time.time()
+        )
+    ):
+        try:
+            refreshed = client.refresh_auth_token(auth_collection)
+        except pocketbase_module.PocketBaseError as exc:
+            if exc.status not in {401, 403}:
+                raise LabError(str(exc)) from None
+            refreshed = _pocketbase_password_auth(
+                url, auth_collection, timeout
+            )
+            if refreshed is None:
+                raise LabError(
+                    "PocketBase token is expired or nonrenewable and no "
+                    f"password credentials are stored for {auth_collection!r}"
+                ) from None
+        try:
+            secrets_store.store(CONFIG, secret_name, refreshed)
+        except secrets_store.SecretError as exc:
+            raise LabError(
+                "PocketBase token refreshed but could not be persisted: "
+                + str(exc)
+            ) from None
+        try:
+            client = pocketbase_module.Client(
+                url, refreshed, collection, timeout=timeout
+            )
+        except ValueError as exc:
+            raise LabError(str(exc)) from None
+    return client
+
+
+def pocketbase_superuser_client() -> pocketbase_module.Client:
+    """Authenticate the provisioner without reusing the audit agent token."""
+    url, collection, _secret_name, timeout, _refresh_before = _pocketbase_settings()
+    token = _pocketbase_password_auth(url, "_superusers", timeout)
+    if token is None:
+        raise LabError(
+            "PocketBase superuser credentials are not stored. Run "
+            "'proxmox-lab secrets set pocketbase-superuser-email' and "
+            "'proxmox-lab secrets set pocketbase-superuser-password'."
+        )
+    try:
+        return pocketbase_module.Client(url, token, collection, timeout=timeout)
     except ValueError as exc:
         raise LabError(str(exc)) from None
 def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
@@ -1448,6 +1537,60 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 def cmd_journal(args: argparse.Namespace) -> None:
     """Read, migrate, or provision the audit ledger."""
+    if args.provision_pocketbase_agent:
+        agent_collection = str(
+            CONFIG.audit.get("pocketbase_agent_collection")
+            or "proxmox_lab_agents"
+        ).strip()
+        try:
+            identity = secrets_store.get(
+                CONFIG, "pocketbase-agent-email", required=False
+            )
+            password = secrets_store.get(
+                CONFIG, "pocketbase-agent-password", required=False
+            )
+        except secrets_store.SecretError as exc:
+            raise LabError(str(exc)) from None
+        if bool(identity) != bool(password):
+            raise LabError(
+                "PocketBase agent credentials are incomplete; store both "
+                "'pocketbase-agent-email' and 'pocketbase-agent-password', "
+                "or remove both before provisioning."
+            )
+        rotate_existing = not identity
+        if not identity:
+            identity, password = pocketbase_module.Client.new_agent_credentials()
+            try:
+                secrets_store.store(CONFIG, "pocketbase-agent-email", identity)
+                secrets_store.store(
+                    CONFIG, "pocketbase-agent-password", password
+                )
+            except secrets_store.SecretError as exc:
+                raise LabError(str(exc)) from None
+        result = pocketbase_superuser_client().provision_agent(
+            agent_collection,
+            identity,
+            password,
+            rotate_existing=rotate_existing,
+        )
+        try:
+            _url, _collection, token_secret, _timeout, _refresh = (
+                _pocketbase_settings()
+            )
+            secrets_store.store(CONFIG, token_secret, result["token"])
+        except secrets_store.SecretError as exc:
+            raise LabError(
+                "PocketBase agent was provisioned but its token could not be "
+                "stored: " + str(exc)
+            ) from None
+        audit = result["audit_collection"]
+        print(json.dumps({
+            "agent_collection": result["agent_collection"],
+            "agent_created": result["agent_created"],
+            "audit_collection_created": audit["created"],
+            "credential_mode": "password-reauthentication",
+        }, indent=2, sort_keys=True))
+        return
     needs_pocketbase = (
         AUDIT_BACKEND == "pocketbase"
         or args.provision_pocketbase
@@ -1543,6 +1686,11 @@ def parser() -> argparse.ArgumentParser:
         "--provision-pocketbase",
         action="store_true",
         help="create or validate the configured PocketBase audit collection",
+    )
+    ledger.add_argument(
+        "--provision-pocketbase-agent",
+        action="store_true",
+        help="create a renewable restricted audit agent using stored superuser credentials",
     )
     ledger.add_argument("--import-jsonl", action="store_true",
                         help="load legacy per-day JSONL files into the database")

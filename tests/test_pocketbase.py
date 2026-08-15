@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 import sys
@@ -49,6 +50,146 @@ class PocketBaseTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "POST")
         self.assertTrue(calls[0][1].endswith("/api/collections/events/records"))
         self.assertEqual(calls[0][2]["data"], record)
+
+    def test_auth_refresh_targets_claimed_collection_and_returns_token(self) -> None:
+        def opener(req: object, *, timeout: float) -> _Response:
+            request = req
+            self.assertEqual(
+                request.full_url,
+                "https://pb.example/api/collections/_superusers/auth-refresh",
+            )  # type: ignore[attr-defined]
+            self.assertEqual(
+                request.get_header("Authorization"), "old-token"
+            )  # type: ignore[attr-defined]
+            return _Response({"token": "new-token"})
+
+        client = pocketbase.Client(
+            "https://pb.example", "old-token", "events", opener=opener
+        )
+        self.assertEqual(client.refresh_auth_token("_superusers"), "new-token")
+
+    def test_password_authentication_omits_authorization_header(self) -> None:
+        def opener(req: object, *, timeout: float) -> _Response:
+            request = req
+            self.assertEqual(
+                request.full_url,
+                "https://pb.example/api/collections/agents/auth-with-password",
+            )  # type: ignore[attr-defined]
+            self.assertIsNone(request.get_header("Authorization"))  # type: ignore[attr-defined]
+            self.assertEqual(
+                json.loads(request.data.decode()),  # type: ignore[attr-defined]
+                {"identity": "agent@lab.invalid", "password": "password"},
+            )
+            return _Response({"token": "agent-token"})
+
+        self.assertEqual(
+            pocketbase.Client.authenticate_password(
+                "https://pb.example",
+                "agents",
+                "agent@lab.invalid",
+                "password",
+                opener=opener,
+            ),
+            "agent-token",
+        )
+
+    def test_jwt_claims_select_only_safe_refresh_collections(self) -> None:
+        def jwt(claims: dict[str, object]) -> str:
+            encoded = base64.urlsafe_b64encode(
+                json.dumps(claims).encode()
+            ).decode().rstrip("=")
+            return f"header.{encoded}.signature"
+
+        renewable = jwt({"collectionId": "_superusers", "exp": 1_000})
+        self.assertEqual(
+            pocketbase.token_auth_collection(renewable), "_superusers"
+        )
+        self.assertTrue(
+            pocketbase.token_expires_within(renewable, 60, now=950)
+        )
+        self.assertFalse(
+            pocketbase.token_expires_within(renewable, 60, now=939)
+        )
+        self.assertIsNone(
+            pocketbase.token_auth_collection(
+                jwt({"collectionId": "../_superusers", "exp": 1_000})
+            )
+        )
+
+    def test_agent_audit_rule_is_limited_to_the_agent_collection(self) -> None:
+        payload = pocketbase.audit_collection_spec(
+            "events", agent_collection_id="agents123"
+        ).payload()
+        self.assertEqual(
+            payload["createRule"],
+            '@request.auth.collectionId = "agents123"',
+        )
+        self.assertEqual(payload["listRule"], payload["createRule"])
+        self.assertEqual(payload["viewRule"], payload["createRule"])
+        self.assertIsNone(payload["updateRule"])
+        self.assertIsNone(payload["deleteRule"])
+
+    def test_provision_agent_creates_restricted_password_account(self) -> None:
+        client = pocketbase.Client("https://pb.example", "superuser", "events")
+        calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+        def request(
+            method: str,
+            path: str,
+            *,
+            payload: dict[str, object] | None = None,
+            **_: object,
+        ) -> dict[str, object]:
+            calls.append((method, path, payload))
+            if method == "GET" and path == "/api/collections/agents":
+                raise pocketbase.PocketBaseError("missing", status=404)
+            if method == "POST" and path == "/api/collections":
+                return {
+                    "id": "agents123",
+                    "type": "auth",
+                    "passwordAuth": {
+                        "enabled": True,
+                        "identityFields": ["email"],
+                    },
+                    "authRule": "",
+                }
+            if method == "GET" and path.endswith("/records"):
+                return {"items": []}
+            if method == "POST" and path.endswith("/records"):
+                return {"id": "record123"}
+            self.fail(f"unexpected request: {method} {path}")
+            return {}
+
+        with mock.patch.object(client, "_request", side_effect=request), \
+             mock.patch.object(
+                 pocketbase.Client,
+                 "authenticate_password",
+                 return_value="agent-token",
+             ) as authenticate, \
+             mock.patch.object(
+                 client,
+                 "provision",
+                 return_value={"created": True, "collection": {}},
+             ) as provision:
+            result = client.provision_agent(
+                "agents", "agent@lab.invalid", "agent-password"
+            )
+
+        self.assertTrue(result["agent_created"])
+        self.assertEqual(result["token"], "agent-token")
+        self.assertEqual(calls[1][2]["type"], "auth")  # type: ignore[index]
+        self.assertEqual(
+            calls[3][2]["passwordConfirm"], "agent-password"  # type: ignore[index]
+        )
+        authenticate.assert_called_once_with(
+            "https://pb.example",
+            "agents",
+            "agent@lab.invalid",
+            "agent-password",
+            timeout=10.0,
+            opener=client._opener,
+        )
+        provision.assert_called_once_with(agent_collection_id="agents123")
 
     def test_event_exists_uses_exact_filter(self) -> None:
         urls: list[str] = []

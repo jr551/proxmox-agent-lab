@@ -286,7 +286,7 @@ if [ "${AUDIT_BACKEND:-}" = "pocketbase" ]; then
             keyring_unavailable "$PB_TOKEN_NAME"
         fi
     elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
-        say "  ${DIM}Use a PocketBase superuser/API token; it is stored only in your OS keyring.${RESET}"
+        say "  ${DIM}Use a renewable PocketBase superuser token to bootstrap; it stays only in your OS keyring.${RESET}"
         if "$BIN" secrets set "$PB_TOKEN_NAME"; then
             say "  ${GREEN}stored${RESET}"
         else
@@ -350,6 +350,12 @@ if "$BIN" doctor; then
     say "    proxmox-lab status"
     say "    proxmox-lab lease-begin --purpose \"first run\""
     say ""
+    if [ "${AUDIT_BACKEND:-}" = "pocketbase" ]; then
+        say "    # Prefer a restricted renewable audit agent after bootstrap:"
+        say "    proxmox-lab secrets set pocketbase-superuser-email"
+        say "    proxmox-lab secrets set pocketbase-superuser-password"
+        say "    proxmox-lab journal --provision-pocketbase-agent"
+    fi
     say "Docs: https://github.com/jr551/proxmox-agent-lab/blob/main/docs/INSTALL.md"
 else
     printf '\n%sAlmost there.%s Fix what doctor listed above, then re-run:\n\n' "$YELLOW$BOLD" "$RESET"

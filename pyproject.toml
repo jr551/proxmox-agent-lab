@@ -55,6 +55,7 @@ packages = ["src/proxmox_agent_lab"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "/.agents",
     "/src",
     "/tests",
     "/docs",

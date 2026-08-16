@@ -416,17 +416,13 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def _require_owned_qemu(lab: Any, lease_id: str, vmid: int) -> None:
+    lab.require_lease_resource(lab.load_lease(lease_id), "qemu", vmid)
+
+
 def cmd_inspect(lab: Any, args: Any) -> None:
     """Capture and explicitly send one lease-owned screen to cloud vision."""
-    lease = lab.load_lease(args.lease)
-    owned = any(
-        item.get("kind") == "qemu" and int(item.get("vmid", -1)) == args.vmid
-        for item in lease.get("resources", [])
-    )
-    if not owned:
-        raise _api_error(
-            lab, f"VMID {args.vmid} is not a qemu guest registered to this lease"
-        )
+    _require_owned_qemu(lab, args.lease, args.vmid)
     api = lab.ProxmoxAPI()
     with VncSession(lab, api, args.vmid) as session:
         rgb = session.client.capture(timeout=25.0, settle=args.settle)
@@ -489,7 +485,7 @@ def cmd_inspect(lab: Any, args: Any) -> None:
 
 def cmd_keys(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    _require_owned_qemu(lab, args.lease, args.vmid)
     combos = args.keys
     screenshot = None
     if args.via == "api":
@@ -516,7 +512,7 @@ def cmd_keys(lab: Any, args: Any) -> None:
 
 def cmd_type(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    _require_owned_qemu(lab, args.lease, args.vmid)
     text = args.text
     if args.text_stdin:
         import sys
@@ -539,7 +535,7 @@ def cmd_type(lab: Any, args: Any) -> None:
 
 def cmd_click(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    _require_owned_qemu(lab, args.lease, args.vmid)
     target = str(getattr(args, "target", "") or "").strip()
     if len(target) < 2:
         raise _api_error(
@@ -627,17 +623,19 @@ def cmd_text(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     kind = args.kind or _kind_of(lab, api, args.vmid)
     with TermSession(lab, api, kind, args.vmid) as session:
-        if args.send:
-            # Typing into a guest console is guest mutation, so it needs an
-            # active lease like any other write. Reading alone does not.
+        if args.send or args.nudge:
+            # Sending even a blank line mutates the guest console.
             if not args.lease:
                 raise _api_error(
-                    lab, "--send types into the guest console and requires --lease"
+                    lab, "--send and --nudge require --lease"
                 )
-            lab.load_lease(args.lease)
-            session.send_line(args.send)
-        elif args.nudge:
-            session.send_line("")
+            lab.require_lease_resource(
+                lab.load_lease(args.lease), kind, args.vmid
+            )
+            if args.send:
+                session.send_line(args.send)
+            else:
+                session.send_line("")
         output = session.read(args.seconds)
     print(json.dumps(
         {"vmid": args.vmid, "kind": kind, "text": textmode.strip_ansi(output)},
@@ -647,7 +645,7 @@ def cmd_text(lab: Any, args: Any) -> None:
 
 def cmd_exec(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    _require_owned_qemu(lab, args.lease, args.vmid)
     command = args.command
     if args.shell:
         command = ["/bin/sh", "-c", " ".join(command)] if not args.windows else [
@@ -691,7 +689,7 @@ def _upload_command(url: str, source: str, windows: bool) -> list[str]:
 def cmd_push(lab: Any, args: Any) -> None:
     """Copy a local file into a guest via the S3 scratch bucket."""
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    _require_owned_qemu(lab, args.lease, args.vmid)
     source = Path(args.file).expanduser().resolve()
     if not source.is_file():
         raise _api_error(lab, f"not a regular file: {source}")
@@ -727,7 +725,7 @@ def cmd_push(lab: Any, args: Any) -> None:
 def cmd_pull(lab: Any, args: Any) -> None:
     """Copy a file out of a guest via the S3 scratch bucket."""
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    _require_owned_qemu(lab, args.lease, args.vmid)
     key = args.key or f"pull/{secrets.token_hex(6)}/{Path(args.remote).name}"
     url = s3.presign(key, method="PUT", expires=args.url_expiry)
     run = agent_exec(

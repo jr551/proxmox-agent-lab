@@ -20,6 +20,15 @@ class OmpSkillPackagingTests(unittest.TestCase):
         included = config["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
         self.assertIn("/.agents", included)
 
+    def test_wheel_forces_omp_skill_layout_into_package(self):
+        with (ROOT / "pyproject.toml").open("rb") as package_file:
+            config = tomllib.load(package_file)
+
+        forced = config["tool"]["hatch"]["build"]["targets"]["wheel"][
+            "force-include"
+        ]
+        self.assertEqual(forced[".agents"], ".agents")
+
 
 if __name__ == "__main__":
     unittest.main()

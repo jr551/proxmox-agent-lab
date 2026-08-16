@@ -146,7 +146,7 @@ def cmd_attach(lab: Any, args: Any) -> None:
             "device. Never pass through a disk backing an active storage."
         )
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    lab.require_lease_resource(lab.load_lease(args.lease), "qemu", args.vmid)
     device = _resolve(lab, args.device)
     slot = _usb_index(lab, api, args.vmid)
     # Address by vendor:product so it survives re-enumeration.
@@ -166,7 +166,7 @@ def cmd_detach(lab: Any, args: Any) -> None:
     """Remove a USB passthrough slot from a guest, returning it to the host."""
     _require_enabled(lab)
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    lab.require_lease_resource(lab.load_lease(args.lease), "qemu", args.vmid)
     if not re.fullmatch(r"usb[0-4]", args.slot):
         raise lab.LabError("--slot must be usb0..usb4")
     config = api.call("GET", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config")

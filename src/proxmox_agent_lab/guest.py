@@ -21,6 +21,8 @@ callers -- and agents -- can say "run this in the guest" and get a result.
 
 from __future__ import annotations
 
+import shlex
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -208,6 +210,18 @@ class GuestSession:
         output, code = self._terminal().run_status(command, timeout=timeout)
         return CommandResult(stdout=output, exit_code=code, channel="serial")
 
+    def run_argv(self, command: list[str], timeout: int = 300) -> CommandResult:
+        """Run an argv vector without collapsing its argument boundaries."""
+        if self.channel == "agent":
+            result = console.agent_exec(
+                self.lab, self.api, self.vmid, command, timeout=timeout
+            )
+            return CommandResult(
+                stdout=result["stdout"], stderr=result["stderr"],
+                exit_code=result["exitcode"], channel="agent",
+            )
+        return self.run(shlex.join(command), timeout=timeout)
+
     def read_screen(self) -> dict[str, Any]:
         """Capture the screen. Works even when no command channel does."""
         if not self.capabilities.graphical_console:
@@ -256,12 +270,15 @@ def cmd_run(lab: Any, args: Any) -> None:
     import sys
 
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    lease = lab.load_lease(args.lease)
+    caps = probe(lab, api, args.vmid)
+    lab.require_lease_resource(lease, caps.kind, args.vmid)
     password = sys.stdin.readline().rstrip("\r\n") if args.password_stdin else None
     try:
         with GuestSession(lab, api, args.vmid, user=args.user,
-                          password=password, prefer=args.prefer) as guest:
-            result = guest.run(" ".join(args.command), timeout=args.timeout)
+                          password=password, prefer=args.prefer,
+                          capabilities=caps) as guest:
+            result = guest.run_argv(args.command, timeout=args.timeout)
             payload = {"vmid": args.vmid, **result.as_dict()}
     except GuestError as exc:
         raise lab.LabError(str(exc)) from None

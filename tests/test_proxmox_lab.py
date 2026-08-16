@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import io
 from pathlib import Path
 
 # Point every module at a fixture config *before* importing the package:
@@ -18,6 +19,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import cli as LAB  # noqa: E402
+from proxmox_agent_lab import guest as GUEST  # noqa: E402
 
 
 class ProxmoxLabTests(unittest.TestCase):
@@ -298,6 +300,79 @@ class ProxmoxLabTests(unittest.TestCase):
                 self.assertEqual(LAB.load_lease(lease["id"]), lease)
             finally:
                 LAB.LEASE_ROOT = old_root
+
+    def test_guest_mutation_requires_registered_resource(self) -> None:
+        lease = {"resources": [], "initial_vmids": []}
+        args = LAB.parser().parse_args([
+            "api", "--lease", "lease-1", "--method", "POST",
+            "--path", f"/nodes/{LAB.NODE}/qemu/9000/status/start",
+        ])
+        api = mock.Mock()
+        with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+             mock.patch.object(LAB, "load_lease", return_value=lease):
+            with self.assertRaisesRegex(LAB.LabError, "not a qemu guest"):
+                LAB.cmd_api(args)
+        api.call.assert_not_called()
+
+    def test_audit_intent_blocks_write_before_api_call(self) -> None:
+        lease = {
+            "resources": [{"kind": "qemu", "vmid": 9000}],
+            "initial_vmids": [],
+        }
+        args = LAB.parser().parse_args([
+            "api", "--lease", "lease-1", "--method", "POST",
+            "--path", f"/nodes/{LAB.NODE}/qemu/9000/status/start",
+        ])
+        api = mock.Mock()
+        with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+             mock.patch.object(LAB, "load_lease", return_value=lease), \
+             mock.patch.object(LAB, "audit", side_effect=LAB.LabError("ledger down")):
+            with self.assertRaisesRegex(LAB.LabError, "ledger down"):
+                LAB.cmd_api(args)
+        api.call.assert_not_called()
+
+    def test_completion_audit_failure_reports_successful_write(self) -> None:
+        lease = {
+            "resources": [{"kind": "qemu", "vmid": 9000}],
+            "initial_vmids": [],
+        }
+        args = LAB.parser().parse_args([
+            "api", "--lease", "lease-1", "--method", "POST",
+            "--path", f"/nodes/{LAB.NODE}/qemu/9000/status/start",
+        ])
+        api = mock.Mock()
+        api.call.return_value = "UPID:success"
+        output = io.StringIO()
+        with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+             mock.patch.object(LAB, "load_lease", return_value=lease), \
+             mock.patch.object(LAB, "audit", side_effect=[None, OSError("disk full")]), \
+             mock.patch("sys.stdout", output):
+            LAB.cmd_api(args)
+        report = LAB.json.loads(output.getvalue())
+        self.assertTrue(report["operation_succeeded"])
+        self.assertEqual(report["audit_recording_failed"], "disk full")
+
+    def test_version_flag_reports_controller_version(self) -> None:
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            with self.assertRaises(SystemExit) as caught:
+                LAB.parser().parse_args(["--version"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), LAB.__version__)
+
+    def test_guest_run_preserves_argv_for_agent_channel(self) -> None:
+        session = object.__new__(GUEST.GuestSession)
+        session.channel = "agent"
+        session.lab = mock.Mock()
+        session.api = mock.Mock()
+        session.vmid = 9000
+        command = ["printf", "%s", "one value", "two;value"]
+        with mock.patch.object(
+            GUEST.console, "agent_exec",
+            return_value={"stdout": "", "stderr": "", "exitcode": 0},
+        ) as execute:
+            session.run_argv(command)
+        self.assertEqual(execute.call_args.args[3], command)
 
 
 if __name__ == "__main__":

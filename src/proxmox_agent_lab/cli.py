@@ -720,6 +720,19 @@ def path_resource(path: str) -> tuple[str, int] | None:
     return match.group(1), int(match.group(2))
 
 
+def require_lease_resource(
+    lease: dict[str, Any], kind: str, vmid: int
+) -> None:
+    """Refuse guest mutation unless the active lease registered that guest."""
+    if not any(
+        item.get("kind") == kind and int(item.get("vmid", -1)) == vmid
+        for item in lease.get("resources", [])
+    ):
+        raise LabError(
+            f"VMID {vmid} is not a {kind} guest registered to this lease"
+        )
+
+
 def cmd_api(args: argparse.Namespace) -> None:
     api = ProxmoxAPI()
     method = args.method.upper()
@@ -750,16 +763,8 @@ def cmd_api(args: argparse.Namespace) -> None:
         ):
             raise LabError(f"Write path is outside the leased guest surface: {args.path}")
         resource = path_resource(args.path)
-        if method == "DELETE" and resource:
-            kind, vmid = resource
-            owned = any(
-                item["kind"] == kind and int(item["vmid"]) == vmid
-                for item in lease["resources"]
-            )
-            if not owned:
-                raise LabError(
-                    f"Refusing deletion of unregistered {kind} VMID {vmid}"
-                )
+        if resource:
+            require_lease_resource(lease, *resource)
         create_match = re.fullmatch(
             rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
         )
@@ -776,6 +781,16 @@ def cmd_api(args: argparse.Namespace) -> None:
                     tags.append(tag)
             data["tags"] = ";".join(tags)
             data.setdefault("onboot", "0")
+    if write:
+        # The intent is durable before the external mutation. A failed ledger
+        # must block the request rather than make a completed write look failed.
+        audit(
+            "proxmox-api-write-intent",
+            lease=args.lease,
+            method=method,
+            path=args.path,
+            data=data,
+        )
     result = api.call(method, args.path, data)
     task_status = None
     if args.wait_task and isinstance(result, str) and result.startswith("UPID:"):
@@ -801,15 +816,22 @@ def cmd_api(args: argparse.Namespace) -> None:
                 except LabError as exc:
                     print(f"warning: could not protect {created_vmid}: {exc}",
                           file=sys.stderr)
-        audit(
-            "proxmox-api-write",
-            lease=args.lease,
-            method=method,
-            path=args.path,
-            data=data,
-            result=result,
-            task_status=task_status,
-        )
+        report = {"data": result, "task_status": task_status}
+        try:
+            audit(
+                "proxmox-api-write",
+                lease=args.lease,
+                method=method,
+                path=args.path,
+                data=data,
+                result=result,
+                task_status=task_status,
+            )
+        except (LabError, OSError, journal_module.sqlite3.Error) as exc:
+            report["operation_succeeded"] = True
+            report["audit_recording_failed"] = str(exc)
+        print(json.dumps(redact(report), indent=2, sort_keys=True))
+        return
     print(
         json.dumps(
             redact({"data": result, "task_status": task_status}),
@@ -1134,6 +1156,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     if CONFIG_ERROR:
         problems.append(f"config could not be read: {CONFIG_ERROR}")
     report: dict[str, Any] = {
+        "controller_version": __version__,
         "config_file": str(CONFIG.source) if CONFIG.source else None,
         "config_expected_at": str(CONFIG.intended),
         "state_dir": str(STATE_ROOT),
@@ -1254,6 +1277,7 @@ def parser() -> argparse.ArgumentParser:
         description="Lease-managed, fail-closed control of a Proxmox home lab "
                     "that powers itself on and off.",
     )
+    root.add_argument("--version", action="version", version=__version__)
     sub = root.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="write a starter config file")

@@ -53,6 +53,9 @@ Changelog = "https://github.com/jr551/proxmox-agent-lab/blob/main/CHANGELOG.md"
 [tool.hatch.build.targets.wheel]
 packages = ["src/proxmox_agent_lab"]
 
+[tool.hatch.build.targets.wheel.force-include]
+".agents" = ".agents"
+
 [tool.hatch.build.targets.sdist]
 include = [
     "/.agents",

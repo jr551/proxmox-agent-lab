@@ -41,6 +41,24 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertFalse(third["cached"])
         self.assertEqual(open_url.call_count, 2)
 
+    def test_update_cache_is_invalidated_after_controller_upgrade(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = b'{"tag_name":"v0.6.0"}'
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(LAB, "STATE_ROOT", Path(tmp)), \
+             mock.patch.object(LAB.request, "urlopen", return_value=response) as open_url:
+            with mock.patch.object(LAB, "__version__", "0.5.3"):
+                first = LAB.check_for_updates(now=100_000)
+            with mock.patch.object(LAB, "__version__", "0.6.2"):
+                second = LAB.check_for_updates(now=100_001)
+
+        self.assertTrue(first["update_available"])
+        self.assertFalse(second["update_available"])
+        self.assertFalse(second["cached"])
+        self.assertEqual(open_url.call_count, 2)
+
     def test_failed_update_check_is_cached_and_non_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(LAB, "STATE_ROOT", Path(tmp)), \

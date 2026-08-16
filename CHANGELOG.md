@@ -4,6 +4,13 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.6.3 - 2026-08-16
+
+### Fixed
+
+- The daily update-check cache is invalidated when the controller version
+  changes, so an upgraded controller cannot display an obsolete update notice.
+
 ## 0.6.2 - 2026-08-16
 
 ### Fixed

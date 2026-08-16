@@ -4,6 +4,14 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.6.2 - 2026-08-16
+
+### Fixed
+
+- Tag-release CI now updates a pre-existing GitHub release and replaces its
+  generated assets instead of failing after a manual release was published
+  first.
+
 ## 0.6.1 - 2026-08-16
 
 ### Added

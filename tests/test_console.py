@@ -797,6 +797,9 @@ class ScreenshotCommandTests(unittest.TestCase):
         lab.load_lease.return_value = {
             "resources": [{"kind": "qemu", "vmid": 8}]
         }
+        lab.require_lease_resource.side_effect = RuntimeError(
+            "VMID 7 is not a qemu guest registered to this lease"
+        )
         args = mock.Mock(lease="lease-12345678", vmid=7)
         with mock.patch.object(lab_console, "VncSession") as vnc, \
              mock.patch.object(lab_console.vision, "analyze_png") as analyze:

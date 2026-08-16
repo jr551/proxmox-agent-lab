@@ -666,7 +666,7 @@ def cmd_leak_test(lab: Any, args: Any) -> None:
 def cmd_attach(lab: Any, args: Any) -> None:
     """Move a guest onto the VPN-only lab network."""
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    lab.require_lease_resource(lab.load_lease(args.lease), "qemu", args.vmid)
     config = api.call("GET", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config")
     current = config.get(args.nic, "")
     if not current:

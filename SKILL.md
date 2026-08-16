@@ -57,6 +57,18 @@ trap 'proxmox-lab lease-end --lease "$L"' EXIT
    until it does.** If cleanup fails, run `cleanup-expired --all` and report
    the exact blocker.
 
+## 🧭 Delegation and skill-aware harnesses
+
+The primary agent owns the lease and is the only actor allowed to mutate the
+lab. Delegates may inspect screenshots, documentation, logs, and command output,
+but must not begin or end leases, run mutating `proxmox-lab` commands, make host
+changes, or receive secrets. Return observations to the primary agent, which
+performs the one approved action.
+
+When the harness supports skill URLs, read bundled guidance through
+`skill://proxmox-agent-lab/docs/AGENTS.md` and its relative `docs/` paths.
+Otherwise resolve the same files relative to this skill directory.
+
 Read [docs/AGENTS.md](docs/AGENTS.md) before first use. Read
 [docs/safety-policy.md](docs/safety-policy.md) for the enforced rules, and the
 topic guides ([console](docs/console.md), [storage](docs/storage.md),

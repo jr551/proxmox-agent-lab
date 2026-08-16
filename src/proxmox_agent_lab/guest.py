@@ -21,6 +21,8 @@ callers -- and agents -- can say "run this in the guest" and get a result.
 
 from __future__ import annotations
 
+import shlex
+
 from dataclasses import dataclass, field
 from pathlib import Path
 import secrets
@@ -578,7 +580,9 @@ def cmd_run(lab: Any, args: Any) -> None:
     import sys
 
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    lease = lab.load_lease(args.lease)
+    caps = probe(lab, api, args.vmid)
+    lab.require_lease_resource(lease, caps.kind, args.vmid)
     password = sys.stdin.readline().rstrip("\r\n") if args.password_stdin else None
     if args.detach:
         command = shlex.join(args.command)
@@ -614,7 +618,8 @@ def cmd_run(lab: Any, args: Any) -> None:
         return
     try:
         with GuestSession(lab, api, args.vmid, user=args.user,
-                          password=password, prefer=args.prefer) as guest:
+                          password=password, prefer=args.prefer,
+                          capabilities=caps) as guest:
             result = guest.run_argv(args.command, timeout=args.timeout)
             payload = {"vmid": args.vmid, **result.as_dict()}
     except GuestError as exc:

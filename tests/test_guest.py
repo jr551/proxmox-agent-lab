@@ -126,7 +126,9 @@ class GuestRunArgvTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             lab = _lab(tmp)
             command = ["bash", "-lc", "printf '%s' 'two words'\n"]
-            with mock.patch.object(lab_guest, "GuestSession") as session_class:
+            capabilities = lab_guest.GuestCapabilities(7, "qemu", agent=True)
+            with mock.patch.object(lab_guest, "probe", return_value=capabilities), \
+                 mock.patch.object(lab_guest, "GuestSession") as session_class:
                 session = session_class.return_value.__enter__.return_value
                 session.run_argv.return_value = lab_guest.CommandResult(
                     stdout="", stderr="", exit_code=0, channel="agent",
@@ -153,11 +155,13 @@ class DetachedRunTests(unittest.TestCase):
     def test_run_detach_starts_and_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             lab = _lab(tmp)
-            with mock.patch.object(
-                lab_console, "agent_exec",
-                return_value={"exitcode": 0, "stdout": "4242\n",
-                              "stderr": ""},
-            ) as execute:
+            capabilities = lab_guest.GuestCapabilities(7, "qemu", agent=True)
+            with mock.patch.object(lab_guest, "probe", return_value=capabilities), \
+                 mock.patch.object(
+                    lab_console, "agent_exec",
+                    return_value={"exitcode": 0, "stdout": "4242\n",
+                                  "stderr": ""},
+                 ) as execute:
                 lab_guest.cmd_run(lab, _args(
                     lab, "guest", "run", "--lease", "L1", "--vmid", "7",
                     "--detach", "--", "bash", "-lc",

@@ -29,6 +29,23 @@ The capture path is a self-contained RFB client: Proxmox `vncproxy`, a
 WebSocket upgrade, RFB 3.8 with VNC authentication, and Raw/Zlib/CopyRect
 decoding into a PNG written with `zlib` alone. No Pillow, numpy, or noVNC.
 
+### Watching something slow: `screenshot-burst`
+
+```bash
+proxmox-lab console screenshot-burst --vmid 9001 --count 6 --interval 10
+```
+
+For a progress bar, an installer's copy step, or a boot animation — anything
+that changes slowly enough that one screenshot can't tell you whether it's
+progressing or stuck. One VNC session stays open and captures `--count`
+frames (default 6) spaced `--interval` seconds apart (default 10, so the
+default run spans about a minute), then stitches them left to right into a
+single PNG with each frame's elapsed seconds stamped in its corner. Frames
+are never scaled or cropped to match, so a resolution change mid-sequence
+(a boot menu switching to a desktop, for instance) is preserved rather than
+distorted. Takes `--out` and `--upload` like `screenshot`. Prefer this over a
+manual sleep-then-screenshot loop.
+
 ## Optional cloud vision fallback
 
 ```bash
@@ -56,7 +73,7 @@ response recommending a click always reports `actionable: false` and
 
 ```bash
 proxmox-lab console keys  --lease "$L" --vmid 9001 enter f2 ctrl-alt-delete
-proxmox-lab console click --lease "$L" --vmid 9001 --x 640 --y 412
+proxmox-lab console click --lease "$L" --vmid 9001 --target "Install" --x 640 --y 412
 proxmox-lab console type  --lease "$L" --vmid 9001 --text-stdin --enter
 ```
 
@@ -76,9 +93,9 @@ proxmox-lab console keys --lease "$L" --vmid 9001 enter --screenshot-after 3
 - `--screenshot-out PATH` (or the shorter `--out PATH`) gives the post-input
   PNG a stable checkpoint name.
 
-Every click names its visible target. The harness moves the cursor, captures a
-full checkpoint, and asks cloud vision to independently match the label and
-coordinate before pressing the button:
+By default, every click names its visible target. The harness moves the cursor,
+captures a full checkpoint, and asks cloud vision to independently match the
+label and coordinate before pressing the button:
 
 ```bash
 proxmox-lab console click --lease "$L" --vmid 9001 \
@@ -86,7 +103,17 @@ proxmox-lab console click --lease "$L" --vmid 9001 \
 ```
 
 Failure, timeout, ambiguity, or disagreement leaves `clicked: false`. Stop and
-inspect; there is no self-confirmation option.
+inspect; there is no self-confirmation option for a named control.
+
+For a deliberate click on background rather than a control, pass
+`--empty-space` and omit `--target`. It bypasses cloud-vision target
+verification, remains bounds-checked, and is audited as an unverified
+coordinate click. Use it only when the intended point is known to be empty:
+
+```bash
+proxmox-lab console click --lease "$L" --vmid 9001 \
+  --empty-space --button 3 --x 640 --y 412 --screenshot-after 3
+```
 
 When a click opens a popup menu or combobox, prefer arrow keys plus `enter` for
 the visible selection. This preserves menu state and avoids guessing a second
@@ -96,6 +123,34 @@ See [gui-installers.md](gui-installers.md) for the bounded state loop agents
 should use with installers, including Haiku. A model without image vision
 should delegate the current full-screen decision to a vision-capable model,
 not run Tesseract over crops.
+
+## Is it actually frozen?
+
+Two best-effort liveness probes, for when a screen has looked the same for a
+while and you need to know whether it's genuinely stuck or just quiet:
+
+```bash
+proxmox-lab console has-gui-locked-up --lease "$L" --vmid 9001
+proxmox-lab console has-terminal-locked-up --vmid 9001
+```
+
+`has-gui-locked-up` moves the pointer to two different points a moment apart
+and checks whether the screen changed either time, using the same pixel-diff
+this project already uses for change highlighting — no cloud vision call.
+This client declares no support for RFB's Cursor pseudo-encoding, so a
+compliant server (QEMU's among them) draws the pointer into the framebuffer
+itself rather than compositing it client-side; `console click`'s own
+verification already depends on this same fact. `has-terminal-locked-up`
+sends no input at all — it samples a text console several times over about
+two seconds and checks whether anything changed, since a live console's
+cursor normally blinks on its own; it refuses a screen `console screenshot`
+would not call text-mode.
+
+Both return `"locked_up"` as a bool alongside the raw per-sample pixel
+deltas, plus a `"caveat"` when the verdict is `true`: a static screen is good
+evidence of a hang but not proof — an app that paints no hover feedback, or a
+console run with cursor blink disabled, looks the same. Treat this as one
+signal, not a certain diagnosis.
 
 ### Keyboard input needs a VGA display
 

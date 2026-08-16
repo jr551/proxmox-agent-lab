@@ -117,6 +117,60 @@ class PowerTests(unittest.TestCase):
             power_module.power_on(config)
         self.assertIn("switch the machine on yourself", str(caught.exception))
 
+    def _composite_config(self, tmp: str) -> "config_module.Config":
+        path = Path(tmp) / "c.toml"
+        path.write_text(
+            '[power]\nmode = "wake-on-lan+home-assistant"\n'
+            'mac = "aa:bb:cc:dd:ee:ff"\nbroadcast = "192.168.1.255"\n'
+            'home_assistant_url = "https://ha.example"\n'
+            'entity_on = "script.lab_power_on"\n'
+            'entity_off = "script.lab_force_off"\n'
+        )
+        return config_module.load(path)
+
+    def test_composite_mode_sends_both_wol_and_home_assistant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+        with mock.patch.object(power_module, "wake_on_lan") as wol, \
+             mock.patch.object(power_module, "_home_assistant") as ha:
+            result = power_module.power_on(config)
+        wol.assert_called_once_with("aa:bb:cc:dd:ee:ff", "192.168.1.255", 9)
+        ha.assert_called_once_with(config, "script.lab_power_on")
+        self.assertEqual(result["mode"], "wake-on-lan+home-assistant")
+        self.assertIsNone(result["errors"])
+
+    def test_composite_mode_survives_one_path_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+        with mock.patch.object(power_module, "wake_on_lan",
+                                side_effect=power_module.PowerError("boom")), \
+             mock.patch.object(power_module, "_home_assistant") as ha:
+            result = power_module.power_on(config)
+        ha.assert_called_once()
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("wake-on-lan: boom", result["errors"][0])
+
+    def test_composite_mode_raises_only_if_both_paths_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+        with mock.patch.object(power_module, "wake_on_lan",
+                                side_effect=power_module.PowerError("wol down")), \
+             mock.patch.object(power_module, "_home_assistant",
+                                side_effect=power_module.PowerError("ha down")):
+            with self.assertRaises(power_module.PowerError) as caught:
+                power_module.power_on(config)
+        self.assertIn("wol down", str(caught.exception))
+        self.assertIn("ha down", str(caught.exception))
+
+    def test_composite_mode_force_off_goes_through_home_assistant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+        self.assertTrue(power_module.can_force_off(config))
+        with mock.patch.object(power_module, "_home_assistant") as ha:
+            result = power_module.force_off(config)
+        ha.assert_called_once_with(config, "script.lab_force_off")
+        self.assertEqual(result["mode"], "wake-on-lan+home-assistant")
+
 
 class SecretsTests(unittest.TestCase):
     def test_env_backend_reads_the_namespaced_variable(self) -> None:
@@ -264,6 +318,95 @@ class JournalTests(unittest.TestCase):
             ).stdout.splitlines()
             self.assertEqual(changed, ["journal/2026-01-01.jsonl"])
 
+    def test_git_sync_retries_a_rejected_non_fast_forward_push(self) -> None:
+        # A competing writer that pushes between our fetch and our push leaves
+        # the rebase against a stale origin; the push is then rejected as
+        # non-fast-forward and sync_git must refetch, rebase and retry.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            repo = root / "logs"
+            subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                           stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "init", "-b", "logs", str(repo)], check=True,
+                           stdout=subprocess.DEVNULL)
+            for key, value in (("user.name", "Test"),
+                               ("user.email", "test@example.invalid")):
+                subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            (repo / "README.md").write_text("private audit logs\n")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"],
+                           check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
+                           check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "push", "-u", "origin", "logs"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+
+            competing = root / "competing"
+            subprocess.run(["git", "clone", "-q", str(remote), str(competing)],
+                           check=True, stdout=subprocess.DEVNULL)
+            for key, value in (("user.name", "Test"),
+                               ("user.email", "test@example.invalid")):
+                subprocess.run(
+                    ["git", "-C", str(competing), "config", key, value],
+                    check=True,
+                )
+            subprocess.run(
+                ["git", "-C", str(competing), "checkout", "-b", "logs",
+                 "origin/logs"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+
+            real_run = subprocess.run
+            injected = {"done": False}
+
+            def push_with_competing_writer(command, **kwargs):
+                # On sync_git's first push attempt, land a conflicting commit
+                # on origin first so the push is rejected as non-fast-forward.
+                if not injected["done"] and command[:2] == ["git", "-C"] \
+                        and command[3:4] == ["push"]:
+                    injected["done"] = True
+                    log = competing / "journal" / "2026-01-02.jsonl"
+                    log.parent.mkdir(parents=True, exist_ok=True)
+                    log.write_text('{"event": "competing"}\n')
+                    real_run(["git", "-C", str(competing), "add",
+                              "journal/2026-01-02.jsonl"], check=True,
+                             stdout=subprocess.DEVNULL)
+                    real_run(["git", "-C", str(competing), "commit",
+                              "-m", "competing"], check=True,
+                             stdout=subprocess.DEVNULL)
+                    real_run(["git", "-C", str(competing), "push",
+                              "origin", "logs"], check=True,
+                             stdout=subprocess.DEVNULL)
+                return real_run(command, **kwargs)
+
+            with mock.patch.object(journal_module.subprocess, "run",
+                                   side_effect=push_with_competing_writer), \
+                 mock.patch.object(journal_module, "SYNC_GIT_RETRY_DELAY", 0):
+                journal_module.sync_git(
+                    repo, self._event("lease-begin", vmid=9001), "lease-begin"
+                )
+            self.assertTrue(injected["done"], "the competing push never ran")
+            logged = subprocess.run(
+                ["git", "--git-dir", str(remote), "show",
+                 "logs:journal/2026-01-01.jsonl"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout
+            self.assertIn('"event": "lease-begin"', logged)
+            competing_log = subprocess.run(
+                ["git", "--git-dir", str(remote), "show",
+                 "logs:journal/2026-01-02.jsonl"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout
+            self.assertIn('"event": "competing"', competing_log)
+
     def test_git_sync_refuses_a_mixed_purpose_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -306,8 +449,10 @@ class GuestChannelTests(unittest.TestCase):
         lab.NODE = "testnode"
         api = mock.Mock()
         api.call.return_value = config
-        return lab, api, mock.patch.object(
-            guest_module.console, "agent_ready", return_value=agent
+        return lab, api, mock.patch.multiple(
+            guest_module.console,
+            agent_ready=mock.Mock(return_value=agent),
+            agent_exec=mock.Mock(return_value={"exitcode": 0}),
         )
 
     def test_agent_is_preferred_when_available(self) -> None:
@@ -321,6 +466,30 @@ class GuestChannelTests(unittest.TestCase):
         with patched:
             session = guest_module.GuestSession(lab, api, 100, password="pw")
         self.assertEqual(session.channel, "serial")
+
+    def test_agent_that_only_pings_is_not_a_command_channel(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "testnode"
+        api = mock.Mock()
+        api.call.return_value = {"serial0": "socket", "agent": "enabled=1"}
+        with mock.patch.object(
+            guest_module.console, "agent_ready", return_value=True
+        ), mock.patch.object(
+            guest_module.console,
+            "agent_exec",
+            side_effect=RuntimeError("Proxmox HTTP 596 for POST agent/exec"),
+        ) as execute:
+            caps = guest_module.probe(lab, api, 100)
+
+        self.assertFalse(caps.agent)
+        self.assertTrue(any(
+            "agent pings but cannot complete a command" in note
+            for note in caps.notes
+        ))
+        execute.assert_called_once_with(
+            lab, api, 100, ["/bin/true"], timeout=5,
+        )
 
     def test_serial_needs_a_password_and_says_so(self) -> None:
         lab, api, patched = self._lab({"serial0": "socket"}, False)

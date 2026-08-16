@@ -30,6 +30,7 @@ sys.path.insert(0, str(SRC))
 SCRIPTS = SRC / "proxmox_agent_lab"
 
 from proxmox_agent_lab import des as lab_des  # noqa: E402
+from proxmox_agent_lab import console as lab_console  # noqa: E402
 from proxmox_agent_lab import netgw as lab_netgw  # noqa: E402
 from proxmox_agent_lab import png as lab_png  # noqa: E402
 from proxmox_agent_lab import rfb as lab_rfb  # noqa: E402
@@ -156,6 +157,41 @@ class PngTests(unittest.TestCase):
     def test_change_highlight_rejects_mismatched_frames(self) -> None:
         with self.assertRaises(ValueError):
             lab_png.highlight_changes(2, 1, b"\x00" * 6, b"\x00" * 3)
+
+    def test_stitch_horizontal_places_frames_left_to_right(self) -> None:
+        red = bytes((255, 0, 0)) * (2 * 2)
+        blue = bytes((0, 0, 255)) * (3 * 2)
+        width, height, stitched = lab_png.stitch_horizontal(
+            [(2, 2, red, ""), (3, 2, blue, "")], gap=1
+        )
+        self.assertEqual((width, height), (2 + 1 + 3, 2))
+        # row 0: red pixel, red pixel, gap (black), blue, blue, blue
+        self.assertEqual(stitched[0:3], b"\xff\x00\x00")
+        self.assertEqual(stitched[6:9], b"\x00\x00\x00")
+        self.assertEqual(stitched[9:12], b"\x00\x00\xff")
+
+    def test_stitch_horizontal_handles_frames_of_different_heights(self) -> None:
+        short = bytes((1, 2, 3)) * (2 * 1)
+        tall = bytes((4, 5, 6)) * (2 * 3)
+        width, height, stitched = lab_png.stitch_horizontal(
+            [(2, 1, short, ""), (2, 3, tall, "")], gap=0
+        )
+        self.assertEqual((width, height), (4, 3))
+        self.assertEqual(len(stitched), width * height * 3)
+        # the short frame's second row (row 1 of the canvas) is unfilled/black
+        second_row_short_side = (1 * width + 0) * 3
+        self.assertEqual(
+            stitched[second_row_short_side:second_row_short_side + 3],
+            b"\x00\x00\x00",
+        )
+
+    def test_stitch_horizontal_rejects_empty_input(self) -> None:
+        with self.assertRaises(ValueError):
+            lab_png.stitch_horizontal([])
+
+    def test_stitch_horizontal_rejects_mismatched_frame_buffer(self) -> None:
+        with self.assertRaises(ValueError):
+            lab_png.stitch_horizontal([(2, 2, b"\x00" * 3, "")])
 
 
 class RfbTests(unittest.TestCase):
@@ -285,16 +321,62 @@ class TextModeTests(unittest.TestCase):
                 decoded = lab_textmode.decode_screen(bytes(screen), width, height)
         self.assertEqual(decoded["text"], "A")
         self.assertEqual(decoded["confidence"], 1.0)
+        self.assertEqual(decoded["ocr_font"], "imported")
 
-    def test_decode_without_font_table_explains_itself(self) -> None:
+    def test_decode_without_a_table_installs_the_builtin_font(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "absent.json"
             with mock.patch.object(
                 lab_textmode, "font_table_path", return_value=missing
             ):
-                result = lab_textmode.decode_screen(b"\x00" * (8 * 16 * 3), 8, 16)
-        self.assertIn("no console font table", result["error"])
-        self.assertIn("console text", result["error"])
+                result = lab_textmode.decode_screen(
+                    b"\x00" * (8 * 16 * 3), 8, 16
+                )
+            table = json.loads(missing.read_text())
+        self.assertNotIn("error", result)
+        self.assertEqual(result["ocr_font"], "builtin")
+        self.assertEqual((table["width"], table["height"]), (8, 16))
+
+    def test_builtin_font_round_trip_decodes_ascii(self) -> None:
+        # Paint one 8x16 cell of 'A' from the embedded font and check the
+        # exact glyph is recovered when no user table exists yet.
+        table = lab_textmode.builtin_font_table()
+        glyph = bytes.fromhex(
+            next(key for key, value in table["glyphs"].items() if value == "A")
+        )
+        width, height = 8, 16
+        screen = bytearray(b"\x00\x00\x00" * width * height)
+        for row in range(height):
+            for column in range(width):
+                if glyph[row] & (1 << (7 - column)):
+                    offset = (row * width + column) * 3
+                    screen[offset : offset + 3] = b"\xff\xff\xff"
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "absent.json"
+            with mock.patch.object(
+                lab_textmode, "font_table_path", return_value=missing
+            ):
+                decoded = lab_textmode.decode_screen(
+                    bytes(screen), width, height
+                )
+        self.assertEqual(decoded["text"], "A")
+        self.assertEqual(decoded["confidence"], 1.0)
+        self.assertEqual(decoded["ocr_font"], "builtin")
+
+    def test_decode_reports_when_the_builtin_font_cannot_be_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "absent.json"
+            with mock.patch.object(
+                lab_textmode, "font_table_path", return_value=missing
+            ), mock.patch.object(
+                lab_textmode, "_write_font_table",
+                side_effect=OSError("read-only filesystem"),
+            ):
+                result = lab_textmode.decode_screen(
+                    b"\x00" * (8 * 16 * 3), 8, 16
+                )
+        self.assertIn("builtin", result["error"])
+        self.assertIn("import-font", result["error"])
 
 
 class S3Tests(unittest.TestCase):
@@ -534,6 +616,29 @@ class SerialSessionTests(unittest.TestCase):
         self.assertEqual(result["stdout"], "1786125185\n")
         self.assertEqual(result["exitcode"], 0)
 
+    def test_a_signal_killed_process_is_never_reported_as_exitcode_none(self) -> None:
+        """qemu-guest-agent reports either exitcode or signal, never both.
+
+        Every caller decides success with `exitcode not in (0, None)`. If a
+        signal-killed process (OOM, crash, an external kill) came back as
+        exitcode None, it would look exactly like the "no code available"
+        case the serial channel legitimately has, instead of the failure it
+        actually is.
+        """
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.NODE = "testnode"
+        api = mock.Mock()
+        api.call.side_effect = [
+            {"pid": 1},
+            {"exited": 1, "signal": 9, "out-data": "", "err-data": ""},
+        ]
+        result = lab_console.agent_exec(lab, api, 9000, ["sleep", "300"])
+        self.assertEqual(result["signal"], 9)
+        self.assertNotIn(result["exitcode"], (0, None))
+        self.assertEqual(result["exitcode"], 137)
+
     def test_send_line_declares_byte_length_not_character_length(self) -> None:
         from proxmox_agent_lab import console as lab_console
 
@@ -767,6 +872,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         session.client.width, session.client.height = 2, 2
 
         with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
             out = Path(tmp) / "shot.png"
             args = mock.Mock(vmid=1, out=str(out), settle=0, timeout=5,
                              upload=False, url_expiry=60, ocr=False)
@@ -777,6 +883,74 @@ class ScreenshotCommandTests(unittest.TestCase):
                 lab_console.cmd_screenshot(lab, args)
             self.assertTrue(out.exists())
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+
+    def test_cmd_screenshot_burst_stitches_captures_over_time(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.capture.return_value = b"\x00\x00\x00" * 4
+        session.client.width, session.client.height = 2, 2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
+            out = Path(tmp) / "burst.png"
+            args = mock.Mock(vmid=1, out=str(out), count=3, interval=10.0,
+                             timeout=5, upload=False, url_expiry=60)
+            with mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch.object(lab_console.time, "sleep") as sleep, \
+                 mock.patch("builtins.print") as printed:
+                lab_console.cmd_screenshot_burst(lab, args)
+            payload = json.loads(printed.call_args.args[0])
+
+            self.assertEqual(session.client.capture.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)  # never sleeps after the last
+            sleep.assert_called_with(10.0)
+            self.assertEqual(payload["frame_count"], 3)
+            self.assertEqual(payload["width"], 2 * 3 + 4 * 2)  # 3 frames + 2 gaps
+            self.assertTrue(out.exists())
+            self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+
+    def test_cmd_screenshot_burst_rejects_a_bad_count(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        args = mock.Mock(vmid=1, count=0, interval=10.0)
+        with self.assertRaises(RuntimeError) as caught:
+            lab_console.cmd_screenshot_burst(lab, args)
+        self.assertIn("--count", str(caught.exception))
+
+    def test_save_screenshot_flags_identical_repeat_frames(self) -> None:
+        """A pixel-identical repeat capture is reported as possibly stale."""
+        from proxmox_agent_lab import console as lab_console
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            first = lab_console._save_screenshot(
+                7, b"\x00\x00\x00" * 4, 2, 2,
+                override=str(Path(tmp) / "a.png"), state_root=state,
+            )
+            repeat = lab_console._save_screenshot(
+                7, b"\x00\x00\x00" * 4, 2, 2,
+                override=str(Path(tmp) / "b.png"), state_root=state,
+            )
+            changed = lab_console._save_screenshot(
+                7, b"\xff\xff\xff" * 4, 2, 2,
+                override=str(Path(tmp) / "c.png"), state_root=state,
+            )
+
+        self.assertFalse(first["identical_to_previous_capture"])
+        self.assertNotIn("stale_possible", first)
+        self.assertTrue(repeat["identical_to_previous_capture"])
+        self.assertIn("stale_possible", repeat)
+        self.assertIn("recapture before acting", repeat["stale_possible"])
+        self.assertFalse(changed["identical_to_previous_capture"])
+        self.assertNotIn("stale_possible", changed)
 
     def test_click_requires_independent_target_verification(self) -> None:
         from proxmox_agent_lab import console as lab_console
@@ -793,7 +967,7 @@ class ScreenshotCommandTests(unittest.TestCase):
             args = mock.Mock(
                 lease="lease-12345678", vmid=1, x=0, y=0, button=1,
                 double=False, screenshot_after=2.5, screenshot_out=str(out),
-                target="OK", calibration_settle=1.0,
+                target="OK", empty_space=False, calibration_settle=1.0,
                 vision_timeout=10, provider="auto",
             )
             with mock.patch.object(lab, "STATE_ROOT", Path(tmp)), \
@@ -801,7 +975,18 @@ class ScreenshotCommandTests(unittest.TestCase):
                                    return_value=session), \
                  mock.patch.object(lab, "ProxmoxAPI"), \
                  mock.patch.object(lab_console.vision, "analyze_png",
-                                   return_value={"provider": "nvidia"}), \
+                                   return_value={
+                                       "provider": "nvidia",
+                                       "analysis": {
+                                           "controls": [
+                                               {"label": "OK",
+                                                "bbox": [0, 0, 2, 2]},
+                                           ],
+                                           "recommended_action": {
+                                               "kind": "click", "value": "0,0",
+                                           },
+                                       },
+                                   }), \
                  mock.patch.object(lab_console.vision, "verifies_target",
                                    side_effect=[(False, "wrong target"),
                                                 (True, "matched")]), \
@@ -822,3 +1007,331 @@ class ScreenshotCommandTests(unittest.TestCase):
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
             self.assertEqual(payload["screenshot_after"]["path"], str(out))
             self.assertTrue(payload["verification"]["accepted"])
+            self.assertEqual(payload["control_bbox"], [0, 0, 2, 2])
+
+    def test_click_empty_space_bypasses_target_verification(self) -> None:
+        import argparse
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        parser = argparse.ArgumentParser()
+        lab_console.register(parser.add_subparsers(), lab)
+        args = parser.parse_args([
+            "console", "click", "--lease", "lease-12345678", "--vmid", "1",
+            "--x", "1", "--y", "1", "--button", "3", "--empty-space",
+        ])
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 2, 2
+
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"), \
+             mock.patch.object(lab_console.vision, "analyze_png") as analyze, \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_click(lab, args)
+
+        session.client.click.assert_called_once_with(1, 1, button=3, double=False)
+        session.client.capture.assert_not_called()
+        analyze.assert_not_called()
+        lab.audit.assert_called_once_with(
+            "console-click-unverified", lease="lease-12345678", vmid=1,
+            x=1, y=1, button=3, sync=False,
+        )
+        payload = json.loads(printed.call_args.args[0])
+        self.assertEqual(payload["clicked"], [1, 1])
+        self.assertTrue(payload["empty_space"])
+        self.assertIn("unverified", payload["verification"]["reason"])
+
+    def test_has_gui_locked_up_true_when_nothing_changes(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 4, 4
+        session.client.capture.return_value = b"\x00\x00\x00" * 16
+        args = mock.Mock(lease="lease-1", vmid=1, settle=0.0,
+                         timeout=5, threshold=24)
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"), \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_has_gui_locked_up(lab, args)
+        payload = json.loads(printed.call_args.args[0])
+
+        self.assertEqual(session.client.pointer.call_count, 2)
+        self.assertTrue(payload["locked_up"])
+        self.assertEqual(payload["changed_pixels_per_probe"], [0, 0])
+        self.assertIn("caveat", payload)
+        lab.audit.assert_called_once_with(
+            "console-has-gui-locked-up", lease="lease-1", vmid=1,
+            locked_up=True, sync=False,
+        )
+
+    def test_has_gui_locked_up_false_when_a_probe_sees_change(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 4, 4
+        blank = b"\x00\x00\x00" * 16
+        changed = b"\xff\xff\xff" * 16
+        session.client.capture.side_effect = [blank, changed, changed]
+        args = mock.Mock(lease="lease-1", vmid=1, settle=0.0,
+                         timeout=5, threshold=24)
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"), \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_has_gui_locked_up(lab, args)
+        payload = json.loads(printed.call_args.args[0])
+
+        self.assertFalse(payload["locked_up"])
+        self.assertNotIn("caveat", payload)
+
+    def test_has_terminal_locked_up_refuses_a_graphical_screen(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 8, 8
+        # Many distinct colours: textmode.analyse should call this graphical.
+        session.client.capture.return_value = bytes(range(192))
+        args = mock.Mock(vmid=1, samples=2, interval=0.0, timeout=5, threshold=24)
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"):
+            with self.assertRaises(RuntimeError) as caught:
+                lab_console.cmd_has_terminal_locked_up(lab, args)
+        self.assertIn("not a text console", str(caught.exception))
+
+    def test_has_terminal_locked_up_true_when_static(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 8, 8
+        # A handful of colours reads as a text console to textmode.analyse.
+        frame = (b"\x00\x00\x00" * 60) + (b"\xff\xff\xff" * 4)
+        session.client.capture.return_value = frame
+        args = mock.Mock(vmid=1, samples=3, interval=0.0, timeout=5, threshold=24)
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"), \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_has_terminal_locked_up(lab, args)
+        payload = json.loads(printed.call_args.args[0])
+
+        self.assertTrue(payload["locked_up"])
+        self.assertEqual(payload["changed_pixels_per_sample"], [0, 0])
+        self.assertIn("caveat", payload)
+
+    def test_has_terminal_locked_up_rejects_too_few_samples(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        args = mock.Mock(vmid=1, samples=1, interval=0.0)
+        with self.assertRaises(RuntimeError) as caught:
+            lab_console.cmd_has_terminal_locked_up(lab, args)
+        self.assertIn("--samples", str(caught.exception))
+
+    def test_inspect_audits_vision_failure(self) -> None:
+        """A rejected vision analysis must leave a journal trail."""
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.load_lease.return_value = {
+            "resources": [{"kind": "qemu", "vmid": 7}]
+        }
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 2, 2
+        session.client.capture.return_value = b"\x00\x00\x00" * 4
+        message = (
+            "no vision provider returned a valid analysis: "
+            "nvidia: rejected (some/vision-model: screen is not a non-empty string)"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
+            args = mock.Mock(
+                lease="lease-12345678", vmid=7, settle=2.0,
+                out=str(Path(tmp) / "inspect.png"), prompt=None, timeout=120,
+                max_tokens=1024, provider="nvidia",
+            )
+            with mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch.object(lab_console.vision, "analyze_png",
+                                   side_effect=lab_console.vision.VisionError(
+                                       message
+                                   )):
+                with self.assertRaises(RuntimeError) as caught:
+                    lab_console.cmd_inspect(lab, args)
+
+        self.assertEqual(str(caught.exception), message)
+        lab.audit.assert_called_once_with(
+            "console-vision-inspect-failed", lease=args.lease, vmid=7,
+            error=message[:200], provider="nvidia", sync=False,
+        )
+
+
+class ChunkedTransferTests(unittest.TestCase):
+    """Chunked push/pull: part keys, reassembly, and hash verification."""
+
+    def _lab(self) -> mock.Mock:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        lab.STATE_ROOT = "/tmp/pb-state"
+        lab.load_lease.return_value = {"resources": []}
+        lab.iso_now = lambda: "2026-08-11T00:00:00Z"
+        return lab
+
+    def _args(self, lab: mock.Mock, *argv: str) -> object:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        lab_console.register(parser.add_subparsers(), lab)
+        return parser.parse_args(list(argv))
+
+    def test_fetch_parts_command_has_all_urls_and_hash(self) -> None:
+        command = lab_console._fetch_parts_command(
+            ["https://s3/part-0", "https://s3/part-1"], "/tmp/out.bin"
+        )
+        self.assertEqual(command[0], "/bin/sh")
+        script = command[2]
+        self.assertIn("https://s3/part-0", script)
+        self.assertIn("https://s3/part-1", script)
+        self.assertIn("cat /tmp/pp-* > /tmp/out.bin", script)
+        self.assertIn("sha256sum /tmp/out.bin", script)
+
+    def test_push_chunked_uploads_parts_and_verifies(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab()
+            source = Path(tmp) / "payload.bin"
+            payload = b"a" * (2 * 1024 * 1024 + 13)  # 2 parts at 1 MiB
+            source.write_bytes(payload)
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            fake_s3 = mock.Mock()
+            fake_s3.put_bytes.return_value = "push/abc/payload.bin"
+            fake_s3.presign.return_value = "https://s3/part"
+            with mock.patch.object(lab_console, "SINGLE_OBJECT_MAX_MB", 0), \
+                 mock.patch.object(lab_console, "s3", fake_s3), \
+                 mock.patch.object(
+                     lab_console, "agent_exec",
+                     return_value={
+                         "exitcode": 0,
+                         "stdout": hashlib.sha256(payload).hexdigest(),
+                         "stderr": "",
+                     },
+                 ):
+                args = self._args(
+                    lab, "push", "--lease", "L1", "--vmid", "7",
+                    "--file", str(source), "--chunk-size", "1",
+                )
+                lab_console.cmd_push(lab, args)
+            keys = [c.args[0] for c in fake_s3.put_bytes.call_args_list]
+            self.assertEqual(len(keys), 3)
+            self.assertTrue(all(
+                k.endswith(("/part-0000", "/part-0001", "/part-0002"))
+                for k in keys
+            ))
+
+    def test_push_chunked_raises_on_guest_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab()
+            source = Path(tmp) / "payload.bin"
+            source.write_bytes(b"a" * (2 * 1024 * 1024 + 1))
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            fake_s3 = mock.Mock()
+            fake_s3.put_bytes.return_value = "push/abc/payload.bin"
+            fake_s3.presign.return_value = "https://s3/part"
+            with mock.patch.object(lab_console, "SINGLE_OBJECT_MAX_MB", 0), \
+                 mock.patch.object(lab_console, "s3", fake_s3), \
+                 mock.patch.object(
+                     lab_console, "agent_exec",
+                     return_value={"exitcode": 0, "stdout": "deadbeef",
+                                   "stderr": ""},
+                 ):
+                args = self._args(
+                    lab, "push", "--lease", "L1", "--vmid", "7",
+                    "--file", str(source), "--chunk-size", "1",
+                    "--sha256", "0" * 64,
+                )
+                with self.assertRaises(RuntimeError) as caught:
+                    lab_console.cmd_push(lab, args)
+            self.assertIn("sha256 mismatch", str(caught.exception))
+
+    def test_pull_skips_when_local_file_already_matches(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab()
+            out = Path(tmp) / "artifact.iso"
+            payload = b"x" * (2 * 1024 * 1024 + 7)
+            out.write_bytes(payload)
+            expected = hashlib.sha256(payload).hexdigest()
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            with mock.patch.object(lab_console, "s3", mock.Mock()), \
+                 mock.patch.object(lab_console, "agent_exec") as execute:
+                args = self._args(
+                    lab, "pull", "--lease", "L1", "--vmid", "7",
+                    "--remote", "/tmp/artifact.iso", "--out", str(out),
+                    "--sha256", expected,
+                )
+                lab_console.cmd_pull(lab, args)
+            execute.assert_not_called()
+
+    def test_pull_assembles_parts_and_checks_guest_hash(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab()
+            out = Path(tmp) / "artifact.iso"
+            payload = b"y" * (1024 * 1024 + 1)  # two 1 MiB parts
+            expected = hashlib.sha256(payload).hexdigest()
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            fake_s3 = mock.Mock()
+            fake_s3.list_objects.return_value = []
+            half = len(payload) // 2
+            fake_s3.get_bytes.side_effect = [payload[:half],
+                                             payload[half:]]
+            fake_s3.presign.return_value = "https://s3/put"
+            with mock.patch.object(lab_console, "SINGLE_OBJECT_MAX_MB", 0), \
+                 mock.patch.object(lab_console, "s3", fake_s3), \
+                 mock.patch.object(
+                     lab_console, "agent_exec",
+                     side_effect=[
+                         {"exitcode": 0, "stdout": str(len(payload)),
+                          "stderr": ""},
+                         {"exitcode": 0, "stdout": str(len(payload)),
+                          "stderr": ""},
+                         {"exitcode": 0, "stdout": expected, "stderr": ""},
+                     ],
+                 ):
+                args = self._args(
+                    lab, "pull", "--lease", "L1", "--vmid", "7",
+                    "--remote", "/tmp/artifact.iso", "--out", str(out),
+                    "--chunk-size", "1",
+                )
+                lab_console.cmd_pull(lab, args)
+            self.assertEqual(out.read_bytes(), payload)
+            self.assertEqual(fake_s3.get_bytes.call_count, 2)
+            self.assertEqual(fake_s3.delete_object.call_count, 2)

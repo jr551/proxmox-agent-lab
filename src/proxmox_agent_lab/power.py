@@ -12,6 +12,13 @@ Modes:
                       path down; that is usually what you want anyway.
 * `home-assistant` -- call scripts in Home Assistant, e.g. a smart plug or a
                       KVM that presses the power button.
+* `wake-on-lan+home-assistant` -- send the magic packet and trigger the Home
+                      Assistant script together on every power-on. Useful
+                      when WoL alone is not reliable enough to trust by
+                      itself (a NIC that occasionally drops out of suspend,
+                      a BIOS that forgets the setting) but a smart-plug/KVM
+                      fallback is also available; force-off still goes
+                      through Home Assistant, since WoL cannot cut power.
 * `command`        -- run a local command. The escape hatch for IPMI, a PDU,
                       or anything with a CLI.
 * `none`           -- no remote power control; the user switches it on.
@@ -116,6 +123,27 @@ def power_on(config: Config) -> dict[str, Any]:
         entity = config.require("power.entity_on", "a Home Assistant script entity")
         _home_assistant(config, entity)
         return {"mode": mode, "entity_id": entity}
+    if mode == "wake-on-lan+home-assistant":
+        mac = config.require(
+            "power.mac", "the lab machine's NIC MAC, with Wake-on-LAN enabled in its BIOS"
+        )
+        entity = config.require("power.entity_on", "a Home Assistant script entity")
+        errors: list[str] = []
+        try:
+            wake_on_lan(mac, config.power.get("broadcast", ""),
+                        int(config.power.get("wol_port", 9)))
+        except PowerError as exc:
+            errors.append(f"wake-on-lan: {exc}")
+        try:
+            _home_assistant(config, entity)
+        except PowerError as exc:
+            errors.append(f"home-assistant: {exc}")
+        if len(errors) == 2:
+            raise PowerError("; ".join(errors))
+        return {
+            "mode": mode, "sent": "magic packet + home-assistant script",
+            "mac": mac, "entity_id": entity, "errors": errors or None,
+        }
     if mode == "command":
         command = config.require("power.on_command")
         _run_command(command, "power-on")
@@ -129,7 +157,7 @@ def power_on(config: Config) -> dict[str, Any]:
 
 def can_force_off(config: Config) -> bool:
     mode = config.power.get("mode", "wake-on-lan")
-    if mode == "home-assistant":
+    if mode in ("home-assistant", "wake-on-lan+home-assistant"):
         return bool(config.power.get("entity_off"))
     if mode == "command":
         return bool(config.power.get("off_command"))
@@ -139,7 +167,9 @@ def can_force_off(config: Config) -> bool:
 def force_off(config: Config) -> dict[str, Any]:
     """Emergency finaliser, only after a graceful shutdown has failed."""
     mode = config.power.get("mode", "wake-on-lan")
-    if mode == "home-assistant":
+    if mode in ("home-assistant", "wake-on-lan+home-assistant"):
+        # Wake-on-LAN cannot cut power, so Home Assistant is the only path
+        # down in the composite mode too.
         entity = config.require(
             "power.entity_off", "a Home Assistant script that cuts power"
         )

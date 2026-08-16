@@ -48,7 +48,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "power": {
         # how to switch the lab machine on: wake-on-lan | home-assistant
-        # | command | none
+        # | wake-on-lan+home-assistant | command | none
         "mode": "wake-on-lan",
         "mac": "",
         "broadcast": "255.255.255.255",
@@ -132,11 +132,18 @@ DEFAULTS: dict[str, Any] = {
         "file_path": "",
     },
     "audit": {
-        "backend": "sqlite",   # sqlite | jsonl
+        "backend": "sqlite",   # sqlite | jsonl | pocketbase
         "journal_dir": "",     # defaults to <state>/journal
         "git_sync": False,     # copy redacted events to a private git repo
         "git_repo": "",
         "git_branch": "logs",
+        "controller_id": "",
+        "pocketbase_url": "",
+        "pocketbase_collection": "proxmox_lab_events",
+        "pocketbase_token_secret": "audit-token",
+        "pocketbase_timeout_seconds": 10,
+        "pocketbase_auth_refresh_before_seconds": 300,
+        "pocketbase_agent_collection": "proxmox_lab_agents",
     },
 }
 
@@ -329,7 +336,8 @@ long_term_backup_keep = 2
 [power]
 # How to switch the machine on. Wake-on-LAN needs nothing but the NIC's MAC
 # and works on almost any desktop; enable WoL in its BIOS first.
-mode = "wake-on-lan"         # wake-on-lan | home-assistant | command | none
+mode = "wake-on-lan"         # wake-on-lan | home-assistant
+                             # | wake-on-lan+home-assistant | command | none
 mac = "aa:bb:cc:dd:ee:ff"
 broadcast = "192.168.1.255"
 boot_timeout_seconds = 300
@@ -338,6 +346,11 @@ boot_timeout_seconds = 300
 # home_assistant_url = "https://homeassistant.example"
 # entity_on = "script.lab_power_on"
 # entity_off = "script.lab_force_off"
+
+# mode = "wake-on-lan+home-assistant"  # both together on power-on; force-off
+# home_assistant_url = "https://homeassistant.example"  # still needs Home
+# entity_on = "script.lab_power_on"                     # Assistant, since WoL
+# entity_off = "script.lab_force_off"                   # cannot cut power
 
 # mode = "command"
 # on_command = "/usr/local/bin/lab-power-on"
@@ -399,8 +412,15 @@ template_2022_vmid = 0
 backend = "auto"             # auto | keychain | secret-tool | env | file
 
 [audit]
-backend = "sqlite"           # sqlite (queryable) | jsonl (git-friendly)
+backend = "sqlite"           # sqlite | jsonl | pocketbase
 git_sync = false             # copy redacted events to a private git repo
 git_repo = ""                # dedicated private logging checkout
 git_branch = "logs"
+controller_id = ""           # defaults to the controller hostname
+pocketbase_url = ""          # e.g. https://rowedb.example
+pocketbase_collection = "proxmox_lab_events"
+pocketbase_token_secret = "audit-token"
+pocketbase_timeout_seconds = 10
+pocketbase_auth_refresh_before_seconds = 300
+pocketbase_agent_collection = "proxmox_lab_agents"
 """

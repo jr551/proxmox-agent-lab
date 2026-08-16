@@ -41,12 +41,15 @@ recommended action as a proposal, not permission. Ordinary screenshots stay
 local. Do not send
 confidential or personal screens to free providers.
 
-`console click` has one minimal guarded interface: name the visible `--target`
-and provide its proposed coordinates. The harness moves the cursor, captures a
-full checkpoint, and asks cloud vision to independently match the named control
-and coordinate. It clicks only after that positive verdict. Failure, timeout,
-ambiguity, or disagreement returns `clicked: false`; stop instead of retrying.
-There is no self-confirmation flag.
+Ordinary `console click` commands name the visible `--target` and provide its
+proposed coordinates. The harness moves the cursor, captures a full checkpoint,
+and asks cloud vision to independently match the named control and coordinate.
+It clicks only after that positive verdict. Failure, timeout, ambiguity, or
+disagreement returns `clicked: false`; stop instead of retrying.
+
+`--empty-space` is the narrow exception for a known blank background, such as
+dismissing a menu. It deliberately skips that verification and is audited as an
+unverified coordinate click; do not use it to bypass installer control checks.
 
 For a popup menu or combobox opened by a verified click, use arrow keys and
 `enter` to choose the visibly highlighted item. Haiku's menus preserve
@@ -77,6 +80,10 @@ or installer.
   clones, or disk creation unless current state proves they failed.
 - Send a progress update at each major screen or at least every five minutes.
   Heartbeat the lease when work reaches 30 minutes.
+- On a long copy or progress screen, prefer `console screenshot-burst` over a
+  manual sleep-then-screenshot loop: it captures several frames over a
+  minute and returns one stitched image showing whether things are actually
+  moving.
 
 ## Before touching the installer
 
@@ -94,6 +101,36 @@ or installer.
     --path "/nodes/$NODE/qemu/$VMID/config" \
     --data 'boot=order=scsi0;ide2'
   ```
+
+## Memory and sizing for GUI installers
+
+Legacy GUI installers have hard memory floors; undersized VMs die mid-install
+with no error surface. Minimums that have been validated:
+
+- Windows 2000 / ME: at least 512 MB
+- Ubuntu 14.10 or newer desktop: at least 1 GB
+- OpenIndiana / illumos GUI (Caiman) installer: at least 4 GB — the
+  installer's own recommendation; the live session plus installer exceed 2 GB
+
+The failure mode on an undersized VM is silent: the GUI session dies under
+memory pressure mid-`Transferring Contents`, leaving a partial ZFS pool and a
+non-bootable loader, with nothing on screen to say what happened.
+
+To recover an interrupted OpenIndiana install:
+
+1. Boot the live DVD.
+2. Import the pool: `zpool import -f rpool`
+3. Verify what made it onto disk: `zpool status` and `zfs list -r rpool/ROOT`
+4. Point the pool at the ROOT dataset that survived:
+   `zpool set bootfs=rpool/ROOT/<dataset> rpool`
+5. Reinstall the loader (this illumos takes no device argument):
+   `sudo bootadm install-bootloader -f -P rpool`
+6. Shut down and boot from disk.
+
+If finalization was interrupted, the loader usually aborts with
+`No rootfs module provided, aborting` at the `ok` prompt — the rootfs was never
+made resolvable. Re-running the full install on a correctly sized VM is the
+reliable option then.
 
 ## Haiku checkpoint map
 
@@ -113,6 +150,10 @@ Treat these as checkpoints, not coordinates; labels and layout may change.
    disk first in boot order, and boot once from disk.
 7. A Haiku desktop reached from the guest disk is install proof. Record the
    final screenshot. It is not guest-agent or command-execution proof.
+
+ReactOS Setup is a special case of this loop, because the guest also has a
+serial debugging channel worth capturing alongside every screenshot. See
+[reactos.md](reactos.md).
 
 For a retained development machine, use a long-term lease only because the
 user asked for persistence and report that the host remains powered on. For a

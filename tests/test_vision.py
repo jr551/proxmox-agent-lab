@@ -198,8 +198,11 @@ class VisionApiTests(unittest.TestCase):
 
     def test_target_verification_requires_label_and_coordinate_agreement(self) -> None:
         result = {
+            "width": 800, "height": 600,
             "analysis": {
-                "controls": [{"label": "Installer", "x": 396, "y": 38}],
+                "controls": [
+                    {"label": "Installer", "bbox": [390, 30, 402, 46]},
+                ],
                 "recommended_action": {"kind": "click", "value": "396,38"},
             },
             "validation": {"structurally_valid": True},
@@ -213,6 +216,44 @@ class VisionApiTests(unittest.TestCase):
         self.assertFalse(
             vision.verifies_target(result, "Installer", 700, 700)[0]
         )
+
+    def test_target_verification_rejects_click_outside_control_bbox(self) -> None:
+        """Regression: a coordinate ~100px off the control used to pass."""
+        result = {
+            "width": 1920, "height": 1200,
+            "analysis": {
+                "controls": [{"label": "OK", "bbox": [400, 300, 500, 340]}],
+                "recommended_action": {"kind": "click", "value": "450,320"},
+            },
+            "validation": {"structurally_valid": True},
+        }
+        accepted, reason = vision.verifies_target(result, "OK", 640, 560)
+        self.assertFalse(accepted)
+        self.assertIn("outside the matched control bounding box", reason)
+
+    def test_target_verification_rejects_degenerate_or_oversized_bbox(self) -> None:
+        result = {
+            "width": 800, "height": 600,
+            "analysis": {
+                "controls": [{"label": "OK", "bbox": [400, 300, 400, 340]}],
+                "recommended_action": {"kind": "click", "value": "400,320"},
+            },
+            "validation": {"structurally_valid": True},
+        }
+        accepted, reason = vision.verifies_target(result, "OK", 400, 320)
+        self.assertFalse(accepted)
+        self.assertIn("degenerate", reason)
+        huge = {
+            "width": 800, "height": 600,
+            "analysis": {
+                "controls": [{"label": "OK", "bbox": [0, 0, 799, 599]}],
+                "recommended_action": {"kind": "click", "value": "400,300"},
+            },
+            "validation": {"structurally_valid": True},
+        }
+        accepted, reason = vision.verifies_target(huge, "OK", 400, 300)
+        self.assertFalse(accepted)
+        self.assertIn("more than 60%", reason)
 
     def test_target_verification_rejects_non_click_and_duplicate_labels(self) -> None:
         result = {
@@ -228,6 +269,25 @@ class VisionApiTests(unittest.TestCase):
         accepted, reason = vision.verifies_target(result, "Install", 10, 10)
         self.assertFalse(accepted)
         self.assertIn("2 controls", reason)
+
+    def test_rejection_summary_includes_validation_reason(self) -> None:
+        invalid = {
+            "provider": "nvidia", "model": "some/vision-model",
+            "structured": True,
+            "validation": {
+                "structurally_valid": False,
+                "warnings": ["screen is not a non-empty string"],
+            },
+        }
+        with mock.patch.object(vision, "_nvidia", return_value=invalid):
+            with self.assertRaises(vision.VisionError) as caught:
+                vision.analyze_png(
+                    mock.Mock(), self.PNG, width=2, height=2, timeout=10,
+                    provider="nvidia",
+                )
+        message = str(caught.exception)
+        self.assertIn("some/vision-model", message)
+        self.assertIn("screen is not a non-empty string", message)
 
 
 if __name__ == "__main__":

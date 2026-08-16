@@ -77,6 +77,24 @@ For a smart plug or a KVM that presses the power button.
 
 Store the token: `proxmox-lab secrets set home-assistant-token`.
 
+### `wake-on-lan+home-assistant`
+
+Sends the magic packet and triggers the Home Assistant script together on
+every power-on — useful when WoL alone isn't reliable enough to trust by
+itself (a NIC that occasionally drops the setting, a flaky BIOS) but a
+smart-plug/KVM fallback is also available. Takes every key from both modes
+above. Force-off still goes through Home Assistant, since WoL cannot cut
+power.
+
+```toml
+mode = "wake-on-lan+home-assistant"
+mac = "aa:bb:cc:dd:ee:ff"
+broadcast = "192.168.1.255"
+home_assistant_url = "https://homeassistant.example"
+entity_on = "script.lab_power_on"
+entity_off = "script.lab_force_off"
+```
+
 ### `command`
 
 Anything with a CLI — IPMI, a PDU, a cloud API.
@@ -140,7 +158,9 @@ scanner can flag all of them without exceptions.
 ## `[s3]`
 
 Optional scratch bucket for moving files in and out of guests. Any
-S3-compatible service works — MinIO, Garage, Backblaze, AWS.
+S3-compatible service works — MinIO, Garage, Backblaze, AWS. No bucket yet?
+`install.sh`'s `lxc` S3 backend provisions a minimal MinIO LXC on the Proxmox
+host for you — see [storage.md](storage.md#s3-scratch-bucket).
 
 | Key | Meaning |
 |---|---|
@@ -254,15 +274,77 @@ a single install at a different lab for one command.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `backend` | `sqlite` | Local audit backend: `sqlite` or `jsonl` |
+| `backend` | `sqlite` | Audit backend: `sqlite`, `jsonl`, or `pocketbase` |
 | `journal_dir` | `<state>/journal` | Local audit ledger directory |
 | `git_sync` | `false` | Copy each redacted event to a private git log |
 | `git_repo` | — | Dedicated private logging checkout |
 | `git_branch` | `logs` | Remote branch receiving logging commits |
+| `controller_id` | hostname | Stable identifier written by the PocketBase backend |
+| `pocketbase_url` | — | Absolute HTTP(S) URL of the PocketBase service |
+| `pocketbase_collection` | `proxmox_lab_events` | Private collection for audit records |
+| `pocketbase_token_secret` | `audit-token` | Secret-store name containing the active API token |
+| `pocketbase_timeout_seconds` | `10` | Per-request timeout |
+| `pocketbase_auth_refresh_before_seconds` | `300` | Renew a renewable JWT this many seconds before expiry |
+| `pocketbase_agent_collection` | `proxmox_lab_agents` | Restricted password-auth collection for controllers |
 
 Every action appends a redacted event: what happened, to which VMID, under
 which lease. Passwords, tokens, typed text and presigned URLs are never
 recorded — only counts, exit codes and object keys.
+
+The `pocketbase` backend sends the same redacted event to a private
+PocketBase collection and does not silently fall back to a local ledger. Keep
+the token in the configured secret store:
+
+```toml
+[audit]
+backend = "pocketbase"
+pocketbase_url = "https://pocketbase.example"
+pocketbase_collection = "proxmox_lab_events"
+pocketbase_token_secret = "audit-token"
+```
+
+```bash
+# One-time bootstrap; these credentials are used only by the explicit
+# provisioning command and are kept in the configured secret store.
+proxmox-lab secrets set pocketbase-superuser-email
+proxmox-lab secrets set pocketbase-superuser-password
+proxmox-lab journal --provision-pocketbase-agent
+proxmox-lab doctor
+```
+
+PocketBase JWTs are inherently finite; there is no unlimited token. The
+controller refreshes a renewable `_superusers` or agent token before its
+configured expiry window and atomically replaces the keyring value. The
+provisioning command instead creates a password-authenticated
+`pocketbase_agent_collection` record, stores its generated credentials and
+active token in the secret store, and grants that collection only list, view,
+and create access to the configured audit collection. If a stored agent token
+has already expired, the controller obtains a replacement through that stored
+account password. Update and delete remain superuser-only.
+
+`journal --provision-pocketbase-agent` may change the configured audit
+collection rules to that restricted agent collection. Use it only for the
+controller collection named in the current configuration. The original
+`journal --provision-pocketbase` creates or validates a superuser-only audit
+collection without changing its rules.
+
+### SQLite migration and rollback
+
+The backend switch is a clean cutover, not a live dual-write migration:
+
+1. Stop all controllers that can write the audit ledger and copy the SQLite
+   database from `journal_dir` to an offline backup.
+2. Add the PocketBase settings and token, leaving `backend = "sqlite"`.
+3. Run `proxmox-lab journal --migrate-sqlite-to-pocketbase`. It validates or
+   creates the collection, preserves each redacted JSON record, and prints the
+   source count, time range, and deterministic SHA-256 digest.
+4. Restarts are safe: deterministic event IDs skip already imported records;
+   the SQLite database is read-only throughout.
+5. Set `backend = "pocketbase"` and run `proxmox-lab doctor` before resuming
+   leases.
+
+Rollback is fail-safe: stop writers, restore `backend = "sqlite"`, and retain
+the untouched SQLite backup. PocketBase records are not deleted on rollback.
 
 `git_sync` is off by default. Most people do not want their lab's audit trail
 pushed anywhere. If you enable it, point `git_repo` at the root of a clean,

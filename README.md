@@ -13,8 +13,8 @@ memory, USB traffic and network behaviour; then destroy the experiment and
 switch the physical computer off — verified.
 
 Built for authorized reverse engineering, defensive security research,
-digital forensics, interoperability, debugging and education. The technical
-package and CLI remain **`proxmox-agent-lab`** and **`proxmox-lab`**.
+digital forensics, interoperability, debugging and education. The Python
+package is **`proxmox-agent-lab`**; the CLI is **`proxmox-lab`**.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
@@ -56,7 +56,7 @@ Agent dies → a watchdog cleans up anyway.
 | 💿 | Fetch cloud images, checksum-verified | `storage download-url` |
 | 🔒 | Force all traffic through a VPN | `net gateway-create` |
 | 🕵️ | Prove there is no leak | `net leak-test` |
-| 📓 | Audit everything (SQLite) | `journal` |
+| 📓 | Audit everything (SQLite or PocketBase) | `journal` |
 | 🔌 | Power on, power off, verified | `lease-begin` / `lease-end` |
 | 📌 | Keep machines alive (host stays on) | `lease-begin --long-term` |
 | 💾 | Weekly backups of what you keep | `backup` |
@@ -96,7 +96,7 @@ run the same script, compare.
 
 ### Bring the analysis environment you already trust
 
-Old Computer AI Lab is the orchestration and containment layer, not another
+Old Computer → AI Lab is the orchestration and containment layer, not another
 tool-bundle distribution. Use clean OS templates or bring environments such as
 [FLARE-VM](https://github.com/mandiant/flare-vm) and
 [REMnux](https://docs.remnux.org/). The lab handles physical power, disposable
@@ -150,7 +150,7 @@ your temp directory and prints the path — handy for an agent that only has the
 skill file:
 
 ```bash
-PXL=$(curl -fsSL .../bootstrap.sh | sh) && "$PXL" doctor
+PXL=$(curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/bootstrap.sh | sh) && "$PXL" doctor
 ```
 
 The cached bootstrap environment checks GitHub at most once per 24 hours and
@@ -163,6 +163,31 @@ grants the right privileges, and arms Wake-on-LAN:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/proxmox-host-setup.sh | bash
 ```
+
+**Optional PocketBase audit host?** Run this as root on Proxmox. It creates a
+persistent unprivileged LXC, asks for networking and port settings, and prints
+the API URL and initial administrator details:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocketbase-host-setup.sh | bash
+```
+
+Keep the default HTTP service on a trusted LAN; place it behind TLS before
+access from an untrusted network.
+Store the printed superuser credentials in the controller's secret store and
+run `proxmox-lab journal --provision-pocketbase-agent`; it creates a restricted
+renewable audit account instead of leaving the controller on a superuser token.
+
+
+**No S3 bucket for guest file transfer?** Run this as root on Proxmox. It
+creates a persistent unprivileged LXC running a minimal MinIO server
+(S3 API only, no browser console), a bucket, and an access key:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-host-setup.sh | bash
+```
+
+Same rule applies: trusted LAN only, TLS in front for anything else.
 
 **You need:** a spare PC running [Proxmox VE](https://www.proxmox.com) 8 or 9,
 and Python 3.11+ to drive it from. Wake-on-LAN is the default power-on and
@@ -206,6 +231,7 @@ traps that cost real debugging time.
 | 📦 [storage.md](docs/storage.md) | Disks, images, file transfer |
 | 🔒 [network.md](docs/network.md) | VPN egress and leak testing |
 | 🪟 [windows.md](docs/windows.md) | Installing Windows |
+| 🧩 [reactos.md](docs/reactos.md) | Debugging ReactOS guests over serial and KDB |
 | ✅ [VERIFICATION.md](docs/VERIFICATION.md) | What has been run on real hardware, and what has not |
 | 📌 [long-term-leases.md](docs/long-term-leases.md) | Machines that stay |
 | 🔗 [share.md](docs/share.md) | Disposable console links |

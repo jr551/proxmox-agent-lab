@@ -18,6 +18,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
+import uuid
 import ssl
 import subprocess
 import sys
@@ -32,6 +34,7 @@ from . import __version__
 from . import config as config_module
 from . import power as power_module
 from . import journal as journal_module
+from . import pocketbase as pocketbase_module
 from . import secrets_store
 from .config import ConfigError
 
@@ -215,6 +218,127 @@ def sync_repo(record: dict[str, Any], suffix: str) -> None:
         print(f"warning: journal sync failed: {str(exc)[:300]}", file=sys.stderr)
 
 
+
+
+_SUPERUSER_CREDENTIAL_KEYS = (
+    "pocketbase-superuser-email", "pocketbase-superuser-password",
+)
+_AGENT_CREDENTIAL_KEYS = (
+    "pocketbase-agent-email", "pocketbase-agent-password",
+)
+
+
+def _pocketbase_token_secret_name() -> str:
+    return str(CONFIG.audit.get("pocketbase_token_secret") or "audit-token").strip()
+
+
+def _pocketbase_settings() -> tuple[str, str, str, float, float]:
+    url = str(CONFIG.audit.get("pocketbase_url") or "").strip()
+    collection = str(
+        CONFIG.audit.get("pocketbase_collection") or "proxmox_lab_events"
+    ).strip()
+    secret_name = _pocketbase_token_secret_name()
+    try:
+        timeout = float(CONFIG.audit.get("pocketbase_timeout_seconds", 10))
+        refresh_before = float(
+            CONFIG.audit.get("pocketbase_auth_refresh_before_seconds", 300)
+        )
+    except (TypeError, ValueError):
+        raise LabError(
+            "[audit] PocketBase timeout and refresh window must be numbers"
+        ) from None
+    if not url:
+        raise LabError("[audit] pocketbase_url is not set")
+    if timeout <= 0:
+        raise LabError("[audit] pocketbase_timeout_seconds must be positive")
+    if refresh_before < 0:
+        raise LabError(
+            "[audit] pocketbase_auth_refresh_before_seconds cannot be negative"
+        )
+    return url, collection, secret_name, timeout, refresh_before
+
+
+def _pocketbase_password_auth(
+    url: str, auth_collection: str, timeout: float,
+) -> str | None:
+    if auth_collection == "_superusers":
+        identity_key, password_key = _SUPERUSER_CREDENTIAL_KEYS
+    else:
+        identity_key, password_key = _AGENT_CREDENTIAL_KEYS
+    try:
+        identity = secrets_store.get(CONFIG, identity_key, required=False)
+        password = secrets_store.get(CONFIG, password_key, required=False)
+    except secrets_store.SecretError as exc:
+        raise LabError(str(exc)) from None
+    if not identity or not password:
+        return None
+    try:
+        return pocketbase_module.Client.authenticate_password(
+            url, auth_collection, identity, password, timeout=timeout
+        )
+    except (ValueError, pocketbase_module.PocketBaseError) as exc:
+        raise LabError(str(exc)) from None
+
+
+def pocketbase_client() -> pocketbase_module.Client:
+    url, collection, secret_name, timeout, refresh_before = _pocketbase_settings()
+    try:
+        token = secrets_store.get(CONFIG, secret_name)
+        client = pocketbase_module.Client(url, token, collection, timeout=timeout)
+    except (ValueError, secrets_store.SecretError) as exc:
+        raise LabError(str(exc)) from None
+    auth_collection = pocketbase_module.token_auth_collection(token)
+    if (
+        auth_collection is not None
+        and pocketbase_module.token_expires_within(
+            token, refresh_before, now=time.time()
+        )
+    ):
+        try:
+            refreshed = client.refresh_auth_token(auth_collection)
+        except pocketbase_module.PocketBaseError as exc:
+            if exc.status not in {401, 403}:
+                raise LabError(str(exc)) from None
+            refreshed = _pocketbase_password_auth(
+                url, auth_collection, timeout
+            )
+            if refreshed is None:
+                raise LabError(
+                    "PocketBase token is expired or nonrenewable and no "
+                    f"password credentials are stored for {auth_collection!r}"
+                ) from None
+        try:
+            secrets_store.store(CONFIG, secret_name, refreshed)
+        except secrets_store.SecretError as exc:
+            raise LabError(
+                "PocketBase token refreshed but could not be persisted: "
+                + str(exc)
+            ) from None
+        try:
+            client = pocketbase_module.Client(
+                url, refreshed, collection, timeout=timeout
+            )
+        except ValueError as exc:
+            raise LabError(str(exc)) from None
+    return client
+
+
+def pocketbase_superuser_client() -> pocketbase_module.Client:
+    """Authenticate the provisioner without reusing the audit agent token."""
+    url, collection, _secret_name, timeout, _refresh_before = _pocketbase_settings()
+    token = _pocketbase_password_auth(url, "_superusers", timeout)
+    if token is None:
+        raise LabError(
+            "PocketBase superuser credentials are not stored. Run "
+            "'proxmox-lab secrets set pocketbase-superuser-email' and "
+            "'proxmox-lab secrets set pocketbase-superuser-password'."
+        )
+    try:
+        return pocketbase_module.Client(url, token, collection, timeout=timeout)
+    except ValueError as exc:
+        raise LabError(str(exc)) from None
+
+
 def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
     now = utc_now()
     record = {
@@ -222,7 +346,26 @@ def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
         "event": event,
         **redact(fields),
     }
-    journal_module.append(JOURNAL_ROOT, AUDIT_BACKEND, record)
+    client: pocketbase_module.Client | None = None
+    if AUDIT_BACKEND == "pocketbase":
+        record["event_id"] = uuid.uuid4().hex
+        record["controller"] = str(
+            CONFIG.audit.get("controller_id") or socket.gethostname()
+        )
+        client = pocketbase_client()
+    try:
+        journal_module.append(
+            JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
+        )
+    except pocketbase_module.PocketBaseError as exc:
+        if exc.status in (401, 403):
+            raise LabError(
+                "audit ledger rejected the event: "
+                f"PocketBase HTTP {exc.status} (the stored audit token is "
+                "invalid or expired). Refresh it with: proxmox-lab secrets set "
+                f"{_pocketbase_token_secret_name()}"
+            ) from None
+        raise
     if sync:
         sync_repo(record, event)
 
@@ -295,6 +438,12 @@ class ProxmoxAPI:
             with request.urlopen(req, context=self._ssl, timeout=timeout) as response:
                 body = json.load(response)
         except error.HTTPError as exc:
+            if exc.code == 596:
+                raise LabError(
+                    f"Proxmox HTTP 596 for {method} {path}: guest agent is not "
+                    "responding; the guest may be hung or its storage offline. "
+                    "Try console screenshot or serial instead."
+                ) from None
             detail = exc.read().decode(errors="replace")[:1000]
             raise LabError(f"Proxmox HTTP {exc.code} for {method} {path}: {detail}")
         except (error.URLError, TimeoutError, OSError) as exc:
@@ -307,6 +456,38 @@ class ProxmoxAPI:
             return True
         except LabError:
             return False
+
+
+_AUDIT_THROUGH_BOOT_RETRY_SECONDS = 30
+
+
+def _audit_through_boot(event: str, **fields: Any) -> None:
+    """audit(), tolerant of a just-woken host's own audit backend still
+    starting up.
+
+    The audit backend can itself be hosted on this same lab host (see
+    pocketbase-host-setup.sh) -- an onboot LXC that starts alongside Proxmox
+    but is not necessarily answering the instant the API is. A short bounded
+    retry covers that normal startup race; if the backend is still
+    unreachable after it, the event is dropped with a loud warning rather
+    than failing the power-on itself, since losing one audit line is
+    recoverable and failing to confirm the host is up is not.
+    """
+    deadline = time.monotonic() + _AUDIT_THROUGH_BOOT_RETRY_SECONDS
+    while True:
+        try:
+            audit(event, **fields)
+            return
+        except pocketbase_module.PocketBaseError as exc:
+            if time.monotonic() >= deadline:
+                print(
+                    f"warning: '{event}' was not recorded to the audit "
+                    f"backend (still unreachable {_AUDIT_THROUGH_BOOT_RETRY_SECONDS}s "
+                    f"after power-on): {exc}",
+                    file=sys.stderr,
+                )
+                return
+            time.sleep(3)
 
 
 def ensure_on(api: ProxmoxAPI, timeout: int | None = None) -> bool:
@@ -325,11 +506,11 @@ def ensure_on(api: ProxmoxAPI, timeout: int | None = None) -> bool:
         detail = power_module.power_on(CONFIG)
     except (power_module.PowerError, ConfigError) as exc:
         raise LabError(f"cannot switch the lab machine on: {exc}") from None
-    audit("lab-power-on-requested", **detail)
+    _audit_through_boot("lab-power-on-requested", **detail)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if api.reachable():
-            audit("lab-power-on-verified", host=HOST, node=NODE)
+            _audit_through_boot("lab-power-on-verified", host=HOST, node=NODE)
             return True
         time.sleep(5)
     raise LabError(
@@ -457,13 +638,51 @@ def stop_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
         wait_task(api, hard_upid, timeout=60)
 
 
-def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
-    upid = api.call(
-        "DELETE",
-        f"/nodes/{NODE}/{kind}/{vmid}",
-        {"purge": 1, "destroy-unreferenced-disks": 1},
+def _guest_is_gone(error: LabError) -> bool:
+    message = str(error)
+    # A prior finalizer run (or manual removal) beat us to it. Proxmox reports
+    # this as a 404, or as a 500 whose body says the config file is absent.
+    return "HTTP 404" in message or (
+        "HTTP 500" in message and "does not exist" in message
     )
+
+
+def _storage_io_error(error: LabError) -> bool:
+    message = str(error).lower()
+    return "input/output error" in message or "i/o error" in message
+
+
+def _delete_guest(
+    api: ProxmoxAPI, kind: str, vmid: int, *, destroy_unreferenced_disks: bool
+) -> None:
+    data: dict[str, int] = {"purge": 1}
+    if destroy_unreferenced_disks:
+        data["destroy-unreferenced-disks"] = 1
+    upid = api.call("DELETE", f"/nodes/{NODE}/{kind}/{vmid}", data)
     wait_task(api, upid, timeout=180)
+
+
+def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
+    try:
+        _delete_guest(api, kind, vmid, destroy_unreferenced_disks=True)
+    except LabError as exc:
+        if _guest_is_gone(exc):
+            return
+        if not _storage_io_error(exc):
+            raise
+        try:
+            # Destroying unreferenced disks makes Proxmox inspect every
+            # configured storage. An unrelated failed device must not strand
+            # a lease whose guest can otherwise be deleted.
+            _delete_guest(api, kind, vmid, destroy_unreferenced_disks=False)
+        except LabError as retry_exc:
+            if _guest_is_gone(retry_exc):
+                return
+            raise LabError(
+                f"Could not delete {kind}/{vmid} after retrying without "
+                f"unreferenced-disk cleanup: {retry_exc}; initial storage "
+                f"error: {exc}"
+            ) from retry_exc
 
 
 def active_leases(excluding: str | None = None) -> list[dict[str, Any]]:
@@ -494,11 +713,32 @@ def lease_requires_cleanup(lease: dict[str, Any]) -> bool:
     )
 
 
+def running_guest_vmids(api: ProxmoxAPI) -> list[int]:
+    """VMIDs currently running on the node, lease or no lease.
+
+    A guest can exist outside any lease's tracked resources -- a persistent
+    builder kept alive on purpose across sessions (see 'guest template' /
+    'guest clone'), or one a caller drove directly by VMID. The decision to
+    power off the host must not rely on lease bookkeeping alone, or a guest
+    like that gets the host pulled out from under it.
+    """
+    resources = api.call("GET", "/cluster/resources", {"type": "vm"}) or []
+    return sorted(
+        int(item["vmid"]) for item in resources
+        if isinstance(item, dict) and item.get("status") == "running"
+    )
+
+
 def shutdown_host(api: ProxmoxAPI) -> bool:
     """Shut the lab machine down and confirm it actually went off."""
     if not api.reachable():
         audit("lab-power-off-already-verified", host=HOST, node=NODE)
         return True
+    running = running_guest_vmids(api)
+    if running:
+        audit("lab-power-off-blocked-by-running-guest", host=HOST, node=NODE,
+              vmids=running, sync=False)
+        return False
     try:
         task = api.call("POST", f"/nodes/{NODE}/status", {"command": "shutdown"})
         audit("lab-graceful-shutdown-requested", node=NODE, task_id=task,
@@ -615,22 +855,26 @@ def cmd_lease_begin(args: argparse.Namespace) -> None:
             "resources": [],
         }
         save_lease(lease)
-        audit(
-            "lease-begin",
-            lease=lease_id,
-            kind=lease["kind"],
-            purpose=lease["purpose"],
-            expires_at=lease["expires_at"],
-            initial_vmids=lease["initial_vmids"],
-        )
-    output = dict(lease)
-    if long_term:
-        output["warning"] = (
-            "This is a long-term lease: the lab machine will stay powered on "
-            "until it is destroyed with 'lease-destroy'. Its guests are "
-            "protected from deletion and backed up weekly."
-        )
-    print(json.dumps(output, indent=2, sort_keys=True))
+        try:
+            audit(
+                "lease-begin",
+                lease=lease_id,
+                kind=lease["kind"],
+                purpose=lease["purpose"],
+                expires_at=lease["expires_at"],
+                initial_vmids=lease["initial_vmids"],
+            )
+            output = dict(lease)
+            if long_term:
+                output["warning"] = (
+                    "This is a long-term lease: the lab machine will stay powered on "
+                    "until it is destroyed with 'lease-destroy'. Its guests are "
+                    "protected from deletion and backed up weekly."
+                )
+            print(json.dumps(output, indent=2, sort_keys=True))
+        except BaseException:
+            lease_path(lease_id).unlink(missing_ok=True)
+            raise
 
 
 def cmd_lease_heartbeat(args: argparse.Namespace) -> None:
@@ -728,9 +972,27 @@ def require_lease_resource(
         item.get("kind") == kind and int(item.get("vmid", -1)) == vmid
         for item in lease.get("resources", [])
     ):
+        if vmid in lease.get("initial_vmids", []):
+            raise LabError(f"VMID {vmid} existed before this lease")
         raise LabError(
             f"VMID {vmid} is not a {kind} guest registered to this lease"
         )
+
+
+def _boot_order_devices(value: str) -> list[str]:
+    """Normalized device list of a PVE `boot` value.
+
+    PVE documents ``boot`` as ``[order=]dev;dev`` — the ``order=`` prefix is
+    optional, so a bare ``boot=ide2;ide0`` is valid and must parse the same.
+    """
+    order = value.strip()
+    if order.startswith("order="):
+        order = order[len("order="):]
+    return [
+        device.strip().lower()
+        for device in order.split(";")
+        if device.strip()
+    ]
 
 
 def cmd_api(args: argparse.Namespace) -> None:
@@ -803,10 +1065,15 @@ def cmd_api(args: argparse.Namespace) -> None:
             kind_created = create_match.group(1)
             created_vmid = int(data["vmid"])
             policy = "retain" if is_long_term(lease) else args.policy
-            register_resource(
-                lease, kind_created, created_vmid, policy,
-                data.get("name") or data.get("hostname"),
-            )
+            # Reload inside the lock: the snapshot taken before api.call is
+            # stale, and an unlocked save clobbers concurrent creations'
+            # registrations. Every other lease mutator serializes here too.
+            with controller_lock():
+                fresh = load_lease(args.lease)
+                register_resource(
+                    fresh, kind_created, created_vmid, policy,
+                    data.get("name") or data.get("hostname"),
+                )
             if is_long_term(lease):
                 from . import longterm
                 try:
@@ -830,6 +1097,30 @@ def cmd_api(args: argparse.Namespace) -> None:
         except (LabError, OSError, journal_module.sqlite3.Error) as exc:
             report["operation_succeeded"] = True
             report["audit_recording_failed"] = str(exc)
+    if write and method == "PUT" and "boot" in data:
+        config_match = re.fullmatch(
+            rf"/nodes/{re.escape(NODE)}/qemu/(\d+)/config", args.path
+        )
+        if config_match:
+            vmid = config_match.group(1)
+            requested = _boot_order_devices(data["boot"])
+            try:
+                persisted = _boot_order_devices(
+                    api.call("GET", f"/nodes/{NODE}/qemu/{vmid}/config").get(
+                        "boot", ""
+                    )
+                )
+            except LabError:
+                persisted = None
+            if persisted is not None and requested and persisted != requested:
+                persisted_text = ";".join(persisted) or "(none)"
+                print(
+                    f"warning: PVE persisted boot order '{persisted_text}' "
+                    f"instead of requested '{';'.join(requested)}' — set ide2/disk "
+                    "attach and boot order in separate calls",
+                    file=sys.stderr,
+                )
+    if write:
         print(json.dumps(redact(report), indent=2, sort_keys=True))
         return
     print(
@@ -1003,9 +1294,125 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
         )
         result["to_power_off"] = "destroy them with 'lease-destroy', or "\
             "stop the host yourself"
+    elif not others and not host_powered_off:
+        running = running_guest_vmids(api) if api.reachable() else []
+        result["host_left_running"] = True
+        if running:
+            result["reason"] = (
+                "guest(s) still running outside any tracked lease: "
+                + ", ".join(str(vmid) for vmid in running)
+            )
+            result["to_power_off"] = (
+                "stop or register those guests, or stop the host yourself"
+            )
+        else:
+            result["reason"] = "host power-off could not be verified"
+            result["to_power_off"] = "check the host and stop it yourself"
     print(json.dumps(result, indent=2, sort_keys=True))
+    created_at = lease.get("created_at") or lease.get("created")
+    if created_at:
+        lifetime = (utc_now() - parse_expiry(created_at)).total_seconds()
+        if lifetime < 300:
+            print(
+                f"hint: lease {args.lease} ended after {int(lifetime)}s. For "
+                "a work session, prefer ONE lease kept alive with "
+                "lease-heartbeat every <=20 min; each begin/end cycle costs "
+                "a host boot and provisioning.",
+                file=sys.stderr,
+            )
     if failures or (not others and not host_powered_off):
         raise LabError("Lease cleanup or host power-off did not complete")
+
+
+def cmd_lease_abandon(args: argparse.Namespace) -> None:
+    """Close a stopped ordinary lease without touching its guests or host."""
+    with controller_lock():
+        lease = load_lease(args.lease, active=False)
+        if lease.get("state") not in ("active", "cleanup_failed"):
+            raise LabError(
+                f"Lease {args.lease} cannot be abandoned from state "
+                f"{lease.get('state')}"
+            )
+        if is_long_term(lease):
+            raise LabError(
+                f"Lease {args.lease} is long-term and cannot be abandoned. "
+                "Use 'proxmox-lab lease-release --lease "
+                f"{args.lease} --confirm' or 'proxmox-lab lease-destroy "
+                f"--lease {args.lease} --confirm'."
+            )
+        if not args.confirm:
+            raise LabError(
+                "lease-abandon leaves every registered guest and the host "
+                "untouched. Re-run with --confirm after they are stopped."
+            )
+        api = ProxmoxAPI()
+        if not api.reachable():
+            raise LabError(
+                "Cannot safely abandon this lease while Proxmox is "
+                "unreachable; registered guests cannot be verified stopped."
+            )
+        stopped: list[str] = []
+        missing: list[str] = []
+        for resource in lease.get("resources", []):
+            kind = resource["kind"]
+            vmid = int(resource["vmid"])
+            resource_id = f"{kind}/{vmid}"
+            try:
+                status = guest_status(api, kind, vmid)
+            except LabError as exc:
+                if "HTTP 404" in str(exc):
+                    missing.append(resource_id)
+                    continue
+                raise LabError(
+                    f"Cannot safely abandon lease {args.lease}: could not "
+                    f"verify {resource_id} is stopped: {exc}"
+                ) from None
+            if status != "stopped":
+                raise LabError(
+                    f"Cannot safely abandon lease {args.lease}: {resource_id} "
+                    f"is {status}, not stopped"
+                )
+            stopped.append(resource_id)
+        lease["state"] = "closed"
+        lease["closed_at"] = iso_now()
+        lease["abandoned_at"] = lease["closed_at"]
+        lease["abandoned_reason"] = (
+            "registered guests verified stopped; no guest or host mutation"
+        )
+        save_lease(lease)
+        audit_error: str | None = None
+        try:
+            audit(
+                "lease-abandon",
+                lease=args.lease,
+                stopped=stopped,
+                missing=missing,
+                reason=lease["abandoned_reason"],
+            )
+        except (
+            LabError,
+            OSError,
+            ValueError,
+            pocketbase_module.PocketBaseError,
+        ) as exc:
+            audit_error = str(exc)
+            print(
+                "warning: lease was closed but its audit event could not be "
+                f"recorded: {audit_error}",
+                file=sys.stderr,
+            )
+    result: dict[str, Any] = {
+        "lease": args.lease,
+        "state": "closed",
+        "guests_verified_stopped": stopped,
+        "guests_already_missing": missing,
+        "guest_mutation": False,
+        "host_mutation": False,
+        "audit_recorded": audit_error is None,
+    }
+    if audit_error is not None:
+        result["audit_error"] = audit_error
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_cleanup_expired(args: argparse.Namespace) -> None:
@@ -1176,6 +1583,20 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             ),
         },
     }
+    if AUDIT_BACKEND not in {"sqlite", "jsonl", "pocketbase"}:
+        problems.append(f"[audit] unsupported backend: {AUDIT_BACKEND}")
+    if AUDIT_BACKEND == "pocketbase":
+        report["audit"]["pocketbase"] = {
+            "url": str(CONFIG.audit.get("pocketbase_url") or ""),
+            "collection": str(
+                CONFIG.audit.get("pocketbase_collection")
+                or "proxmox_lab_events"
+            ),
+            "token_secret": str(
+                CONFIG.audit.get("pocketbase_token_secret")
+                or "audit-token"
+            ),
+        }
     if CONFIG.unknown_sections:
         report["unknown_sections"] = CONFIG.unknown_sections
         problems.append(
@@ -1207,6 +1628,34 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         problems.append("Proxmox API token not stored; run "
                         "'proxmox-lab secrets set proxmox-token'")
 
+    if AUDIT_BACKEND == "pocketbase":
+        try:
+            secrets_store.get(
+                CONFIG,
+                str(
+                    CONFIG.audit.get("pocketbase_token_secret")
+                    or "audit-token"
+                ),
+            )
+            report["pocketbase_token_stored"] = True
+        except secrets_store.SecretError:
+            report["pocketbase_token_stored"] = False
+            problems.append(
+                "PocketBase token not stored; run "
+                "'proxmox-lab secrets set audit-token'"
+            )
+        if not CONFIG.audit.get("pocketbase_url"):
+            problems.append("[audit] pocketbase_url is not set")
+        elif report.get("pocketbase_token_stored"):
+            try:
+                client = pocketbase_client()
+                client.get_collection()
+                report["pocketbase_collection_reachable"] = True
+            except (LabError, pocketbase_module.PocketBaseError) as exc:
+                report["pocketbase_collection_reachable"] = False
+                problems.append(
+                    f"PocketBase audit collection check failed: {exc}"
+                )
     mode = CONFIG.power.get("mode")
     report["power"] = {
         "mode": mode,
@@ -1255,10 +1704,102 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 
 def cmd_journal(args: argparse.Namespace) -> None:
-    """Read the audit ledger."""
+    """Read, migrate, or provision the audit ledger."""
+    if args.provision_pocketbase_agent:
+        agent_collection = str(
+            CONFIG.audit.get("pocketbase_agent_collection")
+            or "proxmox_lab_agents"
+        ).strip()
+        try:
+            identity = secrets_store.get(
+                CONFIG, "pocketbase-agent-email", required=False
+            )
+            password = secrets_store.get(
+                CONFIG, "pocketbase-agent-password", required=False
+            )
+        except secrets_store.SecretError as exc:
+            raise LabError(str(exc)) from None
+        if bool(identity) != bool(password):
+            raise LabError(
+                "PocketBase agent credentials are incomplete; store both "
+                "'pocketbase-agent-email' and 'pocketbase-agent-password', "
+                "or remove both before provisioning."
+            )
+        rotate_existing = not identity
+        if not identity:
+            identity, password = pocketbase_module.Client.new_agent_credentials()
+            try:
+                secrets_store.store(CONFIG, "pocketbase-agent-email", identity)
+                secrets_store.store(
+                    CONFIG, "pocketbase-agent-password", password
+                )
+            except secrets_store.SecretError as exc:
+                raise LabError(str(exc)) from None
+        result = pocketbase_superuser_client().provision_agent(
+            agent_collection,
+            identity,
+            password,
+            rotate_existing=rotate_existing,
+        )
+        try:
+            _url, _collection, token_secret, _timeout, _refresh = (
+                _pocketbase_settings()
+            )
+            secrets_store.store(CONFIG, token_secret, result["token"])
+        except secrets_store.SecretError as exc:
+            raise LabError(
+                "PocketBase agent was provisioned but its token could not be "
+                "stored: " + str(exc)
+            ) from None
+        audit = result["audit_collection"]
+        print(json.dumps({
+            "agent_collection": result["agent_collection"],
+            "agent_created": result["agent_created"],
+            "audit_collection_created": audit["created"],
+            "credential_mode": "password-reauthentication",
+        }, indent=2, sort_keys=True))
+        return
+    needs_pocketbase = (
+        AUDIT_BACKEND == "pocketbase"
+        or args.provision_pocketbase
+        or args.migrate_sqlite_to_pocketbase
+    )
+    client = pocketbase_client() if needs_pocketbase else None
+    if args.provision_pocketbase:
+        if client is None:
+            raise LabError("PocketBase client is not configured")
+        result = client.provision()
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if args.migrate_sqlite_to_pocketbase:
+        if client is None:
+            raise LabError("PocketBase client is not configured")
+        with controller_lock():
+            provision = client.provision()
+            source_dir = (
+                Path(args.sqlite_journal_dir).expanduser()
+                if args.sqlite_journal_dir
+                else JOURNAL_ROOT
+            )
+            result = journal_module.migrate_sqlite_to_pocketbase(
+                source_dir,
+                client,
+                controller=str(
+                    CONFIG.audit.get("controller_id") or socket.gethostname()
+                ),
+            )
+        result["collection"] = client.collection_name
+        result["collection_created"] = provision["created"]
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     if args.summary:
-        print(json.dumps(journal_module.summary(JOURNAL_ROOT), indent=2,
-                         sort_keys=True))
+        print(json.dumps(
+            journal_module.summary(
+                JOURNAL_ROOT, backend=AUDIT_BACKEND, pocketbase=client
+            ),
+            indent=2,
+            sort_keys=True,
+        ))
         return
     if args.import_jsonl:
         count = journal_module.import_jsonl(JOURNAL_ROOT)
@@ -1267,6 +1808,7 @@ def cmd_journal(args: argparse.Namespace) -> None:
     events = journal_module.query(
         JOURNAL_ROOT, limit=args.limit, lease=args.lease,
         event=args.event, since=args.since,
+        backend=AUDIT_BACKEND, pocketbase=client,
     )
     print(json.dumps(events, indent=2, sort_keys=True))
 
@@ -1309,8 +1851,27 @@ def parser() -> argparse.ArgumentParser:
     ledger.add_argument("--event", help="exact name, or a * wildcard")
     ledger.add_argument("--since", help="ISO timestamp lower bound")
     ledger.add_argument("--summary", action="store_true")
+    ledger.add_argument(
+        "--provision-pocketbase",
+        action="store_true",
+        help="create or validate the configured PocketBase audit collection",
+    )
+    ledger.add_argument(
+        "--provision-pocketbase-agent",
+        action="store_true",
+        help="create a renewable restricted audit agent using stored superuser credentials",
+    )
     ledger.add_argument("--import-jsonl", action="store_true",
                         help="load legacy per-day JSONL files into the database")
+    ledger.add_argument(
+        "--migrate-sqlite-to-pocketbase",
+        action="store_true",
+        help="copy the SQLite audit ledger to the configured PocketBase collection",
+    )
+    ledger.add_argument(
+        "--sqlite-journal-dir",
+        help="source journal directory (default: configured journal_dir)",
+    )
     ledger.set_defaults(func=cmd_journal)
 
     power = sub.add_parser(
@@ -1393,6 +1954,14 @@ def parser() -> argparse.ArgumentParser:
     end.add_argument("--lease", required=True)
     end.set_defaults(func=cmd_lease_end)
 
+    abandon = sub.add_parser(
+        "lease-abandon",
+        help="close a stopped ordinary lease without mutating guests or host",
+    )
+    abandon.add_argument("--lease", required=True)
+    abandon.add_argument("--confirm", action="store_true")
+    abandon.set_defaults(func=cmd_lease_abandon)
+
     cleanup = sub.add_parser("cleanup-expired")
     cleanup.add_argument("--all", action="store_true")
     cleanup.add_argument("--no-backup", action="store_true",
@@ -1445,7 +2014,8 @@ def _expected_errors() -> tuple[type[BaseException], ...]:
     """
     errors: list[type[BaseException]] = [
         LabError, ConfigError, secrets_store.SecretError,
-        power_module.PowerError, ValueError, json.JSONDecodeError,
+        pocketbase_module.PocketBaseError, power_module.PowerError, ValueError,
+        json.JSONDecodeError,
     ]
     for name in (
         "android", "console", "guest", "rfb", "s3", "netgw", "share",

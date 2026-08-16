@@ -12,6 +12,10 @@
    consecutive checks.
 8. Every operation writes a redacted audit event and attempts a normal
    fast-forward/rebase Forgejo sync.
+   PocketBase authorization failures identify the audit-token secret to refresh.
+   An `api` write may already have reached Proxmox before its audit event fails;
+   it reports that write as succeeded but unrecorded rather than claiming an
+   unrelated Proxmox permission failure.
 9. Every MCP tool call records only its tool name and refreshes the idle clock.
 10. A reachable host with no active leases is shut down after eight hours
     without an MCP tool call.
@@ -88,3 +92,11 @@ abandoned work eventually safe even if the calling agent crashes or loses its
 thread, and enforces the eight-hour MCP-idle shutdown threshold. A lease
 heartbeat prevents cleanup and idle shutdown during legitimate long-running
 work.
+
+If an ordinary lease is stale but every registered guest is already stopped,
+use `proxmox-lab lease-abandon --lease <id> --confirm`. It verifies those
+guest states, then closes only the local lease record: it does not start,
+stop, delete, or otherwise mutate a guest, and it does not shut down the
+host. It refuses long-term leases, unreachable Proxmox, or any guest that is
+not verifiably stopped. It attempts an audit event and reports explicitly if
+the record could not be written.

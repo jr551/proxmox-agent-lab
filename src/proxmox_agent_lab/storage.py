@@ -27,7 +27,7 @@ from . import config as _config
 _DEFAULT_BULK = _config.get().storage.bulk_storage
 DEFAULT_CONTENT = "images,iso,vztmpl,import,backup,snippets"
 FILESYSTEMS = ("ext4", "xfs")
-CHECKSUM_RE = re.compile(r"^(sha256|sha512|md5)\s*[:=]\s*([0-9a-f]+)$", re.I)
+CHECKSUM_RE = re.compile(r"^(sha256|sha512|sha1|md5)\s*[:=]\s*([0-9a-f]+)$", re.I)
 
 
 def _normalise_checksum(value: str, algorithm: str | None) -> tuple[str, str]:
@@ -324,7 +324,7 @@ def register(sub: Any, lab: Any) -> None:
         help="digest, optionally prefixed with its algorithm (for example sha256:abc...)",
     )
     download.add_argument("--checksum-algorithm",
-                          choices=("sha256", "sha512", "md5"))
+                          choices=("sha256", "sha512", "sha1", "md5"))
     download.add_argument("--allow-unverified", action="store_true",
                           help="skip checksum verification (discouraged)")
     download.add_argument("--timeout", type=int, default=3600)

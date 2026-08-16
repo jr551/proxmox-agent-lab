@@ -142,3 +142,36 @@ After that, Android itself takes a couple of minutes to boot; watch it with
 `console screenshot`, or poll `android status` for `boot_completed`.
 
 Use `--as-template` once and clone thereafter.
+
+## 🔌 A real Android-x86 install instead of the emulator
+
+Everything above runs the Google SDK emulator inside a Debian VM. For a
+genuine Android device network stack — most commonly, driving Android's own
+proxy settings from an external tool of your choice — there is a second,
+separate path: installing the [android-x86](https://www.android-x86.org/)
+project's own OS as a real QEMU guest, with no Debian host underneath it.
+
+```bash
+proxmox-lab recipe android-x86
+```
+
+prints the full machine-readable runbook (verified ISO URL and checksum, VM
+spec, install stages). Two things worth knowing before using it:
+
+- **Bridge choice determines proxy reachability.** Put the guest's network on
+  whatever bridge your own workstation (or proxy tool) can reach directly —
+  usually the same one the Proxmox host's management IP is on. An isolated
+  lab-only bridge is not routable from outside; verified live that neither
+  `adb` nor a raw TCP connection reaches a guest placed there.
+- **The 9.0-r2 setup wizard can loop.** After reaching the Google Services
+  step it may repeatedly return to "Copy apps & data" instead of completing.
+  If that happens, switch to the on-device root shell (`Alt+F1` from the
+  graphical console) and run
+  `settings put secure user_setup_complete 1 && settings put global device_provisioned 1`,
+  then power-cycle with a full stop/start (not just a reset, which left the
+  virtio NIC uninitialized in testing) to land directly on the home screen.
+
+Once booted, `adb shell settings put global http_proxy <host>:<port>` points
+the device's traffic at any HTTP(S)-capable proxy — verified live by watching
+a real `CONNECT` request arrive at a plain listener. This project does not
+wire the recipe to a specific proxy; bring your own.

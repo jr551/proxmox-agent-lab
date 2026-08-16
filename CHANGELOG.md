@@ -4,6 +4,209 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.6.0 - 2026-08-14
+
+### Added
+
+- `lease-abandon --lease <id> --confirm` safely closes an ordinary stale or
+  foreign lease only after every registered guest is verified stopped or
+  absent. It never mutates guests or the host and refuses long-term,
+  unreachable, running, and indeterminate leases.
+- `console click --empty-space` explicitly permits an in-bounds click with no
+  target when the operator intends to click unlabelled screen space. The
+  existing target-verification gate remains the default, and unverified clicks
+  are audited.
+
+### Fixed
+
+- Guest power actions (`start`, `stop`, `shutdown`, `reset`, and `suspend`) now
+  enforce lease ownership before reaching the Proxmox API.
+- `lease-begin` removes a just-persisted lease if a later setup step fails,
+  retaining the original failure instead of stranding an active lease.
+- `lease-end` can retry an owned guest deletion without destroying
+  unreferenced disks after an unrelated storage I/O failure, allowing cleanup
+  and verified host shutdown to proceed.
+- Expired PocketBase audit credentials now identify the audit-token refresh
+  action rather than reporting a misleading superuser failure; completed API
+  writes remain explicitly reported as unrecorded.
+- `guest run` preserves its parsed argv for guest-agent, serial, and detached
+  execution paths instead of lossy command-string reconstruction.
+- Guest probes require a successful guest-agent execution, so Proxmox HTTP 596
+  no longer reports a nonfunctional agent as available.
+- `check-public.py` ignores generic lowercase Proxmox node fixture values while
+  retaining detection of distinctive local-site markers.
+
+## 0.5.3 - 2026-08-14
+
+### Added
+
+- `android-x86` recipe (`proxmox-lab recipe android-x86`): installs the
+  android-x86 project's own OS as a real QEMU guest, distinct from `android
+  create`'s SDK emulator, for testing that need a genuine device network
+  stack -- most commonly, driving Android's own proxy settings from an
+  external tool. Verified live end-to-end, including
+  `adb shell settings put global http_proxy` actually redirecting device
+  traffic to an external listener.
+- `console screenshot-burst`: captures several screenshots over time
+  (default 6 over about a minute) and stitches them into one labeled PNG,
+  for watching a progress bar, installer copy step, or boot animation
+  without a manual sleep-then-screenshot loop.
+- `console has-gui-locked-up` / `console has-terminal-locked-up`: best-effort
+  liveness probes. The GUI check moves the pointer and diffs the screen
+  before/after; the terminal check samples a text console over ~2 seconds
+  and checks for any change (a live cursor normally blinks on its own).
+  Both use the existing pixel-diff helper -- no cloud vision call -- and
+  report a caveat alongside the verdict rather than a bare bool.
+
+### Fixed
+
+- `pocketbase-host-setup.sh` and `minio-host-setup.sh` now set `--onboot 1`
+  on the LXC they create, so an audit backend or S3 bucket hosted on the
+  lab host itself comes back after the host powers off between leases --
+  previously nothing would restart it.
+- `ensure_on()` now tolerates its own audit backend being briefly
+  unreachable right after waking the host (an onboot LXC starting
+  alongside it), retrying for up to 30s before warning and continuing,
+  instead of failing the power-on itself.
+
+### Changed
+
+- PocketBase audit controllers can refresh renewable superuser and restricted
+  agent JWTs before expiry. `journal --provision-pocketbase-agent` now uses
+  locally stored superuser credentials to create a least-privileged
+  password-authenticated audit account; it persists only the generated agent
+  credentials and active token in the configured secret store.
+
+## 0.5.2 - 2026-08-14
+
+### Added
+
+- Guided PocketBase setup: `install.sh` asks whether the audit backend should
+  be an existing PocketBase service or a new one, and `pocketbase-host-setup.sh`
+  provisions a persistent unprivileged LXC running it as a restricted systemd
+  service.
+- Guided MinIO setup for the S3 scratch bucket: `install.sh` asks whether it
+  should be skipped, an existing bucket, or a new MinIO LXC, and
+  `minio-host-setup.sh` provisions a minimal, unprivileged LXC running a
+  version-pinned, checksum-verified MinIO server (S3 API only, no browser
+  console), creating the bucket and an access key.
+- `wake-on-lan+home-assistant` power mode: sends the magic packet and
+  triggers a Home Assistant script together on every power-on, for a host
+  where WoL alone isn't reliable enough to trust by itself but a smart-plug
+  or KVM fallback is also available. Force-off still goes through Home
+  Assistant, since WoL cannot cut power.
+- `journal --summary` on the PocketBase backend now reports the first/last
+  event timestamp and a labeled recent-sample event-type breakdown, instead
+  of only a bare count.
+
+### Fixed
+
+- `lease-end`/the watchdog no longer power off the host while any guest is
+  still running, even one outside lease tracking (a persistent builder kept
+  alive across sessions via `guest template`/`guest clone`, or one driven
+  directly by VMID). Previously the decision looked only at whether any
+  lease was still active.
+- Finalizing a lease whose guest was already gone (deleted by a prior run,
+  or by hand) no longer leaves the lease permanently stuck in
+  `cleanup_failed`; deleting an already-gone guest is now treated the same
+  as the existing "already stopped" idempotency `stop_guest` had.
+- A qemu-guest-agent command killed by a signal is no longer reported as a
+  successful run. `exitcode` and `signal` are mutually exclusive in the
+  guest agent's response; a missing `exitcode` was being treated the same
+  as the serial channel's legitimate "no code available," masking real
+  failures on the one channel that normally always reports one.
+
+## 0.5.1 - 2026-08-13
+
+### Added
+
+- Optional PocketBase audit backend. Configure `[audit] backend = "pocketbase"`
+  with a URL, private collection, and Keychain/secret-store token; `doctor`
+  verifies token availability and collection reachability.
+- `journal --provision-pocketbase` creates or validates the private audit
+  collection without altering an existing schema. `journal
+  --migrate-sqlite-to-pocketbase` performs an idempotent, read-only SQLite
+  ledger import using deterministic event IDs and reports count, time range,
+  and SHA-256 digest before the explicit backend cutover.
+
+## 0.5.0 - 2026-08-11
+
+### Added
+
+- `push`/`pull` move files above 32 MiB in chunks with end-to-end SHA-256
+  verification on Linux guests; `--chunk-size` tunes the part size and a
+  `pull --sha256` that already matches skips the transfer entirely
+  (resumable, idempotent retries).
+- `guest template` / `guest clone` promote a stopped lease-owned guest to a
+  template and clone it back (auto-registered), so a provisioned builder is
+  reusable across leases in seconds.
+- `guest run --detach` starts long builds in the background and returns a pid;
+  `guest log --follow` streams their output and `guest wait` blocks until
+  exit, reporting the recorded exit code.
+- `console bridge` exposes a guest serial console on a local TCP port so
+  kernel debuggers (rosdbg, windbg, gdb) can attach instead of hitting the
+  "connect a debugger" wall.
+- Optional lease-owned DHCP and TFTP servers: `net dhcp-create` (with PXE
+  `--bootfile`/`--next-server`), `net tftp-create`, `net tftp-push`, and
+  `net dhcp-leases` — a minimal PXE stack on the lab bridge, spawned only on
+  demand.
+- `lease-end` prints a hint when a lease is ended seconds after it began,
+  nudging agents to reuse one lease per work session instead of paying a boot
+  cycle each attempt.
+
+### Fixed
+
+- The checkout wrapper now pins a Python 3.11+ interpreter: under a minimal
+  PATH (supervised processes, cron) `python3` could resolve to the macOS
+  system 3.9, which silently degraded the config to defaults and broke every
+  API call with "This install is not configured yet".
+- DHCP/TFTP spawns get an egress NIC on the home bridge so `apt` provisioning
+  works from the isolated lab bridge, and the TFTP root is created before
+  dnsmasq starts (dnsmasq refuses to start when `tftp-root` is missing).
+- `guest template` / `guest clone` wait for their async Proxmox tasks, so
+  cloning immediately after a conversion no longer races the template
+  config.
+
+## 0.4.0 - 2026-08-10
+
+### Added
+
+- `console screenshot --ocr` works out of the box: an embedded public-domain
+  VGA 8x16 font is installed on first use when no table has been imported,
+  so legacy-only guests (Windows 2000 setup, DOS, BIOS screens) no longer
+  need a Linux guest to pull a PSF from (#32).
+- `storage download-url` accepts `sha1` checksums (digest prefixes, `SHA1=`,
+  and bare 40-hex digests) — archive.org media publishes sha1 but not sha256
+  (#28).
+- `console click` verification now requires a vision-reported control bounding
+  box containing the click point, instead of accepting a model-echoed point;
+  verified clicks report the matched `control_bbox` (#27).
+- Screenshots (and `--screenshot-after` captures) flag pixel-identical repeat
+  frames as possibly stale, so a QEMU VNC dirty-tracking glitch cannot pass
+  an old page to a vision read unnoticed (#29).
+- `console inspect` vision failures surface per-provider diagnostics and are
+  recorded as `console-vision-inspect-failed` audit events (#30).
+- The api wrapper warns when PVE persists a different boot order than the
+  requested one (e.g. `ide2;ide0` stored as `ide0;ide2` when the CD attach
+  and boot order are set in one call) (#26).
+
+### Fixed
+
+- Guest creation now registers the new guest under `controller_lock()` with a
+  reloaded lease, so concurrent creations no longer clobber each other's
+  lease registrations and `console inspect` no longer refuses a freshly
+  created guest (#25).
+- Journal git sync retries a non-fast-forward push (refetch, rebase, push)
+  instead of failing every command under concurrent CLI processes (#31).
+
+### Docs
+
+- GUI-installer memory floors and the recovery path for interrupted
+  OpenIndiana/illumos installs (bootfs, `bootadm install-bootloader`) (#23).
+- Note that some legacy ISOs (Ubuntu 14.10 server isolinux) ignore Tab and
+  typed keys at the boot menu, blocking the serial-console kernel-cmdline
+  shortcut; the installer then runs on VGA (#24).
+
 ## 0.3.5 - 2026-08-09
 
 ### Added

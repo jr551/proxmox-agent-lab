@@ -256,6 +256,14 @@ machine-readable, checksum-pinned release facts, compatible QEMU hardware, and
 the bounded cleanup sequence. Follow it directly: do not rediscover SourceForge
 metadata, print downloads into the model context, or use standalone `power-on`.
 
+The pinned 0.4.15 media is a legacy-BIOS install. Use SeaBIOS/i440fx, IDE
+disk and CD-ROM, std VGA, and e1000 networking; keep serial0 attached for
+debug output. ReactOS setup has text-mode, GUI, and first-desktop stages, so
+keep VNC available and do not claim completion until the installed IDE disk
+boots with the ISO detached. Do not assume a guest agent or shell channel.
+ReactOS documents this release line as alpha software, so report a successful
+boot as a compatibility observation, not a stability claim.
+
 For DragonFlyBSD, Haiku, OpenBSD, or Windows ME, use `proxmox-lab recipe
 dragonfly`, `recipe haiku`, `recipe openbsd`, or `recipe windows-me` the same
 way. The freely downloadable OS recipes pin verified media and exact storage
@@ -351,6 +359,25 @@ proxmox-lab journal --summary
 
 Every action appends a redacted event. Secrets, typed text and presigned URLs
 are never recorded.
+
+## 🔧 Workflow shortcuts
+
+- **Reusable builders**: promote a stopped lease-owned guest with
+  `guest template --lease "$L" --vmid <id>`, clone it back in seconds with
+  `guest clone --lease "$L" --template <id> --newid <id>` (auto-registered).
+- **Long jobs**: `guest run --lease "$L" --vmid <id> --detach <cmd…>` returns
+  a pid; stream output with `guest log … --pid <pid> --follow`, block with
+  `guest wait … --pid <pid>` (exit code is recorded as a `grun-exit:N` marker).
+- **Big files**: `push`/`pull` auto-chunk above 32 MiB on Linux guests with
+  end-to-end SHA-256; `pull --sha256 <digest>` skips when the local copy
+  already matches.
+- **Kernel debugging**: `console bridge --lease "$L" --vmid <id> --port <p>`
+  exposes the guest serial on a local TCP port for a KD-protocol client (WinDbg, gdb, nc).
+- **Optional network services** (spawned only on demand): `net dhcp-create`
+  (PXE via `--bootfile`/`--next-server`), `net tftp-create`,
+  `net tftp-push`, `net dhcp-leases` — a minimal PXE stack on the lab bridge.
+- `lease-end` hints when a lease is ended seconds after it began; prefer one
+  lease per session, kept alive with `lease-heartbeat` every ≤20 min.
 
 ## 🛑 Boundaries
 

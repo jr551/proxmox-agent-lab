@@ -65,6 +65,17 @@ PS/2 keyboard, which that VM does not present.
 `guest probe` reports this as `"keyboard_input": false`. If you are typing at a
 guest and nothing happens, that is why. Use the serial channel instead.
 
+### ISOs that ignore the keyboard at the boot menu
+
+Some legacy install ISOs ignore Tab and typed characters at their boot menu
+while Enter and arrow keys still work (observed: Ubuntu 14.10 server,
+isolinux/vesamenu). The "append `console=ttyS0` via Tab" shortcut is unusable
+on that media, so the installer boots onto VGA; drive it with the bounded
+screenshot/keyboard loop instead (see
+[gui-installers.md](gui-installers.md)). Serial access can still be enabled
+after install — for example an upstart getty plus `console=ttyS0` on the
+kernel line — for later text access.
+
 ## 🔤 OCR
 
 Off by default, and it should usually stay off:
@@ -165,3 +176,65 @@ proxmox-lab guest run --lease "$L" --vmid 9001 systemd-analyze critical-chain
 ```
 
 The `trap` is the important line. Everything else is detail.
+
+## ⚡ Builders, templates, and long jobs
+
+For repeated compile/test loops against a disposable builder, do not end a
+lease between attempts — each `lease-begin`/`lease-end` cycle costs a host
+boot and provisioning. Begin once, keep it alive with
+`lease-heartbeat --lease "$L"` (every ≤20 min), and reuse it:
+
+- **Promote a provisioned builder to a template** once it has your toolchain
+  and caches (`guest template --lease "$L" --vmid <id>`, guest must be
+  stopped). Later iterations clone it in seconds
+  (`guest clone --lease "$L" --template <id> --newid <id>`), and the clone is
+  registered to the lease automatically.
+- **Long builds** should not block on an agent exec timeout. Start them
+  detached: `guest run --lease "$L" --vmid <id> --detach <command…>` returns a
+  pid immediately; stream output with
+  `guest log --lease "$L" --vmid <id> --pid <pid> --follow` and block on
+  completion with `guest wait --lease "$L" --vmid <id> --pid <pid>`. The exit
+  code is recorded as a `grun-exit:N` marker in the log.
+- **Large artifacts** (ISOs, qcow2 overlays) transfer in chunks with
+  end-to-end SHA-256 verification: `push`/`pull` automatically chunk files
+  above 32 MiB on Linux guests (`--chunk-size MB` to tune). A `pull` with
+  `--sha256` skips the transfer entirely when the local copy already matches,
+  so retries are cheap and idempotent.
+- **Optional network services**: spawn a lease-owned DHCP server
+  (`net dhcp-create`, optional PXE via `--bootfile` + `--next-server`), a TFTP
+  server for boot files (`net tftp-create`, stage files with `net tftp-push`),
+  or see who got an address (`net dhcp-leases`). Together they form a minimal
+  PXE stack on the lab bridge for netbooting installers. They are optional:
+  nothing spawns them unless you ask.
+- **Kernel debugging**: when a guest waits on a serial debugger
+  (e.g. ReactOS KDBG `connect a debugger on port COM1`), attach through the
+  serial bridge instead of treating it as a wall:
+  `console bridge --lease "$L" --vmid <id> --port 4000`, then connect a KD
+  protocol client (ReactOS KDBG speaks the WinDbg KD protocol — attach
+  WinDbg from a Windows host via a TCP-to-COM shim, or gdb/`nc` for raw
+  serial) to that port.
+
+## 🧠 Kernel debugging playbook
+
+When a guest kernel misbehaves, pick the right tool for the layer:
+
+- **Boot logs / panic traces** — capture the serial stream continuously:
+  `console text --vmid <id> --follow --timeout 300` (serial must exist;
+  `console screenshot` if the panic is on the display).
+- **Attach a kernel debugger** — ReactOS KDBG and Windows KD speak the WinDbg
+  KD protocol over serial. `console bridge --lease "$L" --vmid <id> --port 4000`
+  then attach WinDbg (from a Windows host, via a TCP-to-COM shim) or gdb/`nc`
+  for raw serial.
+- **Live memory introspection** (no guest agent, no patched kernel) —
+  `memflow processes|scan|read|phys-write` against the running guest; vCPU
+  state via `memflow registers`.
+- **Live CPU stepping** — `memflow trace --steps N` / `memflow break --addr`
+  drive QEMU's built-in gdbstub (RSP) for single-step and breakpoints.
+- **Iterate without reinstalling** — before testing a new kernel build,
+  `guest snapshot --lease "$L" --vmid <id> --mode create --name before-kernel`;
+  after a bugcheck, stop the guest and
+  `guest snapshot --mode rollback --name before-kernel` to return to the known
+  good state. List/delete with `--mode list|delete`.
+- **Collect the dump** — after a crash, `pull` the guest's dump file
+  (Windows `C:\Windows\MEMORY.DMP`, ReactOS/BSD equivalent) for offline
+  analysis with the Ghidra LXC (`memflow analyze` for live buffers).

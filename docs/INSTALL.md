@@ -107,57 +107,130 @@ pveum user token add agent@pve lab --privsep 1
 pveum acl modify /vms --tokens 'agent@pve!lab' --roles PVEVMAdmin
 ```
 
-## 4. Install the controller
+## 4. One-time controller setup
 
-On the machine you drive from — your laptop, not the lab host:
-
-```sh
-pip install proxmox-agent-lab
-```
-
-Or from a checkout:
+On the machine you drive from — your laptop, not the lab host — run the
+guided installer:
 
 ```sh
-git clone https://github.com/jr551/proxmox-agent-lab
-cd proxmox-agent-lab
-pip install .
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
 ```
 
-Python 3.11+ is required. There are no other dependencies.
-
-> Prefer isolation? `pipx install proxmox-agent-lab` works and keeps it out of
-> your system Python.
-
-## 5. Configure
+It installs the isolated CLI where `pipx` is available, asks for the Proxmox
+address, node, API-token identity, power details, audit backend, and S3
+scratch bucket, stores secrets in the OS keyring, writes a mode-600 config,
+and runs `doctor`.
+Re-run it with `--configure` to safely replace configuration answers:
 
 ```sh
-proxmox-lab init
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash -s -- --configure
 ```
 
-That writes a commented config to `~/.config/proxmox-agent-lab/config.toml`.
-Edit the four things that matter:
+The script never writes the Proxmox or PocketBase token to TOML. Enter each
+secret only at its local hidden prompt. For unattended provisioning, use the
+documented `PXL_*` variables only in a protected CI secret environment.
 
-```toml
-[proxmox]
-host = "192.168.1.50"     # your Proxmox machine
-node = "pve"              # its hostname
-token_user = "agent@pve"
-token_name = "lab"
+### Optional: host PocketBase on Proxmox
 
-[power]
-mode = "wake-on-lan"
-mac = "aa:bb:cc:dd:ee:ff" # the wired NIC from step 2
-broadcast = "192.168.1.255"
-```
-
-Then store the token secret from step 3. It goes into your OS keyring, never
-into the config file:
+When the installer asks for an audit backend, choose `pocketbase`, then
+`proxmox` if you want the lab host to run the service. It prints this command
+to run **as root on the Proxmox host**:
 
 ```sh
-proxmox-lab secrets set proxmox-token
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocketbase-host-setup.sh | bash
 ```
 
-## 6. Check it
+The host script asks for an LXC ID, storage, bridge, IP configuration, HTTP
+port, and first superuser. It creates a persistent unprivileged Debian LXC
+set to start automatically whenever the Proxmox host does — this lab powers
+its host off between leases, so nothing else would start the container back
+up — installs PocketBase as a restricted systemd service, and prints the
+dashboard and API URLs. It does not modify existing guests or the host
+firewall.
+
+Hosting the audit backend on the same machine the lab powers on and off
+means a `power-on`/`lease-begin` can briefly race the container's own
+startup: `ensure_on` tolerates the audit write failing for up to 30 seconds
+after the Proxmox API answers before it gives up and just warns, rather than
+failing the power-on itself.
+
+The default service is HTTP for a trusted LAN; do not port-forward it. Put a
+TLS reverse proxy in front of it before access from an untrusted network.
+After the controller has its API URL, store the first PocketBase superuser
+email and password locally, then run:
+
+```sh
+proxmox-lab secrets set pocketbase-superuser-email
+proxmox-lab secrets set pocketbase-superuser-password
+proxmox-lab journal --provision-pocketbase-agent
+```
+
+This creates a controller-only PocketBase auth record and replaces
+`audit-token` with its renewable token. The controller refreshes that token
+before expiry and reauthenticates as the restricted account if needed; the
+superuser remains only for explicit reprovisioning. Do not use a nonrenewable
+impersonation token for a controller that must run indefinitely.
+
+### Optional: host MinIO on Proxmox
+
+The S3 scratch bucket (see [storage.md](storage.md#s3-scratch-bucket)) moves
+files in and out of guests. If you don't already run an S3-compatible
+service, the installer can point you at one it creates for you. When it asks
+for the S3 backend, choose `lxc`. It prints this command to run **as root on
+the Proxmox host**:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-host-setup.sh | bash
+```
+
+The host script asks for an LXC ID, storage, bridge, IP configuration, disk
+size, bucket name, and access key. It creates a persistent unprivileged
+Debian LXC set to start automatically whenever the Proxmox host does — this
+lab powers its host off between leases, so nothing else would start the
+container back up — installs a single-binary MinIO server as a restricted
+systemd service (S3 API only — the browser console is disabled), creates
+the bucket, and prints the endpoint, bucket, region, and credentials.
+
+The service is HTTP for a trusted LAN; do not port-forward it. Put a TLS
+reverse proxy in front of it before access from an untrusted network. Re-run
+controller setup, select `existing`, enter the printed endpoint, bucket and
+region, and enter the printed access key and secret key at their hidden
+local prompts.
+
+### Copy this as the first message to your installation agent
+
+```text
+Install proxmox-agent-lab as a first-stage task. First ask me only for the
+non-secret setup choices: Proxmox address, node, API-token user and name,
+power method, whether audit storage should be SQLite, JSONL, an existing
+PocketBase service, or a new PocketBase LXC on the Proxmox host, and whether
+the S3 scratch bucket should be skipped, an existing bucket, or a new MinIO
+LXC on the Proxmox host. Never ask me to paste a token or password into chat,
+config, command arguments, or an environment variable. Run the project’s
+guided install.sh locally so its hidden prompts store secrets only in the OS
+keyring, then run `proxmox-lab doctor` and report every remaining issue
+exactly.
+
+If I choose a new PocketBase LXC, show me the root-only
+`pocketbase-host-setup.sh` command and wait for me to run it on the Proxmox
+host. Do not expose the HTTP port to the Internet or change host firewall
+rules. After I provide the resulting trusted-LAN API URL, finish the
+controller setup. Store the first superuser email and password only through
+hidden local prompts, then run `proxmox-lab journal
+--provision-pocketbase-agent` to create the restricted renewable controller
+account. Report the API URL and collection name another controller needs; do
+not distribute superuser or impersonation tokens.
+
+If I choose a new MinIO LXC, show me the root-only `minio-host-setup.sh`
+command and wait for me to run it on the Proxmox host. Do not expose the S3
+port to the Internet or change host firewall rules. After I provide the
+resulting trusted-LAN endpoint, bucket, region, access key, and secret key,
+finish the controller setup and confirm both secrets landed in the OS
+keyring, never in chat, config, or command arguments.
+```
+
+
+## 5. Check it
 
 ```sh
 proxmox-lab doctor
@@ -180,7 +253,7 @@ If power-on times out: the machine did not wake (BIOS/`ethtool`), the broadcast
 address is wrong for your subnet, or your router drops directed broadcasts —
 try `broadcast = "255.255.255.255"`.
 
-## 7. Your first lease
+## 6. Your first lease
 
 ```sh
 L=$(proxmox-lab lease-begin --purpose "first run" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
@@ -191,7 +264,7 @@ proxmox-lab lease-end --lease "$L"
 `lease-end` must print `"host_powered_off": true`. That is the whole promise of
 this tool: when the work is done, the machine is off.
 
-## 8. Install the watchdog (recommended)
+## 7. Install the watchdog (recommended)
 
 If the controller crashes or you close the laptop mid-run, nothing would clean
 up. The watchdog sweeps expired leases and shuts an idle host down.
@@ -245,6 +318,12 @@ None of these are needed for a working lab.
 **`doctor` says the token is missing but you stored it.** You probably have two
 config files. `doctor` prints `config_file` — check it is the one you edited.
 `$PROXMOX_AGENT_LAB_CONFIG` overrides everything.
+
+
+**An agent says `mcp:proxmox-complete` or `proxmox-mcp-wrapper` is missing.**
+That is a stale local agent integration, not a lab failure. Use the installed
+`proxmox-lab` CLI and this guide’s first-stage prompt; refresh the agent skill
+before relying on an MCP entry that points at an absent wrapper.
 
 **HTTP 401.** The token secret is wrong, or `token_user`/`token_name` do not
 match. The secret is the UUID shown once at creation, not the token id.

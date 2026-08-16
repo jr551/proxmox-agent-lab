@@ -696,6 +696,282 @@ def cmd_attach(lab: Any, args: Any) -> None:
     ))
 
 
+# --- optional spawnable DHCP + TFTP servers ------------------------------
+#
+# Two disposable, lease-owned dnsmasq servers that guests on the lab bridge
+# can optionally use: a DHCP server (with an optional PXE `dhcp-boot`
+# next-server) and a TFTP server for boot files. Neither is created by
+# default; spawn one per lease with `net dhcp-create` / `net tftp-create`.
+# Together (dhcp-boot pointing at the TFTP server) they form a minimal PXE
+# stack for netbooting installers on guests that lack an optical drive.
+
+DHCP_SERVER_IP = "10.66.0.2"
+TFTP_SERVER_IP = "10.66.0.3"
+TFTP_ROOT = "/srv/tftp"
+
+SERVER_PROVISION = """#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq dnsmasq >/dev/null
+IFACE=$(ip -o -4 addr show | awk -v a="__SERVER_IP__/" 'index($4, a) == 1 {print $2; exit}')
+if [ -z "$IFACE" ]; then
+  echo "no interface holds __SERVER_IP__" >&2
+  ip -o -4 addr show >&2
+  exit 1
+fi
+sed "s/__LAB_IF__/$IFACE/g" /tmp/lab-server.conf > /etc/dnsmasq.d/lab-server.conf
+chmod 0644 /etc/dnsmasq.d/lab-server.conf
+__PRE_START__
+systemctl enable --now dnsmasq
+systemctl restart dnsmasq
+sleep 2
+__VERIFY__
+echo provisioned
+"""
+
+
+def _sibling_ip(gateway: str, last_octet: int) -> str:
+    """The lab gateway's address with the final octet replaced."""
+    parts = gateway.split(".")
+    parts[-1] = str(last_octet)
+    return ".".join(parts)
+
+
+def _ensure_agent(lab: Any, api: Any, vmid: int, cloud_user: str,
+                  password: str, timeout: int) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if console.agent_ready(lab, api, vmid):
+            return
+        time.sleep(5)
+    console.bootstrap_guest_agent(lab, api, vmid, cloud_user, password)
+
+
+def _clear_bootstrap_password(lab: Any, api: Any, vmid: int) -> bool:
+    try:
+        api.call("PUT", f"/nodes/{lab.NODE}/qemu/{vmid}/config",
+                 {"delete": "cipassword"})
+        return True
+    except lab.LabError:
+        return False
+
+
+def _spawn_dnsmasq_server(lab: Any, api: Any, args: Any, *, role: str,
+                          conf: str, verify: str, server_ip: str,
+                          name: str, pre_start: str = "") -> tuple[str, bool]:
+    """Clone a template, install dnsmasq, apply conf, verify, return (name, ok)."""
+    lease = lab.load_lease(args.lease)
+    if args.vmid in lease["initial_vmids"]:
+        raise lab.LabError(f"VMID {args.vmid} existed before this lease")
+    require_bridge(lab, api)
+    upid = api.call(
+        "POST",
+        f"/nodes/{lab.NODE}/qemu/{args.template}/clone",
+        {"newid": args.vmid, "name": name, "full": 1, "target": lab.NODE},
+    )
+    lab.wait_task(api, upid, timeout=args.clone_timeout)
+    lab.register_resource(lease, "qemu", args.vmid, args.policy, name)
+
+    # A console password is set before first boot so the serial bootstrap can
+    # install qemu-guest-agent when the image lacks one; it is cleared after.
+    password = secrets.token_urlsafe(18)
+    template_config = api.call(
+        "GET", f"/nodes/{lab.NODE}/qemu/{args.template}/config"
+    )
+    cloud_user = template_config.get("ciuser") or "debian"
+    prefix = LAB_NETWORK.split("/")[1]
+    api.call(
+        "PUT",
+        f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
+        {
+            "cores": args.cores,
+            "memory": args.memory,
+            "ciuser": cloud_user,
+            "cipassword": password,
+            # net0 on the home bridge gives the server egress for its own
+            # provisioning (apt); net1 on the lab bridge is where it serves.
+            # dnsmasq binds only the lab-side interface, so it never answers
+            # on the egress NIC.
+            "net0": "virtio,bridge=vmbr0,firewall=1",
+            "net1": f"virtio,bridge={LAB_BRIDGE}",
+            "ipconfig0": "ip=dhcp",
+            "ipconfig1": f"ip={server_ip}/{prefix},gw={LAB_GATEWAY_IP}",
+            "agent": "enabled=1",
+            "onboot": 0,
+            "tags": f"codex-lab;lease-{args.lease};{role}",
+        },
+    )
+    start = api.call(
+        "POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/start"
+    )
+    lab.wait_task(api, start, timeout=180)
+    _ensure_agent(lab, api, args.vmid, cloud_user, password, args.agent_timeout)
+
+    _write_guest_file(lab, api, args.vmid, "/tmp/lab-server.conf", conf)
+    provision = SERVER_PROVISION.replace(
+        "__SERVER_IP__", server_ip
+    ).replace("__PRE_START__", pre_start).replace("__VERIFY__", verify)
+    _write_guest_file(lab, api, args.vmid, "/tmp/lab-server-provision.sh",
+                      provision)
+    result = _exec(lab, api, args.vmid, "bash /tmp/lab-server-provision.sh",
+                   timeout=args.provision_timeout)
+    if result["exitcode"] not in (0, None):
+        raise lab.LabError(
+            f"{role} provisioning failed: "
+            + (result["stderr"] or result["stdout"])[-600:]
+        )
+    cleared = _clear_bootstrap_password(lab, api, args.vmid)
+    return name, cleared
+
+
+def cmd_dhcp_create(lab: Any, args: Any) -> None:
+    """Spawn a lease-owned DHCP server (optional, dnsmasq)."""
+    import json
+
+    api = lab.ProxmoxAPI()
+    server_ip = args.server_ip or _sibling_ip(LAB_GATEWAY_IP, 2)
+    name = args.name or f"dhcp-{args.vmid}"
+    dns = args.dns or LAB_GATEWAY_IP
+    rng = args.range or f"{LAB_DHCP_RANGE[0]},{LAB_DHCP_RANGE[1]}"
+    conf = (
+        "interface=__LAB_IF__\n"
+        "bind-interfaces\n"
+        "domain-needed\n"
+        "bogus-priv\n"
+        "no-resolv\n"
+        f"server={dns}\n"
+        f"dhcp-range={rng},12h\n"
+        f"dhcp-option=option:router,{args.gateway or LAB_GATEWAY_IP}\n"
+        f"dhcp-option=option:dns-server,{dns}\n"
+    )
+    if args.bootfile:
+        next_server = args.next_server or _sibling_ip(LAB_GATEWAY_IP, 3)
+        conf += f"dhcp-boot={args.bootfile},{next_server}\n"
+    verify = (
+        "ss -ulnp | grep -q ':67 ' || "
+        "{ echo 'dnsmasq not listening on :67' >&2; exit 1; }\n"
+        "mkdir -p /var/lib/misc && touch /var/lib/misc/dnsmasq.leases"
+    )
+    name, cleared = _spawn_dnsmasq_server(
+        lab, api, args, role="dhcp", conf=conf, verify=verify,
+        server_ip=server_ip, name=name,
+    )
+    lab.audit("dhcp-server-created", lease=args.lease, vmid=args.vmid,
+              server_ip=server_ip, range=rng,
+              bootfile=args.bootfile or None, sync=False)
+    print(json.dumps({
+        "vmid": args.vmid, "name": name, "server_ip": server_ip,
+        "range": rng, "dns": dns, "gateway": args.gateway or LAB_GATEWAY_IP,
+        "bootfile": args.bootfile or None,
+        "next_server": (args.next_server or _sibling_ip(LAB_GATEWAY_IP, 3))
+                       if args.bootfile else None,
+        "provisioned": True,
+        "bootstrap_password_cleared": cleared,
+        "next": (
+            f"see leases: proxmox-lab net dhcp leases --lease {args.lease} "
+            f"--vmid {args.vmid}"
+        ),
+    }, indent=2, sort_keys=True))
+
+
+def cmd_dhcp_leases(lab: Any, args: Any) -> None:
+    """Show the DHCP server's current lease table."""
+    import json
+
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
+    result = _exec(lab, api, args.vmid,
+                   "cat /var/lib/misc/dnsmasq.leases 2>/dev/null || true",
+                   timeout=30)
+    leases = []
+    for line in result.get("stdout", "").splitlines():
+        fields = line.split()
+        if len(fields) >= 4:
+            leases.append({
+                "expires_at": fields[0], "mac": fields[1], "ip": fields[2],
+                "hostname": fields[3],
+            })
+    print(json.dumps({"vmid": args.vmid, "leases": leases}, indent=2,
+                     sort_keys=True))
+
+
+def cmd_tftp_create(lab: Any, args: Any) -> None:
+    """Spawn a lease-owned TFTP server (optional, dnsmasq)."""
+    import json
+
+    api = lab.ProxmoxAPI()
+    server_ip = args.server_ip or _sibling_ip(LAB_GATEWAY_IP, 3)
+    name = args.name or f"tftp-{args.vmid}"
+    root = args.root or TFTP_ROOT
+    conf = (
+        "interface=__LAB_IF__\n"
+        "bind-interfaces\n"
+        f"enable-tftp\n"
+        f"tftp-root={root}\n"
+    )
+    verify = (
+        "ss -ulnp | grep -q ':69 ' || "
+        "{ echo 'dnsmasq not listening on :69' >&2; exit 1; }"
+    )
+    name, cleared = _spawn_dnsmasq_server(
+        lab, api, args, role="tftp", conf=conf, verify=verify,
+        server_ip=server_ip, name=name,
+        pre_start=f"mkdir -p {root}",
+    )
+    lab.audit("tftp-server-created", lease=args.lease, vmid=args.vmid,
+              server_ip=server_ip, root=root, sync=False)
+    print(json.dumps({
+        "vmid": args.vmid, "name": name, "server_ip": server_ip,
+        "root": root, "provisioned": True,
+        "bootstrap_password_cleared": cleared,
+        "next": (
+            f"stage a boot file: proxmox-lab net tftp push --lease "
+            f"{args.lease} --vmid {args.vmid} --file <pxelinux.0>"
+        ),
+    }, indent=2, sort_keys=True))
+
+
+def cmd_tftp_push(lab: Any, args: Any) -> None:
+    """Stage a file into the TFTP root of a lease-owned TFTP server."""
+    import json
+    from pathlib import Path
+
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
+    source = Path(args.file).expanduser().resolve()
+    if not source.is_file():
+        raise lab.LabError(f"not a regular file: {source}")
+    name = args.name or source.name
+    if "/" in name or "\\" in name or ".." in name:
+        raise lab.LabError(f"unsafe TFTP file name: {name!r}")
+    dest = f"{args.root or TFTP_ROOT}/{name}"
+    payload = base64.b64encode(source.read_bytes()).decode()
+    api.call(
+        "POST",
+        f"/nodes/{lab.NODE}/qemu/{args.vmid}/agent/file-write",
+        {"file": dest, "content": payload, "encode": 0},
+    )
+    check = _exec(
+        lab, api, args.vmid, f"stat -c %s {dest} 2>/dev/null || echo 0",
+        timeout=60,
+    )
+    try:
+        size = int(check.get("stdout", "0").strip())
+    except ValueError:
+        size = -1
+    if size != source.stat().st_size:
+        raise lab.LabError(
+            f"staged file size mismatch on {dest}: {size} != "
+            f"{source.stat().st_size}"
+        )
+    lab.audit("tftp-file-pushed", lease=args.lease, vmid=args.vmid,
+              path=dest, bytes=size, sync=False)
+    print(json.dumps({
+        "vmid": args.vmid, "path": dest, "bytes": size, "name": name,
+    }, indent=2, sort_keys=True))
+
+
 def cmd_status(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     bridges = api.call("GET", f"/nodes/{lab.NODE}/network") or []
@@ -787,3 +1063,63 @@ def register(sub: Any, lab: Any) -> None:
 
     status = net_sub.add_parser("status", help="show the lab network")
     status.set_defaults(func=bind(cmd_status))
+
+    dhcp = net_sub.add_parser(
+        "dhcp-create",
+        help="spawn a lease-owned DHCP server (optional; dnsmasq)",
+    )
+    dhcp.add_argument("--lease", required=True)
+    dhcp.add_argument("--vmid", type=int, required=True)
+    dhcp.add_argument("--name")
+    dhcp.add_argument("--template", type=int, default=GATEWAY_TEMPLATE_VMID)
+    dhcp.add_argument("--server-ip", help=f"default {DHCP_SERVER_IP}")
+    dhcp.add_argument("--range",
+                      help=f"dhcp-range, default {LAB_DHCP_RANGE[0]},{LAB_DHCP_RANGE[1]}")
+    dhcp.add_argument("--gateway", help=f"router option, default {LAB_GATEWAY_IP}")
+    dhcp.add_argument("--dns", help=f"dns-server option, default {LAB_GATEWAY_IP}")
+    dhcp.add_argument("--bootfile",
+                      help="PXE: boot filename offered by DHCP (enables dhcp-boot)")
+    dhcp.add_argument("--next-server",
+                      help=f"PXE: TFTP server for dhcp-boot, default {TFTP_SERVER_IP}")
+    dhcp.add_argument("--cores", type=int, default=1)
+    dhcp.add_argument("--memory", type=int, default=1024)
+    dhcp.add_argument("--policy", choices=("delete", "retain"), default="delete")
+    dhcp.add_argument("--clone-timeout", type=int, default=1800)
+    dhcp.add_argument("--agent-timeout", type=int, default=120)
+    dhcp.add_argument("--provision-timeout", type=int, default=1200)
+    dhcp.set_defaults(func=bind(cmd_dhcp_create))
+
+    dhcp_leases = net_sub.add_parser(
+        "dhcp-leases", help="show the DHCP server's lease table"
+    )
+    dhcp_leases.add_argument("--lease", required=True)
+    dhcp_leases.add_argument("--vmid", type=int, required=True)
+    dhcp_leases.set_defaults(func=bind(cmd_dhcp_leases))
+
+    tftp = net_sub.add_parser(
+        "tftp-create",
+        help="spawn a lease-owned TFTP server (optional; dnsmasq)",
+    )
+    tftp.add_argument("--lease", required=True)
+    tftp.add_argument("--vmid", type=int, required=True)
+    tftp.add_argument("--name")
+    tftp.add_argument("--template", type=int, default=GATEWAY_TEMPLATE_VMID)
+    tftp.add_argument("--server-ip", help=f"default {TFTP_SERVER_IP}")
+    tftp.add_argument("--root", help=f"TFTP root, default {TFTP_ROOT}")
+    tftp.add_argument("--cores", type=int, default=1)
+    tftp.add_argument("--memory", type=int, default=1024)
+    tftp.add_argument("--policy", choices=("delete", "retain"), default="delete")
+    tftp.add_argument("--clone-timeout", type=int, default=1800)
+    tftp.add_argument("--agent-timeout", type=int, default=120)
+    tftp.add_argument("--provision-timeout", type=int, default=1200)
+    tftp.set_defaults(func=bind(cmd_tftp_create))
+
+    tftp_push = net_sub.add_parser(
+        "tftp-push", help="stage a file into a TFTP server's root"
+    )
+    tftp_push.add_argument("--lease", required=True)
+    tftp_push.add_argument("--vmid", type=int, required=True)
+    tftp_push.add_argument("--file", required=True)
+    tftp_push.add_argument("--name", help="name in the TFTP root (default: file name)")
+    tftp_push.add_argument("--root", help=f"TFTP root, default {TFTP_ROOT}")
+    tftp_push.set_defaults(func=bind(cmd_tftp_push))

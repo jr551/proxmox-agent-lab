@@ -4,6 +4,33 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.6.3 - 2026-08-16
+
+### Fixed
+
+- The daily update-check cache is invalidated when the controller version
+  changes, so an upgraded controller cannot display an obsolete update notice.
+
+## 0.6.2 - 2026-08-16
+
+### Fixed
+
+- Tag-release CI now updates a pre-existing GitHub release and replaces its
+  generated assets instead of failing after a manual release was published
+  first.
+
+## 0.6.1 - 2026-08-16
+
+### Added
+
+- OMP project discovery through `.agents/skills/proxmox-agent-lab/SKILL.md`,
+  with delegated-agent lease and mutation boundaries documented in the
+  canonical skill.
+
+### Fixed
+
+- Both the wheel and source distribution now ship the OMP skill layout.
+
 ## 0.6.0 - 2026-08-14
 
 ### Added

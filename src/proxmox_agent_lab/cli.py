@@ -125,7 +125,11 @@ def check_for_updates(*, now: float | None = None) -> dict[str, Any]:
     except (OSError, ValueError, TypeError):
         previous = {}
     last = previous.get("checked_at", 0)
-    if isinstance(last, (int, float)) and checked_at - last < UPDATE_CHECK_INTERVAL_SECONDS:
+    if (
+        previous.get("current") == __version__
+        and isinstance(last, (int, float))
+        and checked_at - last < UPDATE_CHECK_INTERVAL_SECONDS
+    ):
         return {**previous, "cached": True}
 
     result: dict[str, Any] = {

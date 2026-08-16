@@ -72,9 +72,10 @@ Otherwise resolve the same files relative to this skill directory.
 Read [docs/AGENTS.md](docs/AGENTS.md) before first use. Read
 [docs/safety-policy.md](docs/safety-policy.md) for the enforced rules, and the
 topic guides ([console](docs/console.md), [storage](docs/storage.md),
-[network](docs/network.md), [windows](docs/windows.md)) when a task needs
-them. [VERIFICATION.md](docs/VERIFICATION.md) records which subsystems have
-actually been exercised on hardware and which are unit-tested only.
+[network](docs/network.md), [windows](docs/windows.md), and experimental
+[OCI](docs/oci.md)) when a task needs them. [VERIFICATION.md](docs/VERIFICATION.md)
+records which subsystems have actually been exercised on hardware and which are
+unit-tested only.
 
 ## 📌 Long-term leases
 
@@ -105,6 +106,21 @@ want work done now, an ordinary lease is right. See
   writes. The wrapper tags new guests with `codex-lab` and the lease — leave
   those tags alone.
 - Register anything created through an unusual path with `lease-register`.
+
+## 🧪 Experimental OCI application containers
+
+`oci pull` and `oci create` turn a public OCI image into an **unprivileged
+LXC**, not a Docker runtime and not a QEMU VM. It is useful only for trusted,
+Linux-only application workloads. OCI LXC shares the Proxmox host kernel and
+does **not** provide VM-grade isolation: never use it for malware, unknown
+software, untrusted build scripts, kernel/driver work, emulation, or device
+passthrough.
+
+Proxmox's direct registry API accepts mutable tags rather than `@sha256`
+references. `oci pull` therefore requires both `--host-change-authorized`
+(persistent template storage) and `--allow-mutable-reference`. Use QEMU for
+anything requiring strong isolation, a real kernel, VNC, guest-agent execution,
+or an interactive console. See [docs/oci.md](docs/oci.md).
 
 ## 👀 Reach into a guest
 

@@ -4,6 +4,17 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.6.4 - 2026-08-16
+
+### Added
+
+- Experimental `oci pull` and `oci create` commands for Proxmox VE 9.1+
+  OCI-to-unprivileged-LXC workloads. Pulling requires explicit authorization
+  for persistent host template storage and PVE's mutable-tag-only registry
+  limitation; creation is lease-owned, unprivileged, non-onboot, and
+  ordinary-lease-only. Documentation makes clear that this is not QEMU-grade
+  isolation and must not run untrusted code.
+
 ## 0.6.3 - 2026-08-16
 
 ### Fixed

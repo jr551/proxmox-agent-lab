@@ -1979,6 +1979,7 @@ def parser() -> argparse.ArgumentParser:
     from . import memflow
     from . import netcap
     from . import netgw
+    from . import oci
     from . import recipes
     from . import share
     from . import storage
@@ -1992,6 +1993,7 @@ def parser() -> argparse.ArgumentParser:
     memflow.register(sub, _module())
     netcap.register(sub, _module())
     netgw.register(sub, _module())
+    oci.register(sub, _module())
     recipes.register(sub, _module())
     share.register(sub, _module())
     storage.register(sub, _module())

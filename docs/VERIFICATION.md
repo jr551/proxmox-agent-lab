@@ -19,6 +19,7 @@ Read it as a statement of confidence, not a feature list. Anything marked
 | S3 scratch | `health`, `put`, `list`, `get` — byte-identical round trip |
 | File transfer | 200 KB pushed into a guest and verified by SHA-256 inside it, then pulled back byte-identical |
 | Storage | `status` and `list-disks`; a 1 TB USB disk formatted and used as `usb-bulk` (933 GB free) |
+| Experimental OCI LXC | On Proxmox VE 9.2.2, native `oci pull` fetched the public BusyBox 1.37.0 tag into template storage; `oci create --start` converted it to a running, tagged, lease-owned unprivileged LXC with 128 MiB RAM and no swap. Lease cleanup removed the stopped LXC; the explicitly authorized template deletion also completed. The host stayed on only because an independent lease remained active. |
 | Forced VPN | Egress from a guest used the tunnel rather than the home WAN; kill switch went UNREACHABLE→REACHABLE |
 | Console sharing | A link minted, the RFB handshake completed **through the public tunnel**, and a revoked link 404ed immediately |
 | Android | A device built, booted to the home screen, and driven over the VM console; adb reachable |

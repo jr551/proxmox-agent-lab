@@ -54,6 +54,7 @@ Agent dies → a watchdog cleans up anyway.
 | 📦 | Move files in and out | `push`, `pull` |
 | 🪟 | Install Windows | `windows install` |
 | 💿 | Fetch cloud images, checksum-verified | `storage download-url` |
+| 🧪 | Experimental trusted OCI application LXC | `oci pull`, `oci create` |
 | 🔒 | Force all traffic through a VPN | `net gateway-create` |
 | 🕵️ | Prove there is no leak | `net leak-test` |
 | 📓 | Audit everything (SQLite or PocketBase) | `journal` |
@@ -229,6 +230,7 @@ traps that cost real debugging time.
 | 🤖 [AGENTS.md](docs/AGENTS.md) | How an agent should drive it |
 | 👀 [console.md](docs/console.md) | Screens, keyboard, serial, OCR |
 | 📦 [storage.md](docs/storage.md) | Disks, images, file transfer |
+| 🧪 [oci.md](docs/oci.md) | Experimental OCI LXC: limits and guardrails |
 | 🔒 [network.md](docs/network.md) | VPN egress and leak testing |
 | 🪟 [windows.md](docs/windows.md) | Installing Windows |
 | 🧩 [reactos.md](docs/reactos.md) | Debugging ReactOS guests over serial and KDB |

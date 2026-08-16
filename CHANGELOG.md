@@ -4,6 +4,18 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.6.1 - 2026-08-16
+
+### Added
+
+- OMP project discovery through `.agents/skills/proxmox-agent-lab/SKILL.md`,
+  with delegated-agent lease and mutation boundaries documented in the
+  canonical skill.
+
+### Fixed
+
+- Both the wheel and source distribution now ship the OMP skill layout.
+
 ## 0.6.0 - 2026-08-14
 
 ### Added

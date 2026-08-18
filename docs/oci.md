@@ -45,6 +45,14 @@ L=$(proxmox-lab lease-begin --purpose "run trusted OCI smoke service" \
 trap 'proxmox-lab lease-end --lease "$L"' EXIT
 ```
 
+Optionally check the reference offline first — this validates the grammar and
+shows the template volume a pull would produce, without needing a lease or
+touching the host:
+
+```bash
+proxmox-lab oci validate --reference docker.io/library/busybox:1.37.0
+```
+
 Pull a public image. Template storage persists outside the lease, so this is a
 host storage change and must be explicitly authorized:
 

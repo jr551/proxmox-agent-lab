@@ -8,6 +8,9 @@ All notable changes to this project will be documented here. The format follows
 
 ### Added
 
+- Journal and audit commands now print a stderr notice when the PocketBase
+  token is nonrenewable and expires within 48 hours, before every read and
+  write would start failing hard, with the renewable-agent fix spelled out.
 - `oci validate` checks a registry reference offline against the accepted
   grammar and prints the template volume a pull would produce, without
   touching the Proxmox host.
@@ -18,6 +21,7 @@ All notable changes to this project will be documented here. The format follows
   component contains `-`, `_`, or `.` (for example
   `ghcr.io/home-assistant/home-assistant:stable`), and the tag grammar is now
   ASCII-only instead of accepting any Unicode word character.
+
 
 ## 0.6.4 - 2026-08-16
 

@@ -1191,6 +1191,49 @@ class ProxmoxLabTests(unittest.TestCase):
         )
         self.assertEqual(client.token, "reauthenticated-token")
 
+    def _nonrenewable_token(self, exp: int) -> str:
+        import base64
+        import json
+
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "collectionId": "agents",
+            "exp": exp,
+            "refreshable": False,
+        }).encode()).decode().rstrip("=")
+        return f"header.{payload}.signature"
+
+    def _pocketbase_client_stderr(self, token: str) -> str:
+        import contextlib
+        import io
+
+        audit_config = {
+            "pocketbase_url": "https://pb.example",
+            "pocketbase_collection": "events",
+            "pocketbase_token_secret": "audit-token",
+            "pocketbase_timeout_seconds": 10,
+            "pocketbase_auth_refresh_before_seconds": 300,
+        }
+        stderr = io.StringIO()
+        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
+             mock.patch.object(LAB.secrets_store, "get", return_value=token), \
+             mock.patch.object(LAB.time, "time", return_value=800), \
+             contextlib.redirect_stderr(stderr):
+            LAB.pocketbase_client()
+        return stderr.getvalue()
+
+    def test_pocketbase_client_warns_before_nonrenewable_token_lapses(self) -> None:
+        output = self._pocketbase_client_stderr(
+            self._nonrenewable_token(800 + 3600)
+        )
+        self.assertIn("nonrenewable", output)
+        self.assertIn("--provision-pocketbase-agent", output)
+
+    def test_pocketbase_client_stays_quiet_for_distant_expiry(self) -> None:
+        output = self._pocketbase_client_stderr(
+            self._nonrenewable_token(800 + 60 * 24 * 3600)
+        )
+        self.assertEqual(output, "")
+
     def test_agent_provision_stores_reauth_credentials_and_token(self) -> None:
         import contextlib
         import io

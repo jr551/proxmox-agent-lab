@@ -284,6 +284,31 @@ def _pocketbase_password_auth(
         raise LabError(str(exc)) from None
 
 
+# A nonrenewable token cannot be refreshed, so once it lapses every journal
+# read and audit write fails hard. Warn well before that happens.
+_NONRENEWABLE_TOKEN_WARNING_SECONDS = 48 * 3600
+
+
+def _warn_if_token_nonrenewable(token: str) -> None:
+    claims = pocketbase_module.token_claims(token)
+    if claims.get("refreshable") is not False:
+        return
+    expiry = claims.get("exp")
+    if isinstance(expiry, bool) or not isinstance(expiry, (int, float)):
+        return
+    remaining = expiry - time.time()
+    if remaining > _NONRENEWABLE_TOKEN_WARNING_SECONDS:
+        return
+    hours = max(0.0, remaining) / 3600
+    print(
+        "notice: the PocketBase audit token is nonrenewable and expires in "
+        f"{hours:.1f}h; run 'proxmox-lab journal --provision-pocketbase-agent' "
+        "to switch to a renewable agent, or store the pocketbase-agent-email "
+        "and pocketbase-agent-password secrets so expiry can re-authenticate",
+        file=sys.stderr,
+    )
+
+
 def pocketbase_client() -> pocketbase_module.Client:
     url, collection, secret_name, timeout, refresh_before = _pocketbase_settings()
     try:
@@ -324,6 +349,7 @@ def pocketbase_client() -> pocketbase_module.Client:
             )
         except ValueError as exc:
             raise LabError(str(exc)) from None
+    _warn_if_token_nonrenewable(client.token)
     return client
 
 

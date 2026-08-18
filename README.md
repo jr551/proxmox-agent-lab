@@ -68,6 +68,8 @@ Agent dies → a watchdog cleans up anyway.
 | 💉 | Scan & inject physical RAM (any guest OS) | `memflow scan`, `phys-write` |
 | 🩺 | Diagnose a stuck boot from RAM | `memflow boot-diagnose` |
 | 🧩 | Diagnose virtio devices & feature bits (porting) | `virtio inspect`, `virtio decode` |
+| 💿 | Diagnose why an install ISO won't boot | `iso diagnose` |
+| 🧱 | Read partition tables / repair a dead guest's FS offline | `disk boot-info`, `disk read/write` |
 | 🔌 | Sniff a USB device's traffic to a pcap | `usb sniff` |
 | 🕸️ | Capture a guest's network traffic to a pcap | `netcap capture` |
 | 🔓 | Decrypt & rewrite its HTTPS (MITM in a container) | `netcap intercept` |

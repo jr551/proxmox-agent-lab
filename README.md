@@ -66,6 +66,8 @@ Agent dies → a watchdog cleans up anyway.
 | 🔬 | Introspect a guest's memory, agentless | `memflow processes` |
 | 🐞 | Step through / read / write guest memory | `memflow trace`, `analyze` |
 | 💉 | Scan & inject physical RAM (any guest OS) | `memflow scan`, `phys-write` |
+| 🩺 | Diagnose a stuck boot from RAM | `memflow boot-diagnose` |
+| 🧩 | Diagnose virtio devices & feature bits (porting) | `virtio inspect`, `virtio decode` |
 | 🔌 | Sniff a USB device's traffic to a pcap | `usb sniff` |
 | 🕸️ | Capture a guest's network traffic to a pcap | `netcap capture` |
 | 🔓 | Decrypt & rewrite its HTTPS (MITM in a container) | `netcap intercept` |

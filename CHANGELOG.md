@@ -8,6 +8,13 @@ All notable changes to this project will be documented here. The format follows
 
 ### Added
 
+- `virtio` command group for porting and debugging virtio drivers on any guest
+  OS: `virtio inspect --vmid` reports the configured virtio devices and their
+  live negotiated feature bits from the read-only QEMU monitor, and
+  `virtio decode --value 0x... --device net|blk|scsi` names every bit in a
+  feature word offline. The monitor path is hard-restricted to an allowlist of
+  read-only `info` queries, so it can never mutate a guest.
+
 - `memflow boot-diagnose` diagnoses a stuck boot from a guest's RAM without
   entering the guest: it samples the vCPU registers twice to tell a wedged CPU
   (panic spin, HLT loop, firmware dead end) from one still executing, and scans

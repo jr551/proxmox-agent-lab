@@ -128,6 +128,14 @@ class TermSession:
         payload = (text + "\n").encode()
         self.socket.send(b"0:" + str(len(payload)).encode() + b":" + payload)
 
+    def send_raw(self, text: str) -> None:
+        # No trailing newline: a kernel debugger prompt (KDB, GRUB, a paused
+        # bootloader) often acts on bare characters, and appending "\n" would
+        # change their meaning.
+        payload = text.encode()
+        if payload:
+            self.socket.send(b"0:" + str(len(payload)).encode() + b":" + payload)
+
     def read(self, seconds: float) -> str:
         deadline = time.monotonic() + seconds
         chunks: list[bytes] = []
@@ -966,6 +974,20 @@ def cmd_text(lab: Any, args: Any) -> None:
     """Read the real terminal stream -- exact text, no OCR involved."""
     api = lab.ProxmoxAPI()
     kind = args.kind or _kind_of(lab, api, args.vmid)
+    if args.from_reset:
+        # Attach the terminal session BEFORE resetting: the QEMU serial
+        # chardev streams only to a connected client, so resetting first
+        # loses the earliest boot output. A reset keeps the QEMU process
+        # (and its serial socket) alive; only the guest restarts.
+        if not args.follow:
+            raise _api_error(lab, "--from-reset requires --follow")
+        if kind != "qemu":
+            raise _api_error(lab, "--from-reset only applies to QEMU guests")
+        if not args.lease:
+            raise _api_error(lab, "--from-reset requires --lease")
+        lab.require_lease_resource(
+            lab.load_lease(args.lease), kind, args.vmid
+        )
     if args.follow:
         # Continuous capture (kernel boot logs, panic traces): read until the
         # timeout or Ctrl+C, printing each chunk as it arrives.
@@ -973,6 +995,12 @@ def cmd_text(lab: Any, args: Any) -> None:
 
         deadline = _time.monotonic() + (args.timeout if args.timeout else 3600)
         with TermSession(lab, api, kind, args.vmid) as session:
+            if args.from_reset:
+                api.call(
+                    "POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/reset"
+                )
+                lab.audit("console-text-from-reset", lease=args.lease,
+                          vmid=args.vmid, sync=False)
             while _time.monotonic() < deadline:
                 chunk = session.socket.read_available(1.0)
                 if chunk:
@@ -984,17 +1012,19 @@ def cmd_text(lab: Any, args: Any) -> None:
                     print(text, end="", flush=True)
         return
     with TermSession(lab, api, kind, args.vmid) as session:
-        if args.send or args.nudge:
+        if args.send or args.send_raw or args.nudge:
             # Sending even a blank line mutates the guest console.
             if not args.lease:
                 raise _api_error(
-                    lab, "--send and --nudge require --lease"
+                    lab, "--send, --send-raw and --nudge require --lease"
                 )
             lab.require_lease_resource(
                 lab.load_lease(args.lease), kind, args.vmid
             )
             if args.send:
                 session.send_line(args.send)
+            elif args.send_raw:
+                session.send_raw(args.send_raw)
             else:
                 session.send_line("")
         output = session.read(args.seconds)
@@ -1519,14 +1549,30 @@ def register(sub: Any, lab: Any) -> None:
     text.add_argument("--follow", action="store_true",
                       help="stream serial output continuously (boot/panic logs)")
     text.add_argument("--send", help="send this line first, then read the reply")
+    text.add_argument("--send-raw",
+                      help="send exactly these characters with no trailing "
+                           "newline (kernel-debugger prompts such as KDB act "
+                           "on bare characters)")
     text.add_argument("--nudge", action="store_true",
                       help="send a bare newline to redraw the prompt")
+    text.add_argument("--from-reset", action="store_true",
+                      help="with --follow: attach the serial session first, "
+                           "then reset the guest, so output from t=0 is "
+                           "captured (requires --lease; QEMU only)")
     text.add_argument("--lease")
     text.set_defaults(func=bind(cmd_text))
 
     bridge = console_sub.add_parser(
         "bridge",
         help="expose a guest serial console on a local TCP port (debuggers)",
+        description="Bidirectional pipe between a local TCP port and the "
+                    "guest serial console: bytes you type reach the guest "
+                    "(e.g. a KDB prompt), and guest output streams back. "
+                    "Tip: 'reset' restarts only the guest -- the QEMU "
+                    "process and its serial socket stay alive, so a "
+                    "connected bridge survives resets and captures output "
+                    "from t=0. A stop/start replaces the QEMU process and "
+                    "drops the bridge.",
     )
     bridge.add_argument("--lease", required=True)
     bridge.add_argument("--vmid", type=int, required=True)

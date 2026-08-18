@@ -180,6 +180,32 @@ form of OCR.
 A QEMU guest needs `serial0: socket` in its config for this path; cloud-init
 templates in this lab are built with it.
 
+### Kernel debugging and boot capture
+
+The serial chardev streams only to a **connected** client, so anything printed
+before you attach is gone. Two things make early capture reliable:
+
+- **Reset semantics**: `reset` restarts only the guest — the QEMU process and
+  its serial socket stay alive, so an attached session or `console bridge`
+  survives it. A stop/start replaces the QEMU process and drops everything.
+- **`--from-reset`**: attaches the terminal session *first*, then triggers the
+  reset, so output from t=0 lands in the stream:
+
+```bash
+proxmox-lab console text --vmid 9001 --follow --from-reset --lease "$L"
+```
+
+For a debugger prompt that acts on bare characters (KDB's `cont`, GRUB menus),
+`--send-raw` transmits exactly the given characters with no trailing newline:
+
+```bash
+proxmox-lab console text --vmid 9001 --send-raw "cont" --lease "$L"
+```
+
+`console bridge` is bidirectional — bytes typed into the TCP connection reach
+the guest — so `nc 127.0.0.1 <port>` is a full interactive serial terminal; a
+read-only `socat -u` fallback is not needed.
+
 ## OCR policy
 
 OCR is **off by default and only meaningful for text-mode screens**. The

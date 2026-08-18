@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import io
+import json
 from pathlib import Path
 
 # Point every module at a fixture config *before* importing the package:
@@ -542,33 +543,99 @@ class ProxmoxLabTests(unittest.TestCase):
                 api.call.assert_called_once_with(
                     "GET", "/cluster/resources", {"type": "vm"}
                 )
-    def test_pocketbase_audit_token_rejection_names_secret_refresh(self) -> None:
+    def test_pocketbase_audit_auth_rejection_spools_the_event(self) -> None:
+        """Losing audit credentials mid-session must not abort the action:
+        the event is spooled locally for a later 'journal --flush-spool'."""
+        import contextlib
+        import io
+
         rejected = LAB.pocketbase_module.PocketBaseError(
             "PocketBase HTTP 403: Only superusers can perform this action.",
             status=403,
         )
-        audit_config = LAB.config_module.Section(
-            "audit",
-            {
-                **LAB.CONFIG.audit.as_dict(),
-                "pocketbase_token_secret": "audit-refresh",
-            },
-        )
-        with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
-             mock.patch.object(LAB.CONFIG, "audit", audit_config), \
-             mock.patch.object(LAB, "pocketbase_client"), \
-             mock.patch.object(
-                 LAB.journal_module, "append", side_effect=rejected,
-             ):
-            with self.assertRaises(LAB.LabError) as caught:
-                LAB.audit("lease-begin")
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
+                 mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
+                 mock.patch.object(LAB, "pocketbase_client"), \
+                 mock.patch.object(
+                     LAB.journal_module, "append", side_effect=rejected,
+                 ), \
+                 contextlib.redirect_stderr(stderr):
+                LAB.audit("lease-begin", sync=False)
+            spool = Path(tmp) / "spool.jsonl"
+            self.assertTrue(spool.exists())
+            record = json.loads(spool.read_text().splitlines()[0])
+        self.assertEqual(record["event"], "lease-begin")
+        self.assertIn("event_id", record)
+        self.assertIn("--flush-spool", stderr.getvalue())
 
-        self.assertEqual(
-            str(caught.exception),
-            "audit ledger rejected the event: PocketBase HTTP 403 (the stored "
-            "audit token is invalid or expired). Refresh it with: "
-            "proxmox-lab secrets set audit-refresh",
-        )
+    def test_pocketbase_audit_expired_token_spools_instead_of_failing(self) -> None:
+        import contextlib
+        import io
+
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
+                 mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
+                 mock.patch.object(
+                     LAB, "pocketbase_client",
+                     side_effect=LAB.LabError("token is expired"),
+                 ), \
+                 mock.patch.object(LAB.journal_module, "append") as append, \
+                 contextlib.redirect_stderr(stderr):
+                LAB.audit("guest-exec", sync=False)
+            append.assert_not_called()
+            self.assertTrue((Path(tmp) / "spool.jsonl").exists())
+        self.assertIn("token is expired", stderr.getvalue())
+
+    def test_journal_flush_spool_uploads_and_clears_the_backlog(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool.jsonl"
+            spool.write_text(
+                '{"event": "a", "event_id": "1", "timestamp": "t"}\n'
+                '{"event": "b", "event_id": "2", "timestamp": "t"}\n'
+            )
+            args = LAB.parser().parse_args(["journal", "--flush-spool"])
+            stdout = io.StringIO()
+            with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
+                 mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
+                 mock.patch.object(LAB, "pocketbase_client"), \
+                 mock.patch.object(LAB.journal_module, "append") as append, \
+                 contextlib.redirect_stdout(stdout):
+                LAB.cmd_journal(args)
+            self.assertEqual(append.call_count, 2)
+            self.assertFalse(spool.exists())
+            result = json.loads(stdout.getvalue())
+        self.assertEqual(result["uploaded"], 2)
+        self.assertEqual(result["remaining"], 0)
+
+    def test_journal_flush_spool_keeps_events_after_a_hard_failure(self) -> None:
+        import contextlib
+        import io
+
+        boom = LAB.pocketbase_module.PocketBaseError("down", status=500)
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = Path(tmp) / "spool.jsonl"
+            spool.write_text(
+                '{"event": "a", "event_id": "1", "timestamp": "t"}\n'
+                '{"event": "b", "event_id": "2", "timestamp": "t"}\n'
+            )
+            args = LAB.parser().parse_args(["journal", "--flush-spool"])
+            stdout = io.StringIO()
+            with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
+                 mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
+                 mock.patch.object(LAB, "pocketbase_client"), \
+                 mock.patch.object(
+                     LAB.journal_module, "append", side_effect=boom,
+                 ), \
+                 contextlib.redirect_stdout(stdout):
+                with self.assertRaises(LAB.LabError):
+                    LAB.cmd_journal(args)
+            self.assertEqual(len(spool.read_text().splitlines()), 2)
 
     def test_cmd_api_create_registers_under_lock_with_reloaded_lease(self) -> None:
         """A registration racing the create must survive: cmd_api reloads the

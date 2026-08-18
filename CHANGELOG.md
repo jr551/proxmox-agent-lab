@@ -8,6 +8,21 @@ All notable changes to this project will be documented here. The format follows
 
 ### Added
 
+- An expired or rejected PocketBase audit credential no longer aborts the
+  action being audited: the event is spooled append-only to
+  `<journal_dir>/spool.jsonl` with a stderr notice, and
+  `journal --flush-spool` uploads the backlog once credentials are fixed
+  (duplicates are skipped via the collection's unique `event_id`).
+- `console text --from-reset` (with `--follow`) attaches the serial session
+  before resetting the guest, so boot output from t=0 is captured instead of
+  being lost to the connect race. Lease-gated, QEMU only.
+- `console text --send-raw` transmits exactly the given characters with no
+  trailing newline, for kernel-debugger prompts (KDB `cont`, GRUB menus) that
+  act on bare characters.
+- `console bridge` help and `docs/console.md` now document reset semantics up
+  front: a guest reset keeps the QEMU process and its serial socket alive (a
+  connected bridge survives it), while stop/start replaces the process — and
+  the bridge is bidirectional, so no read-only `socat -u` fallback is needed.
 - Journal and audit commands now print a stderr notice when the PocketBase
   token is nonrenewable and expires within 48 hours, before every read and
   write would start failing hard, with the renewable-agent fix spelled out.

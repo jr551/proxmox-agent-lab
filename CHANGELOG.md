@@ -4,6 +4,17 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- A PocketBase **superuser token** stored as the audit token is detected on
+  first use and converted automatically into a permanent least-privileged
+  agent: the controller provisions the agent with the superuser token, stores
+  the agent's password credentials, and atomically replaces the audit token
+  with the agent's renewable one. Pasting a superuser token is now a one-time
+  bootstrap rather than a standing over-privileged credential.
+
 ## 0.6.5 - 2026-08-18
 
 ### Added

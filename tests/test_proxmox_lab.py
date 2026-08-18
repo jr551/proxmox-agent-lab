@@ -1177,12 +1177,50 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertIn("lab-power-on-requested", warning)
         self.assertIn("still down", warning)
 
-    def test_pocketbase_client_refreshes_a_near_expiry_superuser_token(self) -> None:
+    def test_pocketbase_client_converts_a_superuser_token_to_an_agent(self) -> None:
+        """A superuser token pasted into the audit slot is converted once
+        into a permanent least-privileged agent whose token replaces it."""
         import base64
+        import contextlib
+        import io
         import json
 
         payload = base64.urlsafe_b64encode(json.dumps({
             "collectionId": "_superusers",
+            "exp": 1_000_000,
+        }).encode()).decode().rstrip("=")
+        token = f"header.{payload}.signature"
+        audit_config = {
+            "pocketbase_url": "https://pb.example",
+            "pocketbase_collection": "events",
+            "pocketbase_token_secret": "audit-token",
+            "pocketbase_timeout_seconds": 10,
+            "pocketbase_auth_refresh_before_seconds": 300,
+        }
+        provisioned = {
+            "token": "agent-token",
+            "agent_collection": "proxmox_lab_agents",
+        }
+        stderr = io.StringIO()
+        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
+             mock.patch.object(LAB.secrets_store, "get", return_value=token), \
+             mock.patch.object(
+                 LAB, "_provision_pocketbase_agent", return_value=provisioned,
+             ) as provision, \
+             mock.patch.object(LAB.time, "time", return_value=800), \
+             contextlib.redirect_stderr(stderr):
+            client = LAB.pocketbase_client()
+        self.assertEqual(client.token, "agent-token")
+        self.assertEqual(provision.call_args[0][0].token, token)
+        self.assertIn("superuser token", stderr.getvalue())
+        self.assertIn("proxmox_lab_agents", stderr.getvalue())
+
+    def test_pocketbase_client_refreshes_a_near_expiry_agent_token(self) -> None:
+        import base64
+        import json
+
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "collectionId": "agents",
             "exp": 1_000,
         }).encode()).decode().rstrip("=")
         token = f"header.{payload}.signature"
@@ -1205,7 +1243,7 @@ class ProxmoxLabTests(unittest.TestCase):
              ) as refresh, \
              mock.patch.object(LAB.time, "time", return_value=800):
             client = LAB.pocketbase_client()
-        refresh.assert_called_once_with("_superusers")
+        refresh.assert_called_once_with("agents")
         store.assert_called_once_with(LAB.CONFIG, "audit-token", "refreshed-token")
         self.assertEqual(client.token, "refreshed-token")
 

@@ -207,6 +207,32 @@ the address is not reached within `--timeout` it reports `hit: false` rather
 than blocking. Attaching pauses the guest only for the operation; it resumes on
 detach.
 
+## Diagnose a stuck boot from RAM
+
+A guest that never reaches a login cannot be reached over the guest agent or a
+usable console, but its RAM still holds why. `boot-diagnose` reads that
+evidence from underneath, works on any guest OS, and mutates nothing:
+
+```bash
+proxmox-lab memflow boot-diagnose --lease "$L" --vmid 9040
+```
+
+It does two things. It samples the vCPU registers twice (`--settle` seconds
+apart) to tell a guest **wedged** at a fixed instruction pointer — a panic
+spin, a `HLT` loop, a firmware dead end — from one still **executing** (a slow
+boot). And it scans guest-physical RAM for the text a failed boot leaves
+behind: Linux kernel panics and `VFS: Unable to mount root fs`, dracut
+emergency mode, GRUB `rescue>` and "no such device", SeaBIOS "No bootable
+device", and Windows boot errors such as `INACCESSIBLE_BOOT_DEVICE` and
+`BOOTMGR is missing`. The output reports the CPU state, the instruction
+pointer, every signature found with its physical addresses, and a plain
+verdict.
+
+The matched text is never audited — guest RAM can hold anything — only the
+fact of the scan and the failure category. When it finds a wedged CPU but no
+known text, follow up with the serial console (`console text --follow
+--from-reset`) and, for a kernel, `memflow trace` at the reported IP.
+
 ## Analyse code in Ghidra
 
 For deeper analysis, dump a region and disassemble/decompile it with Ghidra

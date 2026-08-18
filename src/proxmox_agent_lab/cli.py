@@ -2124,6 +2124,7 @@ def parser() -> argparse.ArgumentParser:
     from . import share
     from . import storage
     from . import usb
+    from . import virtio
     from . import windows
 
     android.register(sub, _module())
@@ -2138,6 +2139,7 @@ def parser() -> argparse.ArgumentParser:
     share.register(sub, _module())
     storage.register(sub, _module())
     usb.register(sub, _module())
+    virtio.register(sub, _module())
     windows.register(sub, _module())
     return root
 

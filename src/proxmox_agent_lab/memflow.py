@@ -508,6 +508,135 @@ def cmd_break(lab: Any, args: Any) -> None:
     print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
 
 
+# A guest that hangs mid-boot cannot be reached from inside -- no agent, no
+# usable console -- but its RAM still holds the reason. These signatures are
+# the text a stuck boot leaves behind; each is matched literally against
+# guest-physical memory. Kept specific to avoid matching ordinary log text.
+_BOOT_SIGNATURES: tuple[tuple[str, str, str], ...] = (
+    ("linux-panic", "Kernel panic - not syncing", "linux"),
+    ("linux-no-root", "VFS: Unable to mount root fs", "linux"),
+    ("linux-no-init", "No working init found", "linux"),
+    ("linux-init-died", "Attempted to kill init", "linux"),
+    ("linux-halted", "---[ end Kernel panic", "linux"),
+    ("dracut-fatal", "dracut: FATAL", "linux"),
+    ("dracut-emergency", "Entering emergency mode", "linux"),
+    ("fsck-fail", "fsck failed", "linux"),
+    ("bios-no-boot", "No bootable device", "firmware"),
+    ("bios-boot-failed", "Boot failed", "firmware"),
+    ("seabios-notfound", "Could not read the boot disk", "firmware"),
+    ("grub-rescue", "grub rescue>", "bootloader"),
+    ("grub-no-device", "error: no such device", "bootloader"),
+    ("grub-not-found", "error: file not found", "bootloader"),
+    ("win-inaccessible-boot", "INACCESSIBLE_BOOT_DEVICE", "windows"),
+    ("win-bootmgr-missing", "BOOTMGR is missing", "windows"),
+    ("win-winload-missing", "\\Windows\\system32\\winload", "windows"),
+    ("win-bsod", "A problem has been detected", "windows"),
+)
+
+
+def cmd_boot_diagnose(lab: Any, args: Any) -> None:
+    """Diagnose a stuck boot from the guest's RAM, without entering the guest.
+
+    A guest that never finishes booting cannot be reached over the agent or a
+    usable console, but its physical memory still holds the evidence. This
+    composes two agentless primitives:
+
+      * it samples the vCPU registers twice, a moment apart, to tell a guest
+        that is wedged at a fixed instruction pointer (panic spin, HLT loop,
+        firmware dead end) from one that is still executing; and
+      * it scans guest-physical RAM for the text a failed boot leaves behind
+        (kernel panic, missing root fs, GRUB rescue, BIOS "no bootable
+        device", Windows boot errors).
+
+    It is read-only and works on any guest OS. The matched text is not audited
+    (guest RAM can contain anything); only the fact and category are.
+    """
+    import time as _time
+
+    _require_enabled(lab)
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
+    _require_running_qemu(lab, api, args.vmid)
+
+    first = _helper_json(lab, ["registers", str(args.vmid)], timeout=60)
+    _time.sleep(max(0.5, args.settle))
+    second = _helper_json(lab, ["registers", str(args.vmid)], timeout=60)
+
+    def _ip(regs: Any) -> str | None:
+        if not isinstance(regs, dict):
+            return None
+        for key in ("RIP", "EIP", "PC"):
+            if key in regs:
+                return regs[key]
+        return None
+
+    ip1, ip2 = _ip(first), _ip(second)
+    advancing = ip1 is not None and ip2 is not None and ip1 != ip2
+    if ip1 is None or ip2 is None:
+        cpu_state = "unknown"
+    elif advancing:
+        cpu_state = "executing"
+    else:
+        cpu_state = "wedged"
+
+    findings: list[dict[str, Any]] = []
+    for name, text, category in _BOOT_SIGNATURES:
+        hexneedle = text.encode("utf-8", "replace").hex()
+        result = _helper_json(
+            lab, ["scan", str(args.vmid), hexneedle, str(args.max_hits)],
+            timeout=args.timeout,
+        )
+        hits = result.get("hits", []) if isinstance(result, dict) else []
+        if hits:
+            findings.append({
+                "signature": name,
+                "category": category,
+                "text": text,
+                "hits": hits,
+            })
+
+    categories = sorted({f["category"] for f in findings})
+    if findings and cpu_state == "wedged":
+        verdict = (
+            "guest appears wedged mid-boot; RAM holds "
+            + ", ".join(categories) + " boot-failure text"
+        )
+    elif findings:
+        verdict = (
+            "boot-failure text present in RAM ("
+            + ", ".join(categories) + "); CPU still executing, so it may be "
+            "retrying or logging past a recovered error"
+        )
+    elif cpu_state == "wedged":
+        verdict = (
+            "guest is wedged at a fixed instruction pointer but no known "
+            "boot-failure text was found; capture the serial console and, if "
+            "it is a kernel, try 'memflow trace' at the current IP"
+        )
+    elif cpu_state == "executing":
+        verdict = (
+            "no boot-failure signatures found and the CPU is still executing; "
+            "the guest may simply be booting slowly"
+        )
+    else:
+        verdict = (
+            "could not read vCPU registers to classify CPU state; check "
+            "'memflow doctor' and that the guest is running"
+        )
+
+    lab.audit("memflow-boot-diagnose", lease=args.lease, vmid=args.vmid,
+              cpu_state=cpu_state, categories=categories,
+              signature_count=len(findings), sync=False)
+    print(json.dumps({
+        "vmid": args.vmid,
+        "cpu_state": cpu_state,
+        "instruction_pointer": ip1,
+        "instruction_pointer_moved": advancing,
+        "signatures_found": findings,
+        "verdict": verdict,
+    }, indent=2, sort_keys=True))
+
+
 # --------------------------------------------------------------------------- #
 # Host-side assets, embedded so the feature is self-contained (as netgw does
 # with its provisioning script). host-setup streams this to the host over SSH.
@@ -1178,6 +1307,21 @@ def register(sub: Any, lab: Any) -> None:
     brk.add_argument("--timeout", type=int, default=15,
                      help="seconds to wait for the breakpoint before giving up")
     brk.set_defaults(func=bind(cmd_break))
+
+    bootdiag = mf_sub.add_parser(
+        "boot-diagnose",
+        help="diagnose a stuck boot from guest RAM (no agent, any guest OS)",
+    )
+    bootdiag.add_argument("--lease", required=True)
+    bootdiag.add_argument("--vmid", type=int, required=True)
+    bootdiag.add_argument("--settle", type=float, default=1.0,
+                          help="seconds between the two register samples "
+                               "(default: 1.0)")
+    bootdiag.add_argument("--max-hits", type=int, default=4,
+                          help="max physical addresses to report per signature")
+    bootdiag.add_argument("--timeout", type=int, default=180,
+                          help="per-signature RAM scan timeout in seconds")
+    bootdiag.set_defaults(func=bind(cmd_boot_diagnose))
 
     gsetup = mf_sub.add_parser(
         "ghidra-setup", help="prepare a disposable LXC with Ghidra headless"

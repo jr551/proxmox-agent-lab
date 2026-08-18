@@ -339,3 +339,74 @@ class AnalyzeGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BootDiagnoseTests(unittest.TestCase):
+    def _fake_api(self, status: str = "running"):
+        api = mock.Mock()
+        api.call.return_value = {"status": status}
+        return api
+
+    def _run(self, helper_side_effect, **arg_overrides):
+        args = Args(lease="L", vmid=9050, settle=0.0, max_hits=4, timeout=30)
+        for key, value in arg_overrides.items():
+            setattr(args, key, value)
+        captured: list[str] = []
+        with mock.patch.object(memflow, "ENABLED", True), \
+             mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
+             mock.patch.object(LAB, "load_lease", return_value={}), \
+             mock.patch.object(LAB, "audit") as audit, \
+             mock.patch("time.sleep"), \
+             mock.patch.object(memflow, "_helper_json",
+                               side_effect=helper_side_effect), \
+             mock.patch("builtins.print",
+                        lambda *a, **k: captured.append(str(a[0]))):
+            memflow.cmd_boot_diagnose(LAB, args)
+        return json.loads(captured[-1]), audit
+
+    def test_wedged_cpu_with_panic_text_is_reported(self) -> None:
+        def helper(lab, sub, timeout=90):
+            if sub[0] == "registers":
+                return {"RIP": "ffffffff81000abc"}
+            # Only the linux-panic signature has a hit.
+            text = "Kernel panic - not syncing".encode().hex()
+            if sub[0] == "scan" and sub[2] == text:
+                return {"hits": [{"addr": "0x3f120"}]}
+            return {"hits": []}
+
+        result, audit = self._run(helper)
+        self.assertEqual(result["cpu_state"], "wedged")
+        self.assertFalse(result["instruction_pointer_moved"])
+        names = [f["signature"] for f in result["signatures_found"]]
+        self.assertIn("linux-panic", names)
+        self.assertIn("wedged", result["verdict"])
+        # The matched RAM text is never audited, only the category.
+        self.assertEqual(audit.call_args.kwargs["categories"], ["linux"])
+        self.assertNotIn("Kernel panic",
+                         json.dumps(audit.call_args.kwargs))
+
+    def test_executing_cpu_with_no_signatures_reads_as_slow_boot(self) -> None:
+        ips = ["ffffffff81000abc", "ffffffff81000def"]
+
+        def helper(lab, sub, timeout=90):
+            if sub[0] == "registers":
+                return {"RIP": ips.pop(0)}
+            return {"hits": []}
+
+        result, _ = self._run(helper)
+        self.assertEqual(result["cpu_state"], "executing")
+        self.assertTrue(result["instruction_pointer_moved"])
+        self.assertEqual(result["signatures_found"], [])
+        self.assertIn("booting slowly", result["verdict"])
+
+    def test_stopped_guest_is_refused_before_any_scan(self) -> None:
+        with mock.patch.object(memflow, "ENABLED", True), \
+             mock.patch.object(LAB, "ProxmoxAPI",
+                               return_value=self._fake_api("stopped")), \
+             mock.patch.object(LAB, "load_lease", return_value={}), \
+             mock.patch.object(memflow, "_helper_json") as helper:
+            with self.assertRaises(LAB.LabError):
+                memflow.cmd_boot_diagnose(
+                    LAB, Args(lease="L", vmid=9050, settle=0.0,
+                              max_hits=4, timeout=30))
+        helper.assert_not_called()

@@ -4,6 +4,18 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `memflow boot-diagnose` diagnoses a stuck boot from a guest's RAM without
+  entering the guest: it samples the vCPU registers twice to tell a wedged CPU
+  (panic spin, HLT loop, firmware dead end) from one still executing, and scans
+  guest-physical memory for the text a failed boot leaves behind (Linux kernel
+  panic / unmountable root, dracut emergency, GRUB rescue, BIOS "no bootable
+  device", Windows boot errors). Read-only, any guest OS; matched text is not
+  audited, only the failure category.
+
 ## 0.6.6 - 2026-08-18
 
 ### Added

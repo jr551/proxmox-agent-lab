@@ -8,6 +8,17 @@ All notable changes to this project will be documented here. The format follows
 
 ### Added
 
+- `iso diagnose --path <file>` inspects a boot/install ISO entirely locally:
+  volume identity plus, from the El Torito boot catalog, whether it has
+  bootable BIOS and/or UEFI entries and a hybrid MBR/GPT for USB booting -- so
+  the "boots under SeaBIOS but not OVMF" case is caught before install.
+- `disk boot-info` parses MBR and GPT partition tables (types, GUIDs, ESP,
+  protective MBR) from a local image (`--image`) or a stopped guest's disk
+  (`--vmid`).
+- Offline guest-filesystem access for a powered-off guest, over the memflow
+  host channel via libguestfs: `disk ls`, `disk read`, and `disk write`
+  (hard-gated behind `--i-understand`), plus `disk host-setup` to install the
+  host side. All refuse a running guest.
 - `virtio` command group for porting and debugging virtio drivers on any guest
   OS: `virtio inspect --vmid` reports the configured virtio devices and their
   live negotiated feature bits from the read-only QEMU monitor, and

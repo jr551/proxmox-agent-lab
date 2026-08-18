@@ -309,6 +309,62 @@ def _warn_if_token_nonrenewable(token: str) -> None:
     )
 
 
+def _provision_pocketbase_agent(
+    superuser: pocketbase_module.Client,
+) -> dict[str, Any]:
+    """Create (or rotate) the permanent restricted audit agent.
+
+    Stores the agent's password credentials and its fresh token in the
+    configured secret store, so expiry can always re-authenticate.
+    """
+    agent_collection = str(
+        CONFIG.audit.get("pocketbase_agent_collection")
+        or "proxmox_lab_agents"
+    ).strip()
+    try:
+        identity = secrets_store.get(
+            CONFIG, "pocketbase-agent-email", required=False
+        )
+        password = secrets_store.get(
+            CONFIG, "pocketbase-agent-password", required=False
+        )
+    except secrets_store.SecretError as exc:
+        raise LabError(str(exc)) from None
+    if bool(identity) != bool(password):
+        raise LabError(
+            "PocketBase agent credentials are incomplete; store both "
+            "'pocketbase-agent-email' and 'pocketbase-agent-password', "
+            "or remove both before provisioning."
+        )
+    rotate_existing = not identity
+    if not identity:
+        identity, password = pocketbase_module.Client.new_agent_credentials()
+        try:
+            secrets_store.store(CONFIG, "pocketbase-agent-email", identity)
+            secrets_store.store(
+                CONFIG, "pocketbase-agent-password", password
+            )
+        except secrets_store.SecretError as exc:
+            raise LabError(str(exc)) from None
+    result = superuser.provision_agent(
+        agent_collection,
+        identity,
+        password,
+        rotate_existing=rotate_existing,
+    )
+    try:
+        _url, _collection, token_secret, _timeout, _refresh = (
+            _pocketbase_settings()
+        )
+        secrets_store.store(CONFIG, token_secret, result["token"])
+    except secrets_store.SecretError as exc:
+        raise LabError(
+            "PocketBase agent was provisioned but its token could not be "
+            "stored: " + str(exc)
+        ) from None
+    return result
+
+
 def pocketbase_client() -> pocketbase_module.Client:
     url, collection, secret_name, timeout, refresh_before = _pocketbase_settings()
     try:
@@ -317,6 +373,33 @@ def pocketbase_client() -> pocketbase_module.Client:
     except (ValueError, secrets_store.SecretError) as exc:
         raise LabError(str(exc)) from None
     auth_collection = pocketbase_module.token_auth_collection(token)
+    if auth_collection == "_superusers":
+        # A superuser token pasted into the audit slot is over-privileged
+        # and, in practice, short-lived. Convert it once into a permanent
+        # least-privileged agent with password re-authentication, store the
+        # agent token in its place, and use that from here on.
+        try:
+            result = _provision_pocketbase_agent(client)
+        except pocketbase_module.PocketBaseError as exc:
+            raise LabError(
+                "the stored audit token is a PocketBase superuser token, and "
+                "converting it into a permanent restricted agent failed: "
+                + str(exc)
+            ) from None
+        try:
+            client = pocketbase_module.Client(
+                url, result["token"], collection, timeout=timeout
+            )
+        except ValueError as exc:
+            raise LabError(str(exc)) from None
+        print(
+            "notice: the stored audit token was a PocketBase superuser "
+            "token; a permanent least-privileged agent was provisioned in "
+            f"collection {result['agent_collection']!r} and its renewable "
+            "token now replaces the superuser token in the secret store",
+            file=sys.stderr,
+        )
+        return client
     if (
         auth_collection is not None
         and pocketbase_module.token_expires_within(
@@ -1765,51 +1848,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 def cmd_journal(args: argparse.Namespace) -> None:
     """Read, migrate, or provision the audit ledger."""
     if args.provision_pocketbase_agent:
-        agent_collection = str(
-            CONFIG.audit.get("pocketbase_agent_collection")
-            or "proxmox_lab_agents"
-        ).strip()
-        try:
-            identity = secrets_store.get(
-                CONFIG, "pocketbase-agent-email", required=False
-            )
-            password = secrets_store.get(
-                CONFIG, "pocketbase-agent-password", required=False
-            )
-        except secrets_store.SecretError as exc:
-            raise LabError(str(exc)) from None
-        if bool(identity) != bool(password):
-            raise LabError(
-                "PocketBase agent credentials are incomplete; store both "
-                "'pocketbase-agent-email' and 'pocketbase-agent-password', "
-                "or remove both before provisioning."
-            )
-        rotate_existing = not identity
-        if not identity:
-            identity, password = pocketbase_module.Client.new_agent_credentials()
-            try:
-                secrets_store.store(CONFIG, "pocketbase-agent-email", identity)
-                secrets_store.store(
-                    CONFIG, "pocketbase-agent-password", password
-                )
-            except secrets_store.SecretError as exc:
-                raise LabError(str(exc)) from None
-        result = pocketbase_superuser_client().provision_agent(
-            agent_collection,
-            identity,
-            password,
-            rotate_existing=rotate_existing,
-        )
-        try:
-            _url, _collection, token_secret, _timeout, _refresh = (
-                _pocketbase_settings()
-            )
-            secrets_store.store(CONFIG, token_secret, result["token"])
-        except secrets_store.SecretError as exc:
-            raise LabError(
-                "PocketBase agent was provisioned but its token could not be "
-                "stored: " + str(exc)
-            ) from None
+        result = _provision_pocketbase_agent(pocketbase_superuser_client())
         audit = result["audit_collection"]
         print(json.dumps({
             "agent_collection": result["agent_collection"],

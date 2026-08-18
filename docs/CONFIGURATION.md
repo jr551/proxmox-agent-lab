@@ -312,6 +312,14 @@ proxmox-lab journal --provision-pocketbase-agent
 proxmox-lab doctor
 ```
 
+A shortcut: storing a **superuser token** directly as the audit token
+(`proxmox-lab secrets set audit-token`) is detected on first use and converted
+automatically — the controller provisions the permanent least-privileged agent
+with that token, stores the agent's password credentials, and replaces the
+superuser token in the secret store with the agent's renewable one. Pasting a
+superuser token is therefore a one-time bootstrap, never a standing
+credential.
+
 PocketBase JWTs are inherently finite; there is no unlimited token. The
 controller refreshes a renewable `_superusers` or agent token before its
 configured expiry window and atomically replaces the keyring value. The

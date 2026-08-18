@@ -153,6 +153,34 @@ class OciReferenceGrammarTests(unittest.TestCase):
                 )
 
 
+class OciValidateTests(unittest.TestCase):
+    def test_validate_is_offline_and_reports_template_volume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = _lab(tmp)
+            args = _args(
+                lab, "oci", "validate",
+                "--reference", "ghcr.io/home-assistant/home-assistant:stable",
+            )
+            with mock.patch("builtins.print") as printed:
+                lab_oci.cmd_validate(lab, args)
+            lab.ProxmoxAPI.assert_not_called()
+            lab.audit.assert_not_called()
+            output = printed.call_args[0][0]
+            self.assertIn(
+                '"template": "local:vztmpl/home-assistant_stable.tar"', output
+            )
+
+    def test_validate_rejects_digest_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = _lab(tmp)
+            args = _args(
+                lab, "oci", "validate",
+                "--reference", "docker.io/library/busybox@sha256:" + "a" * 64,
+            )
+            with self.assertRaisesRegex(RuntimeError, "does not accept digest"):
+                lab_oci.cmd_validate(lab, args)
+
+
 class OciCreateTests(unittest.TestCase):
     def test_create_refuses_long_term_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

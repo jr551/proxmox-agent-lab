@@ -6,6 +6,12 @@ All notable changes to this project will be documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `oci validate` checks a registry reference offline against the accepted
+  grammar and prints the template volume a pull would produce, without
+  touching the Proxmox host.
+
 ### Fixed
 
 - `oci pull` no longer rejects valid references whose first repository path

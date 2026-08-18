@@ -125,6 +125,34 @@ class OciPullTests(unittest.TestCase):
             lab.audit.assert_not_called()
 
 
+class OciReferenceGrammarTests(unittest.TestCase):
+    def test_accepts_separators_in_every_repository_component(self) -> None:
+        for reference in (
+            "ghcr.io/home-assistant/home-assistant:stable",
+            "docker.io/hello-world:latest",
+            "registry.example.com:5000/my-app:1.0",
+            "my_image:latest",
+        ):
+            with self.subTest(reference=reference):
+                self.assertIsNotNone(
+                    lab_oci._REFERENCE_RE.fullmatch(reference)
+                )
+
+    def test_rejects_malformed_references(self) -> None:
+        for reference in (
+            "Busybox:latest",       # upper-case repository
+            "busybox",              # missing tag
+            "busybox:",             # empty tag
+            "busybox:é",       # non-ASCII tag
+            "ghcr.io/-bad/name:tag",  # component starts with separator
+            "img:" + "t" * 129,     # tag longer than 128 characters
+        ):
+            with self.subTest(reference=reference):
+                self.assertIsNone(
+                    lab_oci._REFERENCE_RE.fullmatch(reference)
+                )
+
+
 class OciCreateTests(unittest.TestCase):
     def test_create_refuses_long_term_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

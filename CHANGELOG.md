@@ -4,6 +4,15 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- `oci pull` no longer rejects valid references whose first repository path
+  component contains `-`, `_`, or `.` (for example
+  `ghcr.io/home-assistant/home-assistant:stable`), and the tag grammar is now
+  ASCII-only instead of accepting any Unicode word character.
+
 ## 0.6.4 - 2026-08-16
 
 ### Added

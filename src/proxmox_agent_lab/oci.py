@@ -15,10 +15,14 @@ from typing import Any
 # Matches the public-reference grammar accepted by PVE's
 # ``oci-registry-pull`` endpoint. PVE currently accepts tags, not digest
 # references, so every direct registry pull is explicitly gated as mutable.
+# Every repository path component follows the OCI distribution grammar:
+# lower-case alphanumeric runs joined by ".", "_", "__" or one or more "-".
+_REPO_COMPONENT = r"[a-z\d]+(?:(?:[._]|__|-+)[a-z\d]+)*"
 _REFERENCE_RE = re.compile(
     r"^(?:(?:[a-zA-Z\d]|[a-zA-Z\d][a-zA-Z\d-]*[a-zA-Z\d])"
     r"(?:\.(?:[a-zA-Z\d]|[a-zA-Z\d][a-zA-Z\d-]*[a-zA-Z\d]))*(?::\d+)?/)?"
-    r"[a-z\d]+(?:/[a-z\d]+(?:(?:(?:[._]|__|[-]*)[a-z\d]+)+)?)*:\w[\w.-]{0,127}$"
+    rf"{_REPO_COMPONENT}(?:/{_REPO_COMPONENT})*"
+    r":[A-Za-z\d_][A-Za-z\d_.-]{0,127}$"
 )
 _TEMPLATE_RE = re.compile(
     r"^(?P<storage>[A-Za-z0-9][A-Za-z0-9_.-]*):vztmpl/"

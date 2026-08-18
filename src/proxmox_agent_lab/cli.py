@@ -369,6 +369,31 @@ def pocketbase_superuser_client() -> pocketbase_module.Client:
         raise LabError(str(exc)) from None
 
 
+def _audit_spool_path() -> Path:
+    return JOURNAL_ROOT / "spool.jsonl"
+
+
+def _spool_audit_event(record: dict[str, Any], reason: str) -> None:
+    """Keep an already-redacted event locally when the backend rejects it.
+
+    Losing audit credentials mid-session must not force abandoning the tool:
+    the event is preserved append-only and uploaded later with
+    'journal --flush-spool'.
+    """
+    path = _audit_spool_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    print(
+        f"notice: audit backend unavailable ({reason}); event "
+        f"{record.get('event')!r} spooled to {path}. Fix the credentials "
+        "(e.g. 'proxmox-lab secrets set "
+        f"{_pocketbase_token_secret_name()}'), then upload the backlog with "
+        "'proxmox-lab journal --flush-spool'",
+        file=sys.stderr,
+    )
+
+
 def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
     now = utc_now()
     record = {
@@ -377,25 +402,29 @@ def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
         **redact(fields),
     }
     client: pocketbase_module.Client | None = None
+    spooled = False
     if AUDIT_BACKEND == "pocketbase":
         record["event_id"] = uuid.uuid4().hex
         record["controller"] = str(
             CONFIG.audit.get("controller_id") or socket.gethostname()
         )
-        client = pocketbase_client()
-    try:
-        journal_module.append(
-            JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
-        )
-    except pocketbase_module.PocketBaseError as exc:
-        if exc.status in (401, 403):
-            raise LabError(
-                "audit ledger rejected the event: "
-                f"PocketBase HTTP {exc.status} (the stored audit token is "
-                "invalid or expired). Refresh it with: proxmox-lab secrets set "
-                f"{_pocketbase_token_secret_name()}"
-            ) from None
-        raise
+        # An expired or nonrenewable token must not abort the action being
+        # audited; the git-synced JSONL mirror below still records it and the
+        # event is spooled for a later '--flush-spool'.
+        try:
+            client = pocketbase_client()
+        except LabError as exc:
+            _spool_audit_event(record, str(exc))
+            spooled = True
+    if not spooled:
+        try:
+            journal_module.append(
+                JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
+            )
+        except pocketbase_module.PocketBaseError as exc:
+            if exc.status not in (401, 403):
+                raise
+            _spool_audit_event(record, f"PocketBase HTTP {exc.status}")
     if sync:
         sync_repo(record, event)
 
@@ -1793,6 +1822,7 @@ def cmd_journal(args: argparse.Namespace) -> None:
         AUDIT_BACKEND == "pocketbase"
         or args.provision_pocketbase
         or args.migrate_sqlite_to_pocketbase
+        or args.flush_spool
     )
     client = pocketbase_client() if needs_pocketbase else None
     if args.provision_pocketbase:
@@ -1821,6 +1851,46 @@ def cmd_journal(args: argparse.Namespace) -> None:
         result["collection"] = client.collection_name
         result["collection_created"] = provision["created"]
         print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if args.flush_spool:
+        path = _audit_spool_path()
+        lines = path.read_text().splitlines() if path.exists() else []
+        uploaded, duplicates, remaining = 0, 0, []
+        failure: str | None = None
+        for index, line in enumerate(lines):
+            if failure is not None:
+                remaining.append(line)
+                continue
+            record = json.loads(line)
+            try:
+                journal_module.append(
+                    JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
+                )
+                uploaded += 1
+            except pocketbase_module.PocketBaseError as exc:
+                if exc.status == 400:
+                    # The collection's unique event_id index rejects a
+                    # re-upload of an event a previous flush already sent.
+                    duplicates += 1
+                else:
+                    failure = str(exc)
+                    remaining.append(line)
+        if remaining:
+            path.write_text("\n".join(remaining) + "\n")
+        elif path.exists():
+            path.unlink()
+        result = {
+            "uploaded": uploaded,
+            "duplicates_skipped": duplicates,
+            "remaining": len(remaining),
+        }
+        if failure is not None:
+            result["stopped_on_error"] = failure
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if failure is not None:
+            raise LabError(
+                f"spool flush stopped after {uploaded} upload(s): {failure}"
+            )
         return
     if args.summary:
         print(json.dumps(
@@ -1890,6 +1960,11 @@ def parser() -> argparse.ArgumentParser:
         "--provision-pocketbase-agent",
         action="store_true",
         help="create a renewable restricted audit agent using stored superuser credentials",
+    )
+    ledger.add_argument(
+        "--flush-spool",
+        action="store_true",
+        help="upload audit events spooled locally while the backend was down",
     )
     ledger.add_argument("--import-jsonl", action="store_true",
                         help="load legacy per-day JSONL files into the database")

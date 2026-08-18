@@ -1335,3 +1335,85 @@ class ChunkedTransferTests(unittest.TestCase):
             self.assertEqual(out.read_bytes(), payload)
             self.assertEqual(fake_s3.get_bytes.call_count, 2)
             self.assertEqual(fake_s3.delete_object.call_count, 2)
+
+
+class SerialDebugTests(unittest.TestCase):
+    """--send-raw framing and --from-reset attach-before-reset ordering."""
+
+    def _lab(self) -> mock.Mock:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        lab.load_lease.return_value = {"resources": []}
+        return lab
+
+    def _text_args(self, **overrides: object) -> object:
+        import argparse
+
+        defaults = dict(
+            vmid=9001, kind="qemu", seconds=0.0, timeout=0.01, follow=False,
+            send=None, send_raw=None, nudge=False, from_reset=False,
+            lease=None,
+        )
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def test_send_raw_frames_bytes_without_trailing_newline(self) -> None:
+        session = lab_console.TermSession.__new__(lab_console.TermSession)
+        sent: list[bytes] = []
+        session.socket = mock.Mock(send=sent.append)
+        session.send_raw("cont")
+        self.assertEqual(sent, [b"0:4:cont"])
+
+    def test_from_reset_requires_follow(self) -> None:
+        lab = self._lab()
+        args = self._text_args(from_reset=True, lease="L1")
+        with self.assertRaisesRegex(RuntimeError, "requires --follow"):
+            lab_console.cmd_text(lab, args)
+
+    def test_from_reset_rejects_lxc(self) -> None:
+        lab = self._lab()
+        args = self._text_args(
+            from_reset=True, follow=True, lease="L1", kind="lxc"
+        )
+        with self.assertRaisesRegex(RuntimeError, "QEMU"):
+            lab_console.cmd_text(lab, args)
+
+    def test_from_reset_requires_lease(self) -> None:
+        lab = self._lab()
+        args = self._text_args(from_reset=True, follow=True)
+        with self.assertRaisesRegex(RuntimeError, "requires --lease"):
+            lab_console.cmd_text(lab, args)
+
+    def test_from_reset_attaches_serial_before_resetting(self) -> None:
+        lab = self._lab()
+        order: list[str] = []
+        api = mock.Mock()
+        lab.ProxmoxAPI.return_value = api
+
+        def api_call(method: str, path: str, *a: object, **k: object) -> None:
+            if path.endswith("/status/reset"):
+                order.append("reset")
+
+        api.call.side_effect = api_call
+
+        class FakeSession:
+            def __init__(self, *a: object, **k: object) -> None:
+                order.append("attach")
+                self.socket = mock.Mock()
+                self.socket.read_available.return_value = b""
+
+            def __enter__(self) -> "FakeSession":
+                return self
+
+            def __exit__(self, *a: object) -> None:
+                return None
+
+        args = self._text_args(from_reset=True, follow=True, lease="L1")
+        with mock.patch.object(lab_console, "TermSession", FakeSession):
+            lab_console.cmd_text(lab, args)
+        self.assertEqual(order[:2], ["attach", "reset"])
+        api.call.assert_any_call(
+            "POST", "/nodes/aipve/qemu/9001/status/reset"
+        )
+        lab.require_lease_resource.assert_called_once()

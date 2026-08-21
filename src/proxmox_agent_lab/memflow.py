@@ -147,6 +147,18 @@ def require_host_ssh(lab: Any) -> None:
     _require_enabled(lab)
 
 
+def host_run(lab: Any, argv: list[str], *, timeout: int = 60
+             ) -> subprocess.CompletedProcess:
+    """Run one command on the host and return the completed process.
+
+    The argv is joined with shlex, so no caller can inject through an
+    argument. Reserved for read-only host inspection by other subsystems --
+    anything that changes the host keeps its own authorization gate.
+    """
+    _require_enabled(lab)
+    return _ssh(lab, argv, timeout=timeout)
+
+
 def host_mkdir(lab: Any, directory: str, *, timeout: int = 30) -> None:
     """Create one private directory on the host."""
     _require_enabled(lab)

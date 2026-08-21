@@ -85,6 +85,53 @@ After all leases are closed:
   secret belong in the macOS Keychain; `scripts/check-secrets.py` blocks the
   common shapes at commit time.
 
+## What a tag proves, and what owns a guest
+
+Every guest this tool creates is tagged `codex-lab;lease-<id>`. Those tags stay
+on the node for ever; the lease records that explain them do not — they are
+pruned, and on a rebuilt controller they were never there. So a tag is evidence
+that *some* lease created a guest and nothing more. **Ownership checks must not
+resolve `tag → lease file`**: on a fresh controller almost nothing resolves, and
+nearly every deliberately-kept guest would be called unowned.
+
+Ownership comes from the two things the controller actually keeps:
+
+1. **The lease record**, for the life of the lease. This is what
+   `require_lease_resource` checks before any mutation.
+2. **The retained registry** (`retained.json` under the state root), for guests
+   that outlive their lease on purpose. Written at register time for any
+   `policy = retain` resource, never pruned automatically, and cleared when the
+   guest is actually deleted.
+
+`guest inventory` prints both for every guest on the node: its tag, whether
+anything local resolves it, and whether the registry vouches for it. A guest
+this tool created that neither vouches for is **orphaned**.
+
+An orphan matters because of a deliberate interaction between two safety rules:
+cleanup only ever finalizes resources listed in a lease, and `shutdown_host()`
+refuses to power off while *any* guest is running. So one running orphan is
+invisible to every sweep and keeps the machine on indefinitely — five days, in
+the run that prompted this. `doctor` therefore fails when a running orphan
+exists, and reclamation is explicit:
+
+```bash
+proxmox-lab guest inventory --orphaned-only
+proxmox-lab cleanup-expired --reclaim-orphans --host-change-authorized
+```
+
+Reclamation **stops, and never deletes.** Stopping is reversible and is all
+that is needed to unblock power-off; a controller that has lost the record of a
+guest cannot vouch for what is on its disk, so deleting it stays a human
+decision. Adopting one instead is the other half:
+
+```bash
+proxmox-lab guest retain --vmid 101 --purpose "Ubuntu cloud-init template"
+```
+
+That records the guest as deliberately kept — it stops being reported as an
+orphan and becomes eligible for retained backups. It changes controller state
+only; the guest is never touched.
+
 ## Recovery
 
 The macOS LaunchAgent runs `cleanup-expired` every five minutes. It makes

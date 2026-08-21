@@ -43,9 +43,19 @@ the console and upload paths still accepted any certificate.
 |---|---|---|
 | `default_ttl_seconds` | `7200` | A lease not renewed within this window is swept by the watchdog |
 | `idle_shutdown_seconds` | `28800` | Shut a reachable host down after this long with no activity and no lease |
+| `long_term_backup` | `true` | Back up an active long-term lease's guests weekly |
+| `long_term_backup_storage` | — | Where those backups go; blank means `[storage] bulk_storage` |
+| `long_term_backup_keep` | `2` | Backup generations kept per guest |
+| `retained_backup` | `false` | Have the watchdog also back up retained-registry guests (templates, persistent workers). Off by default: it writes gigabytes on a schedule |
+| `retained_backup_interval_days` | `7` | How stale a retained guest's backup may get before the sweep takes another |
 
 A lease is the unit of accountability: writes require one, created guests are
 registered to it, and ending it destroys them and powers the host off.
+
+Guests meant to outlive their lease are recorded in `retained.json` under the
+state directory — see [safety-policy.md](safety-policy.md) for why a node tag
+cannot serve as the owner. `doctor` reports their backup coverage whether or
+not `retained_backup` is on.
 
 ## `[power]`
 

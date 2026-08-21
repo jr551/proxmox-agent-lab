@@ -45,6 +45,12 @@ DEFAULTS: dict[str, Any] = {
         "long_term_backup": True,
         "long_term_backup_storage": "",   # defaults to storage.bulk_storage
         "long_term_backup_keep": 2,
+        # Guests that outlive their lease (templates, persistent workers) have
+        # no lease to drive a backup. Off by default: turning it on starts
+        # writing gigabytes to the bulk store on a schedule, which is the
+        # operator's call. `doctor` reports the coverage gap either way.
+        "retained_backup": False,
+        "retained_backup_interval_days": 7,
     },
     "power": {
         # how to switch the lab machine on: wake-on-lan | home-assistant

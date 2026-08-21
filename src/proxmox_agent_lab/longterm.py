@@ -53,36 +53,127 @@ def _due(last: str | None, now: dt.datetime, interval_days: int) -> bool:
     return (now - when).total_seconds() >= interval_days * 86400
 
 
+def backup_guest(lab: Any, api: Any, vmid: int, *, storage: str, keep: int,
+                 timeout: int, notes: str) -> dict[str, Any]:
+    """One vzdump, snapshot mode so a running guest stays up."""
+    try:
+        upid = api.call(
+            "POST", f"/nodes/{lab.NODE}/vzdump",
+            {
+                "vmid": int(vmid),
+                "storage": storage,
+                "mode": "snapshot",       # keep the guest running
+                "compress": "zstd",
+                "remove": 0,
+                "prune-backups": f"keep-last={keep}",
+                "notes-template": notes,
+            },
+        )
+        status = lab.wait_task(api, upid, timeout=timeout)
+        return {"ok": True, "task": upid, "status": status.get("exitstatus")}
+    except lab.LabError as exc:
+        return {"ok": False, "error": str(exc)[:300]}
+
+
 def backup_lease(lab: Any, api: Any, lease: dict[str, Any], *,
                  storage: str, keep: int, timeout: int) -> dict[str, Any]:
     """Back up every guest in one lease. Returns a per-guest report."""
     results: dict[str, Any] = {}
     for resource in lease.get("resources", []):
         vmid = int(resource["vmid"])
-        try:
-            upid = api.call(
-                "POST", f"/nodes/{lab.NODE}/vzdump",
-                {
-                    "vmid": vmid,
-                    "storage": storage,
-                    "mode": "snapshot",       # keep the guest running
-                    "compress": "zstd",
-                    "remove": 0,
-                    "prune-backups": f"keep-last={keep}",
-                    "notes-template": f"long-term lease {lease['id']}",
-                },
-            )
-            status = lab.wait_task(api, upid, timeout=timeout)
-            results[str(vmid)] = {"ok": True, "task": upid,
-                                  "status": status.get("exitstatus")}
-        except lab.LabError as exc:
-            results[str(vmid)] = {"ok": False, "error": str(exc)[:300]}
+        results[str(vmid)] = backup_guest(
+            lab, api, vmid, storage=storage, keep=keep, timeout=timeout,
+            notes=f"long-term lease {lease['id']}",
+        )
     return results
 
 
+def retained_backup_enabled() -> bool:
+    """Off by default, and deliberately so.
+
+    Turning this on starts writing vzdump archives of every retained guest to
+    the bulk store on a schedule. That is the right protection for templates
+    that cost hours to rebuild, but it is also gigabytes of writes and hours of
+    wall clock on a slow disk, so it is the operator's decision rather than a
+    default this tool assumes. `doctor` reports the coverage gap either way.
+    """
+    return bool(_CONFIG.lease.get("retained_backup", False))
+
+
+def retained_due(lab: Any, *, now: dt.datetime, interval_days: int,
+                 force: bool = False) -> list[dict[str, Any]]:
+    """Retained-registry guests whose last backup is older than the interval."""
+    from . import inventory as inventory_module
+
+    due: list[dict[str, Any]] = []
+    for item in inventory_module.entries(lab.STATE_ROOT).values():
+        if force or _due(item.get("last_backup_at"), now, interval_days):
+            due.append(item)
+    return sorted(due, key=lambda item: int(item.get("vmid", 0)))
+
+
+def backup_retained(lab: Any, api: Any, *, storage: str, keep: int,
+                    timeout: int, interval_days: int, force: bool = False,
+                    ) -> dict[str, Any]:
+    """Back up guests that outlive their lease.
+
+    Lease-driven backups only ever covered guests of an *active long-term
+    lease*, so templates and persistent workers -- the guests whose loss costs
+    the most rebuild time -- had no coverage at all once their lease ended.
+    """
+    from . import inventory as inventory_module
+
+    now = lab.utc_now()
+    report: dict[str, Any] = {"guests": {}}
+    for item in retained_due(lab, now=now, interval_days=interval_days,
+                             force=force):
+        kind, vmid = str(item.get("kind", "qemu")), int(item["vmid"])
+        outcome = backup_guest(
+            lab, api, vmid, storage=storage, keep=keep, timeout=timeout,
+            notes=f"retained guest {kind}/{vmid}",
+        )
+        if outcome["ok"]:
+            inventory_module.mark_backup(
+                lab.STATE_ROOT, kind, vmid, lab.iso_now()
+            )
+        report["guests"][f"{kind}/{vmid}"] = outcome
+        lab.audit("retained-backup", kind=kind, vmid=vmid, storage=storage,
+                  ok=outcome["ok"])
+    report["backed_up"] = sum(
+        1 for x in report["guests"].values() if x.get("ok")
+    )
+    report["failed"] = sum(
+        1 for x in report["guests"].values() if not x.get("ok")
+    )
+    return report
+
+
 def cmd_backup(lab: Any, args: Any) -> None:
-    """Run weekly backups for long-term leases that are due."""
+    """Run weekly backups for long-term leases, and optionally retained guests."""
     api = lab.ProxmoxAPI()
+    if getattr(args, "retained", False):
+        if not (retained_backup_enabled() or args.force):
+            print(json.dumps({
+                "skipped": "retained backups are off; set [lease] "
+                           "retained_backup = true, or pass --force",
+            }, indent=2, sort_keys=True))
+            return
+        if not api.reachable():
+            lab.ensure_on(api)
+        result = backup_retained(
+            lab, api,
+            storage=args.storage or backup_storage(lab),
+            keep=int(args.keep or _CONFIG.lease.get("long_term_backup_keep", 2)),
+            timeout=args.timeout,
+            interval_days=args.interval_days,
+            force=args.force,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if result["failed"]:
+            raise lab.LabError(
+                f"{result['failed']} retained guest backup(s) failed"
+            )
+        return
     leases = lab.long_term_leases()
     if not leases:
         print(json.dumps({"long_term_leases": 0, "backed_up": []}, indent=2))
@@ -278,6 +369,12 @@ def register(sub: Any, lab: Any) -> None:
 
     backup = sub.add_parser(
         "backup", help="run weekly backups for long-term leases that are due"
+    )
+    backup.add_argument(
+        "--retained", action="store_true",
+        help="back up guests in the retained registry (templates, persistent "
+             "workers) instead of long-term leases. Off unless [lease] "
+             "retained_backup = true, or --force",
     )
     backup.add_argument("--storage", help="default: the bulk storage")
     backup.add_argument("--keep", type=int)

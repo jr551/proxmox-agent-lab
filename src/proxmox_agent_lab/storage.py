@@ -204,6 +204,138 @@ def cmd_add_disk(lab: Any, args: Any) -> None:
         )
 
 
+# --- unreferenced image garbage collection --------------------------------
+#
+# A failed create, or a guest destroyed outside a lease (or before the
+# unreferenced-disk retry in delete_guest existed), leaves a disk image behind
+# with no config pointing at it. Deleting one is irreversible, so this finds
+# candidates and reports them; deletion needs a second, explicit run.
+
+def _image_stores(lab: Any, api: Any) -> list[str]:
+    """Storage ids on this node that may hold guest images."""
+    entries = api.call("GET", f"/nodes/{lab.NODE}/storage") or []
+    return sorted(
+        str(item.get("storage"))
+        for item in entries
+        if isinstance(item, dict) and item.get("storage")
+        and "images" in str(item.get("content") or "")
+    )
+
+
+def _volumes(lab: Any, api: Any, store: str) -> list[dict[str, Any]]:
+    listing = api.call(
+        "GET", f"/nodes/{lab.NODE}/storage/{store}/content", {"content": "images"}
+    ) or []
+    return [item for item in listing if isinstance(item, dict) and item.get("volid")]
+
+
+def _referenced_volids(lab: Any, api: Any) -> set[str]:
+    """Every volid mentioned by any guest config on the node.
+
+    Deliberately blunt: every string value of every config key is searched,
+    including snapshots and pending changes, because a false "orphan" here
+    would authorise deleting a disk that is genuinely in use. Missing a real
+    orphan just means it is reported next time.
+    """
+    referenced: set[str] = set()
+    for guest in api.call("GET", "/cluster/resources", {"type": "vm"}) or []:
+        if not isinstance(guest, dict) or "vmid" not in guest:
+            continue
+        kind = str(guest.get("type") or "qemu")
+        try:
+            config = api.call(
+                "GET", f"/nodes/{lab.NODE}/{kind}/{int(guest['vmid'])}/config"
+            ) or {}
+        except lab.LabError:
+            # A guest we cannot read is a guest we cannot clear volumes for.
+            raise lab.LabError(
+                f"could not read the config of {kind}/{guest.get('vmid')}; "
+                "refusing to classify any volume as unreferenced"
+            )
+        for value in config.values():
+            if isinstance(value, str):
+                referenced.add(value)
+    return referenced
+
+
+def _is_referenced(volid: str, referenced: set[str]) -> bool:
+    if volid in referenced:
+        return True
+    # Config values carry options: "usb-bulk:9231/vm-9231-disk-0.raw,size=100G".
+    return any(volid in value for value in referenced)
+
+
+def cmd_gc(lab: Any, args: Any) -> None:
+    """Find image volumes no guest config references. Reports by default."""
+    api = lab.ProxmoxAPI()
+    stores = [args.storage] if args.storage else _image_stores(lab, api)
+    referenced = _referenced_volids(lab, api)
+    orphaned: list[dict[str, Any]] = []
+    kept = 0
+    for store in stores:
+        for volume in _volumes(lab, api, store):
+            volid = str(volume["volid"])
+            vmid = volume.get("vmid")
+            if args.vmid is not None and str(vmid) != str(args.vmid):
+                continue
+            if _is_referenced(volid, referenced):
+                kept += 1
+                continue
+            orphaned.append({
+                "volid": volid,
+                "storage": store,
+                "vmid": int(vmid) if str(vmid or "").isdigit() else None,
+                "size_gb": round(int(volume.get("size") or 0) / 1_000_000_000, 2),
+                "format": volume.get("format"),
+            })
+    orphaned.sort(key=lambda item: item["volid"])
+    result: dict[str, Any] = {
+        "stores": stores,
+        "referenced_volumes": kept,
+        "orphaned_volumes": orphaned,
+        "orphaned_gb": round(sum(x["size_gb"] for x in orphaned), 2),
+        "deleted": [],
+    }
+    if not args.delete:
+        result["dry_run"] = True
+        if orphaned:
+            result["to_delete"] = (
+                "re-run with --delete --host-change-authorized to remove "
+                "exactly these volumes"
+            )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if not args.host_change_authorized:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        raise lab.LabError(
+            "Deleting node storage content is a host-level change. Re-run "
+            "with --host-change-authorized once the user has asked for it."
+        )
+    if args.lease:
+        lab.load_lease(args.lease)
+    failures: dict[str, str] = {}
+    for item in orphaned:
+        # Only volumes this same run classified as unreferenced are deleted;
+        # nothing is taken from an earlier report.
+        try:
+            api.call(
+                "DELETE",
+                f"/nodes/{lab.NODE}/storage/{item['storage']}/content/"
+                f"{item['volid']}",
+            )
+            lab.audit("storage-volume-deleted", lease=args.lease,
+                      volid=item["volid"], size_gb=item["size_gb"],
+                      storage=item["storage"])
+            result["deleted"].append(item["volid"])
+        except lab.LabError as exc:
+            failures[item["volid"]] = str(exc)[:300]
+    if failures:
+        result["failed"] = failures
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if failures:
+        raise lab.LabError(f"{len(failures)} volume(s) could not be deleted")
+
+
 def cmd_set_content(lab: Any, args: Any) -> None:
     if not args.host_change_authorized:
         raise lab.LabError(
@@ -271,6 +403,17 @@ def cmd_download(lab: Any, args: Any) -> None:
     ))
 
 
+def storage_class(name: str) -> str:
+    """`bulk` for the configured slow/roomy store, `fast` for anything else.
+
+    Callers branch on this instead of hardcoding a site's storage id. The
+    distinction is not cosmetic: a USB directory store measured ~25 MB/s
+    sequential write on the lab node, so a guest disk placed there turns any
+    I/O comparison into a measurement of the cable.
+    """
+    return "bulk" if name and name == _DEFAULT_BULK else "fast"
+
+
 def cmd_status(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     entries = api.call("GET", f"/nodes/{lab.NODE}/storage") or []
@@ -279,6 +422,7 @@ def cmd_status(lab: Any, args: Any) -> None:
             {
                 "storage": item.get("storage"),
                 "type": item.get("type"),
+                "class": storage_class(str(item.get("storage") or "")),
                 "content": item.get("content"),
                 "active": bool(item.get("active")),
                 "total_gb": round(int(item.get("total", 0)) / 1_000_000_000, 1),
@@ -342,6 +486,26 @@ def register(sub: Any, lab: Any) -> None:
                           help="skip checksum verification (discouraged)")
     download.add_argument("--timeout", type=int, default=3600)
     download.set_defaults(func=bind(cmd_download))
+
+    gc = storage_sub.add_parser(
+        "gc",
+        help="find image volumes no guest config references (reports only "
+             "unless --delete)",
+        description="Lists every volume on the node's images-capable storage, "
+                    "checks it against every guest config, and reports what "
+                    "nothing references. Deletion is a separate, explicit run: "
+                    "--delete --host-change-authorized, and only volumes that "
+                    "same run classified as unreferenced.",
+    )
+    gc.add_argument("--storage", help="one storage id (default: all images stores)")
+    gc.add_argument("--vmid", type=int, help="only volumes named for this VMID")
+    gc.add_argument("--dry-run", action="store_true",
+                    help="explicit no-op: reporting is already the default")
+    gc.add_argument("--delete", action="store_true",
+                    help="delete the volumes this run found unreferenced")
+    gc.add_argument("--host-change-authorized", action="store_true")
+    gc.add_argument("--lease", help="optional, recorded in the audit event")
+    gc.set_defaults(func=bind(cmd_gc))
 
     content = storage_sub.add_parser(
         "set-content", help="change what a storage may hold"

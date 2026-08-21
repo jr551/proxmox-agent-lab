@@ -11,6 +11,15 @@ os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(
     Path(__file__).parent / "fixtures" / "config.toml"
 )
 
+import shutil
+import tempfile
+# ...and at a disposable state directory: a test must never write into the
+# developer's real controller state. Cleared here so a previous run cannot
+# leak into this one; imports all happen before any test runs.
+_TEST_STATE = Path(tempfile.gettempdir()) / "proxmox-agent-lab-test-state"
+shutil.rmtree(_TEST_STATE, ignore_errors=True)
+_TEST_STATE.mkdir(parents=True, exist_ok=True)
+os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
 from pathlib import Path
 import sys
 import tempfile
@@ -1708,6 +1717,354 @@ class DoctorAuditTests(unittest.TestCase):
         self.assertEqual(report["audit"]["spooled_records"], 0)
         self.assertFalse(any("spool" in problem
                              for problem in report["problems"]))
+
+
+class OrphanReclamationTests(unittest.TestCase):
+    """Found live: a guest whose lease record was gone ran for five days,
+    invisible to every sweep, holding the host on because shutdown_host
+    refuses while any guest runs."""
+
+    def _guests(self) -> list[dict]:
+        return [
+            {"vmid": 9001, "type": "qemu", "status": "running",
+             "tags": "codex-lab;lease-20260821120000-live", "name": "current"},
+            {"vmid": 9002, "type": "qemu", "status": "running",
+             "tags": "codex-lab;lease-20260814100000-gone", "name": "abandoned"},
+            {"vmid": 9003, "type": "qemu", "status": "stopped",
+             "tags": "codex-lab;lease-20260814100000-gone", "name": "cold"},
+        ]
+
+    def _state(self, tmp: str) -> tuple:
+        old = (LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT)
+        LAB.LEASE_ROOT = Path(tmp) / "leases"
+        LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+        LAB.STATE_ROOT = Path(tmp)
+        LAB.save_lease({
+            "id": "20260821120000-live", "state": "active", "kind": "session",
+            "created_at": LAB.iso_now(), "expires_at": LAB.new_expiry(3600),
+            "initial_vmids": [],
+            "resources": [{"kind": "qemu", "vmid": 9001, "policy": "delete"}],
+        })
+        return old
+
+    def _api(self) -> mock.Mock:
+        api = mock.Mock()
+        api.reachable.return_value = True
+        api.call.side_effect = lambda method, path, data=None: (
+            self._guests() if path == "/cluster/resources" else None
+        )
+        return api
+
+    def test_a_pruned_lease_leaves_its_guest_detectable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                orphans = LAB.orphaned_guests(self._api())
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertEqual([x["vmid"] for x in orphans], [9002, 9003])
+
+    def test_the_retained_registry_excludes_a_guest_from_reclamation(self) -> None:
+        from proxmox_agent_lab import inventory as inventory_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                inventory_module.record(
+                    Path(tmp), kind="qemu", vmid=9003, lease="20260814100000-gone",
+                    now=LAB.iso_now(), purpose="template",
+                )
+                orphans = LAB.orphaned_guests(self._api())
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertEqual([x["vmid"] for x in orphans], [9002])
+
+    def test_reclamation_stops_and_never_deletes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                api = self._api()
+                with mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "delete_guest") as deleted, \
+                     mock.patch.object(LAB, "audit") as audited:
+                    result = LAB.reclaim_orphans(api)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertEqual(result["stopped"], [9002])
+        self.assertEqual(result["already_stopped"], [9003])
+        self.assertEqual(stopped.call_args.args[1:], ("qemu", 9002))
+        deleted.assert_not_called()
+        events = [call.args[0] for call in audited.call_args_list]
+        self.assertIn("orphan-guest-stopped", events)
+
+    def test_a_stop_failure_is_reported_not_swallowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                with mock.patch.object(LAB, "stop_guest",
+                                       side_effect=LAB.LabError("locked")), \
+                     mock.patch.object(LAB, "audit"):
+                    result = LAB.reclaim_orphans(self._api())
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertIn("9002", result["failed"])
+        self.assertEqual(result["stopped"], [])
+
+    def test_reclaiming_requires_explicit_authorization(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                args = LAB.parser().parse_args(
+                    ["cleanup-expired", "--no-backup", "--reclaim-orphans"]
+                )
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=self._api()), \
+                     mock.patch.object(LAB, "audit"), \
+                     mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "shutdown_host", return_value=False), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        LAB.LabError, "host-change-authorized"
+                    ):
+                        LAB.cmd_cleanup_expired(args)
+                stopped.assert_not_called()
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+
+    def test_retain_registers_a_durable_owner(self) -> None:
+        from proxmox_agent_lab import inventory as inventory_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                lease = LAB.load_lease("20260821120000-live")
+                lease["purpose"] = "haiku template"
+                with mock.patch.object(LAB, "audit"):
+                    LAB.register_resource(lease, "qemu", 9077, "retain", "tpl")
+                    LAB.register_resource(lease, "qemu", 9078, "delete", "tmp")
+                entries = inventory_module.entries(Path(tmp))
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertEqual(list(entries), ["qemu/9077"],
+                         "only a retained guest outlives its lease")
+        self.assertEqual(entries["qemu/9077"]["purpose"], "haiku template")
+
+    def test_deleting_a_guest_clears_its_registry_entry(self) -> None:
+        from proxmox_agent_lab import inventory as inventory_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                inventory_module.record(Path(tmp), kind="qemu", vmid=9077,
+                                        lease="20260821120000-live",
+                                        now=LAB.iso_now())
+                api = mock.Mock()
+                api.call.return_value = "UPID:x"
+                with mock.patch.object(LAB, "wait_task", return_value={}):
+                    LAB.delete_guest(api, "qemu", 9077)
+                remaining = inventory_module.entries(Path(tmp))
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertEqual(remaining, {})
+
+    def test_the_sweep_lock_does_not_stack_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_state = LAB.STATE_ROOT
+            LAB.STATE_ROOT = Path(tmp)
+            try:
+                with LAB.sweep_lock("retained-backup") as first:
+                    self.assertTrue(first)
+                    with LAB.sweep_lock("retained-backup") as second:
+                        self.assertFalse(
+                            second, "a second sweep must not start a second vzdump"
+                        )
+                with LAB.sweep_lock("retained-backup") as again:
+                    self.assertTrue(again, "released when the first sweep ends")
+            finally:
+                LAB.STATE_ROOT = old_state
+
+
+class SlowStorageGuardTests(unittest.TestCase):
+    """Found live: both ReactOS benchmark guests had their disks on the USB
+    bulk store, which measured ~25 MB/s -- the benchmark measured the cable."""
+
+    def test_a_guest_disk_on_bulk_storage_is_flagged(self) -> None:
+        with mock.patch.object(LAB.CONFIG.storage, "_values",
+                               {"bulk_storage": "usb-bulk",
+                                "upload_storages": ["local"]}):
+            self.assertEqual(
+                LAB.slow_storage_disks({"scsi0": "usb-bulk:100", "memory": "4096"}),
+                ["scsi0=usb-bulk:100"],
+            )
+
+    def test_an_iso_mounted_from_bulk_storage_is_fine(self) -> None:
+        """The docs recommend exactly this; only guest disks are the problem."""
+        with mock.patch.object(LAB.CONFIG.storage, "_values",
+                               {"bulk_storage": "usb-bulk"}):
+            self.assertEqual(
+                LAB.slow_storage_disks(
+                    {"ide2": "usb-bulk:iso/reactos.iso,media=cdrom"}
+                ),
+                [],
+            )
+
+    def test_fast_storage_is_not_flagged(self) -> None:
+        with mock.patch.object(LAB.CONFIG.storage, "_values",
+                               {"bulk_storage": "usb-bulk"}):
+            self.assertEqual(
+                LAB.slow_storage_disks({"scsi0": "local-lvm:32"}), []
+            )
+
+    def test_every_disk_bus_is_covered(self) -> None:
+        with mock.patch.object(LAB.CONFIG.storage, "_values",
+                               {"bulk_storage": "usb-bulk"}):
+            flagged = LAB.slow_storage_disks({
+                "virtio0": "usb-bulk:32", "sata1": "usb-bulk:32",
+                "ide0": "usb-bulk:32", "rootfs": "usb-bulk:8",
+                "efidisk0": "usb-bulk:1", "net0": "virtio,bridge=vmbr1",
+            })
+        self.assertEqual(len(flagged), 5)
+        self.assertNotIn("net0", " ".join(flagged))
+
+
+class HostUpdateReportTests(unittest.TestCase):
+    """Advisory only: the node needing patches is a thing to schedule between
+    leases, not a reason for doctor to fail."""
+
+    def _report(self, upgrade_stdout: str, reboot: str = "no",
+                returncode: int = 0) -> dict:
+        from proxmox_agent_lab import memflow
+
+        def host_run(_lab, argv, **_kwargs):
+            command = argv[-1]
+            if "apt-get" in command:
+                return mock.Mock(returncode=returncode,
+                                 stdout=upgrade_stdout, stderr="")
+            return mock.Mock(returncode=0, stdout=reboot, stderr="")
+
+        with mock.patch.object(memflow, "host_ssh_enabled", return_value=True), \
+             mock.patch.object(memflow, "host_run", side_effect=host_run):
+            return LAB.host_update_report()
+
+    def test_pending_upgrades_are_counted(self) -> None:
+        report = self._report(
+            "Inst libexpat1 [2.6.2] (2.6.4 Debian:13/stable [amd64])\n"
+            "Inst util-linux [2.40] (2.41 Debian:13/stable [amd64])\n"
+            "Conf libexpat1 (2.6.4 Debian:13/stable [amd64])\n"
+        )
+        self.assertTrue(report["checked"])
+        self.assertEqual(report["updates_pending"], 2, "Conf lines are not upgrades")
+        self.assertFalse(report["security_updates"])
+        self.assertFalse(report["reboot_required"])
+
+    def test_a_security_origin_is_flagged(self) -> None:
+        report = self._report(
+            "Inst libexpat1 [2.6.2] (2.6.4 Debian-Security:13/stable [amd64])\n"
+        )
+        self.assertTrue(report["security_updates"])
+
+    def test_a_pending_reboot_is_reported(self) -> None:
+        report = self._report("Inst x [1] (2 Debian:13/stable [amd64])\n",
+                              reboot="yes")
+        self.assertTrue(report["reboot_required"])
+
+    def test_a_failed_check_says_so_rather_than_reporting_zero(self) -> None:
+        report = self._report("", returncode=100)
+        self.assertFalse(report["checked"])
+        self.assertNotIn("updates_pending", report)
+
+    def test_without_the_ssh_channel_it_is_simply_not_checked(self) -> None:
+        from proxmox_agent_lab import memflow
+
+        with mock.patch.object(memflow, "host_ssh_enabled", return_value=False):
+            report = LAB.host_update_report()
+        self.assertFalse(report["checked"])
+        self.assertIn("memflow", report["reason"])
+
+
+class DoctorInventoryTests(unittest.TestCase):
+    """A running guest nothing owns is the reason the node stayed on for five
+    days, so doctor has to fail on it rather than mention it."""
+
+    def _doctor(self, guests: list[dict], tmp: str) -> dict:
+        import contextlib
+        import io
+
+        api = mock.Mock()
+        api.reachable.return_value = True
+        api.call.side_effect = lambda method, path, data=None: (
+            guests if path == "/cluster/resources"
+            else {"/vms": {name: 1 for name in (
+                "VM.Allocate", "VM.Config.Disk", "VM.PowerMgmt",
+                "VM.Console", "VM.Audit")}}
+            if path == "/access/permissions" else {}
+        )
+        args = LAB.parser().parse_args(["doctor"])
+        out = io.StringIO()
+        old = (LAB.LEASE_ROOT, LAB.STATE_ROOT, LAB.JOURNAL_ROOT)
+        LAB.LEASE_ROOT = Path(tmp) / "leases"
+        LAB.STATE_ROOT = Path(tmp)
+        LAB.JOURNAL_ROOT = Path(tmp) / "journal"
+        try:
+            with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                 mock.patch.object(LAB.secrets_store, "get",
+                                   return_value="token"), \
+                 contextlib.redirect_stdout(out):
+                try:
+                    LAB.cmd_doctor(args)
+                except LAB.LabError:
+                    pass
+        finally:
+            LAB.LEASE_ROOT, LAB.STATE_ROOT, LAB.JOURNAL_ROOT = old
+        return json.loads(out.getvalue())
+
+    def test_a_running_orphan_is_a_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._doctor(
+                [{"vmid": 9002, "type": "qemu", "status": "running",
+                  "tags": "codex-lab;lease-20260814100000-gone"}],
+                tmp,
+            )
+        self.assertEqual(report["guests"]["orphaned_running"], [9002])
+        self.assertTrue(any("cannot power off" in problem
+                            for problem in report["problems"]))
+        self.assertFalse(report["ok"])
+
+    def test_a_stopped_orphan_is_a_note_not_a_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._doctor(
+                [{"vmid": 9003, "type": "qemu", "status": "stopped",
+                  "tags": "codex-lab;lease-20260814100000-gone"}],
+                tmp,
+            )
+        self.assertEqual(report["guests"]["orphaned"], 1)
+        self.assertEqual(report["guests"]["orphaned_running"], [])
+        self.assertIn("note", report["guests"])
+        self.assertFalse(any("cannot power off" in problem
+                             for problem in report["problems"]))
+
+    def test_an_untagged_guest_is_never_called_an_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._doctor(
+                [{"vmid": 100, "type": "qemu", "status": "running",
+                  "name": "not-ours"}],
+                tmp,
+            )
+        self.assertEqual(report["guests"]["orphaned"], 0)
+
+
+class StateIsolationTests(unittest.TestCase):
+    def test_the_suite_never_points_at_real_controller_state(self) -> None:
+        """Found the hard way: register_resource began writing a registry under
+        STATE_ROOT, and one unisolated test put a bogus retained guest into the
+        developer's live controller state -- where the backup sweep would then
+        have picked it up."""
+        self.assertEqual(
+            str(LAB.STATE_ROOT), os.environ["PROXMOX_AGENT_LAB_STATE"]
+        )
+        self.assertNotIn(str(Path.home()), str(LAB.STATE_ROOT))
 
 
 if __name__ == "__main__":

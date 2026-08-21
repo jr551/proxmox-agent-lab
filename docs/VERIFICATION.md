@@ -59,6 +59,25 @@ termproxy ticket for a *stopped* guest and reports the refusal in the byte
 stream rather than as an API error, so the attach retry has to ask
 `status/current` instead of trusting a successful attach.
 
+### The 2026-08-21 retained-lifecycle round, checked against the node
+
+| Fix | What the node actually showed |
+|---|---|
+| Orphan detection | `guest inventory` over 26 real guests: 19 resolved to a lease record, **6 were orphaned** (4 running), 1 was not this tool's. The running set — 106, 9242, 9243, 9244, 9999 — is why the node had been up for five days |
+| `doctor` fails on a running orphan | `5 running guest(s) carry a lease tag this controller has no record of … the host cannot power off: 106, 9242, 9243, 9244, 9999` |
+| `storage gc` | Reported 4 unreferenced qcow2 images totalling **51.54 GB** on the bulk store (VMIDs 9180, 9190, 9200 — guests long gone), while correctly keeping 43 referenced volumes. Nothing was deleted: reporting is the default |
+| `storage status` class | `usb-bulk` → `bulk`, `local` and `local-lvm` → `fast` |
+| `doctor --host-checks` | `updates_pending: 78`, `security_updates: true`, `reboot_required: false` over the host SSH channel |
+| Retained registry round trip | `guest retain --vmid 101` recorded the template, `doctor` then reported `never_backed_up: [101]` with the coverage note, `backup --retained` correctly refused while disabled, and `--forget` restored an empty registry |
+
+A test-hygiene bug surfaced only because of this hardware check, and is worth
+recording: `register_resource` began writing the retained registry under
+`STATE_ROOT`, and one pre-existing test did not redirect that root — so running
+the suite put a bogus retained guest (`qemu/9001`, purpose "test") into the
+developer's **live** controller state, where an enabled backup sweep would have
+picked it up. Every test module now points `PROXMOX_AGENT_LAB_STATE` at a
+disposable directory, and a guard test asserts it.
+
 ### Security properties, checked rather than assumed
 
 These were tested by looking for the secret afterwards, not by reading the code:
@@ -136,6 +155,14 @@ Not yet watched working end to end on hardware:
 - Ownership-aware and retrying `cleanup-expired` was verified as a decision
   (see below), not as an execution: actually running the sweep would have
   deleted live guests and powered the host off.
+- `cleanup-expired --reclaim-orphans`: the orphans it would stop were listed on
+  the real node, but the stop itself was not run — those guests are live work.
+- `storage gc --delete`: the 51.54 GB it would remove was reported on the real
+  node; the deletion was left for a human.
+- The bulk-storage warning on a guest disk: unit-tested only. Firing it for
+  real means attaching a disk to a live guest.
+- `backup --retained` actually writing a vzdump archive: refused-while-disabled
+  was verified, the write itself was not. It is gigabytes to a slow disk.
 
 ## 🔁 Reproducing this
 

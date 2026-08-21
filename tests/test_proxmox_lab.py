@@ -1724,11 +1724,12 @@ class OrphanReclamationTests(unittest.TestCase):
     invisible to every sweep, holding the host on because shutdown_host
     refuses while any guest runs."""
 
-    def _guests(self) -> list[dict]:
+    def _guests(self, cpu: float = 0.00005) -> list[dict]:
         return [
-            {"vmid": 9001, "type": "qemu", "status": "running",
+            {"vmid": 9001, "type": "qemu", "status": "running", "cpu": 0.01,
              "tags": "codex-lab;lease-20260821120000-live", "name": "current"},
-            {"vmid": 9002, "type": "qemu", "status": "running",
+            {"vmid": 9002, "type": "qemu", "status": "running", "cpu": cpu,
+             "mem": 1024, "diskwrite": 4096, "netin": 8192,
              "tags": "codex-lab;lease-20260814100000-gone", "name": "abandoned"},
             {"vmid": 9003, "type": "qemu", "status": "stopped",
              "tags": "codex-lab;lease-20260814100000-gone", "name": "cold"},
@@ -1748,14 +1749,14 @@ class OrphanReclamationTests(unittest.TestCase):
         return old
 
     def _api(self, *, tasks: dict | None = None,
-             uptime: dict | None = None) -> mock.Mock:
+             uptime: dict | None = None, cpu: float = 0.00005) -> mock.Mock:
         """`tasks` maps vmid -> task list, `uptime` maps vmid -> seconds."""
         tasks = tasks or {}
         uptime = uptime or {}
 
         def call(method: str, path: str, data: object = None) -> object:
             if path == "/cluster/resources":
-                return self._guests()
+                return self._guests(cpu=cpu)
             if path.endswith("/tasks"):
                 vmid = int((data or {}).get("vmid", 0))
                 return tasks.get(vmid, [])
@@ -1850,6 +1851,60 @@ class OrphanReclamationTests(unittest.TestCase):
         self.assertEqual(
             result["left_active"]["9002"]["signal"], "started recently"
         )
+
+    def test_a_guest_that_is_visibly_working_is_left_alone(self) -> None:
+        """The blind spot the other two signals share: work *inside* a guest
+        produces no Proxmox task and does not reset its uptime, so a long build
+        in an unmanaged container looked idle to both."""
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                api = self._api(cpu=0.42)      # 42% -- unmistakably working
+                with mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "audit"):
+                    result = LAB.reclaim_orphans(api)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        stopped.assert_not_called()
+        self.assertEqual(result["left_active"]["9002"]["signal"], "busy")
+        self.assertEqual(result["left_active"]["9002"]["cpu_percent"], 42.0)
+
+    def test_a_guest_merely_switched_on_is_still_reclaimed(self) -> None:
+        """Measured on the node: an idle container sits near 0.005% CPU while a
+        mostly-idle Debian guest sits near 1%, so the floor has to be well
+        above background noise or nothing would ever be reclaimable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                api = self._api(cpu=0.012)     # 1.2% -- background daemons
+                with mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "audit"):
+                    result = LAB.reclaim_orphans(api)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertEqual(result["stopped"], [9002])
+        stopped.assert_called_once()
+
+    def test_the_measured_load_is_reported_either_way(self) -> None:
+        """So a reader can disagree with the threshold instead of trusting it."""
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                api = self._api(tasks={
+                    9002: [{"type": "vncproxy",
+                            "starttime": int(_time.time()) - 30}],
+                })
+                with mock.patch.object(LAB, "stop_guest"), \
+                     mock.patch.object(LAB, "audit") as audited:
+                    result = LAB.reclaim_orphans(api)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        entry = result["left_active"]["9002"]
+        self.assertEqual(entry["signal"], "vncproxy")
+        self.assertEqual(entry["cpu_percent"], 0.005)
+        self.assertEqual(entry["disk_written_bytes"], 4096)
 
     def test_our_own_stop_does_not_read_as_someone_using_it(self) -> None:
         """Otherwise the first reclamation would make every later run refuse."""

@@ -53,6 +53,26 @@ remain available for comparison in the same ISO. The synthesised entries are
 only meaningful in a `KDBG=1` build, so make the build fail closed when they
 are requested without it rather than discover it an hour later.
 
+## Check where the disks actually are before benchmarking
+
+The rule is ISO on bulk storage, guest disk on fast storage. A live
+virtio-vs-IDE comparison broke it: **both** guests' disks were on the USB bulk
+directory store, which measures about 25 MB/s sequential write, so the run
+mostly measured the USB bus.
+
+`storage status` now reports a `class` per storage, and a write that puts a
+guest disk on the bulk store warns unless `--slow-storage-accepted` is passed.
+Assert it before trusting any number:
+
+```bash
+proxmox-lab storage status | grep -A2 '"class": "bulk"'
+proxmox-lab api --lease "$L" --method GET \
+  --path "/nodes/$NODE/qemu/$VMID/config" | grep -E 'scsi0|virtio0|ide0'
+```
+
+If a disk resolves to the bulk store, move it before benchmarking — or state
+plainly that the figure is a floor, not a comparison.
+
 ## The serial socket has no scrollback
 
 A QEMU guest needs `serial0: socket` in its config for `console text` to work

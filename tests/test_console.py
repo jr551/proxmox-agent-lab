@@ -15,6 +15,16 @@ os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(
     Path(__file__).parent / "fixtures" / "config.toml"
 )
 
+import shutil
+import tempfile
+# ...and at a disposable state directory: a test must never write into the
+# developer's real controller state. Cleared here so a previous run cannot
+# leak into this one; imports all happen before any test runs.
+_TEST_STATE = Path(tempfile.gettempdir()) / "proxmox-agent-lab-test-state"
+shutil.rmtree(_TEST_STATE, ignore_errors=True)
+_TEST_STATE.mkdir(parents=True, exist_ok=True)
+os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
+
 import io
 import json
 from pathlib import Path
@@ -1947,3 +1957,220 @@ class MonitorScreenshotTests(unittest.TestCase):
         lab.LabError = RuntimeError
         with self.assertRaisesRegex(RuntimeError, "--ocr"):
             self._run(lab, mock.Mock(), self._memflow(self._png()), ocr=True)
+
+
+class StorageGarbageCollectionTests(unittest.TestCase):
+    """Deleting a disk image is irreversible, so the only safe default is a
+    report, and a false 'orphan' must be impossible rather than unlikely."""
+
+    STORES = [
+        {"storage": "local-lvm", "content": "images,rootdir"},
+        {"storage": "usb-bulk", "content": "images,iso,backup"},
+        {"storage": "local", "content": "iso,vztmpl"},
+    ]
+    VOLUMES = {
+        "local-lvm": [
+            {"volid": "local-lvm:vm-9001-disk-0", "vmid": 9001,
+             "size": 34_359_738_368, "format": "raw"},
+            {"volid": "local-lvm:vm-9001-state-before-update", "vmid": 9001,
+             "size": 4_294_967_296, "format": "raw"},
+        ],
+        "usb-bulk": [
+            {"volid": "usb-bulk:9002/vm-9002-disk-0.raw", "vmid": 9002,
+             "size": 107_374_182_400, "format": "raw"},
+            {"volid": "usb-bulk:9003/vm-9003-disk-0.raw", "vmid": 9003,
+             "size": 10_737_418_240, "format": "raw"},
+        ],
+    }
+    # 9001 is in use; 9002's config mentions its volume with options appended;
+    # 9003 no longer exists at all.
+    CONFIGS = {
+        9001: {"scsi0": "local-lvm:vm-9001-disk-0,discard=on,size=32G"},
+        9002: {"virtio0": "usb-bulk:9002/vm-9002-disk-0.raw,iothread=1,size=100G"},
+    }
+    # A snapshot's vmstate volume is listed as ordinary images content but
+    # appears only in the snapshot's own config.
+    SNAPSHOTS = {
+        9001: [{"name": "before-update"}, {"name": "current"}],
+        9002: [],
+    }
+    SNAPSHOT_CONFIGS = {
+        (9001, "before-update"): {
+            "vmstate": "local-lvm:vm-9001-state-before-update",
+            "scsi0": "local-lvm:vm-9001-disk-0,discard=on,size=32G",
+        },
+    }
+
+    def _lab(self) -> tuple:
+        import re
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        api = mock.Mock()
+
+        def call(method: str, path: str, data: Any = None) -> Any:
+            if path == "/nodes/aipve/storage":
+                return self.STORES
+            if path == "/cluster/resources":
+                return [{"vmid": vmid, "type": "qemu"} for vmid in self.CONFIGS]
+            matched = re.fullmatch(r"/nodes/aipve/qemu/(\d+)/config", path)
+            if matched:
+                return self.CONFIGS[int(matched.group(1))]
+            matched = re.fullmatch(r"/nodes/aipve/qemu/(\d+)/snapshot", path)
+            if matched:
+                return self.SNAPSHOTS[int(matched.group(1))]
+            matched = re.fullmatch(
+                r"/nodes/aipve/qemu/(\d+)/snapshot/([^/]+)/config", path
+            )
+            if matched:
+                return self.SNAPSHOT_CONFIGS[
+                    (int(matched.group(1)), matched.group(2))
+                ]
+            matched = re.fullmatch(
+                r"/nodes/aipve/storage/([^/]+)/content", path
+            )
+            if matched:
+                return self.VOLUMES.get(matched.group(1), [])
+            if method == "DELETE":
+                return None
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        api.call.side_effect = call
+        lab.ProxmoxAPI.return_value = api
+        return lab, api
+
+    def _args(self, **overrides: Any) -> Any:
+        import argparse
+
+        base = dict(storage=None, vmid=None, dry_run=False, delete=False,
+                    host_change_authorized=False, lease=None)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def _run(self, **overrides: Any) -> tuple:
+        import contextlib
+        import io
+
+        lab, api = self._lab()
+        out = io.StringIO()
+        error = None
+        with contextlib.redirect_stdout(out):
+            try:
+                lab_storage.cmd_gc(lab, self._args(**overrides))
+            except RuntimeError as exc:
+                error = str(exc)
+        return json.loads(out.getvalue()), error, lab, api
+
+    def test_only_unreferenced_volumes_are_reported(self) -> None:
+        result, error, _, _ = self._run()
+        self.assertIsNone(error)
+        self.assertEqual(
+            [x["volid"] for x in result["orphaned_volumes"]],
+            ["usb-bulk:9003/vm-9003-disk-0.raw"],
+        )
+        self.assertEqual(result["referenced_volumes"], 3)
+        self.assertEqual(result["orphaned_gb"], 10.74)
+
+    def test_a_volume_named_in_a_config_with_options_is_referenced(self) -> None:
+        """The config value is 'volid,iothread=1,size=100G', never a bare
+        volid, so an exact-match check would have called it an orphan."""
+        result, _, _, _ = self._run()
+        self.assertNotIn(
+            "usb-bulk:9002/vm-9002-disk-0.raw",
+            [x["volid"] for x in result["orphaned_volumes"]],
+        )
+
+    def test_a_snapshot_state_volume_is_never_an_orphan(self) -> None:
+        """It is listed as ordinary images content but appears only in the
+        snapshot's own config, so a live-config-only scan would have offered
+        to delete the thing a rollback needs."""
+        result, _, _, _ = self._run()
+        self.assertNotIn(
+            "local-lvm:vm-9001-state-before-update",
+            [x["volid"] for x in result["orphaned_volumes"]],
+        )
+
+    def test_an_unreadable_snapshot_list_also_refuses_to_classify(self) -> None:
+        lab, api = self._lab()
+        original = api.call.side_effect
+
+        def call(method: str, path: str, data: Any = None) -> Any:
+            if path.endswith("/9001/snapshot"):
+                raise RuntimeError("HTTP 500")
+            return original(method, path, data)
+
+        api.call.side_effect = call
+        with self.assertRaisesRegex(RuntimeError, "Refusing to classify"):
+            lab_storage.cmd_gc(lab, self._args())
+
+    def test_reporting_is_the_default_and_deletes_nothing(self) -> None:
+        result, error, _, api = self._run()
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["deleted"], [])
+        self.assertIsNone(error)
+        self.assertFalse(
+            [c for c in api.call.call_args_list if c.args[0] == "DELETE"]
+        )
+
+    def test_deleting_needs_host_change_authorization(self) -> None:
+        result, error, _, api = self._run(delete=True)
+        self.assertIn("host-change-authorized", error or "")
+        self.assertEqual(result["deleted"], [])
+        self.assertFalse(
+            [c for c in api.call.call_args_list if c.args[0] == "DELETE"]
+        )
+
+    def test_authorized_deletion_removes_only_this_run_s_orphans(self) -> None:
+        result, error, lab, api = self._run(
+            delete=True, host_change_authorized=True
+        )
+        self.assertIsNone(error)
+        self.assertEqual(result["deleted"], ["usb-bulk:9003/vm-9003-disk-0.raw"])
+        deletes = [c.args[1] for c in api.call.call_args_list
+                   if c.args[0] == "DELETE"]
+        self.assertEqual(
+            deletes,
+            ["/nodes/aipve/storage/usb-bulk/content/"
+             "usb-bulk:9003/vm-9003-disk-0.raw"],
+        )
+        audited = lab.audit.call_args
+        self.assertEqual(audited.args[0], "storage-volume-deleted")
+        self.assertEqual(audited.kwargs["volid"],
+                         "usb-bulk:9003/vm-9003-disk-0.raw")
+        self.assertEqual(audited.kwargs["size_gb"], 10.74)
+
+    def test_an_unreadable_guest_config_refuses_to_classify_anything(self) -> None:
+        """If one config cannot be read, a volume it references would look
+        unreferenced. Nothing may be called an orphan in that case."""
+        lab, api = self._lab()
+        original = api.call.side_effect
+
+        def call(method: str, path: str, data: Any = None) -> Any:
+            if path.endswith("/9002/config"):
+                raise RuntimeError("HTTP 500: permission denied")
+            return original(method, path, data)
+
+        api.call.side_effect = call
+        with self.assertRaisesRegex(RuntimeError, "Refusing to classify"):
+            lab_storage.cmd_gc(lab, self._args())
+
+    def test_only_images_capable_stores_are_scanned(self) -> None:
+        _, _, _, api = self._run()
+        scanned = [
+            c.args[1] for c in api.call.call_args_list
+            if "/content" in c.args[1]
+        ]
+        self.assertNotIn("/nodes/aipve/storage/local/content", scanned)
+
+    def test_the_vmid_filter_narrows_the_report(self) -> None:
+        result, _, _, _ = self._run(vmid=9001)
+        self.assertEqual(result["orphaned_volumes"], [])
+
+
+class StorageClassTests(unittest.TestCase):
+    def test_the_bulk_store_is_labelled_bulk(self) -> None:
+        with mock.patch.object(lab_storage, "_DEFAULT_BULK", "usb-bulk"):
+            self.assertEqual(lab_storage.storage_class("usb-bulk"), "bulk")
+            self.assertEqual(lab_storage.storage_class("local-lvm"), "fast")
+            self.assertEqual(lab_storage.storage_class(""), "fast")

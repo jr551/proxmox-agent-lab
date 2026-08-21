@@ -334,6 +334,41 @@ role to the *token*, not just the user.
 **Everything works, then stops after a reboot.** `ethtool wol g` did not
 persist — see step 2.
 
+**`journalctl -u pvedaemon` is full of `writing cluster log failed:
+ipcc_send_rec[7] failed: Invalid argument`.** Expected on a standalone node and
+safe to ignore: pmxcfs has no cluster to write the entry to, so every task
+completion logs one. The lab node produced about 5,300 in 24 hours. It is host
+behaviour, not this tool — but it does bury genuine pvedaemon errors, so filter
+it when reading logs:
+
+```bash
+journalctl -u pvedaemon | grep -v "writing cluster log failed"
+```
+
+**`ps` on the node shows a zombie `qm terminal` under `termproxy`.** Cosmetic,
+and not something the controller can reap. `termproxy` is spawned by
+**pvedaemon** when a console session is requested, and it spawns
+`/usr/sbin/qm terminal` as its own child — so the reaping parent is a Proxmox
+binary, not this tool. Observed on the node: opening a session created
+`termproxy` (parent: pvedaemon) plus its `qm terminal` child, and closing the
+session removed both, leaving nothing behind. A long-lived `console bridge` is
+therefore the case where children can accumulate; ending the bridge clears
+them. Nothing here parses `ps`, so no summary of "is anything running" is
+misled by a zombie.
+
+**Is the node itself up to date?** Nothing in the lease workflow shows it, so
+ask explicitly:
+
+```bash
+proxmox-lab doctor --host-checks
+```
+
+It reports `updates_pending`, `security_updates` and `reboot_required` as
+advisory fields — a pending security update is something to schedule between
+leases, not a reason for `doctor` to fail. It needs the opt-in `[memflow]` host
+SSH channel, since there is no API for `apt`. Patching and rebooting stay
+manual and deliberately outside this tool.
+
 **The machine wakes on its own.** Something else on your network is sending
 traffic that wakes it. That is a BIOS setting (*Wake on PME*, *Wake on Ring*),
 not this tool.

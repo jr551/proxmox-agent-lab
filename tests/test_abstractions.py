@@ -10,6 +10,15 @@ os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(
     Path(__file__).parent / "fixtures" / "config.toml"
 )
 
+import shutil
+import tempfile
+# ...and at a disposable state directory: a test must never write into the
+# developer's real controller state. Cleared here so a previous run cannot
+# leak into this one; imports all happen before any test runs.
+_TEST_STATE = Path(tempfile.gettempdir()) / "proxmox-agent-lab-test-state"
+shutil.rmtree(_TEST_STATE, ignore_errors=True)
+_TEST_STATE.mkdir(parents=True, exist_ok=True)
+os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
 import sys  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
@@ -20,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import config as config_module  # noqa: E402
 from proxmox_agent_lab import guest as guest_module  # noqa: E402
+from proxmox_agent_lab import inventory as inventory_module  # noqa: E402
 from proxmox_agent_lab import journal as journal_module  # noqa: E402
 from proxmox_agent_lab import power as power_module  # noqa: E402
 from proxmox_agent_lab import secrets_store  # noqa: E402
@@ -652,3 +662,140 @@ class ConfigForwardCompatibilityTests(unittest.TestCase):
             path.write_text("[proxmox\nhost = ")
             with self.assertRaises(config_module.ConfigError):
                 config_module.load(path)
+
+
+class RetainedRegistryTests(unittest.TestCase):
+    """A node tag lives for ever and a lease record does not, so the registry
+    is the only durable owner a keep-forever guest has."""
+
+    def test_record_is_idempotent_and_keeps_the_first_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inventory_module.record(
+                root, kind="qemu", vmid=9231, lease="L1",
+                now="2026-08-01T00:00:00Z", purpose="template", name="tpl",
+            )
+            inventory_module.record(
+                root, kind="qemu", vmid=9231, lease="L2",
+                now="2026-08-02T00:00:00Z", purpose="reused",
+            )
+            entries = inventory_module.entries(root)
+            self.assertEqual(list(entries), ["qemu/9231"])
+            item = entries["qemu/9231"]
+            self.assertEqual(item["created_by_lease"], "L1", "provenance kept")
+            self.assertEqual(item["last_lease"], "L2")
+            self.assertEqual(item["name"], "tpl")
+            self.assertEqual(item["purpose"], "reused")
+
+    def test_forget_removes_only_the_named_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for vmid in (9231, 9232):
+                inventory_module.record(root, kind="qemu", vmid=vmid,
+                                        lease="L1", now="2026-08-01T00:00:00Z")
+            self.assertTrue(inventory_module.forget(root, "qemu", 9231))
+            self.assertFalse(inventory_module.forget(root, "qemu", 9231))
+            self.assertEqual(list(inventory_module.entries(root)), ["qemu/9232"])
+
+    def test_backup_time_is_recorded_for_coverage_tracking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inventory_module.record(root, kind="qemu", vmid=9231, lease="L1",
+                                    now="2026-08-01T00:00:00Z")
+            self.assertIsNone(
+                inventory_module.entries(root)["qemu/9231"]["last_backup_at"]
+            )
+            inventory_module.mark_backup(root, "qemu", 9231,
+                                         "2026-08-20T00:00:00Z")
+            self.assertEqual(
+                inventory_module.entries(root)["qemu/9231"]["last_backup_at"],
+                "2026-08-20T00:00:00Z",
+            )
+
+    def test_a_damaged_registry_never_breaks_a_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inventory_module.registry_path(root).write_text("{not json")
+            self.assertEqual(inventory_module.entries(root), {})
+            inventory_module.record(root, kind="qemu", vmid=1, lease="L",
+                                    now="2026-08-01T00:00:00Z")
+            self.assertIn("qemu/1", inventory_module.entries(root))
+
+    def test_the_registry_is_written_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inventory_module.record(root, kind="qemu", vmid=1, lease="L",
+                                    now="2026-08-01T00:00:00Z")
+            leftovers = [p.name for p in root.iterdir()
+                         if p.name.startswith(".retained-")]
+            self.assertEqual(leftovers, [], "no temp file left behind")
+            self.assertTrue(inventory_module.registry_path(root).is_file())
+
+    def test_lease_tag_parsing(self) -> None:
+        self.assertEqual(
+            inventory_module.lease_of_tags("codex-lab;lease-20260816-abc;windows"),
+            "20260816-abc",
+        )
+        self.assertIsNone(inventory_module.lease_of_tags("codex-lab;windows"))
+        self.assertIsNone(inventory_module.lease_of_tags(None))
+        self.assertTrue(inventory_module.is_lab_guest("codex-lab;lease-x"))
+        self.assertFalse(inventory_module.is_lab_guest("production"))
+
+
+class GuestOwnershipTests(unittest.TestCase):
+    """Found live: ~20 guests carried tags whose lease records were gone, so
+    resolving tag -> lease file called nearly every retained guest unowned."""
+
+    GUESTS = [
+        {"vmid": 9001, "type": "qemu", "status": "running",
+         "tags": "codex-lab;lease-live", "name": "current"},
+        {"vmid": 9002, "type": "qemu", "status": "running",
+         "tags": "codex-lab;lease-pruned", "name": "abandoned"},
+        {"vmid": 9003, "type": "qemu", "status": "stopped",
+         "tags": "codex-lab;lease-pruned", "name": "kept", "template": 1},
+        {"vmid": 9004, "type": "qemu", "status": "running", "name": "untagged"},
+    ]
+
+    def _classify(self, retained: dict) -> dict:
+        described = inventory_module.classify(
+            self.GUESTS, known_leases={"live"}, retained=retained
+        )
+        return {item["vmid"]: item for item in described}
+
+    def test_a_tag_with_no_local_record_is_an_orphan(self) -> None:
+        by_vmid = self._classify({})
+        self.assertFalse(by_vmid[9001]["orphaned"], "its lease still exists")
+        self.assertTrue(by_vmid[9001]["lease_known"])
+        self.assertTrue(by_vmid[9002]["orphaned"])
+        self.assertTrue(by_vmid[9003]["orphaned"])
+
+    def test_the_registry_rescues_a_guest_whose_lease_is_gone(self) -> None:
+        by_vmid = self._classify(
+            {"qemu/9003": {"vmid": 9003, "purpose": "haiku template",
+                           "last_backup_at": None}}
+        )
+        self.assertTrue(by_vmid[9003]["retained"])
+        self.assertFalse(by_vmid[9003]["orphaned"],
+                         "the registry vouches for it")
+        self.assertEqual(by_vmid[9003]["retained_purpose"], "haiku template")
+
+    def test_a_guest_this_tool_never_made_is_not_an_orphan(self) -> None:
+        by_vmid = self._classify({})
+        self.assertFalse(by_vmid[9004]["orphaned"])
+        self.assertFalse(by_vmid[9004]["lab_guest"])
+
+    def test_orphans_filters_to_the_unowned(self) -> None:
+        described = inventory_module.classify(
+            self.GUESTS, known_leases={"live"}, retained={}
+        )
+        self.assertEqual(
+            [x["vmid"] for x in inventory_module.orphans(described)],
+            [9002, 9003],
+        )
+
+    def test_malformed_guest_entries_are_skipped(self) -> None:
+        described = inventory_module.classify(
+            [{"no": "vmid"}, {"vmid": "not-a-number"}, {"vmid": 5, "type": "lxc"}],
+            known_leases=set(), retained={},
+        )
+        self.assertEqual([x["vmid"] for x in described], [5])

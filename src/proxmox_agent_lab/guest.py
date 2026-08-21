@@ -631,12 +631,120 @@ def cmd_run(lab: Any, args: Any) -> None:
         raise lab.LabError(f"command exited {result.exit_code}")
 
 
+def cmd_inventory(lab: Any, args: Any) -> None:
+    """Every guest on the node, and what the controller can prove about it.
+
+    A `lease-<id>` tag lives on the node for ever; the lease record that
+    explains it does not. So this prints both: the tag, and whether anything
+    local still resolves it. `orphaned` means neither a lease record nor the
+    retained registry vouches for a guest this tool created -- nothing will
+    ever clean it up, and while it runs it blocks host power-off.
+    """
+    import json
+
+    api = lab.ProxmoxAPI()
+    described = lab.describe_guests(api)
+    if args.orphaned_only:
+        described = [item for item in described if item["orphaned"]]
+    elif args.retained_only:
+        described = [item for item in described if item["retained"]]
+    summary = {
+        "guests": len(described),
+        "lab_guests": sum(1 for x in described if x["lab_guest"]),
+        "lease_resolved": sum(1 for x in described if x["lease_known"]),
+        "retained": sum(1 for x in described if x["retained"]),
+        "orphaned": sum(1 for x in described if x["orphaned"]),
+    }
+    result: dict[str, Any] = {"summary": summary, "guests": described}
+    if summary["orphaned"]:
+        result["note"] = (
+            "Tags are informational: they prove some lease created a guest, "
+            "not that the controller still owns it. Ownership comes from the "
+            "lease record while it exists and from the retained registry "
+            "afterwards. Stop an orphan with 'cleanup-expired "
+            "--reclaim-orphans --host-change-authorized'."
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_retain(lab: Any, args: Any) -> None:
+    """Adopt an existing guest into the retained registry, or drop it.
+
+    Needed on any install that predates the registry: guests created earlier
+    carry a lease tag whose record is long gone, so nothing local vouches for
+    them and `guest inventory` calls them orphans. This is the operator saying
+    "this one is deliberate". It changes controller state only -- the guest
+    itself is never touched, and no lease is required.
+    """
+    import json
+
+    from . import inventory as inventory_module
+
+    api = lab.ProxmoxAPI()
+    kind = args.kind
+    if args.forget:
+        removed = inventory_module.forget(lab.STATE_ROOT, kind, args.vmid)
+        lab.audit("retained-forgotten", kind=kind, vmid=args.vmid,
+                  found=removed, sync=False)
+        print(json.dumps(
+            {"vmid": args.vmid, "kind": kind, "retained": False,
+             "was_registered": removed},
+            indent=2, sort_keys=True,
+        ))
+        return
+    # Refuse to vouch for something that is not there: a registry entry for a
+    # guest that does not exist would report backup coverage for nothing.
+    status = api.call("GET", f"/nodes/{lab.NODE}/{kind}/{args.vmid}/status/current")
+    entry = inventory_module.record(
+        lab.STATE_ROOT, kind=kind, vmid=args.vmid,
+        lease=args.lease or "adopted", now=lab.iso_now(),
+        purpose=args.purpose or "", name=status.get("name"),
+    )
+    lab.audit("retained-adopted", kind=kind, vmid=args.vmid,
+              purpose=args.purpose or "", lease=args.lease)
+    print(json.dumps(
+        {"vmid": args.vmid, "kind": kind, "retained": True, "entry": entry},
+        indent=2, sort_keys=True,
+    ))
+
+
 def register(sub: Any, lab: Any) -> None:
     def bind(handler: Any) -> Any:
         return lambda args: handler(lab, args)
 
     guest = sub.add_parser("guest", help="talk to a guest over any channel")
     guest_sub = guest.add_subparsers(dest="guest_command", required=True)
+
+    inventory_cmd = guest_sub.add_parser(
+        "inventory",
+        help="every guest, its lease tag, and whether anything local owns it",
+    )
+    inventory_cmd.add_argument(
+        "--orphaned-only", action="store_true",
+        help="only guests no lease record or retained registry vouches for",
+    )
+    inventory_cmd.add_argument(
+        "--retained-only", action="store_true",
+        help="only guests in the retained registry",
+    )
+    inventory_cmd.set_defaults(func=bind(cmd_inventory))
+
+    retain_cmd = guest_sub.add_parser(
+        "retain",
+        help="record an existing guest as deliberately kept (or --forget it)",
+        description="Adds a guest to the retained registry so the controller "
+                    "keeps vouching for it after its lease record is gone: it "
+                    "stops being reported as an orphan and becomes eligible "
+                    "for retained backups. Controller state only -- the guest "
+                    "is never modified.",
+    )
+    retain_cmd.add_argument("--vmid", type=int, required=True)
+    retain_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
+    retain_cmd.add_argument("--purpose", help="why this guest is kept")
+    retain_cmd.add_argument("--lease", help="the lease that created it, if known")
+    retain_cmd.add_argument("--forget", action="store_true",
+                            help="remove the guest from the registry instead")
+    retain_cmd.set_defaults(func=bind(cmd_retain))
 
     probe_cmd = guest_sub.add_parser(
         "probe", help="how can this guest be reached? (read-only)"

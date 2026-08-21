@@ -4,6 +4,82 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.9.0 - 2026-08-21
+
+Eight more reported issues, triaged and fixed. The theme is the *keep-forever*
+half of the lab: guests that outlive their lease had no durable owner, no
+backup coverage, and no way to be reclaimed — so one abandoned guest could keep
+the machine on indefinitely.
+
+### Added
+
+- **A retained-guest registry.** `retained.json` under the state directory
+  records any guest registered with `policy = retain`, and is never pruned
+  automatically. A node tag (`codex-lab;lease-<id>`) lives for ever while the
+  lease record does not, so a tag proves only that *some* lease created a
+  guest — ownership now comes from the lease record while it exists and this
+  registry afterwards. Tags are documented as informational, and no ownership
+  check resolves them.
+- `guest inventory` prints every guest with its tag, whether anything local
+  resolves it, and whether the registry vouches for it. `--orphaned-only` and
+  `--retained-only` narrow it.
+- `guest retain --vmid <id> --purpose ...` adopts an existing guest into the
+  registry (and `--forget` removes it). Needed on any install that predates
+  the registry, and it changes controller state only — the guest is untouched.
+- `cleanup-expired --reclaim-orphans --host-change-authorized` **stops, and
+  never deletes**, guests that neither a lease record nor the registry vouches
+  for. Cleanup only ever finalized lease-listed resources, and host power-off
+  refuses while any guest runs, so one such guest kept the lab machine on for
+  five days. Stopping is reversible and is all that is needed to unblock
+  power-off; a controller that has lost a guest's record cannot vouch for its
+  disk, so deletion stays manual.
+- `storage gc` finds image volumes no guest config references. It **reports by
+  default**; `--delete --host-change-authorized` removes only what that same
+  run classified as unreferenced, and each deletion is audited with volid and
+  size. Snapshot configs are scanned as well as live ones, because a snapshot's
+  `vmstate` volume is listed as ordinary `images` content but referenced only
+  from the snapshot; and if any config or snapshot cannot be read, nothing is
+  classified at all.
+- `storage status` reports a `class` per storage (`bulk` for
+  `[storage] bulk_storage`, `fast` otherwise), so callers stop hardcoding site
+  storage ids.
+- Retained-guest backups: `backup --retained`, plus an opt-in watchdog sweep
+  behind `[lease] retained_backup` (default **false**) and
+  `retained_backup_interval_days`. When the watchdog runs it, it runs outside
+  the controller lock and under its own non-blocking lock, so a long vzdump can
+  neither block a lease operation nor be started twice by successive ticks.
+- `doctor --host-checks` reports the node's `updates_pending`,
+  `security_updates` and `reboot_required` as advisory fields, over the opt-in
+  `[memflow]` host SSH channel. Patching stays manual and outside this tool.
+- `doctor` also reports orphaned guests — failing when one is *running*, since
+  that is what blocks power-off — and `retained_backup` coverage: how many
+  retained guests exist, which have never been backed up, and the oldest
+  backup age, whether or not the sweep is enabled.
+
+### Changed
+
+- A write that would place a *guest disk* on the configured bulk storage now
+  warns unless `--slow-storage-accepted` is passed. An ISO mounted from bulk
+  storage is not warned about; that is the recommended arrangement. The lab's
+  USB store measured about 25 MB/s, enough to turn an I/O comparison into a
+  measurement of the cable.
+- `docs/long-term-leases.md` no longer implies that weekly backups are a
+  general safety net: they only ever covered an active long-term lease's
+  guests. The gap, and how to close it, is now stated.
+- Standalone-node `ipcc_send_rec` log noise and zombie `qm terminal` children
+  are documented in `docs/INSTALL.md`. Neither is fixable here: the first is
+  pmxcfs with no cluster to write to, and `termproxy` is spawned by pvedaemon
+  and reaps its own child, so the controller never owns those processes.
+
+### Fixed
+
+- Test isolation: `register_resource` writes the retained registry under
+  `STATE_ROOT`, and one pre-existing test did not redirect that root, so
+  running the suite wrote a bogus retained guest into the developer's live
+  controller state. Every test module now points
+  `PROXMOX_AGENT_LAB_STATE` at a disposable directory, and a guard test
+  asserts it.
+
 ## 0.8.0 - 2026-08-21
 
 Ten reported issues, fixed and verified against the lab node. The serial and

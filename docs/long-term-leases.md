@@ -17,7 +17,7 @@ Three things, and the first one costs money:
 | 🔌 **The host** | Powered off when the last lease ends | **Stays on**, permanently |
 | ⏰ **Expiry** | 2 hours, renewed by heartbeat | Never expires |
 | 🧹 **Its guests** | Destroyed at `lease-end` | Kept, and `protection` set |
-| 💾 **Backups** | None | Weekly, to the bulk storage |
+| 💾 **Backups** | None by the lease; see the retained registry | Weekly, to the bulk storage |
 | 🚪 **Ending it** | `lease-end` | `lease-destroy --confirm` |
 
 **While any long-term lease is active, the machine never powers down.** Not by
@@ -96,6 +96,36 @@ long_term_backup_keep = 2
 ```
 
 A slow, large disk is the right target. These are safety copies.
+
+### What this does *not* cover
+
+Only guests of an **active long-term lease**. That leaves the rest of the
+keep-forever set — templates, a released long-term lease's machines, persistent
+gateway and share workers — with no coverage at all, which is the opposite of
+what their value deserves. Those are covered by the retained registry instead:
+
+```bash
+proxmox-lab guest retain --vmid 101 --purpose "Ubuntu cloud-init template"
+proxmox-lab backup --retained --force        # once, now
+```
+
+`doctor` reports `retained_backup` — how many retained guests exist, which have
+never been backed up, and the oldest backup age — whether or not the sweep is
+enabled, so the gap is visible rather than assumed. To have the watchdog do it
+on the same weekly interval:
+
+```toml
+[lease]
+retained_backup = true              # off by default: it writes GBs on a schedule
+retained_backup_interval_days = 7
+```
+
+It is off by default deliberately. Turning it on starts writing vzdump archives
+of every retained guest to the bulk store, which on a slow disk is hours of
+wall clock and gigabytes of space — a decision for the operator, not a default.
+When the watchdog runs it, it runs *outside* the controller lock and under its
+own non-blocking lock, so a long backup can neither block a lease operation nor
+have a second copy started by the next five-minute tick.
 
 ## 🔥 Destroying one
 

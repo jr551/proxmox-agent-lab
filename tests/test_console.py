@@ -1977,9 +1977,11 @@ class StorageGarbageCollectionTests(unittest.TestCase):
         ],
         "usb-bulk": [
             {"volid": "usb-bulk:9002/vm-9002-disk-0.raw", "vmid": 9002,
-             "size": 107_374_182_400, "format": "raw"},
+             "size": 107_374_182_400, "used": 40_000_000_000, "format": "raw"},
+            # Provisioned 10 GB, but only 2.8 MB was ever written -- a create
+            # that failed early. Deleting it returns the 2.8 MB, not the 10 GB.
             {"volid": "usb-bulk:9003/vm-9003-disk-0.raw", "vmid": 9003,
-             "size": 10_737_418_240, "format": "raw"},
+             "size": 10_737_418_240, "used": 2_826_240, "format": "raw"},
         ],
     }
     # 9001 is in use; 9002's config mentions its volume with options appended;
@@ -2070,7 +2072,7 @@ class StorageGarbageCollectionTests(unittest.TestCase):
             ["usb-bulk:9003/vm-9003-disk-0.raw"],
         )
         self.assertEqual(result["referenced_volumes"], 3)
-        self.assertEqual(result["orphaned_gb"], 10.74)
+        self.assertEqual(result["orphaned_provisioned_gb"], 10.74)
 
     def test_a_volume_named_in_a_config_with_options_is_referenced(self) -> None:
         """The config value is 'volid,iothread=1,size=100G', never a bare
@@ -2080,6 +2082,16 @@ class StorageGarbageCollectionTests(unittest.TestCase):
             "usb-bulk:9002/vm-9002-disk-0.raw",
             [x["volid"] for x in result["orphaned_volumes"]],
         )
+
+    def test_reclaimable_space_is_reported_separately_from_provisioned(self) -> None:
+        """Found on the node: four orphans read as 51.54 GB, which was their
+        provisioned size. They held 9.33 MB between them, so deleting them --
+        an irreversible act -- would have returned essentially nothing. The two
+        numbers have to be distinguishable before anyone acts on them."""
+        result, _, _, _ = self._run()
+        self.assertEqual(result["orphaned_provisioned_gb"], 10.74)
+        self.assertEqual(result["orphaned_on_disk_gb"], 0.003)
+        self.assertEqual(result["orphaned_volumes"][0]["used_gb"], 0.003)
 
     def test_a_snapshot_state_volume_is_never_an_orphan(self) -> None:
         """It is listed as ordinary images content but appears only in the
@@ -2139,6 +2151,7 @@ class StorageGarbageCollectionTests(unittest.TestCase):
         self.assertEqual(audited.kwargs["volid"],
                          "usb-bulk:9003/vm-9003-disk-0.raw")
         self.assertEqual(audited.kwargs["size_gb"], 10.74)
+        self.assertEqual(audited.kwargs["used_gb"], 0.003)
 
     def test_an_unreadable_guest_config_refuses_to_classify_anything(self) -> None:
         """If one config cannot be read, a volume it references would look

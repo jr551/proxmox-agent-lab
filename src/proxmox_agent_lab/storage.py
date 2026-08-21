@@ -306,7 +306,13 @@ def cmd_gc(lab: Any, args: Any) -> None:
                 "volid": volid,
                 "storage": store,
                 "vmid": int(vmid) if str(vmid or "").isdigit() else None,
+                # Provisioned size and bytes actually on disk are very
+                # different numbers for a thin volume or a sparse qcow2, and
+                # only the second one comes back when the volume is deleted.
+                # Reporting the first as if it were reclaimable space invites
+                # an irreversible deletion for a gain that is not there.
                 "size_gb": round(int(volume.get("size") or 0) / 1_000_000_000, 2),
+                "used_gb": round(int(volume.get("used") or 0) / 1_000_000_000, 3),
                 "format": volume.get("format"),
             })
     orphaned.sort(key=lambda item: item["volid"])
@@ -314,7 +320,8 @@ def cmd_gc(lab: Any, args: Any) -> None:
         "stores": stores,
         "referenced_volumes": kept,
         "orphaned_volumes": orphaned,
-        "orphaned_gb": round(sum(x["size_gb"] for x in orphaned), 2),
+        "orphaned_provisioned_gb": round(sum(x["size_gb"] for x in orphaned), 2),
+        "orphaned_on_disk_gb": round(sum(x["used_gb"] for x in orphaned), 3),
         "deleted": [],
     }
     if not args.delete:
@@ -346,7 +353,7 @@ def cmd_gc(lab: Any, args: Any) -> None:
             )
             lab.audit("storage-volume-deleted", lease=args.lease,
                       volid=item["volid"], size_gb=item["size_gb"],
-                      storage=item["storage"])
+                      used_gb=item["used_gb"], storage=item["storage"])
             result["deleted"].append(item["volid"])
         except lab.LabError as exc:
             failures[item["volid"]] = str(exc)[:300]

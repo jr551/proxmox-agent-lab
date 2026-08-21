@@ -4,6 +4,19 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.9.2 - 2026-08-21
+
+### Fixed
+
+- `storage gc` reported a volume's **provisioned** size as though it were
+  reclaimable space. On the lab node its four orphans read as 51.54 GB and held
+  9.33 MB between them — three creates that failed almost immediately — so the
+  headline number overstated the gain from an irreversible deletion by a factor
+  of about 5,500. The report now separates `orphaned_provisioned_gb` from
+  `orphaned_on_disk_gb`, gives both per volume (`size_gb`, `used_gb`), and
+  audits both on deletion. `docs/storage.md` and `docs/VERIFICATION.md` carry
+  the corrected figures.
+
 ## 0.9.1 - 2026-08-21
 
 ### Added

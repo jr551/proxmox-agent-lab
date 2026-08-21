@@ -116,8 +116,13 @@ exists, and reclamation is explicit:
 
 ```bash
 proxmox-lab guest inventory --orphaned-only
-proxmox-lab cleanup-expired --reclaim-orphans --host-change-authorized
+proxmox-lab cleanup-expired --orphans-only --host-change-authorized
 ```
+
+`--orphans-only` does exactly that and nothing else. Plain `--reclaim-orphans`
+folds reclamation into a full expiry sweep, which in the same run finalizes
+every expired lease — deleting their guests — and then decides whether to power
+the host off. Those are much larger intentions, so they have separate flags.
 
 Reclamation **stops, and never deletes.** Stopping is reversible and is all
 that is needed to unblock power-off; a controller that has lost the record of a

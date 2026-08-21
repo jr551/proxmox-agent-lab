@@ -1835,7 +1835,56 @@ def reclaim_orphans(api: ProxmoxAPI) -> dict[str, Any]:
     return result
 
 
+def cmd_reclaim_orphans_only(args: argparse.Namespace) -> dict[str, Any]:
+    """Stop orphaned guests and do nothing else.
+
+    Reclamation was only reachable as part of a full expiry sweep, which in the
+    same run finalizes every expired lease -- deleting their guests -- and then
+    decides whether to power the host off. "Stop the guests nothing owns" is a
+    much smaller intention than that, and wanting one is not consenting to the
+    other, so it gets its own path: no lease is finalized, no backup runs, and
+    the host is left exactly as it was.
+    """
+    if not args.host_change_authorized:
+        raise LabError(
+            "--orphans-only stops guests this controller has no record of. "
+            "Re-run with --host-change-authorized once the user has asked for "
+            "that. 'guest inventory --orphaned-only' lists them first."
+        )
+    api = ProxmoxAPI()
+    if not api.reachable():
+        raise LabError(
+            "the host is not reachable, so there is nothing running to reclaim"
+        )
+    with controller_lock():
+        reclaimed = reclaim_orphans(api)
+    if reclaimed["stopped"]:
+        audit(
+            "orphans-reclaimed",
+            stopped=reclaimed["stopped"],
+            already_stopped=reclaimed["already_stopped"],
+            failed=sorted(reclaimed["failed"]),
+        )
+    result = {
+        "reclaimed_orphans": reclaimed,
+        "leases_swept": [],
+        "host_powered_off": False,
+        "note": (
+            "Only orphaned guests were touched. No lease was finalized and the "
+            "host was left on; a normal 'cleanup-expired' run makes those "
+            "decisions."
+        ),
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if reclaimed["failed"]:
+        raise LabError("One or more orphaned guests could not be stopped")
+    return result
+
+
 def cmd_cleanup_expired(args: argparse.Namespace) -> None:
+    if getattr(args, "orphans_only", False):
+        cmd_reclaim_orphans_only(args)
+        return
     api = ProxmoxAPI()
     cleaned: list[str] = []
     retried: list[str] = []
@@ -2638,6 +2687,12 @@ def parser() -> argparse.ArgumentParser:
         help="stop (never delete) guests tagged with a lease this controller "
              "has no record of; they are invisible to normal cleanup and a "
              "running one blocks host power-off. Requires "
+             "--host-change-authorized",
+    )
+    cleanup.add_argument(
+        "--orphans-only", action="store_true",
+        help="reclaim orphaned guests and nothing else: no lease is finalized, "
+             "no backup runs, and the host is left on. Requires "
              "--host-change-authorized",
     )
     cleanup.add_argument("--host-change-authorized", action="store_true",

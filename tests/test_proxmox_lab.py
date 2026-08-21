@@ -1810,6 +1810,76 @@ class OrphanReclamationTests(unittest.TestCase):
         self.assertIn("9002", result["failed"])
         self.assertEqual(result["stopped"], [])
 
+    def test_orphans_only_touches_no_lease_and_leaves_the_host_on(self) -> None:
+        """Found while using it: reclamation was only reachable through a full
+        sweep, which in the same run deletes every expired lease's guests and
+        may power the host off. Wanting one is not consenting to the other."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                # An expired lease whose guest a full sweep would delete.
+                LAB.save_lease({
+                    "id": "20260814100000-expired", "state": "active",
+                    "kind": "session", "created_at": LAB.iso_now(),
+                    "expires_at": LAB.new_expiry(-3600), "initial_vmids": [],
+                    "resources": [{"kind": "qemu", "vmid": 9001,
+                                   "policy": "delete", "name": "keepme"}],
+                })
+                args = LAB.parser().parse_args([
+                    "cleanup-expired", "--orphans-only",
+                    "--host-change-authorized",
+                ])
+                out = io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI",
+                                       return_value=self._api()), \
+                     mock.patch.object(LAB, "audit"), \
+                     mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "delete_guest") as deleted, \
+                     mock.patch.object(LAB, "finalize_lease") as finalized, \
+                     mock.patch.object(LAB, "shutdown_host") as powered_off, \
+                     contextlib.redirect_stdout(out):
+                    LAB.cmd_cleanup_expired(args)
+                result = json.loads(out.getvalue())
+                lease = json.loads(
+                    LAB.lease_path("20260814100000-expired").read_text()
+                )
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertEqual(result["reclaimed_orphans"]["stopped"], [9002])
+        self.assertEqual(result["leases_swept"], [])
+        self.assertFalse(result["host_powered_off"])
+        # The expired lease and its guest are untouched.
+        finalized.assert_not_called()
+        deleted.assert_not_called()
+        powered_off.assert_not_called()
+        self.assertEqual(lease["state"], "active")
+        self.assertEqual(stopped.call_args.args[1:], ("qemu", 9002))
+
+    def test_orphans_only_still_requires_authorization(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                args = LAB.parser().parse_args(
+                    ["cleanup-expired", "--orphans-only"]
+                )
+                with mock.patch.object(LAB, "ProxmoxAPI",
+                                       return_value=self._api()), \
+                     mock.patch.object(LAB, "stop_guest") as stopped, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        LAB.LabError, "host-change-authorized"
+                    ):
+                        LAB.cmd_cleanup_expired(args)
+                stopped.assert_not_called()
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+
     def test_reclaiming_requires_explicit_authorization(self) -> None:
         import contextlib
         import io

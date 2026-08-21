@@ -4,6 +4,19 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.9.1 - 2026-08-21
+
+### Added
+
+- `cleanup-expired --orphans-only --host-change-authorized` reclaims orphaned
+  guests and does nothing else: no lease is finalized, no backup runs, and the
+  host is left on. Reclamation had only been reachable as part of a full expiry
+  sweep, which in the same run deletes every expired lease's guests and then
+  decides whether to power the machine off. On the lab node that meant "stop
+  the four guests nothing owns" also proposed deleting ten guests that were
+  fine, including the ReactOS builders and the build gateway. Wanting the first
+  is not consenting to the second.
+
 ## 0.9.0 - 2026-08-21
 
 Eight more reported issues, triaged and fixed. The theme is the *keep-forever*

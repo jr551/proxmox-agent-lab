@@ -1791,7 +1791,20 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         elif report.get("pocketbase_token_stored"):
             try:
                 client = pocketbase_client()
-                client.get_collection()
+                try:
+                    client.get_collection()
+                except pocketbase_module.PocketBaseError as exc:
+                    # The collections API is superuser-only. A restricted
+                    # audit agent (the recommended credential) gets a 403
+                    # there even though it can read and write the ledger,
+                    # so prove reachability through the records API it is
+                    # actually entitled to.
+                    if exc.status != 403 or (
+                        pocketbase_module.token_auth_collection(client.token)
+                        == "_superusers"
+                    ):
+                        raise
+                    client.query(limit=1)
                 report["pocketbase_collection_reachable"] = True
             except (LabError, pocketbase_module.PocketBaseError) as exc:
                 report["pocketbase_collection_reachable"] = False

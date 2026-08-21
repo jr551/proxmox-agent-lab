@@ -1802,19 +1802,106 @@ def cmd_lease_abandon(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
-def reclaim_orphans(api: ProxmoxAPI) -> dict[str, Any]:
+# How recently a guest must have been touched to count as in use. Tasks that
+# only ever mean "something stopped this guest" are excluded, or our own stop
+# would make every later run think the guest is busy.
+ORPHAN_ACTIVITY_WINDOW_SECONDS = 1800
+STOP_TASK_TYPES = frozenset(
+    {"qmstop", "qmshutdown", "qmreset", "vzstop", "vzshutdown"}
+)
+
+
+def recent_guest_activity(
+    api: ProxmoxAPI, kind: str, vmid: int, *,
+    within: int = ORPHAN_ACTIVITY_WINDOW_SECONDS,
+) -> dict[str, Any] | None:
+    """Evidence that something is still using this guest, or None.
+
+    "Orphaned" means *this* controller has no record of the guest. It does not
+    mean nobody is using it: a second controller, or one whose state lives
+    elsewhere, drives guests through the same API token and its lease records
+    are not here. Reclamation stopped a live ReactOS benchmark that way -- the
+    other session had been taking a console screenshot every 45 seconds, and
+    restarted the guest 90 seconds later.
+
+    Two independent signals, because each covers the other's blind spot:
+    recent tasks (console, start, agent) show someone driving it, and a short
+    uptime shows it was started recently even if the task log has rolled. An
+    unreadable task log counts as activity: leaving a guest running is a much
+    smaller mistake than stopping somebody's work.
+    """
+    try:
+        current = api.call(
+            "GET", f"/nodes/{NODE}/{kind}/{vmid}/status/current"
+        ) or {}
+        uptime = int(current.get("uptime") or 0)
+    except (LabError, TypeError, ValueError):
+        uptime = 0
+    if 0 < uptime < within:
+        return {"signal": "started recently", "seconds_ago": uptime}
+    try:
+        tasks = api.call(
+            "GET", f"/nodes/{NODE}/tasks", {"vmid": int(vmid), "limit": 20}
+        ) or []
+    except LabError as exc:
+        return {"signal": "task log unreadable", "detail": str(exc)[:120]}
+    now = time.time()
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("type")) in STOP_TASK_TYPES:
+            continue
+        try:
+            started = int(task.get("starttime") or 0)
+        except (TypeError, ValueError):
+            continue
+        # A task timestamped in the future means the clocks disagree; treat it
+        # as current rather than as ancient.
+        if started and now - started < within:
+            return {
+                "signal": str(task.get("type")),
+                "seconds_ago": max(0, int(now - started)),
+            }
+    return None
+
+
+def reclaim_orphans(
+    api: ProxmoxAPI, *, include_active: bool = False
+) -> dict[str, Any]:
     """Stop -- never delete -- guests no lease record or registry vouches for.
 
     Stopping is reversible and unblocks host power-off, which is the whole
     point: one abandoned guest otherwise keeps the machine on for ever.
     Deleting is not reversible, and the controller by definition cannot vouch
     for what is on a disk it has lost the record of, so that stays manual.
+
+    A guest that shows recent activity is left alone unless `include_active`:
+    "no record here" is not the same as "nobody is using it", and stopping
+    somebody else's running work is the one outcome this command must not have
+    by default.
     """
-    result: dict[str, Any] = {"stopped": [], "failed": {}, "already_stopped": []}
+    result: dict[str, Any] = {
+        "stopped": [], "failed": {}, "already_stopped": [], "left_active": {},
+    }
     for guest in orphaned_guests(api):
         kind, vmid = guest["kind"], int(guest["vmid"])
         if guest.get("status") != "running":
             result["already_stopped"].append(vmid)
+            continue
+        activity = (
+            None if include_active
+            else recent_guest_activity(api, kind, vmid)
+        )
+        if activity:
+            result["left_active"][str(vmid)] = activity
+            audit(
+                "orphan-guest-left-running",
+                kind=kind,
+                vmid=vmid,
+                lease_tag=guest.get("lease_tag"),
+                signal=activity.get("signal"),
+                sync=False,
+            )
             continue
         try:
             stop_guest(api, kind, vmid)
@@ -1857,7 +1944,9 @@ def cmd_reclaim_orphans_only(args: argparse.Namespace) -> dict[str, Any]:
             "the host is not reachable, so there is nothing running to reclaim"
         )
     with controller_lock():
-        reclaimed = reclaim_orphans(api)
+        reclaimed = reclaim_orphans(
+            api, include_active=getattr(args, "include_active", False)
+        )
     if reclaimed["stopped"]:
         audit(
             "orphans-reclaimed",
@@ -1865,7 +1954,7 @@ def cmd_reclaim_orphans_only(args: argparse.Namespace) -> dict[str, Any]:
             already_stopped=reclaimed["already_stopped"],
             failed=sorted(reclaimed["failed"]),
         )
-    result = {
+    result: dict[str, Any] = {
         "reclaimed_orphans": reclaimed,
         "leases_swept": [],
         "host_powered_off": False,
@@ -1875,6 +1964,13 @@ def cmd_reclaim_orphans_only(args: argparse.Namespace) -> dict[str, Any]:
             "decisions."
         ),
     }
+    if reclaimed["left_active"]:
+        result["left_active_note"] = (
+            "These are running and were touched recently, so something is "
+            "using them even though this controller has no record of them -- "
+            "another controller drives guests through the same token. Pass "
+            "--include-active to stop them anyway."
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
     if reclaimed["failed"]:
         raise LabError("One or more orphaned guests could not be stopped")
@@ -1924,7 +2020,9 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
                     "record of. Re-run with --host-change-authorized once the "
                     "user has asked for that. 'status' lists them first."
                 )
-            reclaimed = reclaim_orphans(api)
+            reclaimed = reclaim_orphans(
+                api, include_active=getattr(args, "include_active", False)
+            )
         remaining = active_leases()
         persistent = [x for x in remaining if is_long_term(x)]
         if persistent and api.reachable() and not args.no_backup:
@@ -2377,19 +2475,40 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             "orphaned": len(orphans),
             "orphaned_running": [x["vmid"] for x in running_orphans],
         }
-        if running_orphans:
+        active = {}
+        idle = []
+        for orphan in running_orphans:
+            signal = recent_guest_activity(
+                api, orphan["kind"], int(orphan["vmid"])
+            )
+            if signal:
+                active[str(orphan["vmid"])] = signal
+            else:
+                idle.append(orphan)
+        if active:
+            # Running, unowned *here*, and being driven -- so another
+            # controller owns it. Saying "nothing will clean this up" would be
+            # a misdiagnosis, and acting on it would stop somebody's work.
+            report["guests"]["orphaned_but_active"] = active
+            report["guests"]["active_note"] = (
+                "Running and touched recently, so something is using these "
+                "even though this controller has no record of them -- most "
+                "likely another controller sharing the API token. They keep "
+                "the host on, which is correct while they are in use."
+            )
+        if idle:
             # This is the failure mode that keeps the machine on for days:
             # nothing owns the guest, so no sweep stops it, and shutdown_host
             # refuses while any guest runs.
             problems.append(
-                f"{len(running_orphans)} running guest(s) carry a lease tag "
-                "this controller has no record of, so no sweep will clean them "
-                "up and the host cannot power off: "
-                + ", ".join(str(x["vmid"]) for x in running_orphans)
-                + ". Reclaim with 'cleanup-expired --reclaim-orphans "
+                f"{len(idle)} running guest(s) carry a lease tag this "
+                "controller has no record of and show no recent activity, so "
+                "no sweep will clean them up and the host cannot power off: "
+                + ", ".join(str(x["vmid"]) for x in idle)
+                + ". Reclaim with 'cleanup-expired --orphans-only "
                 "--host-change-authorized'"
             )
-        elif orphans:
+        elif orphans and not active:
             report["guests"]["note"] = (
                 f"{len(orphans)} stopped guest(s) are tagged with a lease this "
                 "controller no longer has; see 'guest inventory --orphaned-only'"
@@ -2694,6 +2813,12 @@ def parser() -> argparse.ArgumentParser:
         help="reclaim orphaned guests and nothing else: no lease is finalized, "
              "no backup runs, and the host is left on. Requires "
              "--host-change-authorized",
+    )
+    cleanup.add_argument(
+        "--include-active", action="store_true",
+        help="also stop an orphaned guest that was touched in the last 30 "
+             "minutes. Skipped by default: another controller drives guests "
+             "through the same token, and its lease records are not here",
     )
     cleanup.add_argument("--host-change-authorized", action="store_true",
                          help="required by --reclaim-orphans")

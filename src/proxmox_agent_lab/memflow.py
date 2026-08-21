@@ -128,6 +128,105 @@ def _ssh(lab: Any, remote_argv: list[str], *, timeout: int = 60,
     return proc
 
 
+# --------------------------------------------------------------------------- #
+# The same channel, offered to the rest of the package.
+#
+# One subsystem outside introspection needs a file back from the host:
+# 'console screenshot --via monitor', where QEMU's screendump writes the PNG on
+# the node. It reuses this SSH identity rather than opening a second host
+# trust boundary, and stays behind the same opt-in gate.
+# --------------------------------------------------------------------------- #
+
+def host_ssh_enabled() -> bool:
+    """True when the opt-in host SSH channel is configured."""
+    return bool(ENABLED and SSH_HOST)
+
+
+def require_host_ssh(lab: Any) -> None:
+    """Raise unless the host SSH channel is enabled and configured."""
+    _require_enabled(lab)
+
+
+def host_run(lab: Any, argv: list[str], *, timeout: int = 60
+             ) -> subprocess.CompletedProcess:
+    """Run one command on the host and return the completed process.
+
+    The argv is joined with shlex, so no caller can inject through an
+    argument. Reserved for read-only host inspection by other subsystems --
+    anything that changes the host keeps its own authorization gate.
+    """
+    _require_enabled(lab)
+    return _ssh(lab, argv, timeout=timeout)
+
+
+def host_mkdir(lab: Any, directory: str, *, timeout: int = 30) -> None:
+    """Create one private directory on the host."""
+    _require_enabled(lab)
+    proc = _ssh(lab, ["mkdir", "-p", "-m", "700", "--", directory],
+                timeout=timeout)
+    if proc.returncode:
+        raise lab.LabError(
+            f"could not create {directory} on {SSH_HOST}: "
+            f"{(proc.stderr or '').strip()[:200] or proc.returncode}"
+        )
+
+
+def host_read_bytes(lab: Any, path: str, *, timeout: int = 120) -> bytes:
+    """Read one file from the host verbatim, without decoding it as text."""
+    _require_enabled(lab)
+    remote = shlex.join(["cat", "--", path])
+    try:
+        proc = subprocess.run(
+            _ssh_argv(remote), capture_output=True, timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise lab.LabError(
+            "ssh was not found on this machine; it is required to reach the "
+            "Proxmox host"
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise lab.LabError(
+            f"no response from {SSH_HOST} within {timeout}s while reading a "
+            "host file"
+        ) from None
+    if proc.returncode:
+        detail = (proc.stderr or b"").decode("utf-8", "replace").strip()[:200]
+        raise lab.LabError(
+            f"could not read {path} from {SSH_HOST}: "
+            f"{detail or proc.returncode}"
+        )
+    return proc.stdout
+
+
+def host_remove_empty_dir(lab: Any, directory: str, *, timeout: int = 30) -> bool:
+    """Remove one directory on the host, only if it is empty.
+
+    `rmdir` refuses a non-empty directory, so a concurrent capture in the same
+    lease cannot lose its file to this cleanup.
+    """
+    if not host_ssh_enabled():
+        return False
+    try:
+        proc = _ssh(lab, ["rmdir", "--", directory], timeout=timeout)
+    except (OSError, lab.LabError):
+        return False
+    return proc.returncode == 0
+
+
+def host_remove_file(lab: Any, path: str, *, timeout: int = 30) -> bool:
+    """Delete one file on the host. Best effort: reports, never raises."""
+    if not host_ssh_enabled():
+        return False
+    try:
+        proc = _ssh(lab, ["rm", "-f", "--", path], timeout=timeout)
+    except (OSError, lab.LabError):
+        # Cleanup runs in a finally path: it reports failure to the caller,
+        # which records it, rather than masking the original error.
+        return False
+    return proc.returncode == 0
+
+
 def _helper(lab: Any, sub_argv: list[str], *, timeout: int = 90,
             ) -> subprocess.CompletedProcess:
     proc = _ssh(lab, [HELPER, *sub_argv], timeout=timeout)
@@ -506,6 +605,135 @@ def cmd_break(lab: Any, args: Any) -> None:
     lab.audit("memflow-break", lease=args.lease, vmid=args.vmid,
               addr=args.addr, hit=bool(result.get("hit")), sync=False)
     print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
+
+
+# A guest that hangs mid-boot cannot be reached from inside -- no agent, no
+# usable console -- but its RAM still holds the reason. These signatures are
+# the text a stuck boot leaves behind; each is matched literally against
+# guest-physical memory. Kept specific to avoid matching ordinary log text.
+_BOOT_SIGNATURES: tuple[tuple[str, str, str], ...] = (
+    ("linux-panic", "Kernel panic - not syncing", "linux"),
+    ("linux-no-root", "VFS: Unable to mount root fs", "linux"),
+    ("linux-no-init", "No working init found", "linux"),
+    ("linux-init-died", "Attempted to kill init", "linux"),
+    ("linux-halted", "---[ end Kernel panic", "linux"),
+    ("dracut-fatal", "dracut: FATAL", "linux"),
+    ("dracut-emergency", "Entering emergency mode", "linux"),
+    ("fsck-fail", "fsck failed", "linux"),
+    ("bios-no-boot", "No bootable device", "firmware"),
+    ("bios-boot-failed", "Boot failed", "firmware"),
+    ("seabios-notfound", "Could not read the boot disk", "firmware"),
+    ("grub-rescue", "grub rescue>", "bootloader"),
+    ("grub-no-device", "error: no such device", "bootloader"),
+    ("grub-not-found", "error: file not found", "bootloader"),
+    ("win-inaccessible-boot", "INACCESSIBLE_BOOT_DEVICE", "windows"),
+    ("win-bootmgr-missing", "BOOTMGR is missing", "windows"),
+    ("win-winload-missing", "\\Windows\\system32\\winload", "windows"),
+    ("win-bsod", "A problem has been detected", "windows"),
+)
+
+
+def cmd_boot_diagnose(lab: Any, args: Any) -> None:
+    """Diagnose a stuck boot from the guest's RAM, without entering the guest.
+
+    A guest that never finishes booting cannot be reached over the agent or a
+    usable console, but its physical memory still holds the evidence. This
+    composes two agentless primitives:
+
+      * it samples the vCPU registers twice, a moment apart, to tell a guest
+        that is wedged at a fixed instruction pointer (panic spin, HLT loop,
+        firmware dead end) from one that is still executing; and
+      * it scans guest-physical RAM for the text a failed boot leaves behind
+        (kernel panic, missing root fs, GRUB rescue, BIOS "no bootable
+        device", Windows boot errors).
+
+    It is read-only and works on any guest OS. The matched text is not audited
+    (guest RAM can contain anything); only the fact and category are.
+    """
+    import time as _time
+
+    _require_enabled(lab)
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
+    _require_running_qemu(lab, api, args.vmid)
+
+    first = _helper_json(lab, ["registers", str(args.vmid)], timeout=60)
+    _time.sleep(max(0.5, args.settle))
+    second = _helper_json(lab, ["registers", str(args.vmid)], timeout=60)
+
+    def _ip(regs: Any) -> str | None:
+        if not isinstance(regs, dict):
+            return None
+        for key in ("RIP", "EIP", "PC"):
+            if key in regs:
+                return regs[key]
+        return None
+
+    ip1, ip2 = _ip(first), _ip(second)
+    advancing = ip1 is not None and ip2 is not None and ip1 != ip2
+    if ip1 is None or ip2 is None:
+        cpu_state = "unknown"
+    elif advancing:
+        cpu_state = "executing"
+    else:
+        cpu_state = "wedged"
+
+    findings: list[dict[str, Any]] = []
+    for name, text, category in _BOOT_SIGNATURES:
+        hexneedle = text.encode("utf-8", "replace").hex()
+        result = _helper_json(
+            lab, ["scan", str(args.vmid), hexneedle, str(args.max_hits)],
+            timeout=args.timeout,
+        )
+        hits = result.get("hits", []) if isinstance(result, dict) else []
+        if hits:
+            findings.append({
+                "signature": name,
+                "category": category,
+                "text": text,
+                "hits": hits,
+            })
+
+    categories = sorted({f["category"] for f in findings})
+    if findings and cpu_state == "wedged":
+        verdict = (
+            "guest appears wedged mid-boot; RAM holds "
+            + ", ".join(categories) + " boot-failure text"
+        )
+    elif findings:
+        verdict = (
+            "boot-failure text present in RAM ("
+            + ", ".join(categories) + "); CPU still executing, so it may be "
+            "retrying or logging past a recovered error"
+        )
+    elif cpu_state == "wedged":
+        verdict = (
+            "guest is wedged at a fixed instruction pointer but no known "
+            "boot-failure text was found; capture the serial console and, if "
+            "it is a kernel, try 'memflow trace' at the current IP"
+        )
+    elif cpu_state == "executing":
+        verdict = (
+            "no boot-failure signatures found and the CPU is still executing; "
+            "the guest may simply be booting slowly"
+        )
+    else:
+        verdict = (
+            "could not read vCPU registers to classify CPU state; check "
+            "'memflow doctor' and that the guest is running"
+        )
+
+    lab.audit("memflow-boot-diagnose", lease=args.lease, vmid=args.vmid,
+              cpu_state=cpu_state, categories=categories,
+              signature_count=len(findings), sync=False)
+    print(json.dumps({
+        "vmid": args.vmid,
+        "cpu_state": cpu_state,
+        "instruction_pointer": ip1,
+        "instruction_pointer_moved": advancing,
+        "signatures_found": findings,
+        "verdict": verdict,
+    }, indent=2, sort_keys=True))
 
 
 # --------------------------------------------------------------------------- #
@@ -1178,6 +1406,21 @@ def register(sub: Any, lab: Any) -> None:
     brk.add_argument("--timeout", type=int, default=15,
                      help="seconds to wait for the breakpoint before giving up")
     brk.set_defaults(func=bind(cmd_break))
+
+    bootdiag = mf_sub.add_parser(
+        "boot-diagnose",
+        help="diagnose a stuck boot from guest RAM (no agent, any guest OS)",
+    )
+    bootdiag.add_argument("--lease", required=True)
+    bootdiag.add_argument("--vmid", type=int, required=True)
+    bootdiag.add_argument("--settle", type=float, default=1.0,
+                          help="seconds between the two register samples "
+                               "(default: 1.0)")
+    bootdiag.add_argument("--max-hits", type=int, default=4,
+                          help="max physical addresses to report per signature")
+    bootdiag.add_argument("--timeout", type=int, default=180,
+                          help="per-signature RAM scan timeout in seconds")
+    bootdiag.set_defaults(func=bind(cmd_boot_diagnose))
 
     gsetup = mf_sub.add_parser(
         "ghidra-setup", help="prepare a disposable LXC with Ghidra headless"

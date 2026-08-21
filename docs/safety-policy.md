@@ -85,6 +85,77 @@ After all leases are closed:
   secret belong in the macOS Keychain; `scripts/check-secrets.py` blocks the
   common shapes at commit time.
 
+## What a tag proves, and what owns a guest
+
+Every guest this tool creates is tagged `codex-lab;lease-<id>`. Those tags stay
+on the node for ever; the lease records that explain them do not — they are
+pruned, and on a rebuilt controller they were never there. So a tag is evidence
+that *some* lease created a guest and nothing more. **Ownership checks must not
+resolve `tag → lease file`**: on a fresh controller almost nothing resolves, and
+nearly every deliberately-kept guest would be called unowned.
+
+Ownership comes from the two things the controller actually keeps:
+
+1. **The lease record**, for the life of the lease. This is what
+   `require_lease_resource` checks before any mutation.
+2. **The retained registry** (`retained.json` under the state root), for guests
+   that outlive their lease on purpose. Written at register time for any
+   `policy = retain` resource, never pruned automatically, and cleared when the
+   guest is actually deleted.
+
+`guest inventory` prints both for every guest on the node: its tag, whether
+anything local resolves it, and whether the registry vouches for it. A guest
+this tool created that neither vouches for is **orphaned**.
+
+An orphan matters because of a deliberate interaction between two safety rules:
+cleanup only ever finalizes resources listed in a lease, and `shutdown_host()`
+refuses to power off while *any* guest is running. So one running orphan is
+invisible to every sweep and keeps the machine on indefinitely — five days, in
+the run that prompted this. `doctor` therefore fails when a running orphan
+exists, and reclamation is explicit:
+
+```bash
+proxmox-lab guest inventory --orphaned-only
+proxmox-lab cleanup-expired --orphans-only --host-change-authorized
+```
+
+`--orphans-only` does exactly that and nothing else. Plain `--reclaim-orphans`
+folds reclamation into a full expiry sweep, which in the same run finalizes
+every expired lease — deleting their guests — and then decides whether to power
+the host off. Those are much larger intentions, so they have separate flags.
+
+### "Orphaned" does not mean "abandoned"
+
+It means *this* controller has no record of the guest. A second controller — or
+one whose state directory lives elsewhere — drives guests through the same API
+token, and its lease records are not here. So a running orphan may be somebody
+else's live work.
+
+Reclamation therefore leaves a guest alone if either signal says it is in use:
+a non-stop task for it in the last 30 minutes (console, start, agent), or an
+uptime shorter than that. Stop tasks are excluded, or our own stop would make
+every later run refuse; an unreadable task log counts as in use, because not
+knowing must not resolve to stopping someone's work. `--include-active`
+overrides it. `doctor` reports such guests as `orphaned_but_active` rather than
+as a problem — they keep the host on, which is correct while they are in use.
+
+This was learned the direct way: a reclamation run stopped a ReactOS benchmark
+that another session had been screenshotting every 45 seconds, and that session
+restarted the guest 90 seconds later.
+
+Reclamation **stops, and never deletes.** Stopping is reversible and is all
+that is needed to unblock power-off; a controller that has lost the record of a
+guest cannot vouch for what is on its disk, so deleting it stays a human
+decision. Adopting one instead is the other half:
+
+```bash
+proxmox-lab guest retain --vmid 101 --purpose "Ubuntu cloud-init template"
+```
+
+That records the guest as deliberately kept — it stops being reported as an
+orphan and becomes eligible for retained backups. It changes controller state
+only; the guest is never touched.
+
 ## Recovery
 
 The macOS LaunchAgent runs `cleanup-expired` every five minutes. It makes
@@ -92,6 +163,21 @@ abandoned work eventually safe even if the calling agent crashes or loses its
 thread, and enforces the eight-hour MCP-idle shutdown threshold. A lease
 heartbeat prevents cleanup and idle shutdown during legitimate long-running
 work.
+
+Two properties of that sweep matter enough to state:
+
+- **It retries a failed cleanup.** A lease left in `cleanup_failed` — say a
+  QEMU lock timed out while stopping one guest — is picked up by every later
+  sweep until it succeeds. Finalizing is idempotent, so a resource that is
+  already gone costs nothing. Previously such a lease was skipped for ever and
+  its guests, and the host, stayed up until someone reran `lease-end` by hand.
+- **It never destroys a resource another live lease owns.** Before stopping or
+  deleting a registered guest, cleanup checks whether any other lease that is
+  still live (long-term, or not yet expired) also registers that
+  `(kind, vmid)`. If one does, the resource is left alone and reported as
+  `left_to_another_lease`. An expired claim does not shield a guest, so two
+  stale leases cannot leave one running for ever. `lease-register` also refuses
+  outright to take a guest that a live lease already owns.
 
 If an ordinary lease is stale but every registered guest is already stopped,
 use `proxmox-lab lease-abandon --lease <id> --confirm`. It verifies those

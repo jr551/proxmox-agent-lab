@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import struct
 import time
 from typing import Any
 
@@ -72,6 +73,10 @@ def _open_websocket(lab: Any, kind: str, vmid: int, proxy: dict[str, Any],
             )
         },
         timeout=timeout,
+        # Same certificate policy as the REST client: a console carries guest
+        # keystrokes and screen contents, so it must not be the one path that
+        # trusts any certificate.
+        verify_tls=bool(getattr(lab, "VERIFY_TLS", True)),
     )
 
 
@@ -103,6 +108,183 @@ class VncSession:
         self.close()
 
 
+# Proxmox's terminal path puts its own records on the same stream as the
+# guest: the websocket auth is acknowledged with a bare "OK", and the process
+# behind termproxy ('qm terminal' for a QEMU serial line, lxc-console for a
+# container) announces itself before the guest has said anything. None of it is
+# guest output, and a caller cannot tell the difference: it saves the line into
+# a boot log, matches it as a boot marker, or feeds it to a kernel debugger.
+# So it is removed here, once, for every consumer of a session.
+#
+# Observed framing on a Proxmox 9.2 node, which is why this is not a simple
+# prefix test:
+#
+#     b'OK'                                                  <- ack, no newline
+#     b'\r\n'                                                 <- may or may not
+#     b'starting serial terminal on interface serial0\r\n'    <- the record
+#     b'de' b'bian' b'@' ...                                 <- guest, byte-wise
+#
+# The ack arrives alone, the record is CRLF-terminated, blank lines and console
+# echo can precede it, and guest output is split at arbitrary byte boundaries.
+TERM_STATUS_RECORDS = (
+    re.compile(rb"starting serial terminal on interface \S+"
+               rb"(?: \(press [^)]*\))?"),
+    re.compile(rb"Connected to tty \d+"),
+    re.compile(rb"Type <Ctrl\+a q> to exit the console"
+               rb"(?:, <Ctrl\+a Ctrl\+a> to enter Ctrl\+a itself)?"),
+    # A stopped guest is reported *in the stream*: termproxy issues a ticket,
+    # the websocket opens, and 'qm terminal' writes this and exits. It is a
+    # transport answer, not something the guest printed.
+    re.compile(rb"(?:VM|CT|Container) \d+ (?:is )?not running"),
+)
+# The literal openings of the records above, used to recognise one that is
+# still arriving: a websocket read is not a record boundary.
+TERM_STATUS_PREFIXES = (
+    b"starting serial terminal on interface",
+    b"Connected to tty",
+    b"Type <Ctrl+a q> to exit the console",
+)
+# 'VM <id> not running' is deliberately absent above: its opening is short and
+# generic, and it is matched only as a complete line.
+TERM_HANDSHAKE_ACK = b"OK"
+
+# A partial is only treated as a possibly-incomplete record once it is this
+# long. Below it, output goes straight through: an interactive prompt ends
+# without a newline, and must never be held back waiting for one.
+TERM_STATUS_PREFIX_MIN = 4
+# A record is well under this. Past it, whatever is buffered is guest output
+# that merely started like one.
+TERM_STATUS_PREFIX_MAX = 256
+# How much guest output is watched for a status record before the filter stops
+# looking. The records are emitted once, at session start.
+TERM_STATUS_WINDOW = 4096
+
+
+def _is_status_record(line: bytes) -> bool:
+    cleaned = line.strip(b"\r").strip()
+    return any(
+        pattern.fullmatch(cleaned) for pattern in TERM_STATUS_RECORDS
+    )
+
+
+def _is_blank_line(line: bytes) -> bool:
+    """True for a line with no visible characters once escapes are removed.
+
+    Blank lines and bare cursor/bracketed-paste sequences arrive around the
+    status records, so they must not be mistaken for the guest's first real
+    output and end the search early.
+    """
+    return not textmode.strip_ansi(line.decode("utf-8", "replace")).strip()
+
+
+def _may_grow_into_status_record(partial: bytes) -> bool:
+    """True while `partial` could still become a complete status record."""
+    cleaned = partial.strip(b"\r")
+    if not TERM_STATUS_PREFIX_MIN <= len(cleaned) <= TERM_STATUS_PREFIX_MAX:
+        return False
+    return any(
+        prefix.startswith(cleaned) or cleaned.startswith(prefix)
+        for prefix in TERM_STATUS_PREFIXES
+    )
+
+
+class TermFilter:
+    """Remove Proxmox terminal transport records from one session's stream.
+
+    Stateful on purpose, for three reasons. The handshake acknowledgement is
+    a bare "OK" that must be recognised exactly once, so a later guest line
+    beginning "OK" is not truncated -- which the old prefix test did. A record
+    can be split across websocket reads, so an undecidable tail is held rather
+    than guessed at. And a record is not always the first thing on the stream:
+    a blank line or the console's echo can precede it, so the search runs over
+    a bounded startup window instead of stopping at the first guest byte.
+
+    Nothing is held once the window closes, so an interactive session (the
+    bridge, a debugger prompt) is never delayed by this.
+    """
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+        self._handshake_done = False
+        self._watching = True
+        self._scanned = 0
+
+    def feed(self, data: bytes) -> bytes:
+        """Return the guest bytes in `data`, holding an incomplete record."""
+        if not self._watching:
+            return data
+        self._pending += data
+        return self._drain()
+
+    def flush(self) -> bytes:
+        """Release what is held, at the end of a session.
+
+        A tail that is still a prefix of a status record is the record that was
+        already being matched, truncated by the session ending, so it is
+        dropped. Anything else is guest output and is handed over.
+        """
+        pending = bytes(self._pending)
+        self._pending.clear()
+        self._watching = False
+        if not self._handshake_done:
+            self._handshake_done = True
+            if TERM_HANDSHAKE_ACK.startswith(pending):
+                return b""
+            if pending.startswith(TERM_HANDSHAKE_ACK):
+                pending = pending[len(TERM_HANDSHAKE_ACK):]
+        if _may_grow_into_status_record(pending):
+            return b""
+        return pending
+
+    def _take_handshake(self) -> bool:
+        """Consume the auth acknowledgement. False while it is still arriving."""
+        if self._pending[:2] == TERM_HANDSHAKE_ACK:
+            del self._pending[:2]
+            if self._pending[:2] == b"\r\n":
+                del self._pending[:2]
+            elif self._pending[:1] == b"\n":
+                del self._pending[:1]
+            self._handshake_done = True
+            return True
+        if TERM_HANDSHAKE_ACK.startswith(bytes(self._pending)):
+            return False            # only "O" so far; the rest is in flight
+        self._handshake_done = True  # no ack on this stream
+        return True
+
+    def _drain(self) -> bytes:
+        if not self._handshake_done and not self._take_handshake():
+            return b""
+        out = bytearray()
+        while self._pending:
+            newline = self._pending.find(b"\n")
+            if newline == -1:
+                tail = bytes(self._pending)
+                if _may_grow_into_status_record(tail):
+                    break               # hold: the record may still complete
+                out += tail
+                self._pending.clear()
+                self._scanned += len(tail)
+                if self._scanned > TERM_STATUS_WINDOW:
+                    self._watching = False
+                break
+            line = bytes(self._pending[:newline + 1])
+            del self._pending[:newline + 1]
+            if _is_status_record(line):
+                # An LXC console emits two of these back to back, so keep
+                # looking rather than stopping at the first.
+                continue
+            out += line
+            self._scanned += len(line)
+            if not _is_blank_line(line) or self._scanned > TERM_STATUS_WINDOW:
+                # The guest has started talking: nothing more is transport.
+                self._watching = False
+                break
+        if not self._watching and self._pending:
+            out += self._pending
+            self._pending.clear()
+        return bytes(out)
+
+
 class TermSession:
     """A live Proxmox terminal session (LXC console or QEMU serial)."""
 
@@ -117,9 +299,27 @@ class TermSession:
                 "guest needs a serial device (serial0: socket) for this path.",
             )
         self.socket = _open_websocket(lab, kind, vmid, proxy, timeout)
+        self.filter = TermFilter()
+        self.last_read_was_empty = True
         # Proxmox's terminal protocol: authenticate, then set the window size.
         self.socket.send(f"{proxy['user']}:{proxy['ticket']}\n".encode())
         self.socket.send(b"1:120:40:")
+
+    def read_bytes(self, timeout: float) -> bytes:
+        """Guest bytes only. Transport records never reach the caller.
+
+        An empty return does not mean the socket was idle -- a read that
+        contained nothing but a transport record filters down to nothing -- so
+        `last_read_was_empty` records what actually arrived, for callers that
+        stop at the first gap in output.
+        """
+        raw = self.socket.read_available(timeout)
+        self.last_read_was_empty = not raw
+        return self.filter.feed(raw)
+
+    def flush_bytes(self) -> bytes:
+        """Guest bytes still held back when the session ends."""
+        return self.filter.flush()
 
     def send_line(self, text: str) -> None:
         # Proxmox's terminal frame is "0:<length>:<data>" where length counts
@@ -128,23 +328,28 @@ class TermSession:
         payload = (text + "\n").encode()
         self.socket.send(b"0:" + str(len(payload)).encode() + b":" + payload)
 
+    def send_raw(self, text: str) -> None:
+        # No trailing newline: a kernel debugger prompt (KDB, GRUB, a paused
+        # bootloader) often acts on bare characters, and appending "\n" would
+        # change their meaning.
+        payload = text.encode()
+        if payload:
+            self.socket.send(b"0:" + str(len(payload)).encode() + b":" + payload)
+
     def read(self, seconds: float) -> str:
         deadline = time.monotonic() + seconds
         chunks: list[bytes] = []
         while time.monotonic() < deadline:
-            data = self.socket.read_available(max(0.2, deadline - time.monotonic()))
+            data = self.read_bytes(max(0.2, deadline - time.monotonic()))
             if data:
                 chunks.append(data)
-            elif chunks:
+            elif self.last_read_was_empty and chunks:
+                # Stop at a real gap in guest output. A read that held only a
+                # transport record is not a gap: stopping there would drop the
+                # prompt or boot line that follows it.
                 break
-        text = b"".join(chunks).decode("utf-8", "replace")
-        # Proxmox acknowledges the terminal authentication with a bare "OK"
-        # before any guest output; it is protocol noise, not screen content.
-        if text.startswith("OK\n"):
-            text = text[3:]
-        elif text.startswith("OK"):
-            text = text[2:]
-        return text
+        chunks.append(self.flush_bytes())
+        return b"".join(chunks).decode("utf-8", "replace")
 
     def expect(self, patterns: tuple[str, ...], timeout: float = 60.0,
                poke: bool = False) -> tuple[str, str]:
@@ -158,7 +363,7 @@ class TermSession:
         buffer = ""
         last_poke = 0.0
         while time.monotonic() < deadline:
-            chunk = self.socket.read_available(1.5)
+            chunk = self.read_bytes(1.5)
             if chunk:
                 buffer += chunk.decode("utf-8", "replace")
                 for pattern in patterns:
@@ -450,14 +655,137 @@ def _model_frame(lab: Any, lease_id: str, vmid: int, rgb: bytes, width: int,
     }
 
 
+# --- screendump fallback -------------------------------------------------
+#
+# VNC is the screenshot path: it returns pixels to the controller and touches
+# nothing on the host. QEMU's own screendump exists for the cases VNC cannot
+# serve, but it *writes a file on the Proxmox host*, so it is not read-only the
+# way 'virtio monitor' is, and it needs the opt-in host SSH channel to bring
+# the PNG back. Hence: explicit, lease-scoped, PNG-only, and never the default.
+# Arbitrary monitor commands are deliberately not exposed.
+MONITOR_SCREENSHOT_ROOT = "/var/tmp/proxmox-agent-lab-screens"
+
+
+def _monitor_remote_path(lease_id: str, vmid: int) -> str:
+    """The one host path a monitor screenshot may write, built here.
+
+    Scoped to the lease so two leases cannot collide or read each other's
+    capture, and never taken from an argument: there is no way to ask this
+    command to write somewhere else on the host.
+    """
+    safe_lease = "".join(c for c in str(lease_id) if c.isalnum() or c in "-_")
+    if not safe_lease:
+        raise ValueError("a monitor screenshot needs a lease id")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"{MONITOR_SCREENSHOT_ROOT}/{safe_lease[:64]}/vm{int(vmid)}-{stamp}.png"
+
+
+def _screendump_command(remote_path: str) -> str:
+    """The only monitor command this path will ever send."""
+    if not remote_path.startswith(MONITOR_SCREENSHOT_ROOT + "/"):
+        raise ValueError(
+            f"refusing a screendump outside {MONITOR_SCREENSHOT_ROOT}"
+        )
+    if not remote_path.endswith(".png"):
+        raise ValueError("a monitor screenshot may only be written as PNG")
+    if ".." in remote_path or any(c.isspace() for c in remote_path):
+        raise ValueError(f"unsafe screendump path: {remote_path!r}")
+    return f"screendump {remote_path} -f png"
+
+
+def _png_dimensions(data: bytes) -> tuple[int, int]:
+    """Read width and height out of a PNG header, proving it is one."""
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        raise ValueError("the host did not return a PNG")
+    width, height = struct.unpack(">II", data[16:24])
+    if not width or not height:
+        raise ValueError("the host returned a PNG with no pixels")
+    return int(width), int(height)
+
+
+def _screenshot_via_monitor(lab: Any, api: Any, args: Any) -> dict[str, Any]:
+    """Capture with QEMU screendump, fetch the PNG, delete the host copy."""
+    from . import memflow
+
+    if not getattr(args, "lease", None):
+        raise _api_error(lab, "console screenshot --via monitor requires --lease")
+    if getattr(args, "ocr", False):
+        raise _api_error(
+            lab,
+            "--ocr needs the raw framebuffer; use the default --via vnc for it",
+        )
+    _require_owned_qemu(lab, args.lease, args.vmid)
+    memflow.require_host_ssh(lab)
+    remote = _monitor_remote_path(args.lease, args.vmid)
+    command = _screendump_command(remote)
+    memflow.host_mkdir(lab, remote.rsplit("/", 1)[0])
+    timeout = max(30, int(getattr(args, "timeout", 25) or 25))
+    removed = False
+    try:
+        answer = api.call(
+            "POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/monitor",
+            {"command": command},
+        )
+        # QEMU's monitor reports a refusal in the response body, not as an
+        # HTTP error, so an unsupported format or a stopped guest would
+        # otherwise look like success with no file to read.
+        if isinstance(answer, str) and answer.strip():
+            raise _api_error(
+                lab, f"QEMU screendump refused: {answer.strip()[:300]}"
+            )
+        data = memflow.host_read_bytes(lab, remote, timeout=timeout)
+    finally:
+        removed = memflow.host_remove_file(lab, remote)
+        # Best effort, and only if empty: leaves nothing of ours on the host.
+        memflow.host_remove_empty_dir(lab, remote.rsplit("/", 1)[0])
+    width, height = _png_dimensions(data)
+    target = _screenshot_path(args.vmid, getattr(args, "out", None), "-monitor")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    # The fact of the capture, never its contents: a screen can show anything.
+    lab.audit("console-screenshot", lease=args.lease, vmid=args.vmid,
+              source="monitor", width=width, height=height,
+              bytes=len(data), host_file_removed=removed, sync=False)
+    result: dict[str, Any] = {
+        "vmid": args.vmid,
+        "source": "monitor",
+        "path": str(target),
+        "width": width,
+        "height": height,
+        "bytes": len(data),
+        "host_file_removed": removed,
+        "agent_hint": (
+            "Read this PNG with vision. This capture came from QEMU, not VNC, "
+            "so it carries no text-console analysis and no stale-frame check "
+            "-- prefer the default --via vnc unless VNC itself is the problem."
+        ),
+    }
+    if not removed:
+        result["host_file_warning"] = (
+            f"could not delete {remote} on the host; remove it manually"
+        )
+    if getattr(args, "upload", False):
+        key = f"screens/vm{args.vmid}-{int(time.time())}.png"
+        s3.put_bytes(key, data, "image/png")
+        result["s3_key"] = key
+        result["s3_url"] = s3.presign(key, expires=args.url_expiry)
+    return result
+
+
 def cmd_screenshot(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
+    if getattr(args, "via", "vnc") == "monitor":
+        print(json.dumps(
+            _screenshot_via_monitor(lab, api, args), indent=2, sort_keys=True
+        ))
+        return
     with VncSession(lab, api, args.vmid) as session:
         rgb = session.client.capture(timeout=args.timeout, settle=args.settle)
         width, height = session.client.width, session.client.height
     result = _save_screenshot(
         args.vmid, rgb, width, height, args.out, state_root=lab.STATE_ROOT
     )
+    result["source"] = "vnc"
     target = Path(result["path"])
     png = target.read_bytes()
     analysis = textmode.analyse(rgb, width, height)
@@ -896,17 +1224,12 @@ def _bridge_serve(lab: Any, api: Any, kind: str, vmid: int,
     import select
 
     with TermSession(lab, api, kind, vmid) as term:
-        # The terminal handshake acknowledges auth with a bare "OK" that is
-        # protocol noise, not serial output; drop it once (with its newline
-        # when present).
-        first = term.socket.read_available(0.2)
-        if first.startswith(b"OK"):
-            first = first[3:] if first.startswith(b"OK\n") else first[2:]
-        if first and not _bridge_send_all(client, first):
-            return
+        # Transport records are filtered by the session itself, so a debugger
+        # on the other end of this socket sees exactly what the guest sent --
+        # the same stream 'console text' prints.
         client.setblocking(False)
         while True:
-            data = term.socket.read_available(0.2)
+            data = term.read_bytes(0.2)
             if data and not _bridge_send_all(client, data):
                 return
             readable, _, _ = select.select([client], [], [], 0.2)
@@ -962,39 +1285,132 @@ def cmd_bridge(lab: Any, args: Any) -> None:
         listener.close()
 
 
+# Answers from a failed attach that mean "not yet" rather than "misconfigured
+# guest" or "real API failure".
+TERM_NOT_READY_MARKERS = (
+    "not running",
+    "no such file or directory",
+    "failed to connect to",
+    "connection refused",
+)
+
+
+def _term_not_ready(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in TERM_NOT_READY_MARKERS)
+
+
+def _guest_is_running(lab: Any, api: Any, kind: str, vmid: int) -> bool:
+    """Whether the guest is running, per the API rather than the byte stream.
+
+    This has to be asked explicitly. Proxmox issues a termproxy ticket for a
+    *stopped* guest and lets the websocket open; only then does 'qm terminal'
+    write "VM <id> not running" into the stream and exit. So a successful
+    attach proves nothing about the guest, and a capture started too early
+    used to record that sentence where boot output should have been.
+    """
+    try:
+        return lab.guest_status(api, kind, vmid) == "running"
+    except lab.LabError:
+        return False
+
+
+def _attach_term(lab: Any, api: Any, kind: str, vmid: int, *,
+                 wait: float = 0.0, poll: float = 0.5) -> TermSession:
+    """Open a terminal session, optionally waiting for the guest to start.
+
+    The capture order that preserves boot output is attach first, power on
+    second. That was not executable: the terminal only carries guest output
+    once the guest is running, and attaching earlier produced a log containing
+    one transport sentence and nothing else. Waiting here makes the documented
+    order work -- the session is created as soon as the guest is up.
+
+    This narrows the gap to one poll interval; it does not close it. Only
+    'console text --from-reset' (or a bridge held open across a reset)
+    guarantees output from t=0, because the QEMU process and its serial socket
+    survive a reset.
+    """
+    deadline = time.monotonic() + max(0.0, wait)
+    while True:
+        if _guest_is_running(lab, api, kind, vmid):
+            try:
+                return TermSession(lab, api, kind, vmid)
+            except lab.LabError as exc:
+                if wait <= 0 or not _term_not_ready(exc):
+                    raise
+        elif wait <= 0:
+            raise _api_error(
+                lab,
+                f"{kind}/{vmid} is not running, so its terminal carries no "
+                "guest output. Start the guest first, or pass "
+                "--wait-for-guest SECONDS to attach as soon as it starts.",
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _api_error(
+                lab,
+                f"the serial terminal for {kind}/{vmid} did not become "
+                f"available within {wait:g}s: the guest is still not running",
+            )
+        time.sleep(min(poll, remaining))
+
+
 def cmd_text(lab: Any, args: Any) -> None:
     """Read the real terminal stream -- exact text, no OCR involved."""
     api = lab.ProxmoxAPI()
+    wait = float(getattr(args, "wait_for_guest", 0.0) or 0.0)
+    # A stopped guest still answers status/current, so the kind is resolvable
+    # before power-on; only the terminal itself has to be waited for.
     kind = args.kind or _kind_of(lab, api, args.vmid)
+    if args.from_reset:
+        # Attach the terminal session BEFORE resetting: the QEMU serial
+        # chardev streams only to a connected client, so resetting first
+        # loses the earliest boot output. A reset keeps the QEMU process
+        # (and its serial socket) alive; only the guest restarts.
+        if not args.follow:
+            raise _api_error(lab, "--from-reset requires --follow")
+        if kind != "qemu":
+            raise _api_error(lab, "--from-reset only applies to QEMU guests")
+        if not args.lease:
+            raise _api_error(lab, "--from-reset requires --lease")
+        lab.require_lease_resource(
+            lab.load_lease(args.lease), kind, args.vmid
+        )
     if args.follow:
         # Continuous capture (kernel boot logs, panic traces): read until the
         # timeout or Ctrl+C, printing each chunk as it arrives.
         import time as _time
 
         deadline = _time.monotonic() + (args.timeout if args.timeout else 3600)
-        with TermSession(lab, api, kind, args.vmid) as session:
+        with _attach_term(lab, api, kind, args.vmid, wait=wait) as session:
+            if args.from_reset:
+                api.call(
+                    "POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/reset"
+                )
+                lab.audit("console-text-from-reset", lease=args.lease,
+                          vmid=args.vmid, sync=False)
             while _time.monotonic() < deadline:
-                chunk = session.socket.read_available(1.0)
+                chunk = session.read_bytes(1.0)
                 if chunk:
-                    text = chunk.decode("utf-8", "replace")
-                    if text.startswith("OK\n"):
-                        text = text[3:]
-                    elif text.startswith("OK"):
-                        text = text[2:]
-                    print(text, end="", flush=True)
+                    print(chunk.decode("utf-8", "replace"), end="", flush=True)
+            tail = session.flush_bytes()
+            if tail:
+                print(tail.decode("utf-8", "replace"), end="", flush=True)
         return
-    with TermSession(lab, api, kind, args.vmid) as session:
-        if args.send or args.nudge:
+    with _attach_term(lab, api, kind, args.vmid, wait=wait) as session:
+        if args.send or args.send_raw or args.nudge:
             # Sending even a blank line mutates the guest console.
             if not args.lease:
                 raise _api_error(
-                    lab, "--send and --nudge require --lease"
+                    lab, "--send, --send-raw and --nudge require --lease"
                 )
             lab.require_lease_resource(
                 lab.load_lease(args.lease), kind, args.vmid
             )
             if args.send:
                 session.send_line(args.send)
+            elif args.send_raw:
+                session.send_raw(args.send_raw)
             else:
                 session.send_line("")
         output = session.read(args.seconds)
@@ -1399,6 +1815,14 @@ def register(sub: Any, lab: Any) -> None:
     shot.add_argument("--url-expiry", type=int, default=3600)
     shot.add_argument("--ocr", action="store_true",
                       help="decode text-mode screens; refused on graphical screens")
+    shot.add_argument(
+        "--via", choices=("vnc", "monitor"), default="vnc",
+        help="capture path: 'vnc' (default) reads pixels over the console; "
+             "'monitor' uses QEMU screendump on the host, which writes a "
+             "lease-scoped temporary PNG there and needs --lease plus the "
+             "opt-in [memflow] host SSH channel to fetch and delete it",
+    )
+    shot.add_argument("--lease", help="required with --via monitor")
     shot.set_defaults(func=bind(cmd_screenshot))
 
     burst = console_sub.add_parser(
@@ -1519,14 +1943,35 @@ def register(sub: Any, lab: Any) -> None:
     text.add_argument("--follow", action="store_true",
                       help="stream serial output continuously (boot/panic logs)")
     text.add_argument("--send", help="send this line first, then read the reply")
+    text.add_argument("--send-raw",
+                      help="send exactly these characters with no trailing "
+                           "newline (kernel-debugger prompts such as KDB act "
+                           "on bare characters)")
     text.add_argument("--nudge", action="store_true",
                       help="send a bare newline to redraw the prompt")
+    text.add_argument("--from-reset", action="store_true",
+                      help="with --follow: attach the serial session first, "
+                           "then reset the guest, so output from t=0 is "
+                           "captured (requires --lease; QEMU only)")
+    text.add_argument(
+        "--wait-for-guest", type=float, default=0.0, metavar="SECONDS",
+        help="wait up to this long for the guest's serial terminal to exist, "
+             "so a capture can be started before the guest is powered on",
+    )
     text.add_argument("--lease")
     text.set_defaults(func=bind(cmd_text))
 
     bridge = console_sub.add_parser(
         "bridge",
         help="expose a guest serial console on a local TCP port (debuggers)",
+        description="Bidirectional pipe between a local TCP port and the "
+                    "guest serial console: bytes you type reach the guest "
+                    "(e.g. a KDB prompt), and guest output streams back. "
+                    "Tip: 'reset' restarts only the guest -- the QEMU "
+                    "process and its serial socket stay alive, so a "
+                    "connected bridge survives resets and captures output "
+                    "from t=0. A stop/start replaces the QEMU process and "
+                    "drops the bridge.",
     )
     bridge.add_argument("--lease", required=True)
     bridge.add_argument("--vmid", type=int, required=True)

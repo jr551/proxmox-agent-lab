@@ -33,9 +33,86 @@ available), mounted at `/mnt/pve/<name>`, registered as directory storage and
 set to hold `images,iso,vztmpl,import,backup,snippets`. Use `--content` to
 narrow that.
 
+All of that is the contract, so a partial result **exits non-zero**: if the
+storage is created but setting its content types fails, the JSON is still
+printed (with `content_configured: false` and the reason) and then the command
+fails, because a caller that read exit 0 would go on to upload content the
+storage will not accept. The disk is already formatted at that point, so
+finish it with `storage set-content` rather than rerunning `add-disk`, which
+would erase it again:
+
+```bash
+proxmox-lab storage set-content --lease "$L" --name bulk \
+  --content images,iso,vztmpl,import,backup,snippets \
+  --host-change-authorized
+```
+
 A slow bulk disk such as a USB drive is a good home for install media, imported
 cloud images and backups. Keep running guest disks on `local-lvm`; a USB disk
 is fine for cold storage but will make a booted VM feel slow.
+
+## Fast or bulk: `storage status` says which
+
+`storage status` reports a `class` for every storage — `bulk` for the one named
+in `[storage] bulk_storage`, `fast` for everything else — so a caller can
+branch without hardcoding a site's storage id.
+
+The distinction is not cosmetic. The lab's USB directory store measured about
+**25 MB/s** sequential write, so a guest whose disk lives there is I/O-bound on
+the cable. A live virtio-vs-IDE comparison was run with both guests' disks on
+exactly that store, and mostly measured the USB bus.
+
+So a write that would put a *guest disk* on the bulk store prints a warning:
+
+```
+warning: scsi0=usb-bulk:100 puts a guest disk on 'usb-bulk', the configured
+bulk store. It is the right home for ISOs and cold images, not for a running
+or benchmarked guest -- 'storage status' reports class fast|bulk. Pass
+--slow-storage-accepted to silence this.
+```
+
+An ISO *mounted* from the bulk store (`media=cdrom`) is not warned about: that
+is the recommended arrangement. Pass `--slow-storage-accepted` when a slow
+guest disk is genuinely what you want.
+
+## Reclaiming unreferenced images: `storage gc`
+
+Failed creates, and guests destroyed outside a lease, leave disk images behind
+that no config points at. Finding them safely is the hard part, so `gc`
+**reports by default and deletes nothing**:
+
+```bash
+proxmox-lab storage gc                      # what is unreferenced?
+proxmox-lab storage gc --delete --host-change-authorized
+```
+
+It lists every volume on the node's images-capable storage, then checks it
+against every guest config on the node. The check is deliberately blunt — every
+string value of every config key is searched, so a volume referenced as
+`usb-bulk:9002/vm-9002-disk-0.raw,iothread=1,size=100G` is recognised — because
+a false "orphan" here would authorise deleting a disk that is in use. Missing a
+real orphan only means it is reported next time.
+
+Three more guards worth knowing:
+
+- **Snapshots are read too, and that is not optional.** A snapshot's `vmstate`
+  volume (`vm-<id>-state-<name>`) is listed by the storage as ordinary `images`
+  content but appears *only* in the snapshot's own config, so a live-config-only
+  scan would have offered to delete the thing a rollback needs.
+- If any guest config or snapshot cannot be read, **nothing** is classified: a
+  volume it referenced would otherwise look unreferenced.
+- `--delete` only removes volumes that the *same run* found unreferenced;
+  nothing is carried over from an earlier report.
+
+Every deletion is audited with its volid, provisioned size and on-disk size.
+
+**Read the right number before deleting anything.** The report distinguishes
+`orphaned_provisioned_gb` from `orphaned_on_disk_gb`, and only the second is
+returned by a deletion. On the lab node the first run found 4 unreferenced
+qcow2 images provisioned at 51.54 GB that held **9.33 MB** between them — three
+creates that failed almost immediately. Deleting them was the right tidy-up and
+reclaimed essentially no space; treating the provisioned figure as free space
+would have made an irreversible act look worthwhile when it was not.
 
 ## Fetching cloud images
 

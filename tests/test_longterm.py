@@ -11,6 +11,16 @@ os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(
     Path(__file__).parent / "fixtures" / "config.toml"
 )
 
+import shutil
+import tempfile
+# ...and at a disposable state directory: a test must never write into the
+# developer's real controller state. Cleared here so a previous run cannot
+# leak into this one; imports all happen before any test runs.
+_TEST_STATE = Path(tempfile.gettempdir()) / "proxmox-agent-lab-test-state"
+shutil.rmtree(_TEST_STATE, ignore_errors=True)
+_TEST_STATE.mkdir(parents=True, exist_ok=True)
+os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
+
 import json  # noqa: E402
 import sys  # noqa: E402
 import tempfile  # noqa: E402
@@ -268,20 +278,165 @@ class ExpiryTests(unittest.TestCase):
         lease = make_lease(id="20260101000000-33333333", kind="long-term",
                            expires_at=None)
         with tempfile.TemporaryDirectory() as tmp:
-            old_root, LAB.LEASE_ROOT = LAB.LEASE_ROOT, Path(tmp)
+            # A retain registration also writes the retained registry under
+            # STATE_ROOT, so both roots have to be redirected here.
+            old_roots = (LAB.LEASE_ROOT, LAB.STATE_ROOT)
+            LAB.LEASE_ROOT, LAB.STATE_ROOT = Path(tmp), Path(tmp)
             try:
                 LAB.register_resource(lease, "qemu", 9001, "retain", "box")
             finally:
-                LAB.LEASE_ROOT = old_root
+                LAB.LEASE_ROOT, LAB.STATE_ROOT = old_roots
         self.assertIsNone(lease["expires_at"])
         self.assertEqual(lease["resources"][0]["policy"], "retain")
 
     def test_registering_a_guest_does_extend_an_ordinary_lease(self) -> None:
         lease = make_lease(id="20260101000000-44444444", expires_at=None)
         with tempfile.TemporaryDirectory() as tmp:
-            old_root, LAB.LEASE_ROOT = LAB.LEASE_ROOT, Path(tmp)
+            old_roots = (LAB.LEASE_ROOT, LAB.STATE_ROOT)
+            LAB.LEASE_ROOT, LAB.STATE_ROOT = Path(tmp), Path(tmp)
             try:
                 LAB.register_resource(lease, "qemu", 9001, "delete", "box")
             finally:
-                LAB.LEASE_ROOT = old_root
+                LAB.LEASE_ROOT, LAB.STATE_ROOT = old_roots
         self.assertIsNotNone(lease["expires_at"])
+
+
+class RetainedBackupTests(unittest.TestCase):
+    """Found live: no long-term lease existed, so nothing had ever been backed
+    up -- while the node held templates worth hours of rebuild each."""
+
+    def _lab(self, tmp: str) -> mock.Mock:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        lab.STATE_ROOT = Path(tmp)
+        lab.utc_now.return_value = dt.datetime(
+            2026, 8, 21, tzinfo=dt.timezone.utc
+        )
+        lab.iso_now.return_value = "2026-08-21T00:00:00Z"
+        lab.wait_task.return_value = {"exitstatus": "OK"}
+        return lab
+
+    def _register(self, tmp: str, *vmids: int, last: str | None = None) -> None:
+        from proxmox_agent_lab import inventory as inventory_module
+
+        for vmid in vmids:
+            inventory_module.record(
+                Path(tmp), kind="qemu", vmid=vmid, lease="20260801000000-aaaa",
+                now="2026-08-01T00:00:00Z", purpose="template",
+            )
+            if last:
+                inventory_module.mark_backup(Path(tmp), "qemu", vmid, last)
+
+    def test_a_never_backed_up_retained_guest_is_due(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab(tmp)
+            self._register(tmp, 9101, 9102)
+            due = longterm.retained_due(
+                lab, now=lab.utc_now(), interval_days=7
+            )
+        self.assertEqual([x["vmid"] for x in due], [9101, 9102])
+
+    def test_a_recent_backup_is_not_repeated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab(tmp)
+            self._register(tmp, 9101, last="2026-08-20T00:00:00Z")
+            self._register(tmp, 9102, last="2026-07-01T00:00:00Z")
+            due = longterm.retained_due(
+                lab, now=lab.utc_now(), interval_days=7
+            )
+        self.assertEqual([x["vmid"] for x in due], [9102], "only the stale one")
+
+    def test_a_successful_backup_is_recorded_for_coverage(self) -> None:
+        from proxmox_agent_lab import inventory as inventory_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab(tmp)
+            self._register(tmp, 9101)
+            api = mock.Mock()
+            api.call.return_value = "UPID:x"
+            result = longterm.backup_retained(
+                lab, api, storage="usb-bulk", keep=2, timeout=60,
+                interval_days=7,
+            )
+            recorded = inventory_module.entries(Path(tmp))["qemu/9101"]
+        self.assertEqual(result["backed_up"], 1)
+        self.assertEqual(recorded["last_backup_at"], "2026-08-21T00:00:00Z")
+        sent = api.call.call_args.args[2]
+        self.assertEqual(sent["mode"], "snapshot", "a running guest stays up")
+        self.assertEqual(sent["prune-backups"], "keep-last=2")
+        self.assertEqual(sent["storage"], "usb-bulk")
+
+    def test_a_failed_backup_leaves_the_coverage_gap_visible(self) -> None:
+        from proxmox_agent_lab import inventory as inventory_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab(tmp)
+            self._register(tmp, 9101)
+            api = mock.Mock()
+            api.call.side_effect = RuntimeError("no space left on device")
+            result = longterm.backup_retained(
+                lab, api, storage="usb-bulk", keep=2, timeout=60,
+                interval_days=7,
+            )
+            recorded = inventory_module.entries(Path(tmp))["qemu/9101"]
+        self.assertEqual(result["failed"], 1)
+        self.assertIsNone(recorded["last_backup_at"],
+                          "a failure must not look like coverage")
+
+    def test_the_sweep_is_off_unless_configured(self) -> None:
+        self.assertFalse(longterm.retained_backup_enabled())
+
+    def test_the_command_refuses_to_run_while_disabled(self) -> None:
+        import argparse
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = self._lab(tmp)
+            self._register(tmp, 9101)
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            args = argparse.Namespace(
+                retained=True, storage=None, keep=None, interval_days=7,
+                force=False, timeout=60,
+            )
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                longterm.cmd_backup(lab, args)
+            api.call.assert_not_called()
+        self.assertIn("retained_backup", out.getvalue())
+
+
+class RetainedCoverageReportTests(unittest.TestCase):
+    def test_doctor_reports_guests_that_have_never_been_backed_up(self) -> None:
+        from proxmox_agent_lab import inventory as inventory_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = LAB.STATE_ROOT
+            LAB.STATE_ROOT = Path(tmp)
+            try:
+                inventory_module.record(Path(tmp), kind="qemu", vmid=9101,
+                                        lease="20260801000000-aaaa",
+                                        now="2026-08-01T00:00:00Z")
+                inventory_module.record(Path(tmp), kind="qemu", vmid=9102,
+                                        lease="20260801000000-aaaa",
+                                        now="2026-08-01T00:00:00Z")
+                inventory_module.mark_backup(Path(tmp), "qemu", 9102,
+                                            "2026-08-19T00:00:00Z")
+                coverage = LAB.retained_backup_coverage()
+            finally:
+                LAB.STATE_ROOT = old
+        self.assertEqual(coverage["retained_guests"], 2)
+        self.assertEqual(coverage["never_backed_up"], [9101])
+        self.assertFalse(coverage["sweep_enabled"])
+        self.assertIn("no backup", coverage["note"])
+
+    def test_no_retained_guests_means_nothing_to_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = LAB.STATE_ROOT
+            LAB.STATE_ROOT = Path(tmp)
+            try:
+                self.assertEqual(LAB.retained_backup_coverage(), {})
+            finally:
+                LAB.STATE_ROOT = old

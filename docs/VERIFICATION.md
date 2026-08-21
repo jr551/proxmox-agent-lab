@@ -32,6 +32,59 @@ Read it as a statement of confidence, not a feature list. Anything marked
 | Compiled pin-check patch | A live conditional branch in a disposable test client was patched in RAM and the client changed behaviour without a restart |
 | Guarded GUI click | On Haiku VM 9060, `Installer` at `(900,700)` was rejected with `clicked: false`; the cursor on `Install Haiku` at `(781,582)` was independently accepted, clicked once, and the returned frame changed to `Welcome to the Haiku Installer!` |
 
+### The 2026-08-21 fix round, checked against the node
+
+Each of these was reproduced with the released build first, then re-run with
+the fix, on a Proxmox 9.2 node and its real controller state:
+
+| Fix | Before | After |
+|---|---|---|
+| Serial stream carried transport text | `console text` on a running guest returned `text: "starting serial terminal on interface serial0\n"` | The same read returns `""`; the record is gone across repeated attachments |
+| Serial stream on a **stopped** guest | returned `text: "VM 9231 not running\n"` and **exit 0** — a capture that looked successful | exits 1 with `qemu/9231 is not running … pass --wait-for-guest` |
+| Attach before power-on | not executable; the log held one transport sentence | capture started while stopped, waited, attached at power-on, and recorded `Booting from Hard Disk…`, `GRUB loading.`, `Linux version 6.12.101…` — 548 lines from t=0, with no transport records |
+| Real guest text still arrives | — | a nudged serial console returned `debian@…:~$ ` intact; removing the record does not remove the prompt after it |
+| Console WebSocket certificate policy | opened regardless of `verify_tls` | `verify_tls=true` → `SSLCertVerificationError` against the self-signed node; `verify_tls=false` → opens |
+| `upload` certificate policy | always `--insecure` | curl without `--insecure` refuses this node (`SSL certificate problem`), with it connects |
+| `journal` on a JSONL backend | reported the SQLite database and returned `[]` for a query | summary over the real mirror: 2,607 events in 15 files, 89 leases, correct first/last timestamps; `--event 'lease-*'` returned real records newest-first |
+| `doctor` on a broken audit mirror | reported one problem, no mirror status | reports `audit.git_status.problem = "checkout is dirty…"` and `audit.spooled_records` |
+| Expiry sweep scope | considered 1 lease, skipping a `cleanup_failed` one 7 days old whose guest was still running | considers both; the dry run showed the stale lease's `qemu/9211 running -> would delete` |
+
+Two bugs in the first attempt at these fixes were found only by running them
+on the node, and are worth recording because a fake would not have caught
+either: the transport record is **not** always the first thing on the stream
+(a blank line precedes it, which ended the search early), and a read
+containing only a transport record looks exactly like an idle socket, so the
+capture stopped at it and lost the prompt that followed. Proxmox also issues a
+termproxy ticket for a *stopped* guest and reports the refusal in the byte
+stream rather than as an API error, so the attach retry has to ask
+`status/current` instead of trusting a successful attach.
+
+### The 2026-08-21 retained-lifecycle round, checked against the node
+
+| Fix | What the node actually showed |
+|---|---|
+| Orphan detection | `guest inventory` over 26 real guests: 19 resolved to a lease record, **6 were orphaned** (4 running), 1 was not this tool's. The running set — 106, 9242, 9243, 9244, 9999 — is why the node had been up for five days |
+| `doctor` fails on a running orphan | `5 running guest(s) carry a lease tag this controller has no record of … the host cannot power off: 106, 9242, 9243, 9244, 9999` |
+| `storage gc` | Reported 4 unreferenced qcow2 images on the bulk store (VMIDs 9180, 9190, 9200 — guests long gone), while correctly keeping 43 referenced volumes. Nothing was deleted: reporting is the default. They were **provisioned at 51.54 GB but held 9.33 MB**, which is why the report now separates the two figures |
+| `storage status` class | `usb-bulk` → `bulk`, `local` and `local-lvm` → `fast` |
+| `doctor --host-checks` | `updates_pending: 78`, `security_updates: true`, `reboot_required: false` over the host SSH channel |
+| Retained registry round trip | `guest retain --vmid 101` recorded the template, `doctor` then reported `never_backed_up: [101]` with the coverage note, `backup --retained` correctly refused while disabled, and `--forget` restored an empty registry |
+
+Running the reclamation for real also surfaced the limit of the orphan
+heuristic: it stopped `qemu/9243` and `qemu/9244`, ReactOS benchmark guests
+that a *different* controller session was driving over VNC through the same API
+token. Stopping (never deleting) meant it was recoverable, and that session
+restarted 9244 within 90 seconds — but the guard added in 0.9.3 exists because
+of it, not in anticipation of it.
+
+A test-hygiene bug surfaced only because of this hardware check, and is worth
+recording: `register_resource` began writing the retained registry under
+`STATE_ROOT`, and one pre-existing test did not redirect that root — so running
+the suite put a bogus retained guest (`qemu/9001`, purpose "test") into the
+developer's **live** controller state, where an enabled backup sweep would have
+picked it up. Every test module now points `PROXMOX_AGENT_LAB_STATE` at a
+disposable directory, and a guard test asserts it.
+
 ### Security properties, checked rather than assumed
 
 These were tested by looking for the secret afterwards, not by reading the code:
@@ -93,6 +146,30 @@ Not yet watched working end to end on hardware:
 - USB capture against a real passed-through device
 - Passive guest network capture and end-to-end TLS interception
 - Ghidra analysis and multi-step live tracing through the memflow helpers
+- `console screenshot --via monitor`: the QEMU `screendump` fallback. On the
+  lab node the guards, the SSH channel and the host cleanup all ran, but
+  Proxmox refused the monitor endpoint itself — `Permission check failed
+  (/vms/9004, Sys.Audit|Sys.Modify)` — so no PNG has been fetched off a real
+  node this way. The lab token is `PVEVMAdmin`-scoped by design; this fallback
+  needs a privilege it does not have.
+- `[proxmox] verify_tls = true` completing a handshake against a *trusted*
+  certificate. Both switch positions were exercised on the node (see below),
+  but it still serves the self-signed certificate a fresh install ships with,
+  so the verified path has only ever been observed refusing.
+- `storage add-disk` failing non-zero when content configuration fails: the
+  exit status and the preserved partial result are unit-tested only. Forcing
+  it on hardware would mean reformatting a disk.
+- Ownership-aware and retrying `cleanup-expired` was verified as a decision
+  (see below), not as an execution: actually running the sweep would have
+  deleted live guests and powered the host off.
+- `cleanup-expired --reclaim-orphans`: the orphans it would stop were listed on
+  the real node, but the stop itself was not run — those guests are live work.
+- `storage gc --delete`: the 51.54 GB it would remove was reported on the real
+  node; the deletion was left for a human.
+- The bulk-storage warning on a guest disk: unit-tested only. Firing it for
+  real means attaching a disk to a live guest.
+- `backup --retained` actually writing a vzdump archive: refused-while-disabled
+  was verified, the write itself was not. It is gigabytes to a slow disk.
 
 ## 🔁 Reproducing this
 

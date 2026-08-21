@@ -10,6 +10,16 @@ from unittest import mock
 os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(
     Path(__file__).parent / "fixtures" / "config.toml"
 )
+
+import shutil
+import tempfile
+# ...and at a disposable state directory: a test must never write into the
+# developer's real controller state. Cleared here so a previous run cannot
+# leak into this one; imports all happen before any test runs.
+_TEST_STATE = Path(tempfile.gettempdir()) / "proxmox-agent-lab-test-state"
+shutil.rmtree(_TEST_STATE, ignore_errors=True)
+_TEST_STATE.mkdir(parents=True, exist_ok=True)
+os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import vision  # noqa: E402

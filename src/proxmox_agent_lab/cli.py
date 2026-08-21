@@ -32,6 +32,7 @@ from urllib import error, parse, request
 
 from . import __version__
 from . import config as config_module
+from . import inventory as inventory_module
 from . import power as power_module
 from . import journal as journal_module
 from . import pocketbase as pocketbase_module
@@ -195,6 +196,25 @@ def controller_lock() -> Any:
         yield
 
 
+@contextlib.contextmanager
+def sweep_lock(name: str) -> Any:
+    """A non-blocking lock for work that runs long and must not stack up.
+
+    A backup can run for hours. It must not hold the controller lock, or every
+    lease operation queues behind it, and a watchdog firing every five minutes
+    must not start a second copy of the same vzdump. So this is separate and
+    non-blocking: yields False when a previous sweep still holds it.
+    """
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    with (STATE_ROOT / f"{name}.lock").open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+
+
 def sync_repo(record: dict[str, Any], suffix: str) -> None:
     """Optionally copy one audit record to a private git log repository.
 
@@ -284,6 +304,87 @@ def _pocketbase_password_auth(
         raise LabError(str(exc)) from None
 
 
+# A nonrenewable token cannot be refreshed, so once it lapses every journal
+# read and audit write fails hard. Warn well before that happens.
+_NONRENEWABLE_TOKEN_WARNING_SECONDS = 48 * 3600
+
+
+def _warn_if_token_nonrenewable(token: str) -> None:
+    claims = pocketbase_module.token_claims(token)
+    if claims.get("refreshable") is not False:
+        return
+    expiry = claims.get("exp")
+    if isinstance(expiry, bool) or not isinstance(expiry, (int, float)):
+        return
+    remaining = expiry - time.time()
+    if remaining > _NONRENEWABLE_TOKEN_WARNING_SECONDS:
+        return
+    hours = max(0.0, remaining) / 3600
+    print(
+        "notice: the PocketBase audit token is nonrenewable and expires in "
+        f"{hours:.1f}h; run 'proxmox-lab journal --provision-pocketbase-agent' "
+        "to switch to a renewable agent, or store the pocketbase-agent-email "
+        "and pocketbase-agent-password secrets so expiry can re-authenticate",
+        file=sys.stderr,
+    )
+
+
+def _provision_pocketbase_agent(
+    superuser: pocketbase_module.Client,
+) -> dict[str, Any]:
+    """Create (or rotate) the permanent restricted audit agent.
+
+    Stores the agent's password credentials and its fresh token in the
+    configured secret store, so expiry can always re-authenticate.
+    """
+    agent_collection = str(
+        CONFIG.audit.get("pocketbase_agent_collection")
+        or "proxmox_lab_agents"
+    ).strip()
+    try:
+        identity = secrets_store.get(
+            CONFIG, "pocketbase-agent-email", required=False
+        )
+        password = secrets_store.get(
+            CONFIG, "pocketbase-agent-password", required=False
+        )
+    except secrets_store.SecretError as exc:
+        raise LabError(str(exc)) from None
+    if bool(identity) != bool(password):
+        raise LabError(
+            "PocketBase agent credentials are incomplete; store both "
+            "'pocketbase-agent-email' and 'pocketbase-agent-password', "
+            "or remove both before provisioning."
+        )
+    rotate_existing = not identity
+    if not identity:
+        identity, password = pocketbase_module.Client.new_agent_credentials()
+        try:
+            secrets_store.store(CONFIG, "pocketbase-agent-email", identity)
+            secrets_store.store(
+                CONFIG, "pocketbase-agent-password", password
+            )
+        except secrets_store.SecretError as exc:
+            raise LabError(str(exc)) from None
+    result = superuser.provision_agent(
+        agent_collection,
+        identity,
+        password,
+        rotate_existing=rotate_existing,
+    )
+    try:
+        _url, _collection, token_secret, _timeout, _refresh = (
+            _pocketbase_settings()
+        )
+        secrets_store.store(CONFIG, token_secret, result["token"])
+    except secrets_store.SecretError as exc:
+        raise LabError(
+            "PocketBase agent was provisioned but its token could not be "
+            "stored: " + str(exc)
+        ) from None
+    return result
+
+
 def pocketbase_client() -> pocketbase_module.Client:
     url, collection, secret_name, timeout, refresh_before = _pocketbase_settings()
     try:
@@ -292,6 +393,33 @@ def pocketbase_client() -> pocketbase_module.Client:
     except (ValueError, secrets_store.SecretError) as exc:
         raise LabError(str(exc)) from None
     auth_collection = pocketbase_module.token_auth_collection(token)
+    if auth_collection == "_superusers":
+        # A superuser token pasted into the audit slot is over-privileged
+        # and, in practice, short-lived. Convert it once into a permanent
+        # least-privileged agent with password re-authentication, store the
+        # agent token in its place, and use that from here on.
+        try:
+            result = _provision_pocketbase_agent(client)
+        except pocketbase_module.PocketBaseError as exc:
+            raise LabError(
+                "the stored audit token is a PocketBase superuser token, and "
+                "converting it into a permanent restricted agent failed: "
+                + str(exc)
+            ) from None
+        try:
+            client = pocketbase_module.Client(
+                url, result["token"], collection, timeout=timeout
+            )
+        except ValueError as exc:
+            raise LabError(str(exc)) from None
+        print(
+            "notice: the stored audit token was a PocketBase superuser "
+            "token; a permanent least-privileged agent was provisioned in "
+            f"collection {result['agent_collection']!r} and its renewable "
+            "token now replaces the superuser token in the secret store",
+            file=sys.stderr,
+        )
+        return client
     if (
         auth_collection is not None
         and pocketbase_module.token_expires_within(
@@ -324,6 +452,7 @@ def pocketbase_client() -> pocketbase_module.Client:
             )
         except ValueError as exc:
             raise LabError(str(exc)) from None
+    _warn_if_token_nonrenewable(client.token)
     return client
 
 
@@ -343,6 +472,31 @@ def pocketbase_superuser_client() -> pocketbase_module.Client:
         raise LabError(str(exc)) from None
 
 
+def _audit_spool_path() -> Path:
+    return JOURNAL_ROOT / "spool.jsonl"
+
+
+def _spool_audit_event(record: dict[str, Any], reason: str) -> None:
+    """Keep an already-redacted event locally when the backend rejects it.
+
+    Losing audit credentials mid-session must not force abandoning the tool:
+    the event is preserved append-only and uploaded later with
+    'journal --flush-spool'.
+    """
+    path = _audit_spool_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    print(
+        f"notice: audit backend unavailable ({reason}); event "
+        f"{record.get('event')!r} spooled to {path}. Fix the credentials "
+        "(e.g. 'proxmox-lab secrets set "
+        f"{_pocketbase_token_secret_name()}'), then upload the backlog with "
+        "'proxmox-lab journal --flush-spool'",
+        file=sys.stderr,
+    )
+
+
 def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
     now = utc_now()
     record = {
@@ -351,25 +505,29 @@ def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
         **redact(fields),
     }
     client: pocketbase_module.Client | None = None
+    spooled = False
     if AUDIT_BACKEND == "pocketbase":
         record["event_id"] = uuid.uuid4().hex
         record["controller"] = str(
             CONFIG.audit.get("controller_id") or socket.gethostname()
         )
-        client = pocketbase_client()
-    try:
-        journal_module.append(
-            JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
-        )
-    except pocketbase_module.PocketBaseError as exc:
-        if exc.status in (401, 403):
-            raise LabError(
-                "audit ledger rejected the event: "
-                f"PocketBase HTTP {exc.status} (the stored audit token is "
-                "invalid or expired). Refresh it with: proxmox-lab secrets set "
-                f"{_pocketbase_token_secret_name()}"
-            ) from None
-        raise
+        # An expired or nonrenewable token must not abort the action being
+        # audited; the git-synced JSONL mirror below still records it and the
+        # event is spooled for a later '--flush-spool'.
+        try:
+            client = pocketbase_client()
+        except LabError as exc:
+            _spool_audit_event(record, str(exc))
+            spooled = True
+    if not spooled:
+        try:
+            journal_module.append(
+                JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
+            )
+        except pocketbase_module.PocketBaseError as exc:
+            if exc.status not in (401, 403):
+                raise
+            _spool_audit_event(record, f"PocketBase HTTP {exc.status}")
     if sync:
         sync_repo(record, event)
 
@@ -666,11 +824,21 @@ def _delete_guest(
     wait_task(api, upid, timeout=180)
 
 
+def _forget_retained(kind: str, vmid: int) -> None:
+    """Keep the registry honest: a guest that is gone is not retained."""
+    try:
+        inventory_module.forget(STATE_ROOT, kind, vmid)
+    except OSError:
+        pass
+
+
 def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
     try:
         _delete_guest(api, kind, vmid, destroy_unreferenced_disks=True)
+        _forget_retained(kind, vmid)
     except LabError as exc:
         if _guest_is_gone(exc):
+            _forget_retained(kind, vmid)
             return
         if not _storage_io_error(exc):
             raise
@@ -679,8 +847,10 @@ def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
             # configured storage. An unrelated failed device must not strand
             # a lease whose guest can otherwise be deleted.
             _delete_guest(api, kind, vmid, destroy_unreferenced_disks=False)
+            _forget_retained(kind, vmid)
         except LabError as retry_exc:
             if _guest_is_gone(retry_exc):
+                _forget_retained(kind, vmid)
                 return
             raise LabError(
                 f"Could not delete {kind}/{vmid} after retrying without "
@@ -689,16 +859,80 @@ def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
             ) from retry_exc
 
 
-def active_leases(excluding: str | None = None) -> list[dict[str, Any]]:
+def _leases_in_states(
+    states: tuple[str, ...], excluding: str | None = None
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for path in sorted(LEASE_ROOT.glob("*.json")) if LEASE_ROOT.exists() else []:
         try:
             lease = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if lease.get("state") == "active" and lease.get("id") != excluding:
+        if lease.get("state") in states and lease.get("id") != excluding:
             result.append(lease)
     return result
+
+
+def active_leases(excluding: str | None = None) -> list[dict[str, Any]]:
+    return _leases_in_states(("active",), excluding)
+
+
+def cleanup_candidate_leases() -> list[dict[str, Any]]:
+    """Leases a sweep is allowed to finalize.
+
+    `cleanup_failed` is included on purpose. A transient QEMU lock while
+    stopping one guest used to take a lease out of every later sweep, leaving
+    its guests -- and so the host -- running until somebody reran `lease-end`
+    by hand with the exact lease id. Finalizing is idempotent, so retrying an
+    already-cleaned resource costs nothing and the fail-closed guarantee holds.
+    """
+    return _leases_in_states(("active", "cleanup_failed"))
+
+
+def lease_claims(lease: dict[str, Any], kind: str, vmid: int) -> bool:
+    """True when `lease` lists (kind, vmid) among its resources."""
+    for item in lease.get("resources", []):
+        try:
+            if item.get("kind") == kind and int(item.get("vmid")) == int(vmid):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def lease_is_live(lease: dict[str, Any], now: dt.datetime | None = None) -> bool:
+    """True while a lease still holds a claim on its resources.
+
+    A long-term lease always does. An ordinary one does until it expires:
+    after that the watchdog may clean it up, so it must not simultaneously be
+    able to shield a resource from cleanup for ever.
+    """
+    if lease.get("state") != "active":
+        return False
+    if is_long_term(lease):
+        return True
+    expires = lease.get("expires_at")
+    if not expires:
+        return True
+    try:
+        return parse_expiry(str(expires)) > (now or utc_now())
+    except (TypeError, ValueError):
+        return True
+
+
+def resource_owner_elsewhere(
+    lease_id: str, kind: str, vmid: int, *, now: dt.datetime | None = None
+) -> str | None:
+    """The id of another *live* lease that also owns (kind, vmid), if any.
+
+    Registration does not stop two leases from listing the same guest -- a
+    VMID can be handed to a newer lease while an older one still names it --
+    so ownership is resolved at cleanup time, before anything destructive.
+    """
+    for other in active_leases(excluding=lease_id):
+        if lease_claims(other, kind, vmid) and lease_is_live(other, now):
+            return str(other.get("id"))
+    return None
 
 
 def is_long_term(lease: dict[str, Any]) -> bool:
@@ -715,6 +949,46 @@ def lease_requires_cleanup(lease: dict[str, Any]) -> bool:
         resource.get("policy", "delete") == "delete"
         for resource in lease.get("resources", [])
     )
+
+
+def all_lease_ids() -> set[str]:
+    """Every lease id the controller still holds a record for, any state."""
+    ids: set[str] = set()
+    for path in sorted(LEASE_ROOT.glob("*.json")) if LEASE_ROOT.exists() else []:
+        try:
+            lease = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if lease.get("id"):
+            ids.add(str(lease["id"]))
+    return ids
+
+
+def node_guests(api: ProxmoxAPI) -> list[dict[str, Any]]:
+    return [
+        item for item in (api.call("GET", "/cluster/resources", {"type": "vm"}) or [])
+        if isinstance(item, dict) and "vmid" in item
+    ]
+
+
+def describe_guests(api: ProxmoxAPI) -> list[dict[str, Any]]:
+    """Every guest on the node, with what the controller can prove about it."""
+    return inventory_module.classify(
+        node_guests(api),
+        known_leases=all_lease_ids(),
+        retained=inventory_module.entries(STATE_ROOT),
+    )
+
+
+def orphaned_guests(api: ProxmoxAPI) -> list[dict[str, Any]]:
+    """Guests this tool created that no lease record or registry vouches for.
+
+    Cleanup only ever finalizes resources listed in a lease, so a guest whose
+    lease record is gone is invisible to it for ever -- and while such a guest
+    runs, `shutdown_host()` refuses to power the machine off (by design). One
+    of these can therefore keep the lab on indefinitely.
+    """
+    return inventory_module.orphans(describe_guests(api))
 
 
 def running_guest_vmids(api: ProxmoxAPI) -> list[int]:
@@ -821,6 +1095,23 @@ def cmd_status(args: argparse.Namespace) -> None:
             for x in active_leases()
         ],
     }
+    described = inventory_module.classify(
+        [x for x in guests if isinstance(x, dict) and "vmid" in x],
+        known_leases=all_lease_ids(),
+        retained=inventory_module.entries(STATE_ROOT),
+    )
+    orphans = inventory_module.orphans(described)
+    output["retained_guests"] = [x for x in described if x["retained"]]
+    output["orphaned_guests"] = orphans
+    if orphans:
+        running = [x["vmid"] for x in orphans if x["status"] == "running"]
+        output["orphan_note"] = (
+            f"{len(orphans)} guest(s) carry a lease tag this controller has no "
+            "record of, so no sweep will ever clean them up"
+            + (f"; {len(running)} still running, which blocks host power-off. "
+               "Reclaim with 'cleanup-expired --reclaim-orphans "
+               "--host-change-authorized'" if running else "")
+        )
     print(json.dumps(redact(output), indent=2, sort_keys=True))
 
 
@@ -923,6 +1214,19 @@ def register_resource(
     if not is_long_term(lease):
         lease["expires_at"] = new_expiry()
     save_lease(lease)
+    if policy == "retain":
+        # This guest is meant to outlive the lease, and the lease record will
+        # not be here for ever. Its node tag proves only that some lease made
+        # it, so the durable owner is recorded now or never.
+        try:
+            inventory_module.record(
+                STATE_ROOT, kind=kind, vmid=vmid, lease=str(lease.get("id")),
+                now=iso_now(), purpose=str(lease.get("purpose") or ""),
+                name=name,
+            )
+        except OSError as exc:
+            print(f"warning: could not record retained guest {kind}/{vmid}: "
+                  f"{exc}", file=sys.stderr)
 
 
 def cmd_lease_register(args: argparse.Namespace) -> None:
@@ -936,6 +1240,14 @@ def cmd_lease_register(args: argparse.Namespace) -> None:
             raise LabError(
                 f"VMID {args.vmid} existed before this lease; use --allow-existing "
                 "only for an explicitly authorized retained resource"
+            )
+        owner = resource_owner_elsewhere(args.lease, args.kind, args.vmid)
+        if owner:
+            raise LabError(
+                f"{args.kind}/{args.vmid} is already registered to live lease "
+                f"{owner}. Two leases owning one guest is how a cleanup sweep "
+                f"comes to delete a machine another lease is still using. "
+                f"Work under {owner}, or end/abandon it first."
             )
         register_resource(lease, args.kind, args.vmid, args.policy, args.name)
         audit(
@@ -999,6 +1311,34 @@ def _boot_order_devices(value: str) -> list[str]:
     ]
 
 
+DISK_CONFIG_KEY = re.compile(
+    r"\A(?:scsi|virtio|ide|sata|efidisk|tpmstate|rootfs|mp|unused)\d*\Z"
+)
+
+
+def slow_storage_disks(data: dict[str, Any]) -> list[str]:
+    """Disk specs in `data` that would place a guest disk on bulk storage.
+
+    An ISO *mounted* from the bulk store is exactly what the docs recommend,
+    so `media=cdrom` is excluded. A guest's own disk there is a different
+    thing: the lab's USB directory store measured about 25 MB/s sequential
+    write, which is slow enough that an I/O comparison run on it measures the
+    cable rather than the guest.
+    """
+    bulk = str(CONFIG.storage.bulk_storage or "")
+    if not bulk:
+        return []
+    found: list[str] = []
+    for key, value in data.items():
+        if not DISK_CONFIG_KEY.fullmatch(str(key)) or not isinstance(value, str):
+            continue
+        if "media=cdrom" in value:
+            continue
+        if value.split(":", 1)[0].strip() == bulk:
+            found.append(f"{key}={value}")
+    return sorted(found)
+
+
 def cmd_api(args: argparse.Namespace) -> None:
     api = ProxmoxAPI()
     method = args.method.upper()
@@ -1047,7 +1387,19 @@ def cmd_api(args: argparse.Namespace) -> None:
                     tags.append(tag)
             data["tags"] = ";".join(tags)
             data.setdefault("onboot", "0")
+    slow_disks: list[str] = []
     if write:
+        slow_disks = slow_storage_disks(data)
+        if slow_disks and not args.slow_storage_accepted:
+            print(
+                f"warning: {', '.join(slow_disks)} puts a guest disk on "
+                f"'{CONFIG.storage.bulk_storage}', the configured bulk store. "
+                "It is the right home for ISOs and cold images, not for a "
+                "running or benchmarked guest -- 'storage status' reports "
+                "class fast|bulk. Pass --slow-storage-accepted to silence "
+                "this.",
+                file=sys.stderr,
+            )
         # The intent is durable before the external mutation. A failed ledger
         # must block the request rather than make a completed write look failed.
         audit(
@@ -1136,6 +1488,29 @@ def cmd_api(args: argparse.Namespace) -> None:
     )
 
 
+def upload_curl_argv(
+    config_path: str, source: Path, content: str, storage: str
+) -> list[str]:
+    """The curl argv for one storage upload.
+
+    Certificate policy comes from the same [proxmox] verify_tls switch the API
+    client uses. An operator who has put a trusted certificate on the node and
+    turned verification on must not get an unverified upload channel, or a
+    man-in-the-middle could swap the ISO while every REST call stays safe.
+    The token is only ever in the 0600 curl config file, never in argv.
+    """
+    argv = ["curl", "--config", config_path]
+    if not VERIFY_TLS:
+        argv.append("--insecure")
+    return [
+        *argv,
+        "--request", "POST",
+        "--form", f"content={content}",
+        "--form", f"filename=@{source}",
+        f"{API_ROOT}/nodes/{NODE}/storage/{storage}/upload",
+    ]
+
+
 def cmd_upload(args: argparse.Namespace) -> None:
     if args.storage not in UPLOAD_STORAGES:
         raise LabError(
@@ -1160,19 +1535,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
         config.write(config_text)
         config.flush()
         result = subprocess.run(
-            [
-                "curl",
-                "--config",
-                config.name,
-                "--insecure",
-                "--request",
-                "POST",
-                "--form",
-                f"content={args.content}",
-                "--form",
-                f"filename=@{source}",
-                f"{API_ROOT}/nodes/{NODE}/storage/{args.storage}/upload",
-            ],
+            upload_curl_argv(config.name, source, args.content, args.storage),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1211,9 +1574,26 @@ def cmd_upload(args: argparse.Namespace) -> None:
 
 def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
     failures: list[str] = []
+    transferred: list[str] = []
+    now = utc_now()
     for resource in reversed(lease.get("resources", [])):
         kind = resource["kind"]
         vmid = int(resource["vmid"])
+        owner = resource_owner_elsewhere(lease["id"], kind, vmid, now=now)
+        if owner:
+            # A newer, still-live lease claims this guest. Stopping or
+            # deleting it here would destroy a machine that lease is using --
+            # the one failure mode expiry cleanup must never have.
+            transferred.append(f"{kind}/{vmid}")
+            audit(
+                "lease-resource-owned-by-another-lease",
+                lease=lease["id"],
+                kind=kind,
+                vmid=vmid,
+                owner=owner,
+                sync=False,
+            )
+            continue
         try:
             stop_guest(api, kind, vmid)
             if resource.get("policy", "delete") == "delete":
@@ -1239,6 +1619,7 @@ def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
     lease["state"] = "closed" if not failures else "cleanup_failed"
     lease["closed_at"] = iso_now()
     lease["failures"] = failures
+    lease["transferred_resources"] = transferred
     save_lease(lease)
     return failures
 
@@ -1288,6 +1669,8 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
         "remaining_active_leases": [x["id"] for x in others],
         "host_powered_off": host_powered_off,
     }
+    if lease.get("transferred_resources"):
+        result["left_to_another_lease"] = lease["transferred_resources"]
     if persistent:
         # Say this loudly. A machine left running is the surprise nobody
         # wants on their electricity bill.
@@ -1419,16 +1802,200 @@ def cmd_lease_abandon(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+# How recently a guest must have been touched to count as in use. Tasks that
+# only ever mean "something stopped this guest" are excluded, or our own stop
+# would make every later run think the guest is busy.
+ORPHAN_ACTIVITY_WINDOW_SECONDS = 1800
+STOP_TASK_TYPES = frozenset(
+    {"qmstop", "qmshutdown", "qmreset", "vzstop", "vzshutdown"}
+)
+
+
+def recent_guest_activity(
+    api: ProxmoxAPI, kind: str, vmid: int, *,
+    within: int = ORPHAN_ACTIVITY_WINDOW_SECONDS,
+) -> dict[str, Any] | None:
+    """Evidence that something is still using this guest, or None.
+
+    "Orphaned" means *this* controller has no record of the guest. It does not
+    mean nobody is using it: a second controller, or one whose state lives
+    elsewhere, drives guests through the same API token and its lease records
+    are not here. Reclamation stopped a live ReactOS benchmark that way -- the
+    other session had been taking a console screenshot every 45 seconds, and
+    restarted the guest 90 seconds later.
+
+    Two independent signals, because each covers the other's blind spot:
+    recent tasks (console, start, agent) show someone driving it, and a short
+    uptime shows it was started recently even if the task log has rolled. An
+    unreadable task log counts as activity: leaving a guest running is a much
+    smaller mistake than stopping somebody's work.
+    """
+    try:
+        current = api.call(
+            "GET", f"/nodes/{NODE}/{kind}/{vmid}/status/current"
+        ) or {}
+        uptime = int(current.get("uptime") or 0)
+    except (LabError, TypeError, ValueError):
+        uptime = 0
+    if 0 < uptime < within:
+        return {"signal": "started recently", "seconds_ago": uptime}
+    try:
+        tasks = api.call(
+            "GET", f"/nodes/{NODE}/tasks", {"vmid": int(vmid), "limit": 20}
+        ) or []
+    except LabError as exc:
+        return {"signal": "task log unreadable", "detail": str(exc)[:120]}
+    now = time.time()
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("type")) in STOP_TASK_TYPES:
+            continue
+        try:
+            started = int(task.get("starttime") or 0)
+        except (TypeError, ValueError):
+            continue
+        # A task timestamped in the future means the clocks disagree; treat it
+        # as current rather than as ancient.
+        if started and now - started < within:
+            return {
+                "signal": str(task.get("type")),
+                "seconds_ago": max(0, int(now - started)),
+            }
+    return None
+
+
+def reclaim_orphans(
+    api: ProxmoxAPI, *, include_active: bool = False
+) -> dict[str, Any]:
+    """Stop -- never delete -- guests no lease record or registry vouches for.
+
+    Stopping is reversible and unblocks host power-off, which is the whole
+    point: one abandoned guest otherwise keeps the machine on for ever.
+    Deleting is not reversible, and the controller by definition cannot vouch
+    for what is on a disk it has lost the record of, so that stays manual.
+
+    A guest that shows recent activity is left alone unless `include_active`:
+    "no record here" is not the same as "nobody is using it", and stopping
+    somebody else's running work is the one outcome this command must not have
+    by default.
+    """
+    result: dict[str, Any] = {
+        "stopped": [], "failed": {}, "already_stopped": [], "left_active": {},
+    }
+    for guest in orphaned_guests(api):
+        kind, vmid = guest["kind"], int(guest["vmid"])
+        if guest.get("status") != "running":
+            result["already_stopped"].append(vmid)
+            continue
+        activity = (
+            None if include_active
+            else recent_guest_activity(api, kind, vmid)
+        )
+        if activity:
+            result["left_active"][str(vmid)] = activity
+            audit(
+                "orphan-guest-left-running",
+                kind=kind,
+                vmid=vmid,
+                lease_tag=guest.get("lease_tag"),
+                signal=activity.get("signal"),
+                sync=False,
+            )
+            continue
+        try:
+            stop_guest(api, kind, vmid)
+            result["stopped"].append(vmid)
+            audit(
+                "orphan-guest-stopped",
+                kind=kind,
+                vmid=vmid,
+                lease_tag=guest.get("lease_tag"),
+                reason="no lease record or retained registry entry",
+            )
+        except LabError as exc:
+            result["failed"][str(vmid)] = str(exc)[:300]
+            audit(
+                "orphan-guest-stop-failed", kind=kind, vmid=vmid,
+                error=str(exc)[:300], sync=False,
+            )
+    return result
+
+
+def cmd_reclaim_orphans_only(args: argparse.Namespace) -> dict[str, Any]:
+    """Stop orphaned guests and do nothing else.
+
+    Reclamation was only reachable as part of a full expiry sweep, which in the
+    same run finalizes every expired lease -- deleting their guests -- and then
+    decides whether to power the host off. "Stop the guests nothing owns" is a
+    much smaller intention than that, and wanting one is not consenting to the
+    other, so it gets its own path: no lease is finalized, no backup runs, and
+    the host is left exactly as it was.
+    """
+    if not args.host_change_authorized:
+        raise LabError(
+            "--orphans-only stops guests this controller has no record of. "
+            "Re-run with --host-change-authorized once the user has asked for "
+            "that. 'guest inventory --orphaned-only' lists them first."
+        )
+    api = ProxmoxAPI()
+    if not api.reachable():
+        raise LabError(
+            "the host is not reachable, so there is nothing running to reclaim"
+        )
+    with controller_lock():
+        reclaimed = reclaim_orphans(
+            api, include_active=getattr(args, "include_active", False)
+        )
+    if reclaimed["stopped"]:
+        audit(
+            "orphans-reclaimed",
+            stopped=reclaimed["stopped"],
+            already_stopped=reclaimed["already_stopped"],
+            failed=sorted(reclaimed["failed"]),
+        )
+    result: dict[str, Any] = {
+        "reclaimed_orphans": reclaimed,
+        "leases_swept": [],
+        "host_powered_off": False,
+        "note": (
+            "Only orphaned guests were touched. No lease was finalized and the "
+            "host was left on; a normal 'cleanup-expired' run makes those "
+            "decisions."
+        ),
+    }
+    if reclaimed["left_active"]:
+        result["left_active_note"] = (
+            "These are running and were touched recently, so something is "
+            "using them even though this controller has no record of them -- "
+            "another controller drives guests through the same token. Pass "
+            "--include-active to stop them anyway."
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if reclaimed["failed"]:
+        raise LabError("One or more orphaned guests could not be stopped")
+    return result
+
+
 def cmd_cleanup_expired(args: argparse.Namespace) -> None:
+    if getattr(args, "orphans_only", False):
+        cmd_reclaim_orphans_only(args)
+        return
     api = ProxmoxAPI()
     cleaned: list[str] = []
+    retried: list[str] = []
     failed: dict[str, list[str]] = {}
+    transferred: dict[str, list[str]] = {}
     with controller_lock():
         now = utc_now()
-        for lease in active_leases():
+        for lease in cleanup_candidate_leases():
             if is_long_term(lease):
                 continue          # never expires, never swept
-            if not args.all and parse_expiry(lease["expires_at"]) > now:
+            if lease.get("state") == "cleanup_failed":
+                # Already past its end and known incomplete: a retry is
+                # exactly what it needs, whatever its expiry says.
+                retried.append(lease["id"])
+            elif not args.all and parse_expiry(lease["expires_at"]) > now:
                 continue
             if not api.reachable() and lease_requires_cleanup(lease):
                 ensure_on(api)
@@ -1439,10 +2006,23 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
                 lease["state"] = "closed"
                 lease["closed_at"] = iso_now()
                 save_lease(lease)
+            if lease.get("transferred_resources"):
+                transferred[lease["id"]] = lease["transferred_resources"]
             if failures:
                 failed[lease["id"]] = failures
             else:
                 cleaned.append(lease["id"])
+        reclaimed: dict[str, Any] | None = None
+        if getattr(args, "reclaim_orphans", False) and api.reachable():
+            if not args.host_change_authorized:
+                raise LabError(
+                    "--reclaim-orphans stops guests this controller has no "
+                    "record of. Re-run with --host-change-authorized once the "
+                    "user has asked for that. 'status' lists them first."
+                )
+            reclaimed = reclaim_orphans(
+                api, include_active=getattr(args, "include_active", False)
+            )
         remaining = active_leases()
         persistent = [x for x in remaining if is_long_term(x)]
         if persistent and api.reachable() and not args.no_backup:
@@ -1486,26 +2066,59 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
         # append a journal line and a Forgejo commit each time, burying real
         # events under thousands of identical entries, so stay silent unless
         # the sweep actually did or failed something.
-        if cleaned or failed or idle_shutdown_triggered or host_powered_off:
+        if (cleaned or failed or idle_shutdown_triggered or host_powered_off
+                or (reclaimed and reclaimed["stopped"])):
             audit(
                 "cleanup-expired",
                 cleaned=cleaned,
+                retried=retried,
                 failed=failed,
+                transferred=transferred,
                 remaining=[x["id"] for x in remaining],
                 idle_seconds=idle_seconds,
                 idle_shutdown_triggered=idle_shutdown_triggered,
                 host_powered_off=host_powered_off,
             )
+    # Deliberately after the controller lock is released: a vzdump can run for
+    # hours, and nothing else may queue behind it.
+    retained_backup: dict[str, Any] | None = None
+    if not args.no_backup and not host_powered_off and api.reachable():
+        from . import longterm as longterm_module
+
+        if longterm_module.retained_backup_enabled():
+            with sweep_lock("retained-backup") as acquired:
+                if not acquired:
+                    retained_backup = {
+                        "skipped": "a previous backup sweep is still running"
+                    }
+                else:
+                    try:
+                        retained_backup = longterm_module.backup_retained(
+                            _module(), api,
+                            storage=longterm_module.backup_storage(_module()),
+                            keep=int(
+                                CONFIG.lease.get("long_term_backup_keep", 2)
+                            ),
+                            timeout=7200,
+                            interval_days=int(CONFIG.lease.get(
+                                "retained_backup_interval_days", 7)),
+                        )
+                    except (LabError, OSError) as exc:
+                        retained_backup = {"error": str(exc)[:300]}
     print(
         json.dumps(
             {
                 "cleaned": cleaned,
+                "retried": retried,
                 "failed": failed,
+                "left_to_another_lease": transferred,
+                "retained_backup": retained_backup,
                 "remaining": [x["id"] for x in remaining],
                 "mcp_idle_seconds": idle_seconds,
                 "mcp_idle_shutdown_after_seconds": MCP_IDLE_SHUTDOWN_SECONDS,
                 "idle_shutdown_triggered": idle_shutdown_triggered,
                 "host_powered_off": host_powered_off,
+                **({"reclaimed_orphans": reclaimed} if reclaimed else {}),
             },
             indent=2,
             sort_keys=True,
@@ -1513,6 +2126,8 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
     )
     if failed:
         raise LabError("One or more expired leases could not be cleaned")
+    if reclaimed and reclaimed["failed"]:
+        raise LabError("One or more orphaned guests could not be stopped")
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -1561,6 +2176,99 @@ def cmd_secrets(args: argparse.Namespace) -> None:
         print(json.dumps({"stored": args.name, "backend": backend}))
 
 
+def retained_backup_coverage() -> dict[str, Any]:
+    """How stale each retained guest's last backup is.
+
+    Backups used to happen only as a side effect of an active long-term lease,
+    so the keep-forever guests -- templates, persistent workers -- could have
+    none at all. Whether or not the sweep is enabled, the drift is reported.
+    """
+    entries = inventory_module.entries(STATE_ROOT)
+    if not entries:
+        return {}
+    now = utc_now()
+    never: list[int] = []
+    oldest_days: float | None = None
+    for item in entries.values():
+        last = item.get("last_backup_at")
+        if not last:
+            never.append(int(item.get("vmid", 0)))
+            continue
+        try:
+            age = (now - parse_expiry(str(last))).total_seconds() / 86400
+        except (TypeError, ValueError):
+            never.append(int(item.get("vmid", 0)))
+            continue
+        oldest_days = age if oldest_days is None else max(oldest_days, age)
+    coverage: dict[str, Any] = {
+        "retained_guests": len(entries),
+        "sweep_enabled": bool(CONFIG.lease.get("retained_backup", False)),
+        "never_backed_up": sorted(never),
+        "oldest_backup_age_days": (
+            round(oldest_days, 1) if oldest_days is not None else None
+        ),
+    }
+    if never and not coverage["sweep_enabled"]:
+        coverage["note"] = (
+            "These guests are meant to be kept but have no backup. Enable "
+            "[lease] retained_backup, run 'proxmox-lab backup --retained "
+            "--force', or accept the risk deliberately."
+        )
+    return coverage
+
+
+def host_update_report() -> dict[str, Any]:
+    """Pending package updates and reboot state on the lab node.
+
+    The node is an ordinary Debian/PVE host that needs patching, but the whole
+    workflow is lease-in, work, power-off -- so nobody ever sees `apt` drift.
+    This is advisory only: a pending security update is a thing to schedule
+    between leases, not a reason for `doctor` to fail. Reached over the opt-in
+    `[memflow]` host SSH channel, because there is no API for it.
+    """
+    from . import memflow
+
+    if not memflow.host_ssh_enabled():
+        return {
+            "checked": False,
+            "reason": "needs the opt-in [memflow] host SSH channel",
+        }
+    report: dict[str, Any] = {"checked": True}
+    try:
+        simulated = memflow.host_run(
+            _module(),
+            ["sh", "-c", "LC_ALL=C apt-get -s -o Debug::NoLocking=1 upgrade"],
+            timeout=120,
+        )
+    except LabError as exc:
+        return {"checked": False, "reason": str(exc)[:200]}
+    if simulated.returncode:
+        return {
+            "checked": False,
+            "reason": (simulated.stderr or simulated.stdout or "").strip()[:200],
+        }
+    lines = (simulated.stdout or "").splitlines()
+    upgrades = [line for line in lines if line.startswith("Inst ")]
+    report["updates_pending"] = len(upgrades)
+    report["security_updates"] = any(
+        "-security" in line or "Debian-Security" in line for line in upgrades
+    )
+    try:
+        reboot = memflow.host_run(
+            _module(),
+            ["sh", "-c", "test -e /var/run/reboot-required && echo yes || echo no"],
+            timeout=30,
+        )
+        report["reboot_required"] = (reboot.stdout or "").strip() == "yes"
+    except LabError:
+        report["reboot_required"] = None
+    report["remediation"] = (
+        "Patch and reboot between leases, never during one. Updating the node "
+        "is a host change and is deliberately not automated here."
+    )
+    return report
+
+
 def cmd_doctor(args: argparse.Namespace) -> None:
     """Check the install end to end and say exactly what is missing."""
     problems: list[str] = []
@@ -1589,6 +2297,44 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     }
     if AUDIT_BACKEND not in {"sqlite", "jsonl", "pocketbase"}:
         problems.append(f"[audit] unsupported backend: {AUDIT_BACKEND}")
+    if CONFIG.audit.get("git_sync"):
+        configured = str(CONFIG.audit.get("git_repo") or "")
+        if not configured:
+            report["audit"]["git_status"] = {
+                "ok": False, "problem": "git_repo is empty",
+            }
+            problems.append(
+                "[audit] git_sync is on but git_repo is empty; no audit "
+                "record is being exported"
+            )
+        else:
+            git_status = journal_module.git_sync_status(
+                Path(configured),
+                str(CONFIG.audit.get("git_branch") or "logs"),
+            )
+            report["audit"]["git_status"] = git_status
+            if not git_status["ok"]:
+                problems.append(
+                    "[audit] git_sync is enabled but the mirror is unusable "
+                    f"({git_status['problem']}): {git_status['repo']}. Each "
+                    "mutating command only prints a warning, so the private "
+                    "export has been failing silently"
+                )
+    spool = _audit_spool_path()
+    try:
+        spooled: int | None = sum(
+            1 for line in spool.read_text().splitlines() if line.strip()
+        ) if spool.exists() else 0
+    except OSError as exc:
+        spooled = None
+        problems.append(f"audit spool at {spool} could not be read: {exc}")
+    report["audit"]["spooled_records"] = spooled
+    if spooled:
+        problems.append(
+            f"{spooled} audit record(s) are still spooled locally at {spool}: "
+            "the configured backend refused them. Upload the backlog with "
+            "'proxmox-lab journal --flush-spool'"
+        )
     if AUDIT_BACKEND == "pocketbase":
         report["audit"]["pocketbase"] = {
             "url": str(CONFIG.audit.get("pocketbase_url") or ""),
@@ -1653,7 +2399,20 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         elif report.get("pocketbase_token_stored"):
             try:
                 client = pocketbase_client()
-                client.get_collection()
+                try:
+                    client.get_collection()
+                except pocketbase_module.PocketBaseError as exc:
+                    # The collections API is superuser-only. A restricted
+                    # audit agent (the recommended credential) gets a 403
+                    # there even though it can read and write the ledger,
+                    # so prove reachability through the records API it is
+                    # actually entitled to.
+                    if exc.status != 403 or (
+                        pocketbase_module.token_auth_collection(client.token)
+                        == "_superusers"
+                    ):
+                        raise
+                    client.query(limit=1)
                 report["pocketbase_collection_reachable"] = True
             except (LabError, pocketbase_module.PocketBaseError) as exc:
                 report["pocketbase_collection_reachable"] = False
@@ -1700,6 +2459,65 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             report["note"] = ("host unreachable -- expected when the machine "
                               "is powered off")
 
+    if HOST and NODE and report.get("proxmox_token_stored") \
+            and report.get("proxmox_reachable"):
+        api = ProxmoxAPI()
+        try:
+            described = describe_guests(api)
+        except LabError as exc:
+            report["inventory_error"] = str(exc)[:200]
+            described = []
+        orphans = inventory_module.orphans(described)
+        running_orphans = [x for x in orphans if x["status"] == "running"]
+        report["guests"] = {
+            "total": len(described),
+            "retained": sum(1 for x in described if x["retained"]),
+            "orphaned": len(orphans),
+            "orphaned_running": [x["vmid"] for x in running_orphans],
+        }
+        active = {}
+        idle = []
+        for orphan in running_orphans:
+            signal = recent_guest_activity(
+                api, orphan["kind"], int(orphan["vmid"])
+            )
+            if signal:
+                active[str(orphan["vmid"])] = signal
+            else:
+                idle.append(orphan)
+        if active:
+            # Running, unowned *here*, and being driven -- so another
+            # controller owns it. Saying "nothing will clean this up" would be
+            # a misdiagnosis, and acting on it would stop somebody's work.
+            report["guests"]["orphaned_but_active"] = active
+            report["guests"]["active_note"] = (
+                "Running and touched recently, so something is using these "
+                "even though this controller has no record of them -- most "
+                "likely another controller sharing the API token. They keep "
+                "the host on, which is correct while they are in use."
+            )
+        if idle:
+            # This is the failure mode that keeps the machine on for days:
+            # nothing owns the guest, so no sweep stops it, and shutdown_host
+            # refuses while any guest runs.
+            problems.append(
+                f"{len(idle)} running guest(s) carry a lease tag this "
+                "controller has no record of and show no recent activity, so "
+                "no sweep will clean them up and the host cannot power off: "
+                + ", ".join(str(x["vmid"]) for x in idle)
+                + ". Reclaim with 'cleanup-expired --orphans-only "
+                "--host-change-authorized'"
+            )
+        elif orphans and not active:
+            report["guests"]["note"] = (
+                f"{len(orphans)} stopped guest(s) are tagged with a lease this "
+                "controller no longer has; see 'guest inventory --orphaned-only'"
+            )
+        coverage = retained_backup_coverage()
+        if coverage:
+            report["retained_backup"] = coverage
+    if getattr(args, "host_checks", False):
+        report["host"] = host_update_report()
     report["problems"] = problems
     report["ok"] = not problems
     print(json.dumps(report, indent=2, sort_keys=True))
@@ -1710,51 +2528,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 def cmd_journal(args: argparse.Namespace) -> None:
     """Read, migrate, or provision the audit ledger."""
     if args.provision_pocketbase_agent:
-        agent_collection = str(
-            CONFIG.audit.get("pocketbase_agent_collection")
-            or "proxmox_lab_agents"
-        ).strip()
-        try:
-            identity = secrets_store.get(
-                CONFIG, "pocketbase-agent-email", required=False
-            )
-            password = secrets_store.get(
-                CONFIG, "pocketbase-agent-password", required=False
-            )
-        except secrets_store.SecretError as exc:
-            raise LabError(str(exc)) from None
-        if bool(identity) != bool(password):
-            raise LabError(
-                "PocketBase agent credentials are incomplete; store both "
-                "'pocketbase-agent-email' and 'pocketbase-agent-password', "
-                "or remove both before provisioning."
-            )
-        rotate_existing = not identity
-        if not identity:
-            identity, password = pocketbase_module.Client.new_agent_credentials()
-            try:
-                secrets_store.store(CONFIG, "pocketbase-agent-email", identity)
-                secrets_store.store(
-                    CONFIG, "pocketbase-agent-password", password
-                )
-            except secrets_store.SecretError as exc:
-                raise LabError(str(exc)) from None
-        result = pocketbase_superuser_client().provision_agent(
-            agent_collection,
-            identity,
-            password,
-            rotate_existing=rotate_existing,
-        )
-        try:
-            _url, _collection, token_secret, _timeout, _refresh = (
-                _pocketbase_settings()
-            )
-            secrets_store.store(CONFIG, token_secret, result["token"])
-        except secrets_store.SecretError as exc:
-            raise LabError(
-                "PocketBase agent was provisioned but its token could not be "
-                "stored: " + str(exc)
-            ) from None
+        result = _provision_pocketbase_agent(pocketbase_superuser_client())
         audit = result["audit_collection"]
         print(json.dumps({
             "agent_collection": result["agent_collection"],
@@ -1767,6 +2541,7 @@ def cmd_journal(args: argparse.Namespace) -> None:
         AUDIT_BACKEND == "pocketbase"
         or args.provision_pocketbase
         or args.migrate_sqlite_to_pocketbase
+        or args.flush_spool
     )
     client = pocketbase_client() if needs_pocketbase else None
     if args.provision_pocketbase:
@@ -1795,6 +2570,46 @@ def cmd_journal(args: argparse.Namespace) -> None:
         result["collection"] = client.collection_name
         result["collection_created"] = provision["created"]
         print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if args.flush_spool:
+        path = _audit_spool_path()
+        lines = path.read_text().splitlines() if path.exists() else []
+        uploaded, duplicates, remaining = 0, 0, []
+        failure: str | None = None
+        for index, line in enumerate(lines):
+            if failure is not None:
+                remaining.append(line)
+                continue
+            record = json.loads(line)
+            try:
+                journal_module.append(
+                    JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
+                )
+                uploaded += 1
+            except pocketbase_module.PocketBaseError as exc:
+                if exc.status == 400:
+                    # The collection's unique event_id index rejects a
+                    # re-upload of an event a previous flush already sent.
+                    duplicates += 1
+                else:
+                    failure = str(exc)
+                    remaining.append(line)
+        if remaining:
+            path.write_text("\n".join(remaining) + "\n")
+        elif path.exists():
+            path.unlink()
+        result = {
+            "uploaded": uploaded,
+            "duplicates_skipped": duplicates,
+            "remaining": len(remaining),
+        }
+        if failure is not None:
+            result["stopped_on_error"] = failure
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if failure is not None:
+            raise LabError(
+                f"spool flush stopped after {uploaded} upload(s): {failure}"
+            )
         return
     if args.summary:
         print(json.dumps(
@@ -1832,6 +2647,12 @@ def parser() -> argparse.ArgumentParser:
     init.set_defaults(func=cmd_init)
 
     doctor = sub.add_parser("doctor", help="check config, secrets and access")
+    doctor.add_argument(
+        "--host-checks", action="store_true",
+        help="also report the node's pending package updates and whether it "
+             "needs a reboot (advisory; needs the opt-in [memflow] host SSH "
+             "channel and adds a few seconds)",
+    )
     doctor.set_defaults(func=cmd_doctor)
 
     store = sub.add_parser("secrets", help="store and inspect secrets")
@@ -1864,6 +2685,11 @@ def parser() -> argparse.ArgumentParser:
         "--provision-pocketbase-agent",
         action="store_true",
         help="create a renewable restricted audit agent using stored superuser credentials",
+    )
+    ledger.add_argument(
+        "--flush-spool",
+        action="store_true",
+        help="upload audit events spooled locally while the backend was down",
     )
     ledger.add_argument("--import-jsonl", action="store_true",
                         help="load legacy per-day JSONL files into the database")
@@ -1931,6 +2757,11 @@ def parser() -> argparse.ArgumentParser:
     api.add_argument("--policy", choices=("delete", "retain"), default="delete")
     api.add_argument("--host-change-authorized", action="store_true")
     api.add_argument(
+        "--slow-storage-accepted", action="store_true",
+        help="acknowledge placing a guest disk on the configured bulk "
+             "storage, which is slow enough to distort any I/O measurement",
+    )
+    api.add_argument(
         "--password-stdin",
         action="store_true",
         help="Read a password value from stdin without exposing it in argv",
@@ -1970,34 +2801,61 @@ def parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--all", action="store_true")
     cleanup.add_argument("--no-backup", action="store_true",
                          help="skip the long-term backup sweep")
+    cleanup.add_argument(
+        "--reclaim-orphans", action="store_true",
+        help="stop (never delete) guests tagged with a lease this controller "
+             "has no record of; they are invisible to normal cleanup and a "
+             "running one blocks host power-off. Requires "
+             "--host-change-authorized",
+    )
+    cleanup.add_argument(
+        "--orphans-only", action="store_true",
+        help="reclaim orphaned guests and nothing else: no lease is finalized, "
+             "no backup runs, and the host is left on. Requires "
+             "--host-change-authorized",
+    )
+    cleanup.add_argument(
+        "--include-active", action="store_true",
+        help="also stop an orphaned guest that was touched in the last 30 "
+             "minutes. Skipped by default: another controller drives guests "
+             "through the same token, and its lease records are not here",
+    )
+    cleanup.add_argument("--host-change-authorized", action="store_true",
+                         help="required by --reclaim-orphans")
     cleanup.set_defaults(func=cmd_cleanup_expired)
 
     from . import android
     from . import console
+    from . import disk
     from . import guest
     from . import longterm
     from . import memflow
     from . import netcap
     from . import netgw
+    from . import isoinspect
     from . import oci
     from . import recipes
     from . import share
     from . import storage
     from . import usb
+    from . import virtio
     from . import windows
 
     android.register(sub, _module())
     console.register(sub, _module())
+    disk.register(sub, _module())
     guest.register(sub, _module())
     longterm.register(sub, _module())
     memflow.register(sub, _module())
     netcap.register(sub, _module())
     netgw.register(sub, _module())
+    isoinspect.register(sub, _module())
     oci.register(sub, _module())
     recipes.register(sub, _module())
     share.register(sub, _module())
     storage.register(sub, _module())
     usb.register(sub, _module())
+    virtio.register(sub, _module())
     windows.register(sub, _module())
     return root
 

@@ -15,10 +15,14 @@ from typing import Any
 # Matches the public-reference grammar accepted by PVE's
 # ``oci-registry-pull`` endpoint. PVE currently accepts tags, not digest
 # references, so every direct registry pull is explicitly gated as mutable.
+# Every repository path component follows the OCI distribution grammar:
+# lower-case alphanumeric runs joined by ".", "_", "__" or one or more "-".
+_REPO_COMPONENT = r"[a-z\d]+(?:(?:[._]|__|-+)[a-z\d]+)*"
 _REFERENCE_RE = re.compile(
     r"^(?:(?:[a-zA-Z\d]|[a-zA-Z\d][a-zA-Z\d-]*[a-zA-Z\d])"
     r"(?:\.(?:[a-zA-Z\d]|[a-zA-Z\d][a-zA-Z\d-]*[a-zA-Z\d]))*(?::\d+)?/)?"
-    r"[a-z\d]+(?:/[a-z\d]+(?:(?:(?:[._]|__|[-]*)[a-z\d]+)+)?)*:\w[\w.-]{0,127}$"
+    rf"{_REPO_COMPONENT}(?:/{_REPO_COMPONENT})*"
+    r":[A-Za-z\d_][A-Za-z\d_.-]{0,127}$"
 )
 _TEMPLATE_RE = re.compile(
     r"^(?P<storage>[A-Za-z0-9][A-Za-z0-9_.-]*):vztmpl/"
@@ -136,6 +140,21 @@ def cmd_pull(lab: Any, args: Any) -> None:
     }, indent=2, sort_keys=True))
 
 
+def cmd_validate(lab: Any, args: Any) -> None:
+    """Check a reference offline and show the template volume a pull yields."""
+    _validate_reference(lab, args.reference)
+    if not _STORAGE_RE.fullmatch(args.storage):
+        raise lab.LabError(f"invalid PVE storage name: {args.storage!r}")
+    print(json.dumps({
+        "experimental": True,
+        "reference": args.reference,
+        "storage": args.storage,
+        "template": _template_for_reference(args.storage, args.reference),
+        "valid": True,
+        "warning": _EXPERIMENTAL_WARNING,
+    }, indent=2, sort_keys=True))
+
+
 def cmd_create(lab: Any, args: Any) -> None:
     """Create one lease-owned unprivileged LXC from a pulled OCI archive."""
     _validate_template(lab, args.template)
@@ -234,6 +253,16 @@ def register(sub: Any, lab: Any) -> None:
     pull.add_argument("--allow-mutable-reference", action="store_true")
     pull.add_argument("--timeout", type=int, default=1800)
     pull.set_defaults(func=lambda args: cmd_pull(lab, args))
+
+    validate = commands.add_parser(
+        "validate",
+        help="check a reference offline and show the resulting template volume",
+    )
+    validate.add_argument("--reference", required=True,
+                          help="public image with explicit tag, never a digest")
+    validate.add_argument("--storage", default="local",
+                          help="file-based PVE storage with vztmpl content")
+    validate.set_defaults(func=lambda args: cmd_validate(lab, args))
 
     create = commands.add_parser(
         "create", help="create a lease-owned OCI LXC (experimental)",

@@ -230,6 +230,15 @@ When a guest kernel misbehaves, pick the right tool for the layer:
   state via `memflow registers`.
 - **Live CPU stepping** — `memflow trace --steps N` / `memflow break --addr`
   drive QEMU's built-in gdbstub (RSP) for single-step and breakpoints.
+- **Diagnose a stuck boot** — `memflow boot-diagnose --lease "$L" --vmid <id>`
+  classifies the CPU as wedged vs executing and scans RAM for boot-failure
+  text (kernel panic, GRUB rescue, BIOS/Windows boot errors) when no console
+  is usable.
+- **Port or debug virtio drivers** — `virtio inspect --vmid <id>` reports the
+  configured virtio devices and their live negotiated feature bits (via the
+  read-only QEMU monitor); `virtio decode --value 0x… --device net|blk|scsi`
+  names every bit in a feature word offline, for checking a driver's
+  negotiation against what the device offers.
 - **Iterate without reinstalling** — before testing a new kernel build,
   `guest snapshot --lease "$L" --vmid <id> --mode create --name before-kernel`;
   after a bugcheck, stop the guest and

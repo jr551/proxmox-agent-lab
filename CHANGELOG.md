@@ -4,6 +4,285 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.9.3 - 2026-08-21
+
+### Fixed
+
+- Orphan reclamation stopped guests that were in active use. "Orphaned" means
+  *this* controller has no record of a guest — not that nobody is using it: a
+  second controller, or one whose state directory lives elsewhere, drives
+  guests through the same API token and its lease records are not here. A run
+  on the lab node stopped a ReactOS benchmark that another session had been
+  screenshotting every 45 seconds; that session restarted the guest 90 seconds
+  later.
+
+  Reclamation now leaves a running orphan alone when either signal says it is
+  in use — a non-stop task for it within the last 30 minutes, or an uptime
+  shorter than that — and reports it as `left_active`. Stop tasks are excluded
+  from the signal, or the first reclamation would make every later run refuse;
+  an unreadable task log counts as in use, because not knowing must not resolve
+  to stopping someone's work. `--include-active` overrides it.
+- `doctor` distinguishes the two cases. A running orphan with recent activity
+  is reported as `orphaned_but_active` with a note that another controller
+  likely owns it; only an idle one is a problem, since only that one is keeping
+  the host on for no reason.
+
+## 0.9.2 - 2026-08-21
+
+### Fixed
+
+- `storage gc` reported a volume's **provisioned** size as though it were
+  reclaimable space. On the lab node its four orphans read as 51.54 GB and held
+  9.33 MB between them — three creates that failed almost immediately — so the
+  headline number overstated the gain from an irreversible deletion by a factor
+  of about 5,500. The report now separates `orphaned_provisioned_gb` from
+  `orphaned_on_disk_gb`, gives both per volume (`size_gb`, `used_gb`), and
+  audits both on deletion. `docs/storage.md` and `docs/VERIFICATION.md` carry
+  the corrected figures.
+
+## 0.9.1 - 2026-08-21
+
+### Added
+
+- `cleanup-expired --orphans-only --host-change-authorized` reclaims orphaned
+  guests and does nothing else: no lease is finalized, no backup runs, and the
+  host is left on. Reclamation had only been reachable as part of a full expiry
+  sweep, which in the same run deletes every expired lease's guests and then
+  decides whether to power the machine off. On the lab node that meant "stop
+  the four guests nothing owns" also proposed deleting ten guests that were
+  fine, including the ReactOS builders and the build gateway. Wanting the first
+  is not consenting to the second.
+
+## 0.9.0 - 2026-08-21
+
+Eight more reported issues, triaged and fixed. The theme is the *keep-forever*
+half of the lab: guests that outlive their lease had no durable owner, no
+backup coverage, and no way to be reclaimed — so one abandoned guest could keep
+the machine on indefinitely.
+
+### Added
+
+- **A retained-guest registry.** `retained.json` under the state directory
+  records any guest registered with `policy = retain`, and is never pruned
+  automatically. A node tag (`codex-lab;lease-<id>`) lives for ever while the
+  lease record does not, so a tag proves only that *some* lease created a
+  guest — ownership now comes from the lease record while it exists and this
+  registry afterwards. Tags are documented as informational, and no ownership
+  check resolves them.
+- `guest inventory` prints every guest with its tag, whether anything local
+  resolves it, and whether the registry vouches for it. `--orphaned-only` and
+  `--retained-only` narrow it.
+- `guest retain --vmid <id> --purpose ...` adopts an existing guest into the
+  registry (and `--forget` removes it). Needed on any install that predates
+  the registry, and it changes controller state only — the guest is untouched.
+- `cleanup-expired --reclaim-orphans --host-change-authorized` **stops, and
+  never deletes**, guests that neither a lease record nor the registry vouches
+  for. Cleanup only ever finalized lease-listed resources, and host power-off
+  refuses while any guest runs, so one such guest kept the lab machine on for
+  five days. Stopping is reversible and is all that is needed to unblock
+  power-off; a controller that has lost a guest's record cannot vouch for its
+  disk, so deletion stays manual.
+- `storage gc` finds image volumes no guest config references. It **reports by
+  default**; `--delete --host-change-authorized` removes only what that same
+  run classified as unreferenced, and each deletion is audited with volid and
+  size. Snapshot configs are scanned as well as live ones, because a snapshot's
+  `vmstate` volume is listed as ordinary `images` content but referenced only
+  from the snapshot; and if any config or snapshot cannot be read, nothing is
+  classified at all.
+- `storage status` reports a `class` per storage (`bulk` for
+  `[storage] bulk_storage`, `fast` otherwise), so callers stop hardcoding site
+  storage ids.
+- Retained-guest backups: `backup --retained`, plus an opt-in watchdog sweep
+  behind `[lease] retained_backup` (default **false**) and
+  `retained_backup_interval_days`. When the watchdog runs it, it runs outside
+  the controller lock and under its own non-blocking lock, so a long vzdump can
+  neither block a lease operation nor be started twice by successive ticks.
+- `doctor --host-checks` reports the node's `updates_pending`,
+  `security_updates` and `reboot_required` as advisory fields, over the opt-in
+  `[memflow]` host SSH channel. Patching stays manual and outside this tool.
+- `doctor` also reports orphaned guests — failing when one is *running*, since
+  that is what blocks power-off — and `retained_backup` coverage: how many
+  retained guests exist, which have never been backed up, and the oldest
+  backup age, whether or not the sweep is enabled.
+
+### Changed
+
+- A write that would place a *guest disk* on the configured bulk storage now
+  warns unless `--slow-storage-accepted` is passed. An ISO mounted from bulk
+  storage is not warned about; that is the recommended arrangement. The lab's
+  USB store measured about 25 MB/s, enough to turn an I/O comparison into a
+  measurement of the cable.
+- `docs/long-term-leases.md` no longer implies that weekly backups are a
+  general safety net: they only ever covered an active long-term lease's
+  guests. The gap, and how to close it, is now stated.
+- Standalone-node `ipcc_send_rec` log noise and zombie `qm terminal` children
+  are documented in `docs/INSTALL.md`. Neither is fixable here: the first is
+  pmxcfs with no cluster to write to, and `termproxy` is spawned by pvedaemon
+  and reaps its own child, so the controller never owns those processes.
+
+### Fixed
+
+- Test isolation: `register_resource` writes the retained registry under
+  `STATE_ROOT`, and one pre-existing test did not redirect that root, so
+  running the suite wrote a bogus retained guest into the developer's live
+  controller state. Every test module now points
+  `PROXMOX_AGENT_LAB_STATE` at a disposable directory, and a guard test
+  asserts it.
+
+## 0.8.0 - 2026-08-21
+
+Ten reported issues, fixed and verified against the lab node. The serial and
+cleanup fixes change observable behaviour; see the notes at the end.
+
+### Fixed
+
+- **The serial stream is guest bytes only.** `console text`, `--follow` and
+  `console bridge` shared an incomplete filter that stripped the `OK`
+  handshake and nothing else, so Proxmox's own terminal records reached
+  callers as if the guest had printed them -- contaminating boot logs and
+  potentially reaching a kernel debugger's input. Complete transport records
+  are now removed for every consumer of a session, including when one is split
+  across websocket reads, when a blank line or console echo precedes it, and
+  for the pair an LXC console emits. A guest line that merely begins with `OK`
+  is no longer truncated.
+- **`console text` can follow the documented attach-before-power-on order.**
+  Proxmox issues a terminal ticket for a *stopped* guest and reports the
+  refusal in the byte stream (`VM <id> not running`), so a capture started
+  before power-on used to exit 0 having recorded that one sentence where boot
+  output should have been. Attachment now asks `status/current`, and the new
+  `console text --wait-for-guest SECONDS` waits, bounded, for the guest to
+  start and attaches as soon as it does. `--from-reset` remains the only way
+  to guarantee output from t=0.
+- **`journal query` and `journal summary` read the configured backend.** With
+  `[audit] backend = "jsonl"` both opened `journal.db` and reported a
+  configured JSONL ledger as empty -- worst of all during an incident review.
+  They now read the daily files, with the same `lease`, `event` wildcard,
+  `since` and `limit` filters, newest first.
+- **`upload` honours `[proxmox] verify_tls`.** It always passed curl
+  `--insecure`, so an operator who had enabled certificate verification still
+  got an unverified upload path for ISO and import content.
+- **The console WebSocket honours `[proxmox] verify_tls`.** VNC and serial
+  sessions unconditionally disabled certificate and hostname checking, leaving
+  guest input and output on the one connection to the node that trusted any
+  certificate.
+- **`storage add-disk` fails non-zero when it only half-succeeded.** Formatting
+  the disk and registering the storage but failing to set its content types
+  printed a warning and exited 0, so automation went on to upload content the
+  storage would not accept. The partial result is still printed -- the disk is
+  already formatted, so recovery is `storage set-content`, not a rerun.
+- **Expiry cleanup will not destroy a resource another lease is using.**
+  Registration never prevented two leases from naming the same guest, and
+  finalization stopped and deleted every registered resource unconditionally,
+  so a watchdog sweep could delete a VM a newer, still-live lease was working
+  on. Cleanup now checks ownership first and reports what it left alone as
+  `left_to_another_lease`; two *expired* leases still release a guest, so
+  nothing leaks. `lease-register` refuses a guest a live lease already owns.
+- **`cleanup-expired` retries a lease whose cleanup failed.** A transient QEMU
+  lock while stopping one guest left the lease `cleanup_failed`, which every
+  later sweep skipped -- so its guests, and the host, stayed up until someone
+  reran `lease-end` by hand with the exact lease id. Such leases are now swept
+  again (finalizing is idempotent) and reported as `retried`.
+- **`doctor` reports an unusable audit mirror.** With `[audit] git_sync = true`
+  pointing at a missing, non-repository, dirty or unwritable checkout, every
+  mutating command printed a warning that is easy to miss for weeks while
+  `doctor` said nothing. It now reports `audit.git_status` and fails, and
+  reports `audit.spooled_records` so a local backlog the configured backend
+  refused is visible too.
+
+### Added
+
+- `console screenshot --via monitor` is an explicit fallback for when the VNC
+  path cannot produce a frame. It asks QEMU for a `screendump` through the
+  monitor endpoint, fetches the PNG over the opt-in `[memflow]` host SSH
+  channel, and deletes the host copy in a `finally` path. The host path is
+  fixed and lease-scoped, the only format is PNG, the bytes are verified to be
+  one, and no remote path can be passed in. Arbitrary `qm monitor` commands
+  remain unavailable. VNC stays the default and the preferred route.
+
+### Changed
+
+- `console text` on a stopped guest now exits non-zero with an explanation
+  instead of exiting 0 with a capture containing `VM <id> not running`.
+- `storage add-disk` exits non-zero on partial success (see above).
+- `cleanup-expired` output gains `retried` and `left_to_another_lease`; its
+  first sweep after upgrading may clean up a `cleanup_failed` lease that
+  previous versions had been skipping.
+
+## 0.7.0 - 2026-08-18
+
+### Added
+
+- `iso diagnose --path <file>` inspects a boot/install ISO entirely locally:
+  volume identity plus, from the El Torito boot catalog, whether it has
+  bootable BIOS and/or UEFI entries and a hybrid MBR/GPT for USB booting -- so
+  the "boots under SeaBIOS but not OVMF" case is caught before install.
+- `disk boot-info` parses MBR and GPT partition tables (types, GUIDs, ESP,
+  protective MBR) from a local image (`--image`) or a stopped guest's disk
+  (`--vmid`).
+- Offline guest-filesystem access for a powered-off guest, over the memflow
+  host channel via libguestfs: `disk ls`, `disk read`, and `disk write`
+  (hard-gated behind `--i-understand`), plus `disk host-setup` to install the
+  host side. All refuse a running guest.
+- `virtio` command group for porting and debugging virtio drivers on any guest
+  OS: `virtio inspect --vmid` reports the configured virtio devices and their
+  live negotiated feature bits from the read-only QEMU monitor, and
+  `virtio decode --value 0x... --device net|blk|scsi` names every bit in a
+  feature word offline. The monitor path is hard-restricted to an allowlist of
+  read-only `info` queries, so it can never mutate a guest.
+
+- `memflow boot-diagnose` diagnoses a stuck boot from a guest's RAM without
+  entering the guest: it samples the vCPU registers twice to tell a wedged CPU
+  (panic spin, HLT loop, firmware dead end) from one still executing, and scans
+  guest-physical memory for the text a failed boot leaves behind (Linux kernel
+  panic / unmountable root, dracut emergency, GRUB rescue, BIOS "no bootable
+  device", Windows boot errors). Read-only, any guest OS; matched text is not
+  audited, only the failure category.
+
+## 0.6.6 - 2026-08-18
+
+### Added
+
+- A PocketBase **superuser token** stored as the audit token is detected on
+  first use and converted automatically into a permanent least-privileged
+  agent: the controller provisions the agent with the superuser token, stores
+  the agent's password credentials, and atomically replaces the audit token
+  with the agent's renewable one. Pasting a superuser token is now a one-time
+  bootstrap rather than a standing over-privileged credential.
+
+## 0.6.5 - 2026-08-18
+
+### Added
+
+- An expired or rejected PocketBase audit credential no longer aborts the
+  action being audited: the event is spooled append-only to
+  `<journal_dir>/spool.jsonl` with a stderr notice, and
+  `journal --flush-spool` uploads the backlog once credentials are fixed
+  (duplicates are skipped via the collection's unique `event_id`).
+- `console text --from-reset` (with `--follow`) attaches the serial session
+  before resetting the guest, so boot output from t=0 is captured instead of
+  being lost to the connect race. Lease-gated, QEMU only.
+- `console text --send-raw` transmits exactly the given characters with no
+  trailing newline, for kernel-debugger prompts (KDB `cont`, GRUB menus) that
+  act on bare characters.
+- `console bridge` help and `docs/console.md` now document reset semantics up
+  front: a guest reset keeps the QEMU process and its serial socket alive (a
+  connected bridge survives it), while stop/start replaces the process — and
+  the bridge is bidirectional, so no read-only `socat -u` fallback is needed.
+- Journal and audit commands now print a stderr notice when the PocketBase
+  token is nonrenewable and expires within 48 hours, before every read and
+  write would start failing hard, with the renewable-agent fix spelled out.
+- `oci validate` checks a registry reference offline against the accepted
+  grammar and prints the template volume a pull would produce, without
+  touching the Proxmox host.
+
+### Fixed
+
+- `oci pull` no longer rejects valid references whose first repository path
+  component contains `-`, `_`, or `.` (for example
+  `ghcr.io/home-assistant/home-assistant:stable`), and the tag grammar is now
+  ASCII-only instead of accepting any Unicode word character.
+
+
 ## 0.6.4 - 2026-08-16
 
 ### Added

@@ -5,16 +5,20 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**Give an old computer one more job.**
+**Give an old computer one more job: an on-demand lab an AI agent can wake,
+use, and switch back off.**
 
-Turn spare hardware into a safe, AI-operated research lab. Boot disposable
-Windows, Linux and Android machines; inspect software, drivers, firmware,
-memory, USB traffic and network behaviour; then destroy the experiment and
-switch the physical computer off — verified.
+Turn spare hardware into a safe, AI-operated compute pool. When there is work,
+an agent powers the physical machine on, spins up a disposable Windows, Linux
+or Android guest **from a template**, does the job — build and boot a kernel,
+drive an installer, study software, drivers, firmware, memory, USB and network
+behaviour — then destroys the guest and switches the computer back off,
+*verified*. Between jobs, nothing runs and nothing is left on.
 
-Built for authorized reverse engineering, defensive security research,
-digital forensics, interoperability, debugging and education. The Python
-package is **`proxmox-agent-lab`**; the CLI is **`proxmox-lab`**.
+Built for home-lab hosting, kernel and OS development, authorized reverse
+engineering, defensive security research, digital forensics, interoperability,
+debugging and education. The Python package is **`proxmox-agent-lab`**; the CLI
+is **`proxmox-lab`**.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
@@ -41,6 +45,26 @@ and experiments that outlive the agent controlling them. Here, work happens in
 a **lease**. Lease ends → guests destroyed → host powered off, *verified*.
 Agent dies → a watchdog cleans up anyway.
 
+## 🔁 On-demand environments for agents
+
+The unit of work is a **lease**; the fastest way to fill one is a **template**.
+Build a golden image once — a kernel-dev box, a specific distro, a Windows test
+rig, a malware sled — then let the agent clone it on demand:
+
+```text
+host asleep → agent takes a lease → Wake-on-LAN powers the PC on →
+clone the template → run the job → lease ends →
+guest destroyed → host verified OFF
+```
+
+The template is the reusable part; every run is a fresh, identical, throwaway
+copy of it, and nothing runs between jobs. That is what makes it safe to hand a
+real kernel and root access to an autonomous agent: the blast radius is one
+clone, and the machine powers itself down when the work is done. Need a service
+to stay up instead? A **long-term lease** keeps the host on for exactly as long
+as you want it — the same box is both an always-on home server and a disposable
+agent lab.
+
 ## ⚡ What it can do
 
 | | Capability | Command |
@@ -66,6 +90,10 @@ Agent dies → a watchdog cleans up anyway.
 | 🔬 | Introspect a guest's memory, agentless | `memflow processes` |
 | 🐞 | Step through / read / write guest memory | `memflow trace`, `analyze` |
 | 💉 | Scan & inject physical RAM (any guest OS) | `memflow scan`, `phys-write` |
+| 🩺 | Diagnose a stuck boot from RAM | `memflow boot-diagnose` |
+| 🧩 | Diagnose virtio devices & feature bits (porting) | `virtio inspect`, `virtio decode` |
+| 💿 | Diagnose why an install ISO won't boot | `iso diagnose` |
+| 🧱 | Read partition tables / repair a dead guest's FS offline | `disk boot-info`, `disk read/write` |
 | 🔌 | Sniff a USB device's traffic to a pcap | `usb sniff` |
 | 🕸️ | Capture a guest's network traffic to a pcap | `netcap capture` |
 | 🔓 | Decrypt & rewrite its HTTPS (MITM in a container) | `netcap intercept` |
@@ -94,6 +122,19 @@ looks at the screen and clicks *Next*.
 
 🐧 **Reproducing a bug across distros.** Boot Rocky, Ubuntu and Debian in turn,
 run the same script, compare.
+
+🐧 **Kernel and OS development.** Build a kernel or a whole OS, boot it on real
+virtual hardware, and when it panics on boot read the vCPU registers and RAM
+from *outside* the guest (`memflow boot-diagnose`), single-step it over the
+gdbstub (`memflow trace`), inspect its virtio devices and negotiated feature
+bits (`virtio inspect`), or repair its disk offline (`disk write`) — then roll
+back to the template and try the next build. No serial cable, no second
+machine.
+
+🏠 **Home-lab hosting on the same box.** Keep a service alive with a long-term
+lease while the agent spins ephemeral job guests alongside it. One retired PC
+is both your always-on home server and your agent's disposable lab, and it only
+draws power when something actually needs it.
 
 ### Bring the analysis environment you already trust
 
@@ -205,14 +246,19 @@ standard library.
 L=$(proxmox-lab lease-begin --purpose "tour" \
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 
-proxmox-lab guest probe --vmid 9001        # how can I reach this guest?
-proxmox-lab guest run --lease "$L" --vmid 9001 uname -a
-proxmox-lab console screenshot --vmid 9001 # what's on the screen?
+# Clone a golden template (9000) into a fresh throwaway guest for this lease
+proxmox-lab guest clone --lease "$L" --template 9000 --newid 9101
 
-proxmox-lab lease-end --lease "$L"         # destroy guests, power off
+proxmox-lab guest probe --vmid 9101         # how can I reach this guest?
+proxmox-lab guest run --lease "$L" --vmid 9101 uname -a
+proxmox-lab console screenshot --vmid 9101  # what's on the screen?
+
+proxmox-lab lease-end --lease "$L"          # destroy the clone, power off
 ```
 
-That last line prints `"host_powered_off": true`. That's the whole point.
+`lease-begin` wakes the PC; `lease-end` prints `"host_powered_off": true` and
+the clone is gone. That round trip — on, clone, work, destroy, off — is the
+whole point.
 
 ## Point your agent at it
 

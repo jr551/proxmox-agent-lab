@@ -32,15 +32,30 @@ Runtime state — leases, screenshots, the journal — goes to
 | `token_name` | — | Token id, e.g. `lab` |
 | `verify_tls` | `false` | Verify the certificate. Off by default because a fresh Proxmox install is self-signed; turn it on once you have a trusted cert. |
 
+`verify_tls` is one switch for every connection to the node: REST calls, the
+VNC and serial console WebSockets, and `upload`'s curl invocation. Turning it
+on leaves no unverified path behind — earlier versions verified the API while
+the console and upload paths still accepted any certificate.
+
 ## `[lease]`
 
 | Key | Default | Meaning |
 |---|---|---|
 | `default_ttl_seconds` | `7200` | A lease not renewed within this window is swept by the watchdog |
 | `idle_shutdown_seconds` | `28800` | Shut a reachable host down after this long with no activity and no lease |
+| `long_term_backup` | `true` | Back up an active long-term lease's guests weekly |
+| `long_term_backup_storage` | — | Where those backups go; blank means `[storage] bulk_storage` |
+| `long_term_backup_keep` | `2` | Backup generations kept per guest |
+| `retained_backup` | `false` | Have the watchdog also back up retained-registry guests (templates, persistent workers). Off by default: it writes gigabytes on a schedule |
+| `retained_backup_interval_days` | `7` | How stale a retained guest's backup may get before the sweep takes another |
 
 A lease is the unit of accountability: writes require one, created guests are
 registered to it, and ending it destroys them and powers the host off.
+
+Guests meant to outlive their lease are recorded in `retained.json` under the
+state directory — see [safety-policy.md](safety-policy.md) for why a node tag
+cannot serve as the owner. `doctor` reports their backup coverage whether or
+not `retained_backup` is on.
 
 ## `[power]`
 
@@ -312,6 +327,14 @@ proxmox-lab journal --provision-pocketbase-agent
 proxmox-lab doctor
 ```
 
+A shortcut: storing a **superuser token** directly as the audit token
+(`proxmox-lab secrets set audit-token`) is detected on first use and converted
+automatically — the controller provisions the permanent least-privileged agent
+with that token, stores the agent's password credentials, and replaces the
+superuser token in the secret store with the agent's renewable one. Pasting a
+superuser token is therefore a one-time bootstrap, never a standing
+credential.
+
 PocketBase JWTs are inherently finite; there is no unlimited token. The
 controller refreshes a renewable `_superusers` or agent token before its
 configured expiry window and atomically replaces the keyring value. The
@@ -354,6 +377,15 @@ one JSONL file per day. Sync fails closed if that checkout contains any other
 uncommitted file, and only `journal/YYYY-MM-DD.jsonl` is ever staged.
 `doctor` reports these independently as `audit.local_backend` and
 `audit.git_sync`; SQLite plus Git sync is an intentional supported setup.
+
+When `git_sync` is on, `doctor` also checks that the mirror could actually
+receive a record and reports `audit.git_status` — the repository exists, is a
+repository root, is clean and is writable. A failure there is a `doctor`
+problem, because each mutating command only prints a warning when a push
+fails, which is easy to miss for weeks. `doctor` reports
+`audit.spooled_records` for the same reason: a non-zero backlog means the
+configured backend refused events that are now only on local disk, and it
+names `journal --flush-spool` as the fix.
 
 ---
 

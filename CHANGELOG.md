@@ -4,6 +4,29 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.9.4 - 2026-08-21
+
+### Fixed
+
+- The orphan activity guard could not see work happening *inside* a guest. Its
+  two signals were external — a recent Proxmox task, or a short uptime — and a
+  long build in an unmanaged container produces neither: no task is recorded
+  and the uptime keeps growing. After 30 minutes such a guest read as idle and
+  was reclaimable. A third signal now protects it: CPU at or above 10%.
+
+  The floor is set from measurement on the lab node rather than taste — a
+  genuinely idle container runs at 0.005% and a mostly-idle Debian guest at
+  about 1%, so anything lower would make nothing reclaimable at all.
+
+### Changed
+
+- Every orphan now carries its measured load — CPU percent, memory, and disk
+  and network counters — in the reclamation result, in the audit event for a
+  guest that was stopped, and in `doctor` (`orphaned_but_active` for protected
+  guests, `orphaned_idle_load` for the rest). Below the CPU floor a guest is
+  not proven idle, only not proven busy, so the numbers behind the decision are
+  reported instead of just its outcome.
+
 ## 0.9.3 - 2026-08-21
 
 ### Fixed

@@ -1809,11 +1809,40 @@ ORPHAN_ACTIVITY_WINDOW_SECONDS = 1800
 STOP_TASK_TYPES = frozenset(
     {"qmstop", "qmshutdown", "qmreset", "vzstop", "vzshutdown"}
 )
+# Work happening *inside* a guest produces no Proxmox task and does not reset
+# its uptime, so a long build in an unmanaged container looks idle to both of
+# the other signals. This floor is set where a guest is unmistakably doing
+# something: an idle Debian guest on the lab node sits near 1% and a genuinely
+# idle container near 0.005%, so 10% is not a judgement call.
+BUSY_CPU_FRACTION = 0.10
+
+
+def guest_load(record: dict[str, Any] | None) -> dict[str, Any]:
+    """The activity numbers Proxmox already reports for a guest.
+
+    Returned with every orphan, busy or not, so the reader can disagree with
+    the threshold instead of having to trust it.
+    """
+    if not isinstance(record, dict):
+        return {}
+    load: dict[str, Any] = {}
+    try:
+        load["cpu_percent"] = round(float(record.get("cpu") or 0.0) * 100, 3)
+    except (TypeError, ValueError):
+        pass
+    for source, name in (("mem", "mem_bytes"), ("diskwrite", "disk_written_bytes"),
+                         ("netin", "net_in_bytes")):
+        try:
+            load[name] = int(record.get(source) or 0)
+        except (TypeError, ValueError):
+            continue
+    return load
 
 
 def recent_guest_activity(
     api: ProxmoxAPI, kind: str, vmid: int, *,
     within: int = ORPHAN_ACTIVITY_WINDOW_SECONDS,
+    record: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Evidence that something is still using this guest, or None.
 
@@ -1824,12 +1853,21 @@ def recent_guest_activity(
     other session had been taking a console screenshot every 45 seconds, and
     restarted the guest 90 seconds later.
 
-    Two independent signals, because each covers the other's blind spot:
-    recent tasks (console, start, agent) show someone driving it, and a short
-    uptime shows it was started recently even if the task log has rolled. An
-    unreadable task log counts as activity: leaving a guest running is a much
-    smaller mistake than stopping somebody's work.
+    Three independent signals, because each covers the others' blind spots:
+    recent tasks (console, start, agent) show someone driving it from outside;
+    a short uptime shows it was started recently even if the task log has
+    rolled; and measurable CPU shows work happening *inside* it, which the
+    other two cannot see at all -- a three-hour build in an unmanaged container
+    generates no Proxmox task and does not reset the uptime. An unreadable task
+    log counts as activity: leaving a guest running is a much smaller mistake
+    than stopping somebody's work.
+
+    A guest below the CPU floor is not proven idle, only not proven busy, so
+    its measured load is reported either way.
     """
+    load = guest_load(record)
+    if load.get("cpu_percent", 0) >= BUSY_CPU_FRACTION * 100:
+        return {"signal": "busy", "cpu_percent": load["cpu_percent"], **load}
     try:
         current = api.call(
             "GET", f"/nodes/{NODE}/{kind}/{vmid}/status/current"
@@ -1861,6 +1899,7 @@ def recent_guest_activity(
             return {
                 "signal": str(task.get("type")),
                 "seconds_ago": max(0, int(now - started)),
+                **load,
             }
     return None
 
@@ -1890,7 +1929,7 @@ def reclaim_orphans(
             continue
         activity = (
             None if include_active
-            else recent_guest_activity(api, kind, vmid)
+            else recent_guest_activity(api, kind, vmid, record=guest.get("load"))
         )
         if activity:
             result["left_active"][str(vmid)] = activity
@@ -1912,6 +1951,7 @@ def reclaim_orphans(
                 vmid=vmid,
                 lease_tag=guest.get("lease_tag"),
                 reason="no lease record or retained registry entry",
+                **guest_load(guest.get("load")),
             )
         except LabError as exc:
             result["failed"][str(vmid)] = str(exc)[:300]
@@ -2479,7 +2519,8 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         idle = []
         for orphan in running_orphans:
             signal = recent_guest_activity(
-                api, orphan["kind"], int(orphan["vmid"])
+                api, orphan["kind"], int(orphan["vmid"]),
+                record=orphan.get("load"),
             )
             if signal:
                 active[str(orphan["vmid"])] = signal
@@ -2497,6 +2538,9 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                 "the host on, which is correct while they are in use."
             )
         if idle:
+            report["guests"]["orphaned_idle_load"] = {
+                str(x["vmid"]): guest_load(x.get("load")) for x in idle
+            }
             # This is the failure mode that keeps the machine on for days:
             # nothing owns the guest, so no sweep stops it, and shutdown_host
             # refuses while any guest runs.

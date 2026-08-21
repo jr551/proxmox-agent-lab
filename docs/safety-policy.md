@@ -131,13 +131,29 @@ one whose state directory lives elsewhere — drives guests through the same API
 token, and its lease records are not here. So a running orphan may be somebody
 else's live work.
 
-Reclamation therefore leaves a guest alone if either signal says it is in use:
-a non-stop task for it in the last 30 minutes (console, start, agent), or an
-uptime shorter than that. Stop tasks are excluded, or our own stop would make
-every later run refuse; an unreadable task log counts as in use, because not
-knowing must not resolve to stopping someone's work. `--include-active`
-overrides it. `doctor` reports such guests as `orphaned_but_active` rather than
-as a problem — they keep the host on, which is correct while they are in use.
+Reclamation therefore leaves a guest alone if **any** of three signals says it
+is in use:
+
+1. a non-stop task for it in the last 30 minutes — console, start, agent: some
+   thing driving it from outside;
+2. an uptime shorter than that — started recently, even if the task log rolled;
+3. CPU at or above 10% — work happening *inside* it, which neither of the
+   others can see at all. A three-hour build in an unmanaged container produces
+   no Proxmox task and does not reset the uptime.
+
+Stop tasks are excluded from signal 1, or our own stop would make every later
+run refuse. An unreadable task log counts as in use, because not knowing must
+not resolve to stopping someone's work. `--include-active` overrides all three.
+`doctor` reports such guests as `orphaned_but_active` rather than as a problem —
+they keep the host on, which is correct while they are in use.
+
+The 10% floor has to sit well above background noise: measured on the lab node,
+a genuinely idle container runs at 0.005% and a mostly-idle Debian guest at
+about 1%, so a lower floor would make nothing ever reclaimable. Below the floor
+a guest is not *proven* idle, only not proven busy — so the measured CPU,
+memory and disk/network counters are reported for every orphan either way, in
+the reclamation result and in `doctor`'s `orphaned_idle_load`. Disagree with the
+threshold using the numbers rather than trusting it.
 
 This was learned the direct way: a reclamation run stopped a ReactOS benchmark
 that another session had been screenshotting every 45 seconds, and that session

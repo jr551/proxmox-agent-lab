@@ -203,6 +203,14 @@ def classify(
         if registry is not None:
             described["retained_purpose"] = registry.get("purpose")
             described["last_backup_at"] = registry.get("last_backup_at")
+        if guest.get("status") == "running":
+            # Carried through so a caller can tell a guest that is working from
+            # one that is merely switched on, without a second API call.
+            described["load"] = {
+                key: guest.get(key)
+                for key in ("cpu", "mem", "diskwrite", "netin")
+                if guest.get(key) is not None
+            }
         out.append(described)
     return sorted(out, key=lambda item: item["vmid"])
 

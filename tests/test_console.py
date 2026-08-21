@@ -1972,6 +1972,8 @@ class StorageGarbageCollectionTests(unittest.TestCase):
         "local-lvm": [
             {"volid": "local-lvm:vm-9001-disk-0", "vmid": 9001,
              "size": 34_359_738_368, "format": "raw"},
+            {"volid": "local-lvm:vm-9001-state-before-update", "vmid": 9001,
+             "size": 4_294_967_296, "format": "raw"},
         ],
         "usb-bulk": [
             {"volid": "usb-bulk:9002/vm-9002-disk-0.raw", "vmid": 9002,
@@ -1985,6 +1987,18 @@ class StorageGarbageCollectionTests(unittest.TestCase):
     CONFIGS = {
         9001: {"scsi0": "local-lvm:vm-9001-disk-0,discard=on,size=32G"},
         9002: {"virtio0": "usb-bulk:9002/vm-9002-disk-0.raw,iothread=1,size=100G"},
+    }
+    # A snapshot's vmstate volume is listed as ordinary images content but
+    # appears only in the snapshot's own config.
+    SNAPSHOTS = {
+        9001: [{"name": "before-update"}, {"name": "current"}],
+        9002: [],
+    }
+    SNAPSHOT_CONFIGS = {
+        (9001, "before-update"): {
+            "vmstate": "local-lvm:vm-9001-state-before-update",
+            "scsi0": "local-lvm:vm-9001-disk-0,discard=on,size=32G",
+        },
     }
 
     def _lab(self) -> tuple:
@@ -2003,6 +2017,16 @@ class StorageGarbageCollectionTests(unittest.TestCase):
             matched = re.fullmatch(r"/nodes/aipve/qemu/(\d+)/config", path)
             if matched:
                 return self.CONFIGS[int(matched.group(1))]
+            matched = re.fullmatch(r"/nodes/aipve/qemu/(\d+)/snapshot", path)
+            if matched:
+                return self.SNAPSHOTS[int(matched.group(1))]
+            matched = re.fullmatch(
+                r"/nodes/aipve/qemu/(\d+)/snapshot/([^/]+)/config", path
+            )
+            if matched:
+                return self.SNAPSHOT_CONFIGS[
+                    (int(matched.group(1)), matched.group(2))
+                ]
             matched = re.fullmatch(
                 r"/nodes/aipve/storage/([^/]+)/content", path
             )
@@ -2045,7 +2069,7 @@ class StorageGarbageCollectionTests(unittest.TestCase):
             [x["volid"] for x in result["orphaned_volumes"]],
             ["usb-bulk:9003/vm-9003-disk-0.raw"],
         )
-        self.assertEqual(result["referenced_volumes"], 2)
+        self.assertEqual(result["referenced_volumes"], 3)
         self.assertEqual(result["orphaned_gb"], 10.74)
 
     def test_a_volume_named_in_a_config_with_options_is_referenced(self) -> None:
@@ -2056,6 +2080,29 @@ class StorageGarbageCollectionTests(unittest.TestCase):
             "usb-bulk:9002/vm-9002-disk-0.raw",
             [x["volid"] for x in result["orphaned_volumes"]],
         )
+
+    def test_a_snapshot_state_volume_is_never_an_orphan(self) -> None:
+        """It is listed as ordinary images content but appears only in the
+        snapshot's own config, so a live-config-only scan would have offered
+        to delete the thing a rollback needs."""
+        result, _, _, _ = self._run()
+        self.assertNotIn(
+            "local-lvm:vm-9001-state-before-update",
+            [x["volid"] for x in result["orphaned_volumes"]],
+        )
+
+    def test_an_unreadable_snapshot_list_also_refuses_to_classify(self) -> None:
+        lab, api = self._lab()
+        original = api.call.side_effect
+
+        def call(method: str, path: str, data: Any = None) -> Any:
+            if path.endswith("/9001/snapshot"):
+                raise RuntimeError("HTTP 500")
+            return original(method, path, data)
+
+        api.call.side_effect = call
+        with self.assertRaisesRegex(RuntimeError, "Refusing to classify"):
+            lab_storage.cmd_gc(lab, self._args())
 
     def test_reporting_is_the_default_and_deletes_nothing(self) -> None:
         result, error, _, api = self._run()
@@ -2105,7 +2152,7 @@ class StorageGarbageCollectionTests(unittest.TestCase):
             return original(method, path, data)
 
         api.call.side_effect = call
-        with self.assertRaisesRegex(RuntimeError, "refusing to classify"):
+        with self.assertRaisesRegex(RuntimeError, "Refusing to classify"):
             lab_storage.cmd_gc(lab, self._args())
 
     def test_only_images_capable_stores_are_scanned(self) -> None:

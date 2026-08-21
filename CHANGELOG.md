@@ -36,7 +36,10 @@ the machine on indefinitely.
 - `storage gc` finds image volumes no guest config references. It **reports by
   default**; `--delete --host-change-authorized` removes only what that same
   run classified as unreferenced, and each deletion is audited with volid and
-  size. If any guest config cannot be read, nothing is classified at all.
+  size. Snapshot configs are scanned as well as live ones, because a snapshot's
+  `vmstate` volume is listed as ordinary `images` content but referenced only
+  from the snapshot; and if any config or snapshot cannot be read, nothing is
+  classified at all.
 - `storage status` reports a `class` per storage (`bulk` for
   `[storage] bulk_storage`, `fast` otherwise), so callers stop hardcoding site
   storage ids.

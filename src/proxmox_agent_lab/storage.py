@@ -232,29 +232,50 @@ def _volumes(lab: Any, api: Any, store: str) -> list[dict[str, Any]]:
 def _referenced_volids(lab: Any, api: Any) -> set[str]:
     """Every volid mentioned by any guest config on the node.
 
-    Deliberately blunt: every string value of every config key is searched,
-    including snapshots and pending changes, because a false "orphan" here
-    would authorise deleting a disk that is genuinely in use. Missing a real
-    orphan just means it is reported next time.
+    Deliberately blunt: every string value of every config key is kept, because
+    a false "orphan" here would authorise deleting a disk that is genuinely in
+    use. Missing a real orphan only means it is reported next time.
+
+    Snapshots are read as well as the live config, and that is not optional. A
+    snapshot's `vmstate` volume (`vm-<id>-state-<name>`) is listed by the
+    storage as ordinary `images` content but appears *only* in the snapshot's
+    own config -- so a live-config-only scan would have called it unreferenced
+    and offered to delete the thing a rollback needs.
     """
     referenced: set[str] = set()
+
+    def keep(config: Any) -> None:
+        if isinstance(config, dict):
+            referenced.update(
+                value for value in config.values() if isinstance(value, str)
+            )
+
+    def read(path: str, what: str) -> Any:
+        try:
+            return api.call("GET", path)
+        except lab.LabError as exc:
+            # Anything unreadable is something we cannot clear volumes for.
+            raise lab.LabError(
+                f"could not read {what}: {exc}. Refusing to classify any "
+                "volume as unreferenced"
+            ) from None
+
     for guest in api.call("GET", "/cluster/resources", {"type": "vm"}) or []:
         if not isinstance(guest, dict) or "vmid" not in guest:
             continue
         kind = str(guest.get("type") or "qemu")
-        try:
-            config = api.call(
-                "GET", f"/nodes/{lab.NODE}/{kind}/{int(guest['vmid'])}/config"
-            ) or {}
-        except lab.LabError:
-            # A guest we cannot read is a guest we cannot clear volumes for.
-            raise lab.LabError(
-                f"could not read the config of {kind}/{guest.get('vmid')}; "
-                "refusing to classify any volume as unreferenced"
-            )
-        for value in config.values():
-            if isinstance(value, str):
-                referenced.add(value)
+        vmid = int(guest["vmid"])
+        base = f"/nodes/{lab.NODE}/{kind}/{vmid}"
+        keep(read(f"{base}/config", f"the config of {kind}/{vmid}"))
+        snapshots = read(f"{base}/snapshot", f"the snapshots of {kind}/{vmid}")
+        for snapshot in snapshots or []:
+            name = isinstance(snapshot, dict) and snapshot.get("name")
+            if not name or name == "current":
+                continue
+            keep(read(
+                f"{base}/snapshot/{name}/config",
+                f"snapshot {name} of {kind}/{vmid}",
+            ))
     return referenced
 
 

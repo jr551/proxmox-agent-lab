@@ -93,10 +93,14 @@ string value of every config key is searched, so a volume referenced as
 a false "orphan" here would authorise deleting a disk that is in use. Missing a
 real orphan only means it is reported next time.
 
-Two more guards worth knowing:
+Three more guards worth knowing:
 
-- If any guest config cannot be read, **nothing** is classified: a volume that
-  config referenced would otherwise look unreferenced.
+- **Snapshots are read too, and that is not optional.** A snapshot's `vmstate`
+  volume (`vm-<id>-state-<name>`) is listed by the storage as ordinary `images`
+  content but appears *only* in the snapshot's own config, so a live-config-only
+  scan would have offered to delete the thing a rollback needs.
+- If any guest config or snapshot cannot be read, **nothing** is classified: a
+  volume it referenced would otherwise look unreferenced.
 - `--delete` only removes volumes that the *same run* found unreferenced;
   nothing is carried over from an earlier report.
 

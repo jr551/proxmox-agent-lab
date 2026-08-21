@@ -124,6 +124,25 @@ folds reclamation into a full expiry sweep, which in the same run finalizes
 every expired lease — deleting their guests — and then decides whether to power
 the host off. Those are much larger intentions, so they have separate flags.
 
+### "Orphaned" does not mean "abandoned"
+
+It means *this* controller has no record of the guest. A second controller — or
+one whose state directory lives elsewhere — drives guests through the same API
+token, and its lease records are not here. So a running orphan may be somebody
+else's live work.
+
+Reclamation therefore leaves a guest alone if either signal says it is in use:
+a non-stop task for it in the last 30 minutes (console, start, agent), or an
+uptime shorter than that. Stop tasks are excluded, or our own stop would make
+every later run refuse; an unreadable task log counts as in use, because not
+knowing must not resolve to stopping someone's work. `--include-active`
+overrides it. `doctor` reports such guests as `orphaned_but_active` rather than
+as a problem — they keep the host on, which is correct while they are in use.
+
+This was learned the direct way: a reclamation run stopped a ReactOS benchmark
+that another session had been screenshotting every 45 seconds, and that session
+restarted the guest 90 seconds later.
+
 Reclamation **stops, and never deletes.** Stopping is reversible and is all
 that is needed to unblock power-off; a controller that has lost the record of a
 guest cannot vouch for what is on its disk, so deleting it stays a human

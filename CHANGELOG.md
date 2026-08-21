@@ -4,6 +4,29 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.9.3 - 2026-08-21
+
+### Fixed
+
+- Orphan reclamation stopped guests that were in active use. "Orphaned" means
+  *this* controller has no record of a guest — not that nobody is using it: a
+  second controller, or one whose state directory lives elsewhere, drives
+  guests through the same API token and its lease records are not here. A run
+  on the lab node stopped a ReactOS benchmark that another session had been
+  screenshotting every 45 seconds; that session restarted the guest 90 seconds
+  later.
+
+  Reclamation now leaves a running orphan alone when either signal says it is
+  in use — a non-stop task for it within the last 30 minutes, or an uptime
+  shorter than that — and reports it as `left_active`. Stop tasks are excluded
+  from the signal, or the first reclamation would make every later run refuse;
+  an unreadable task log counts as in use, because not knowing must not resolve
+  to stopping someone's work. `--include-active` overrides it.
+- `doctor` distinguishes the two cases. A running orphan with recent activity
+  is reported as `orphaned_but_active` with a note that another controller
+  likely owns it; only an idle one is a problem, since only that one is keeping
+  the host on for no reason.
+
 ## 0.9.2 - 2026-08-21
 
 ### Fixed

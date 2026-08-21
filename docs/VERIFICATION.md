@@ -70,6 +70,13 @@ stream rather than as an API error, so the attach retry has to ask
 | `doctor --host-checks` | `updates_pending: 78`, `security_updates: true`, `reboot_required: false` over the host SSH channel |
 | Retained registry round trip | `guest retain --vmid 101` recorded the template, `doctor` then reported `never_backed_up: [101]` with the coverage note, `backup --retained` correctly refused while disabled, and `--forget` restored an empty registry |
 
+Running the reclamation for real also surfaced the limit of the orphan
+heuristic: it stopped `qemu/9243` and `qemu/9244`, ReactOS benchmark guests
+that a *different* controller session was driving over VNC through the same API
+token. Stopping (never deleting) meant it was recoverable, and that session
+restarted 9244 within 90 seconds — but the guard added in 0.9.3 exists because
+of it, not in anticipation of it.
+
 A test-hygiene bug surfaced only because of this hardware check, and is worth
 recording: `register_resource` began writing the retained registry under
 `STATE_ROOT`, and one pre-existing test did not redirect that root — so running

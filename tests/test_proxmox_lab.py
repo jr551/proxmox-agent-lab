@@ -1747,12 +1747,26 @@ class OrphanReclamationTests(unittest.TestCase):
         })
         return old
 
-    def _api(self) -> mock.Mock:
+    def _api(self, *, tasks: dict | None = None,
+             uptime: dict | None = None) -> mock.Mock:
+        """`tasks` maps vmid -> task list, `uptime` maps vmid -> seconds."""
+        tasks = tasks or {}
+        uptime = uptime or {}
+
+        def call(method: str, path: str, data: object = None) -> object:
+            if path == "/cluster/resources":
+                return self._guests()
+            if path.endswith("/tasks"):
+                vmid = int((data or {}).get("vmid", 0))
+                return tasks.get(vmid, [])
+            if path.endswith("/status/current"):
+                vmid = int(path.split("/")[-3])
+                return {"status": "running", "uptime": uptime.get(vmid, 999_999)}
+            return None
+
         api = mock.Mock()
         api.reachable.return_value = True
-        api.call.side_effect = lambda method, path, data=None: (
-            self._guests() if path == "/cluster/resources" else None
-        )
+        api.call.side_effect = call
         return api
 
     def test_a_pruned_lease_leaves_its_guest_detectable(self) -> None:
@@ -1796,6 +1810,110 @@ class OrphanReclamationTests(unittest.TestCase):
         deleted.assert_not_called()
         events = [call.args[0] for call in audited.call_args_list]
         self.assertIn("orphan-guest-stopped", events)
+
+    def test_a_guest_something_is_still_driving_is_left_alone(self) -> None:
+        """Found by running it: 'orphaned' means this controller has no record,
+        not that nobody is using it. Another controller was taking a console
+        screenshot of 9002 every 45 seconds through the same token, and the
+        reclamation stopped it mid-run."""
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                api = self._api(tasks={
+                    9002: [{"type": "vncproxy",
+                            "starttime": int(_time.time()) - 45}],
+                })
+                with mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "audit"):
+                    result = LAB.reclaim_orphans(api)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        stopped.assert_not_called()
+        self.assertEqual(result["stopped"], [])
+        self.assertEqual(result["left_active"]["9002"]["signal"], "vncproxy")
+
+    def test_a_guest_started_moments_ago_is_left_alone(self) -> None:
+        """The task log can roll; a short uptime still says it is in use, and
+        needs no clock agreement between controller and node."""
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                api = self._api(uptime={9002: 219})
+                with mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "audit"):
+                    result = LAB.reclaim_orphans(api)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        stopped.assert_not_called()
+        self.assertEqual(
+            result["left_active"]["9002"]["signal"], "started recently"
+        )
+
+    def test_our_own_stop_does_not_read_as_someone_using_it(self) -> None:
+        """Otherwise the first reclamation would make every later run refuse."""
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                api = self._api(tasks={
+                    9002: [{"type": "qmshutdown",
+                            "starttime": int(_time.time()) - 30},
+                           {"type": "qmstop",
+                            "starttime": int(_time.time()) - 20}],
+                })
+                with mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "audit"):
+                    result = LAB.reclaim_orphans(api)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertEqual(result["stopped"], [9002])
+        self.assertEqual(result["left_active"], {})
+        stopped.assert_called_once()
+
+    def test_an_unreadable_task_log_leaves_the_guest_running(self) -> None:
+        """Not knowing must not resolve to stopping somebody's work."""
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                api = self._api()
+                original = api.call.side_effect
+
+                def call(method: str, path: str, data: object = None) -> object:
+                    if path.endswith("/tasks"):
+                        raise LAB.LabError("HTTP 403")
+                    return original(method, path, data)
+
+                api.call.side_effect = call
+                with mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "audit"):
+                    result = LAB.reclaim_orphans(api)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        stopped.assert_not_called()
+        self.assertEqual(
+            result["left_active"]["9002"]["signal"], "task log unreadable"
+        )
+
+    def test_include_active_stops_it_anyway(self) -> None:
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._state(tmp)
+            try:
+                api = self._api(tasks={
+                    9002: [{"type": "vncproxy",
+                            "starttime": int(_time.time()) - 45}],
+                })
+                with mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "audit"):
+                    result = LAB.reclaim_orphans(api, include_active=True)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+        self.assertEqual(result["stopped"], [9002])
+        stopped.assert_called_once()
 
     def test_a_stop_failure_is_reported_not_swallowed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

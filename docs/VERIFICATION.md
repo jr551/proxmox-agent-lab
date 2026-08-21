@@ -65,7 +65,7 @@ stream rather than as an API error, so the attach retry has to ask
 |---|---|
 | Orphan detection | `guest inventory` over 26 real guests: 19 resolved to a lease record, **6 were orphaned** (4 running), 1 was not this tool's. The running set — 106, 9242, 9243, 9244, 9999 — is why the node had been up for five days |
 | `doctor` fails on a running orphan | `5 running guest(s) carry a lease tag this controller has no record of … the host cannot power off: 106, 9242, 9243, 9244, 9999` |
-| `storage gc` | Reported 4 unreferenced qcow2 images totalling **51.54 GB** on the bulk store (VMIDs 9180, 9190, 9200 — guests long gone), while correctly keeping 43 referenced volumes. Nothing was deleted: reporting is the default |
+| `storage gc` | Reported 4 unreferenced qcow2 images on the bulk store (VMIDs 9180, 9190, 9200 — guests long gone), while correctly keeping 43 referenced volumes. Nothing was deleted: reporting is the default. They were **provisioned at 51.54 GB but held 9.33 MB**, which is why the report now separates the two figures |
 | `storage status` class | `usb-bulk` → `bulk`, `local` and `local-lvm` → `fast` |
 | `doctor --host-checks` | `updates_pending: 78`, `security_updates: true`, `reboot_required: false` over the host SSH channel |
 | Retained registry round trip | `guest retain --vmid 101` recorded the template, `doctor` then reported `never_backed_up: [101]` with the coverage note, `backup --retained` correctly refused while disabled, and `--forget` restored an empty registry |

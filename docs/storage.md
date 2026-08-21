@@ -104,9 +104,15 @@ Three more guards worth knowing:
 - `--delete` only removes volumes that the *same run* found unreferenced;
   nothing is carried over from an earlier report.
 
-Every deletion is audited with its volid and size. A first run on the lab node
-found 4 unreferenced qcow2 images totalling 51.5 GB, all belonging to VMIDs
-whose guests no longer existed.
+Every deletion is audited with its volid, provisioned size and on-disk size.
+
+**Read the right number before deleting anything.** The report distinguishes
+`orphaned_provisioned_gb` from `orphaned_on_disk_gb`, and only the second is
+returned by a deletion. On the lab node the first run found 4 unreferenced
+qcow2 images provisioned at 51.54 GB that held **9.33 MB** between them — three
+creates that failed almost immediately. Deleting them was the right tidy-up and
+reclaimed essentially no space; treating the provisioned figure as free space
+would have made an irreversible act look worthwhile when it was not.
 
 ## Fetching cloud images
 

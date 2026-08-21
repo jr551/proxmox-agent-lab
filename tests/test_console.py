@@ -530,6 +530,37 @@ class StorageGuardTests(unittest.TestCase):
         self.assertEqual(len(formatted), 1, "the format call should fire once")
         self.assertEqual(formatted[0][0][2]["device"], "/dev/sdb")
 
+    def test_failing_to_set_content_types_is_not_a_success(self) -> None:
+        """Found live: the disk was formatted and registered, setting content
+        types failed, and the command still exited 0. A caller then uploaded
+        to a storage that would not accept the content."""
+        import contextlib
+        import io
+
+        lab, api = self._lab([self.USB])
+
+        def call(method: str, path: str, data: Any = None) -> Any:
+            if path.endswith("/disks/list"):
+                return [self.USB]
+            if method == "PUT" and path.startswith("/storage/"):
+                raise RuntimeError("HTTP 500: storage 'test-bulk' is busy")
+            return "UPID:testnode:task"
+
+        api.call.side_effect = call
+        lab.wait_task.return_value = {"exitstatus": "OK"}
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            with self.assertRaises(RuntimeError) as caught:
+                lab_storage.cmd_add_disk(lab, self._args())
+        self.assertIn("set-content", str(caught.exception))
+        # The partial state is still reported, so recovery does not need the
+        # command to be rerun (which would reformat the disk).
+        result = json.loads(printed.getvalue())
+        self.assertFalse(result["content_configured"])
+        self.assertIn("content_warning", result)
+        self.assertEqual(result["storage"], "test-bulk")
+        self.assertFalse(lab.audit.call_args.kwargs["content_configured"])
+
 
 class SerialSessionTests(unittest.TestCase):
     """A serial console echoes what you type and wraps long lines, so these
@@ -1345,6 +1376,9 @@ class SerialDebugTests(unittest.TestCase):
         lab.LabError = RuntimeError
         lab.NODE = "aipve"
         lab.load_lease.return_value = {"resources": []}
+        # A reset keeps the QEMU process alive, so --from-reset only applies to
+        # a guest that is already running.
+        lab.guest_status.return_value = "running"
         return lab
 
     def _text_args(self, **overrides: object) -> object:
@@ -1398,10 +1432,20 @@ class SerialDebugTests(unittest.TestCase):
         api.call.side_effect = api_call
 
         class FakeSession:
+            """Filters like the real session does, so the fake cannot pass a
+            stream the production path would have rejected."""
+
             def __init__(self, *a: object, **k: object) -> None:
                 order.append("attach")
                 self.socket = mock.Mock()
                 self.socket.read_available.return_value = b""
+                self.filter = lab_console.TermFilter()
+
+            def read_bytes(self, timeout: float) -> bytes:
+                return self.filter.feed(self.socket.read_available(timeout))
+
+            def flush_bytes(self) -> bytes:
+                return self.filter.flush()
 
             def __enter__(self) -> "FakeSession":
                 return self
@@ -1417,3 +1461,489 @@ class SerialDebugTests(unittest.TestCase):
             "POST", "/nodes/aipve/qemu/9001/status/reset"
         )
         lab.require_lease_resource.assert_called_once()
+
+
+class TermTransportFilterTests(unittest.TestCase):
+    """Found live: a termproxy status line was returned as guest serial output.
+
+    It contaminated saved boot logs and could be sent on to a debugger as if
+    the guest had printed it. These assert that transport records are removed
+    whether or not they arrive whole, and that real guest text is not.
+    """
+
+    BANNER = b"starting serial terminal on interface serial0 (press Ctrl+O to exit)\n"
+    # What a Proxmox 9.2 node actually sends: no suffix, CRLF terminated.
+    LIVE_BANNER = b"starting serial terminal on interface serial0\r\n"
+
+    def test_handshake_and_banner_in_one_read_are_both_removed(self) -> None:
+        term = lab_console.TermFilter()
+        out = term.feed(b"OK\n" + self.BANNER + b"Booting ReactOS\n")
+        self.assertEqual(out, b"Booting ReactOS\n")
+
+    def test_handshake_without_a_newline_is_removed(self) -> None:
+        term = lab_console.TermFilter()
+        self.assertEqual(term.feed(b"OK" + self.BANNER), b"")
+        self.assertEqual(term.feed(b"guest\n"), b"guest\n")
+
+    def test_records_split_across_reads_are_still_removed(self) -> None:
+        """A websocket read is not a record boundary."""
+        term = lab_console.TermFilter()
+        chunks = [b"O", b"K\nstarting serial ter",
+                  b"minal on interface serial0 (press Ctrl+O to exit)",
+                  b"\nBooting ReactOS\n"]
+        out = b"".join(term.feed(chunk) for chunk in chunks)
+        self.assertEqual(out, b"Booting ReactOS\n")
+        self.assertEqual(term.flush(), b"")
+
+    def test_the_framing_a_real_node_sends(self) -> None:
+        """Captured from a Proxmox 9.2 node: the ack arrives alone with no
+        newline, a blank CRLF can precede the record, the record is CRLF
+        terminated, and guest bytes then arrive a few at a time. The first fix
+        for this issue stripped nothing here, because the blank line looked
+        like guest output and ended the search."""
+        term = lab_console.TermFilter()
+        frames = [
+            b"OK",
+            b"\r\n",
+            b"starting serial terminal on interface serial0\r\n",
+            b"\r\n",
+            b"\x1b[?2", b"004", b"l\r", b"\x1b[", b"?2004h",
+            b"de", b"bian", b"@", b"host", b":~", b"$ ",
+        ]
+        out = b"".join(term.feed(frame) for frame in frames) + term.flush()
+        self.assertNotIn(b"starting serial terminal", out)
+        self.assertIn(b"debian@host:~$ ", out)
+
+    def test_an_lxc_style_pair_of_records_is_removed_before_the_prompt(self) -> None:
+        term = lab_console.TermFilter()
+        out = term.feed(b"OK") + term.feed(
+            b"Connected to tty 1\r\n"
+            b"Type <Ctrl+a q> to exit the console, "
+            b"<Ctrl+a Ctrl+a> to enter Ctrl+a itself\r\n"
+        ) + term.feed(b"root@ct:~# ")
+        self.assertEqual(out, b"root@ct:~# ")
+
+    def test_the_record_is_still_removed_after_guest_echo(self) -> None:
+        """It is not always the first thing on the stream."""
+        term = lab_console.TermFilter()
+        out = term.feed(b"OK\r\n\r\n") + term.feed(
+            b"starting serial terminal on interface serial0\r\n[    0.00] boot\n"
+        )
+        self.assertNotIn(b"starting serial", out)
+        self.assertIn(b"[    0.00] boot\n", out)
+
+    def test_the_stopped_guest_refusal_is_not_guest_output(self) -> None:
+        """Captured live from a stopped guest: the ticket is issued, the socket
+        opens, and this is all that ever arrives. Saved into a boot log it
+        reads as something the guest printed."""
+        term = lab_console.TermFilter()
+        out = term.feed(b"OK") + term.feed(b"VM 9231 not running\r\n")
+        self.assertEqual(out + term.flush(), b"")
+
+    def test_a_guest_line_about_something_not_running_survives(self) -> None:
+        term = lab_console.TermFilter()
+        term.feed(b"OK")
+        line = b"systemd: nginx.service is not running, restarting\n"
+        self.assertEqual(term.feed(line), line)
+
+    def test_a_short_ambiguous_tail_is_not_held_back(self) -> None:
+        """An interactive prompt has no newline; holding it would hang a
+        debugger waiting for a byte that has already arrived."""
+        term = lab_console.TermFilter()
+        term.feed(b"OK")
+        self.assertEqual(term.feed(b"C"), b"C")
+        self.assertEqual(term.feed(b"on"), b"on")
+
+    def test_a_guest_line_beginning_with_ok_is_preserved(self) -> None:
+        """The old prefix test truncated any guest line starting 'OK'."""
+        term = lab_console.TermFilter()
+        term.feed(b"OK\n")
+        self.assertEqual(term.feed(b"OKAY device ready\n"),
+                         b"OKAY device ready\n")
+
+    def test_guest_output_is_never_held_waiting_for_a_record(self) -> None:
+        """Held bytes must be limited to something that could still be one."""
+        term = lab_console.TermFilter()
+        term.feed(b"OK\n")
+        self.assertEqual(term.feed(b"kdb:> "), b"kdb:> ")
+
+    def test_a_truncated_record_is_not_leaked_when_the_session_ends(self) -> None:
+        term = lab_console.TermFilter()
+        self.assertEqual(term.feed(b"OK\nstarting serial terminal on inter"), b"")
+        self.assertEqual(term.flush(), b"")
+
+    def test_a_bare_handshake_reads_as_no_guest_output(self) -> None:
+        term = lab_console.TermFilter()
+        self.assertEqual(term.feed(b"OK"), b"")
+        self.assertEqual(term.flush(), b"")
+
+    def test_the_lxc_console_banner_is_removed_too(self) -> None:
+        term = lab_console.TermFilter()
+        out = term.feed(
+            b"OK\nConnected to tty 1\n"
+            b"Type <Ctrl+a q> to exit the console, "
+            b"<Ctrl+a Ctrl+a> to enter Ctrl+a itself\n"
+            b"root@ct:~# "
+        )
+        self.assertEqual(out, b"root@ct:~# ")
+
+    def test_session_read_returns_guest_text_only(self) -> None:
+        session = lab_console.TermSession.__new__(lab_console.TermSession)
+        session.filter = lab_console.TermFilter()
+        reads = [b"OK\n" + self.BANNER, b"Booting ReactOS\n", b""]
+        session.socket = mock.Mock()
+        session.socket.read_available.side_effect = \
+            lambda _t: reads.pop(0) if reads else b""
+        self.assertEqual(session.read(0.6), "Booting ReactOS\n")
+
+    def test_a_transport_only_read_does_not_end_the_capture(self) -> None:
+        """Found live: the record filtered down to no bytes, read() read that
+        as a gap in guest output and stopped, and the prompt arriving right
+        after it was lost. Removing noise must not remove signal."""
+        session = lab_console.TermSession.__new__(lab_console.TermSession)
+        session.filter = lab_console.TermFilter()
+        session.last_read_was_empty = True
+        reads = [b"OK", b"\r\n", self.LIVE_BANNER, b"debian@host:~$ "]
+        session.socket = mock.Mock()
+        session.socket.read_available.side_effect = \
+            lambda _t: reads.pop(0) if reads else b""
+        text = session.read(2.0)
+        self.assertIn("debian@host:~$ ", text)
+        self.assertNotIn("starting serial terminal", text)
+
+    def test_the_bridge_client_sees_the_same_filtered_stream(self) -> None:
+        """The JSON wrapper was not the only leaking path; the bridge was too."""
+        reads = [b"OK\n" + self.BANNER, b"Booting ReactOS\n"]
+
+        class FakeTerm:
+            def __init__(self, *a: object, **k: object) -> None:
+                self.filter = lab_console.TermFilter()
+                self.socket = mock.Mock()
+                self.socket.read_available.side_effect = \
+                    lambda _t: reads.pop(0) if reads else b""
+
+            def read_bytes(self, timeout: float) -> bytes:
+                return self.filter.feed(self.socket.read_available(timeout))
+
+            def __enter__(self) -> "FakeTerm":
+                return self
+
+            def __exit__(self, *a: object) -> None:
+                return None
+
+        import select as select_module
+
+        sent: list[bytes] = []
+        client = mock.Mock()
+        client.recv.return_value = b""          # third pass: client disconnects
+        idle = [([], [], []), ([], [], [])]     # let both guest reads through
+
+        def fake_select(readable, _w, _x, _timeout):
+            return idle.pop(0) if idle else (readable, [], [])
+
+        with mock.patch.object(lab_console, "TermSession", FakeTerm), \
+             mock.patch.object(select_module, "select", fake_select), \
+             mock.patch.object(
+                 lab_console, "_bridge_send_all",
+                 side_effect=lambda _c, data: bool(sent.append(data)) or True):
+            lab_console._bridge_serve(
+                mock.Mock(), mock.Mock(), "qemu", 9001, client
+            )
+        self.assertEqual(b"".join(sent), b"Booting ReactOS\n")
+        self.assertNotIn(b"starting serial terminal", b"".join(sent))
+
+
+class SerialAttachTests(unittest.TestCase):
+    """Found live on a Proxmox 9.2 node: `termproxy` issues a ticket for a
+    *stopped* guest and the websocket opens, then 'qm terminal' writes
+    "VM <id> not running" into the stream and exits. So the documented
+    attach-before-power-on capture produced a log with one transport sentence
+    in it, and the attach itself could not tell that anything was wrong."""
+
+    def _lab(self, *statuses: str) -> mock.Mock:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        remaining = list(statuses)
+        lab.guest_status.side_effect = \
+            lambda *_a: remaining.pop(0) if remaining else statuses[-1]
+        return lab
+
+    def test_attach_waits_for_a_stopped_guest_then_attaches(self) -> None:
+        lab = self._lab("stopped", "stopped", "running")
+        with mock.patch.object(lab_console, "TermSession",
+                               return_value="session") as term, \
+             mock.patch.object(lab_console.time, "sleep") as slept:
+            session = lab_console._attach_term(
+                lab, mock.Mock(), "qemu", 9001, wait=30, poll=0.01
+            )
+        self.assertEqual(session, "session")
+        self.assertEqual(lab.guest_status.call_count, 3)
+        self.assertEqual(term.call_count, 1, "attach only once the guest is up")
+        self.assertEqual(slept.call_count, 2)
+
+    def test_without_waiting_a_stopped_guest_is_a_clear_error(self) -> None:
+        """It used to return a session that streamed 'VM 9001 not running' as
+        if the guest had printed it, and exit 0."""
+        lab = self._lab("stopped")
+        with mock.patch.object(lab_console, "TermSession") as term:
+            with self.assertRaisesRegex(RuntimeError, "is not running"):
+                lab_console._attach_term(lab, mock.Mock(), "qemu", 9001)
+        term.assert_not_called()
+
+    def test_a_running_guest_is_attached_without_waiting(self) -> None:
+        lab = self._lab("running")
+        with mock.patch.object(lab_console, "TermSession",
+                               return_value="session"), \
+             mock.patch.object(lab_console.time, "sleep") as slept:
+            self.assertEqual(
+                lab_console._attach_term(lab, mock.Mock(), "qemu", 9001,
+                                         wait=30),
+                "session",
+            )
+        slept.assert_not_called()
+
+    def test_the_wait_is_bounded(self) -> None:
+        lab = self._lab("stopped")
+        with mock.patch.object(lab_console, "TermSession"), \
+             mock.patch.object(lab_console.time, "sleep"):
+            with self.assertRaisesRegex(
+                RuntimeError, "did not become available within"
+            ):
+                lab_console._attach_term(
+                    lab, mock.Mock(), "qemu", 9001, wait=0.02, poll=0.01
+                )
+
+    def test_a_real_configuration_error_is_not_retried(self) -> None:
+        """Waiting is for 'not yet', not for a guest with no serial device."""
+        lab = self._lab("running")
+        with mock.patch.object(
+            lab_console, "TermSession",
+            side_effect=RuntimeError(
+                "termproxy did not return a ticket for qemu/9001"
+            ),
+        ) as term:
+            with self.assertRaisesRegex(RuntimeError, "termproxy"):
+                lab_console._attach_term(
+                    lab, mock.Mock(), "qemu", 9001, wait=5, poll=0.01
+                )
+        self.assertEqual(term.call_count, 1)
+
+    def test_an_unreadable_status_counts_as_not_running(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.guest_status.side_effect = RuntimeError("HTTP 500")
+        with mock.patch.object(lab_console, "TermSession") as term:
+            with self.assertRaisesRegex(RuntimeError, "is not running"):
+                lab_console._attach_term(lab, mock.Mock(), "qemu", 9001)
+        term.assert_not_called()
+
+
+class ConsoleTlsTests(unittest.TestCase):
+    """Found live: the console websocket disabled certificate checks even with
+    [proxmox] verify_tls = true, so only the REST path was protected."""
+
+    def _open(self, verify: bool) -> tuple[object, dict]:
+        import ssl as ssl_module
+
+        context = ssl_module.create_default_context()
+        wrapped = mock.Mock()
+        recorded: dict = {}
+
+        def wrap_socket(_raw: object, **kwargs: object) -> object:
+            recorded.update(kwargs)
+            return wrapped
+
+        context.wrap_socket = wrap_socket        # type: ignore[method-assign]
+        wrapped.recv.side_effect = [
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Sec-WebSocket-Protocol: binary\r\n\r\n"
+        ]
+        from proxmox_agent_lab import ws as lab_ws
+
+        with mock.patch.object(lab_ws.ssl, "create_default_context",
+                               return_value=context), \
+             mock.patch.object(lab_ws.socket, "create_connection",
+                               return_value=mock.Mock()):
+            lab_ws.WebSocket(
+                "pve.example", 8006, "/api2/json/x", {}, {},
+                verify_tls=verify,
+            )
+        return context, recorded
+
+    def test_verified_mode_checks_the_certificate_and_hostname(self) -> None:
+        import ssl as ssl_module
+
+        context, recorded = self._open(True)
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl_module.CERT_REQUIRED)
+        self.assertEqual(recorded.get("server_hostname"), "pve.example")
+
+    def test_the_self_signed_opt_out_is_still_available(self) -> None:
+        import ssl as ssl_module
+
+        context, recorded = self._open(False)
+        self.assertFalse(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl_module.CERT_NONE)
+        self.assertIsNone(recorded.get("server_hostname"))
+
+    def test_the_console_passes_the_configured_policy_through(self) -> None:
+        lab = mock.Mock()
+        lab.HOST, lab.PORT, lab.NODE = "pve.example", 8006, "aipve"
+        lab.TOKEN_USER, lab.TOKEN_NAME = "agent@pve", "lab"
+        lab.keychain_secret.return_value = "secret"
+        for verify in (True, False):
+            lab.VERIFY_TLS = verify
+            with mock.patch.object(lab_console.ws, "WebSocket") as socket_class:
+                lab_console._open_websocket(
+                    lab, "qemu", 9001, {"port": "5900", "ticket": "t"}, 20.0
+                )
+            self.assertEqual(
+                socket_class.call_args.kwargs["verify_tls"], verify
+            )
+
+
+class MonitorScreenshotTests(unittest.TestCase):
+    """'console screenshot --via monitor' writes a file on the *host*, so the
+    path, the format and the cleanup are all fixed by the code, not the
+    caller."""
+
+    def _args(self, **overrides: object) -> object:
+        import argparse
+
+        defaults = dict(vmid=9001, lease="20260821120000-abc0", via="monitor",
+                        out=None, ocr=False, upload=False, timeout=25.0,
+                        url_expiry=3600, settle=0.0)
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def test_the_only_monitor_command_is_a_png_screendump(self) -> None:
+        path = lab_console._monitor_remote_path("20260821120000-abc0", 9001)
+        command = lab_console._screendump_command(path)
+        self.assertTrue(command.startswith("screendump "))
+        self.assertTrue(command.endswith(" -f png"))
+        self.assertIn(lab_console.MONITOR_SCREENSHOT_ROOT, command)
+
+    def test_the_host_path_is_lease_scoped(self) -> None:
+        first = lab_console._monitor_remote_path("lease-one", 9001)
+        second = lab_console._monitor_remote_path("lease-two", 9001)
+        self.assertIn("/lease-one/", first)
+        self.assertIn("/lease-two/", second)
+        self.assertNotEqual(first, second)
+
+    def test_a_lease_id_cannot_escape_the_screenshot_root(self) -> None:
+        path = lab_console._monitor_remote_path("../../etc/x", 9001)
+        self.assertTrue(
+            path.startswith(lab_console.MONITOR_SCREENSHOT_ROOT + "/")
+        )
+        self.assertNotIn("..", path)
+
+    def test_paths_and_formats_outside_the_contract_are_refused(self) -> None:
+        for candidate in (
+            "/etc/shadow.png",
+            f"{lab_console.MONITOR_SCREENSHOT_ROOT}/x/shot.ppm",
+            f"{lab_console.MONITOR_SCREENSHOT_ROOT}/../shot.png",
+            f"{lab_console.MONITOR_SCREENSHOT_ROOT}/x/two words.png",
+        ):
+            with self.assertRaises(ValueError):
+                lab_console._screendump_command(candidate)
+
+    def test_non_png_bytes_from_the_host_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            lab_console._png_dimensions(b"not a png at all........")
+
+    def _run(self, lab: mock.Mock, api: mock.Mock, memflow: mock.Mock,
+             **overrides: object) -> dict:
+        # Importing it first guarantees the package attribute exists, so the
+        # lazy 'from . import memflow' inside the command sees the double.
+        from proxmox_agent_lab import memflow as _real   # noqa: F401
+
+        with mock.patch("proxmox_agent_lab.memflow", memflow):
+            return lab_console._screenshot_via_monitor(
+                lab, api, self._args(**overrides)
+            )
+
+    def _memflow(self, png: bytes) -> mock.Mock:
+        memflow = mock.Mock()
+        memflow.host_read_bytes.return_value = png
+        memflow.host_remove_file.return_value = True
+        return memflow
+
+    def _png(self) -> bytes:
+        return lab_png.encode_png(2, 1, bytes([1, 2, 3, 4, 5, 6]))
+
+    def test_the_capture_is_fetched_and_the_host_copy_deleted(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        api = mock.Mock()
+        api.call.return_value = ""
+        memflow = self._memflow(self._png())
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._run(lab, api, memflow,
+                               out=str(Path(tmp) / "shot.png"))
+        self.assertEqual(result["source"], "monitor")
+        self.assertEqual((result["width"], result["height"]), (2, 1))
+        self.assertTrue(result["host_file_removed"])
+        sent = api.call.call_args.args[2]["command"]
+        self.assertTrue(sent.endswith(" -f png"))
+        memflow.host_remove_file.assert_called_once()
+        self.assertEqual(
+            memflow.host_remove_file.call_args.args[1],
+            memflow.host_read_bytes.call_args.args[1],
+        )
+        # Nothing of ours is left on the host, not even the directory.
+        memflow.host_remove_empty_dir.assert_called_once()
+        self.assertEqual(
+            memflow.host_remove_empty_dir.call_args.args[1],
+            memflow.host_mkdir.call_args.args[1],
+        )
+        audited = lab.audit.call_args.kwargs
+        self.assertEqual(audited["source"], "monitor")
+        self.assertNotIn("image", audited)
+
+    def test_the_host_file_is_deleted_even_when_the_fetch_fails(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        api = mock.Mock()
+        api.call.return_value = ""
+        memflow = self._memflow(b"")
+        memflow.host_read_bytes.side_effect = RuntimeError("no such file")
+        with self.assertRaisesRegex(RuntimeError, "no such file"):
+            self._run(lab, api, memflow)
+        memflow.host_remove_file.assert_called_once()
+
+    def test_a_monitor_refusal_in_the_body_is_an_error(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        api = mock.Mock()
+        api.call.return_value = (
+            "Currently only 'png' and 'ppm' formats are supported."
+        )
+        memflow = self._memflow(self._png())
+        with self.assertRaisesRegex(RuntimeError, "screendump refused"):
+            self._run(lab, api, memflow)
+        memflow.host_remove_file.assert_called_once()
+
+    def test_it_requires_a_lease_and_ownership_before_touching_the_host(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        memflow = self._memflow(self._png())
+        with self.assertRaisesRegex(RuntimeError, "requires --lease"):
+            self._run(lab, mock.Mock(), memflow, lease=None)
+        memflow.require_host_ssh.assert_not_called()
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.require_lease_resource.side_effect = RuntimeError("not registered")
+        with self.assertRaisesRegex(RuntimeError, "not registered"):
+            self._run(lab, mock.Mock(), memflow)
+        memflow.require_host_ssh.assert_not_called()
+
+    def test_ocr_is_refused_because_there_is_no_framebuffer(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        with self.assertRaisesRegex(RuntimeError, "--ocr"):
+            self._run(lab, mock.Mock(), self._memflow(self._png()), ocr=True)

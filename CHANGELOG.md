@@ -4,6 +4,85 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.8.0 - 2026-08-21
+
+Ten reported issues, fixed and verified against the lab node. The serial and
+cleanup fixes change observable behaviour; see the notes at the end.
+
+### Fixed
+
+- **The serial stream is guest bytes only.** `console text`, `--follow` and
+  `console bridge` shared an incomplete filter that stripped the `OK`
+  handshake and nothing else, so Proxmox's own terminal records reached
+  callers as if the guest had printed them -- contaminating boot logs and
+  potentially reaching a kernel debugger's input. Complete transport records
+  are now removed for every consumer of a session, including when one is split
+  across websocket reads, when a blank line or console echo precedes it, and
+  for the pair an LXC console emits. A guest line that merely begins with `OK`
+  is no longer truncated.
+- **`console text` can follow the documented attach-before-power-on order.**
+  Proxmox issues a terminal ticket for a *stopped* guest and reports the
+  refusal in the byte stream (`VM <id> not running`), so a capture started
+  before power-on used to exit 0 having recorded that one sentence where boot
+  output should have been. Attachment now asks `status/current`, and the new
+  `console text --wait-for-guest SECONDS` waits, bounded, for the guest to
+  start and attaches as soon as it does. `--from-reset` remains the only way
+  to guarantee output from t=0.
+- **`journal query` and `journal summary` read the configured backend.** With
+  `[audit] backend = "jsonl"` both opened `journal.db` and reported a
+  configured JSONL ledger as empty -- worst of all during an incident review.
+  They now read the daily files, with the same `lease`, `event` wildcard,
+  `since` and `limit` filters, newest first.
+- **`upload` honours `[proxmox] verify_tls`.** It always passed curl
+  `--insecure`, so an operator who had enabled certificate verification still
+  got an unverified upload path for ISO and import content.
+- **The console WebSocket honours `[proxmox] verify_tls`.** VNC and serial
+  sessions unconditionally disabled certificate and hostname checking, leaving
+  guest input and output on the one connection to the node that trusted any
+  certificate.
+- **`storage add-disk` fails non-zero when it only half-succeeded.** Formatting
+  the disk and registering the storage but failing to set its content types
+  printed a warning and exited 0, so automation went on to upload content the
+  storage would not accept. The partial result is still printed -- the disk is
+  already formatted, so recovery is `storage set-content`, not a rerun.
+- **Expiry cleanup will not destroy a resource another lease is using.**
+  Registration never prevented two leases from naming the same guest, and
+  finalization stopped and deleted every registered resource unconditionally,
+  so a watchdog sweep could delete a VM a newer, still-live lease was working
+  on. Cleanup now checks ownership first and reports what it left alone as
+  `left_to_another_lease`; two *expired* leases still release a guest, so
+  nothing leaks. `lease-register` refuses a guest a live lease already owns.
+- **`cleanup-expired` retries a lease whose cleanup failed.** A transient QEMU
+  lock while stopping one guest left the lease `cleanup_failed`, which every
+  later sweep skipped -- so its guests, and the host, stayed up until someone
+  reran `lease-end` by hand with the exact lease id. Such leases are now swept
+  again (finalizing is idempotent) and reported as `retried`.
+- **`doctor` reports an unusable audit mirror.** With `[audit] git_sync = true`
+  pointing at a missing, non-repository, dirty or unwritable checkout, every
+  mutating command printed a warning that is easy to miss for weeks while
+  `doctor` said nothing. It now reports `audit.git_status` and fails, and
+  reports `audit.spooled_records` so a local backlog the configured backend
+  refused is visible too.
+
+### Added
+
+- `console screenshot --via monitor` is an explicit fallback for when the VNC
+  path cannot produce a frame. It asks QEMU for a `screendump` through the
+  monitor endpoint, fetches the PNG over the opt-in `[memflow]` host SSH
+  channel, and deletes the host copy in a `finally` path. The host path is
+  fixed and lease-scoped, the only format is PNG, the bytes are verified to be
+  one, and no remote path can be passed in. Arbitrary `qm monitor` commands
+  remain unavailable. VNC stays the default and the preferred route.
+
+### Changed
+
+- `console text` on a stopped guest now exits non-zero with an explanation
+  instead of exiting 0 with a capture containing `VM <id> not running`.
+- `storage add-disk` exits non-zero on partial success (see above).
+- `cleanup-expired` output gains `retried` and `left_to_another_lease`; its
+  first sweep after upgrading may clean up a `cleanup_failed` lease that
+  previous versions had been skipping.
+
 ## 0.7.0 - 2026-08-18
 
 ### Added

@@ -64,13 +64,24 @@ This is the single most expensive trap on this list. Several early runs
 attached a capture after the guest had already booted, saw an empty log, and
 concluded that COM1 was not wired up or that the ReactOS build had debugging
 compiled out. Both conclusions were wrong; the output had simply already
-happened. Attach before or at power-on:
+happened. Attach before or at power-on — and note both flags, because
+Proxmox refuses to open a terminal for a stopped guest, so the naive ordering
+used to exit immediately with `VM not running`:
 
 ```bash
-proxmox-lab console text --vmid "$VMID" --seconds 900 > run.log 2>&1 &
+proxmox-lab console text --vmid "$VMID" --follow --timeout 900 \
+  --wait-for-guest 300 > run.log 2>&1 &
 proxmox-lab api --lease "$L" --method POST \
   --path "/nodes/$NODE/qemu/$VMID/status/start"
 ```
+
+`--wait-for-guest` retries the attach until the serial line exists; `--follow`
+is what streams for the whole window (a plain `--seconds 900` read returns as
+soon as the output pauses). This still leaves a one-poll-interval gap at the
+very start. When the first bytes matter absolutely, take the reset route
+instead — `console text --follow --from-reset --lease "$L"` attaches first and
+then restarts the guest inside the live session, which is the only way to be
+certain of t=0.
 
 **One `console text` session per VM.** A second concurrent session on the same
 guest does not error — it just receives nothing, while the first keeps all the

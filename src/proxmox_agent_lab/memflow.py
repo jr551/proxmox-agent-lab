@@ -128,6 +128,93 @@ def _ssh(lab: Any, remote_argv: list[str], *, timeout: int = 60,
     return proc
 
 
+# --------------------------------------------------------------------------- #
+# The same channel, offered to the rest of the package.
+#
+# One subsystem outside introspection needs a file back from the host:
+# 'console screenshot --via monitor', where QEMU's screendump writes the PNG on
+# the node. It reuses this SSH identity rather than opening a second host
+# trust boundary, and stays behind the same opt-in gate.
+# --------------------------------------------------------------------------- #
+
+def host_ssh_enabled() -> bool:
+    """True when the opt-in host SSH channel is configured."""
+    return bool(ENABLED and SSH_HOST)
+
+
+def require_host_ssh(lab: Any) -> None:
+    """Raise unless the host SSH channel is enabled and configured."""
+    _require_enabled(lab)
+
+
+def host_mkdir(lab: Any, directory: str, *, timeout: int = 30) -> None:
+    """Create one private directory on the host."""
+    _require_enabled(lab)
+    proc = _ssh(lab, ["mkdir", "-p", "-m", "700", "--", directory],
+                timeout=timeout)
+    if proc.returncode:
+        raise lab.LabError(
+            f"could not create {directory} on {SSH_HOST}: "
+            f"{(proc.stderr or '').strip()[:200] or proc.returncode}"
+        )
+
+
+def host_read_bytes(lab: Any, path: str, *, timeout: int = 120) -> bytes:
+    """Read one file from the host verbatim, without decoding it as text."""
+    _require_enabled(lab)
+    remote = shlex.join(["cat", "--", path])
+    try:
+        proc = subprocess.run(
+            _ssh_argv(remote), capture_output=True, timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise lab.LabError(
+            "ssh was not found on this machine; it is required to reach the "
+            "Proxmox host"
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise lab.LabError(
+            f"no response from {SSH_HOST} within {timeout}s while reading a "
+            "host file"
+        ) from None
+    if proc.returncode:
+        detail = (proc.stderr or b"").decode("utf-8", "replace").strip()[:200]
+        raise lab.LabError(
+            f"could not read {path} from {SSH_HOST}: "
+            f"{detail or proc.returncode}"
+        )
+    return proc.stdout
+
+
+def host_remove_empty_dir(lab: Any, directory: str, *, timeout: int = 30) -> bool:
+    """Remove one directory on the host, only if it is empty.
+
+    `rmdir` refuses a non-empty directory, so a concurrent capture in the same
+    lease cannot lose its file to this cleanup.
+    """
+    if not host_ssh_enabled():
+        return False
+    try:
+        proc = _ssh(lab, ["rmdir", "--", directory], timeout=timeout)
+    except (OSError, lab.LabError):
+        return False
+    return proc.returncode == 0
+
+
+def host_remove_file(lab: Any, path: str, *, timeout: int = 30) -> bool:
+    """Delete one file on the host. Best effort: reports, never raises."""
+    if not host_ssh_enabled():
+        return False
+    try:
+        proc = _ssh(lab, ["rm", "-f", "--", path], timeout=timeout)
+    except (OSError, lab.LabError):
+        # Cleanup runs in a finally path: it reports failure to the caller,
+        # which records it, rather than masking the original error.
+        return False
+    return proc.returncode == 0
+
+
 def _helper(lab: Any, sub_argv: list[str], *, timeout: int = 90,
             ) -> subprocess.CompletedProcess:
     proc = _ssh(lab, [HELPER, *sub_argv], timeout=timeout)

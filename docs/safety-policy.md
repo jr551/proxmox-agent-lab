@@ -93,6 +93,21 @@ thread, and enforces the eight-hour MCP-idle shutdown threshold. A lease
 heartbeat prevents cleanup and idle shutdown during legitimate long-running
 work.
 
+Two properties of that sweep matter enough to state:
+
+- **It retries a failed cleanup.** A lease left in `cleanup_failed` — say a
+  QEMU lock timed out while stopping one guest — is picked up by every later
+  sweep until it succeeds. Finalizing is idempotent, so a resource that is
+  already gone costs nothing. Previously such a lease was skipped for ever and
+  its guests, and the host, stayed up until someone reran `lease-end` by hand.
+- **It never destroys a resource another live lease owns.** Before stopping or
+  deleting a registered guest, cleanup checks whether any other lease that is
+  still live (long-term, or not yet expired) also registers that
+  `(kind, vmid)`. If one does, the resource is left alone and reported as
+  `left_to_another_lease`. An expired claim does not shield a guest, so two
+  stale leases cannot leave one running for ever. `lease-register` also refuses
+  outright to take a guest that a live lease already owns.
+
 If an ordinary lease is stale but every registered guest is already stopped,
 use `proxmox-lab lease-abandon --lease <id> --confirm`. It verifies those
 guest states, then closes only the local lease record: it does not start,

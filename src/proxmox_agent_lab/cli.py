@@ -827,16 +827,80 @@ def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
             ) from retry_exc
 
 
-def active_leases(excluding: str | None = None) -> list[dict[str, Any]]:
+def _leases_in_states(
+    states: tuple[str, ...], excluding: str | None = None
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for path in sorted(LEASE_ROOT.glob("*.json")) if LEASE_ROOT.exists() else []:
         try:
             lease = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if lease.get("state") == "active" and lease.get("id") != excluding:
+        if lease.get("state") in states and lease.get("id") != excluding:
             result.append(lease)
     return result
+
+
+def active_leases(excluding: str | None = None) -> list[dict[str, Any]]:
+    return _leases_in_states(("active",), excluding)
+
+
+def cleanup_candidate_leases() -> list[dict[str, Any]]:
+    """Leases a sweep is allowed to finalize.
+
+    `cleanup_failed` is included on purpose. A transient QEMU lock while
+    stopping one guest used to take a lease out of every later sweep, leaving
+    its guests -- and so the host -- running until somebody reran `lease-end`
+    by hand with the exact lease id. Finalizing is idempotent, so retrying an
+    already-cleaned resource costs nothing and the fail-closed guarantee holds.
+    """
+    return _leases_in_states(("active", "cleanup_failed"))
+
+
+def lease_claims(lease: dict[str, Any], kind: str, vmid: int) -> bool:
+    """True when `lease` lists (kind, vmid) among its resources."""
+    for item in lease.get("resources", []):
+        try:
+            if item.get("kind") == kind and int(item.get("vmid")) == int(vmid):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def lease_is_live(lease: dict[str, Any], now: dt.datetime | None = None) -> bool:
+    """True while a lease still holds a claim on its resources.
+
+    A long-term lease always does. An ordinary one does until it expires:
+    after that the watchdog may clean it up, so it must not simultaneously be
+    able to shield a resource from cleanup for ever.
+    """
+    if lease.get("state") != "active":
+        return False
+    if is_long_term(lease):
+        return True
+    expires = lease.get("expires_at")
+    if not expires:
+        return True
+    try:
+        return parse_expiry(str(expires)) > (now or utc_now())
+    except (TypeError, ValueError):
+        return True
+
+
+def resource_owner_elsewhere(
+    lease_id: str, kind: str, vmid: int, *, now: dt.datetime | None = None
+) -> str | None:
+    """The id of another *live* lease that also owns (kind, vmid), if any.
+
+    Registration does not stop two leases from listing the same guest -- a
+    VMID can be handed to a newer lease while an older one still names it --
+    so ownership is resolved at cleanup time, before anything destructive.
+    """
+    for other in active_leases(excluding=lease_id):
+        if lease_claims(other, kind, vmid) and lease_is_live(other, now):
+            return str(other.get("id"))
+    return None
 
 
 def is_long_term(lease: dict[str, Any]) -> bool:
@@ -1075,6 +1139,14 @@ def cmd_lease_register(args: argparse.Namespace) -> None:
                 f"VMID {args.vmid} existed before this lease; use --allow-existing "
                 "only for an explicitly authorized retained resource"
             )
+        owner = resource_owner_elsewhere(args.lease, args.kind, args.vmid)
+        if owner:
+            raise LabError(
+                f"{args.kind}/{args.vmid} is already registered to live lease "
+                f"{owner}. Two leases owning one guest is how a cleanup sweep "
+                f"comes to delete a machine another lease is still using. "
+                f"Work under {owner}, or end/abandon it first."
+            )
         register_resource(lease, args.kind, args.vmid, args.policy, args.name)
         audit(
             "lease-register",
@@ -1274,6 +1346,29 @@ def cmd_api(args: argparse.Namespace) -> None:
     )
 
 
+def upload_curl_argv(
+    config_path: str, source: Path, content: str, storage: str
+) -> list[str]:
+    """The curl argv for one storage upload.
+
+    Certificate policy comes from the same [proxmox] verify_tls switch the API
+    client uses. An operator who has put a trusted certificate on the node and
+    turned verification on must not get an unverified upload channel, or a
+    man-in-the-middle could swap the ISO while every REST call stays safe.
+    The token is only ever in the 0600 curl config file, never in argv.
+    """
+    argv = ["curl", "--config", config_path]
+    if not VERIFY_TLS:
+        argv.append("--insecure")
+    return [
+        *argv,
+        "--request", "POST",
+        "--form", f"content={content}",
+        "--form", f"filename=@{source}",
+        f"{API_ROOT}/nodes/{NODE}/storage/{storage}/upload",
+    ]
+
+
 def cmd_upload(args: argparse.Namespace) -> None:
     if args.storage not in UPLOAD_STORAGES:
         raise LabError(
@@ -1298,19 +1393,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
         config.write(config_text)
         config.flush()
         result = subprocess.run(
-            [
-                "curl",
-                "--config",
-                config.name,
-                "--insecure",
-                "--request",
-                "POST",
-                "--form",
-                f"content={args.content}",
-                "--form",
-                f"filename=@{source}",
-                f"{API_ROOT}/nodes/{NODE}/storage/{args.storage}/upload",
-            ],
+            upload_curl_argv(config.name, source, args.content, args.storage),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1349,9 +1432,26 @@ def cmd_upload(args: argparse.Namespace) -> None:
 
 def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
     failures: list[str] = []
+    transferred: list[str] = []
+    now = utc_now()
     for resource in reversed(lease.get("resources", [])):
         kind = resource["kind"]
         vmid = int(resource["vmid"])
+        owner = resource_owner_elsewhere(lease["id"], kind, vmid, now=now)
+        if owner:
+            # A newer, still-live lease claims this guest. Stopping or
+            # deleting it here would destroy a machine that lease is using --
+            # the one failure mode expiry cleanup must never have.
+            transferred.append(f"{kind}/{vmid}")
+            audit(
+                "lease-resource-owned-by-another-lease",
+                lease=lease["id"],
+                kind=kind,
+                vmid=vmid,
+                owner=owner,
+                sync=False,
+            )
+            continue
         try:
             stop_guest(api, kind, vmid)
             if resource.get("policy", "delete") == "delete":
@@ -1377,6 +1477,7 @@ def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
     lease["state"] = "closed" if not failures else "cleanup_failed"
     lease["closed_at"] = iso_now()
     lease["failures"] = failures
+    lease["transferred_resources"] = transferred
     save_lease(lease)
     return failures
 
@@ -1426,6 +1527,8 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
         "remaining_active_leases": [x["id"] for x in others],
         "host_powered_off": host_powered_off,
     }
+    if lease.get("transferred_resources"):
+        result["left_to_another_lease"] = lease["transferred_resources"]
     if persistent:
         # Say this loudly. A machine left running is the surprise nobody
         # wants on their electricity bill.
@@ -1560,13 +1663,19 @@ def cmd_lease_abandon(args: argparse.Namespace) -> None:
 def cmd_cleanup_expired(args: argparse.Namespace) -> None:
     api = ProxmoxAPI()
     cleaned: list[str] = []
+    retried: list[str] = []
     failed: dict[str, list[str]] = {}
+    transferred: dict[str, list[str]] = {}
     with controller_lock():
         now = utc_now()
-        for lease in active_leases():
+        for lease in cleanup_candidate_leases():
             if is_long_term(lease):
                 continue          # never expires, never swept
-            if not args.all and parse_expiry(lease["expires_at"]) > now:
+            if lease.get("state") == "cleanup_failed":
+                # Already past its end and known incomplete: a retry is
+                # exactly what it needs, whatever its expiry says.
+                retried.append(lease["id"])
+            elif not args.all and parse_expiry(lease["expires_at"]) > now:
                 continue
             if not api.reachable() and lease_requires_cleanup(lease):
                 ensure_on(api)
@@ -1577,6 +1686,8 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
                 lease["state"] = "closed"
                 lease["closed_at"] = iso_now()
                 save_lease(lease)
+            if lease.get("transferred_resources"):
+                transferred[lease["id"]] = lease["transferred_resources"]
             if failures:
                 failed[lease["id"]] = failures
             else:
@@ -1628,7 +1739,9 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
             audit(
                 "cleanup-expired",
                 cleaned=cleaned,
+                retried=retried,
                 failed=failed,
+                transferred=transferred,
                 remaining=[x["id"] for x in remaining],
                 idle_seconds=idle_seconds,
                 idle_shutdown_triggered=idle_shutdown_triggered,
@@ -1638,7 +1751,9 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "cleaned": cleaned,
+                "retried": retried,
                 "failed": failed,
+                "left_to_another_lease": transferred,
                 "remaining": [x["id"] for x in remaining],
                 "mcp_idle_seconds": idle_seconds,
                 "mcp_idle_shutdown_after_seconds": MCP_IDLE_SHUTDOWN_SECONDS,
@@ -1727,6 +1842,44 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     }
     if AUDIT_BACKEND not in {"sqlite", "jsonl", "pocketbase"}:
         problems.append(f"[audit] unsupported backend: {AUDIT_BACKEND}")
+    if CONFIG.audit.get("git_sync"):
+        configured = str(CONFIG.audit.get("git_repo") or "")
+        if not configured:
+            report["audit"]["git_status"] = {
+                "ok": False, "problem": "git_repo is empty",
+            }
+            problems.append(
+                "[audit] git_sync is on but git_repo is empty; no audit "
+                "record is being exported"
+            )
+        else:
+            git_status = journal_module.git_sync_status(
+                Path(configured),
+                str(CONFIG.audit.get("git_branch") or "logs"),
+            )
+            report["audit"]["git_status"] = git_status
+            if not git_status["ok"]:
+                problems.append(
+                    "[audit] git_sync is enabled but the mirror is unusable "
+                    f"({git_status['problem']}): {git_status['repo']}. Each "
+                    "mutating command only prints a warning, so the private "
+                    "export has been failing silently"
+                )
+    spool = _audit_spool_path()
+    try:
+        spooled: int | None = sum(
+            1 for line in spool.read_text().splitlines() if line.strip()
+        ) if spool.exists() else 0
+    except OSError as exc:
+        spooled = None
+        problems.append(f"audit spool at {spool} could not be read: {exc}")
+    report["audit"]["spooled_records"] = spooled
+    if spooled:
+        problems.append(
+            f"{spooled} audit record(s) are still spooled locally at {spool}: "
+            "the configured backend refused them. Upload the backlog with "
+            "'proxmox-lab journal --flush-spool'"
+        )
     if AUDIT_BACKEND == "pocketbase":
         report["audit"]["pocketbase"] = {
             "url": str(CONFIG.audit.get("pocketbase_url") or ""),

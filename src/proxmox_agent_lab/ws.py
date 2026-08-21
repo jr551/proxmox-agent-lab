@@ -4,6 +4,10 @@ Proxmox tunnels both the VNC (RFB) stream and the serial/LXC terminal stream
 over `/api2/json/nodes/<node>/<kind>/<vmid>/vncwebsocket`. Depending on the
 negotiated subprotocol the payload is either raw binary or base64 text, so both
 are handled here and hidden from callers.
+
+Certificate verification is the caller's decision and defaults to on: the
+console stream is not less sensitive than the REST API, so it follows the same
+`[proxmox] verify_tls` switch instead of quietly trusting any certificate.
 """
 
 from __future__ import annotations
@@ -41,15 +45,23 @@ class WebSocket:
         *,
         subprotocols: tuple[str, ...] = ("binary", "base64"),
         timeout: float = 20.0,
+        verify_tls: bool = True,
     ) -> None:
         self.timeout = timeout
         self._recv_buffer = bytearray()
         self._payload_buffer = bytearray()
         context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+        # The console carries guest input and output, so it gets the same
+        # certificate policy as the REST client -- [proxmox] verify_tls -- and
+        # not a private exemption. Verification stays off only while the node
+        # still has the self-signed certificate a fresh install ships with.
+        if not verify_tls:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
         raw = socket.create_connection((host, port), timeout=timeout)
-        self._socket = context.wrap_socket(raw, server_hostname=None)
+        self._socket = context.wrap_socket(
+            raw, server_hostname=host if verify_tls else None
+        )
         self._socket.settimeout(timeout)
         key = base64.b64encode(os.urandom(16)).decode()
         target = path + "?" + parse.urlencode(query)

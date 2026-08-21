@@ -427,6 +427,104 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(journal_module.import_jsonl(root), 2)
             self.assertEqual(len(journal_module.query(root)), 2)
 
+    def test_jsonl_query_reads_what_the_jsonl_backend_wrote(self) -> None:
+        """Found live: query() opened journal.db whatever the backend was, so a
+        configured JSONL ledger reported no events at all -- worst of all
+        during an incident review."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index in range(3):
+                journal_module.append(
+                    root, "jsonl",
+                    {"timestamp": f"2026-01-0{index + 1}T00:00:00Z",
+                     "event": "lease-begin", "lease": f"L{index}", "vmid": 1},
+                )
+            events = journal_module.query(root, backend="jsonl")
+            self.assertEqual(len(events), 3)
+            self.assertEqual(events[0]["lease"], "L2", "newest first")
+            self.assertFalse(journal_module.database_path(root).exists())
+
+    def test_jsonl_query_applies_the_same_filters_as_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for backend in ("sqlite", "jsonl"):
+                journal_module.append(
+                    root, backend,
+                    {"timestamp": "2026-01-01T00:00:00Z",
+                     "event": "lease-begin", "lease": "L1"},
+                )
+                journal_module.append(
+                    root, backend,
+                    {"timestamp": "2026-01-02T00:00:00Z",
+                     "event": "lease-end", "lease": "L2"},
+                )
+                journal_module.append(
+                    root, backend,
+                    {"timestamp": "2026-01-03T00:00:00Z",
+                     "event": "guest-run", "lease": "L1"},
+                )
+            for backend in ("sqlite", "jsonl"):
+                with self.subTest(backend=backend):
+                    self.assertEqual(
+                        len(journal_module.query(root, lease="L1",
+                                                 backend=backend)), 2)
+                    self.assertEqual(
+                        len(journal_module.query(root, event="lease-*",
+                                                 backend=backend)), 2)
+                    self.assertEqual(
+                        len(journal_module.query(root, since="2026-01-02",
+                                                 backend=backend)), 2)
+                    self.assertEqual(
+                        len(journal_module.query(root, limit=1,
+                                                 backend=backend)), 1)
+
+    def test_jsonl_summary_counts_the_jsonl_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertFalse(
+                journal_module.summary(root, backend="jsonl")["exists"]
+            )
+            for _ in range(4):
+                journal_module.append(root, "jsonl",
+                                      self._event("guest-run", lease="L1"))
+            summary = journal_module.summary(root, backend="jsonl")
+            self.assertTrue(summary["exists"])
+            self.assertEqual(summary["events"], 4)
+            self.assertEqual(summary["distinct_leases"], 1)
+            self.assertEqual(summary["most_common"]["guest-run"], 4)
+            self.assertEqual(summary["backend"], "jsonl")
+
+    def test_git_sync_status_reports_an_unusable_mirror(self) -> None:
+        """Found live: git_sync pointed at a path that did not exist, every
+        command printed a warning nobody read, and doctor said nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = journal_module.git_sync_status(Path(tmp) / "nope")
+            self.assertFalse(missing["ok"])
+            self.assertIn("does not exist", missing["problem"])
+
+            plain = Path(tmp) / "plain"
+            plain.mkdir()
+            not_a_repo = journal_module.git_sync_status(plain)
+            self.assertFalse(not_a_repo["ok"])
+            self.assertIn("not a git repository", not_a_repo["problem"])
+
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "logs", str(repo)], check=True,
+                           stdout=subprocess.DEVNULL)
+            self.assertTrue(journal_module.git_sync_status(repo)["ok"])
+
+            (repo / "source.py").write_text("do_not_commit = True\n")
+            dirty = journal_module.git_sync_status(repo)
+            self.assertFalse(dirty["ok"])
+            self.assertIn("dirty", dirty["problem"])
+
+    def test_git_sync_status_refuses_an_unsafe_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status = journal_module.git_sync_status(Path(tmp), "logs/../../x")
+            self.assertFalse(status["ok"])
+            self.assertIn("unsafe", status["problem"])
+
     def test_summary_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

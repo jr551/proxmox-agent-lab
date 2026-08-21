@@ -32,6 +32,11 @@ Runtime state — leases, screenshots, the journal — goes to
 | `token_name` | — | Token id, e.g. `lab` |
 | `verify_tls` | `false` | Verify the certificate. Off by default because a fresh Proxmox install is self-signed; turn it on once you have a trusted cert. |
 
+`verify_tls` is one switch for every connection to the node: REST calls, the
+VNC and serial console WebSockets, and `upload`'s curl invocation. Turning it
+on leaves no unverified path behind — earlier versions verified the API while
+the console and upload paths still accepted any certificate.
+
 ## `[lease]`
 
 | Key | Default | Meaning |
@@ -362,6 +367,15 @@ one JSONL file per day. Sync fails closed if that checkout contains any other
 uncommitted file, and only `journal/YYYY-MM-DD.jsonl` is ever staged.
 `doctor` reports these independently as `audit.local_backend` and
 `audit.git_sync`; SQLite plus Git sync is an intentional supported setup.
+
+When `git_sync` is on, `doctor` also checks that the mirror could actually
+receive a record and reports `audit.git_status` — the repository exists, is a
+repository root, is clean and is writable. A failure there is a `doctor`
+problem, because each mutating command only prints a warning when a push
+fails, which is easy to miss for weeks. `doctor` reports
+`audit.spooled_records` for the same reason: a non-zero backlog means the
+configured backend refused events that are now only on local disk, and it
+names `journal --flush-spool` as the fix.
 
 ---
 

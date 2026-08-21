@@ -46,6 +46,42 @@ are never scaled or cropped to match, so a resolution change mid-sequence
 distorted. Takes `--out` and `--upload` like `screenshot`. Prefer this over a
 manual sleep-then-screenshot loop.
 
+### If VNC itself is the problem: `--via monitor`
+
+```bash
+proxmox-lab console screenshot --vmid 9001 --via monitor --lease "$L"
+```
+
+An explicit fallback for the case where the VNC path cannot produce a frame at
+all. It asks QEMU for a `screendump` through the Proxmox monitor endpoint, then
+fetches the PNG and deletes the host copy.
+
+Unlike everything else in this file, it **writes a file on the Proxmox host**,
+so it is deliberately narrow:
+
+- the host path is fixed and lease-scoped (`/var/tmp/proxmox-agent-lab-screens/
+  <lease>/vm<vmid>-<stamp>.png`); no path can be passed in
+- the only format requested is PNG, and the bytes are verified to be one
+- the file is deleted in a `finally` path, and the result says whether that
+  succeeded
+- it needs `--lease`, an owned QEMU guest, and the opt-in `[memflow]` host SSH
+  channel to bring the file back — see [memflow.md](memflow.md) for that gate
+- only the fact of the capture is audited (source, dimensions, byte count),
+  never image content
+- arbitrary `qm monitor` commands stay unavailable; `virtio monitor` remains a
+  read-only `info` allowlist
+
+Proxmox guards the monitor endpoint with `Sys.Audit|Sys.Modify` on the VM path,
+which a `PVEVMAdmin`-scoped lab token does not have. Without it the command
+fails with a clear `Permission check failed (/vms/<vmid>, Sys.Audit|Sys.Modify)`
+rather than doing anything halfway. Grant that privilege only if this fallback
+is actually needed; VNC needs nothing beyond `VM.Console`.
+
+The result carries `"source": "monitor"` (the default VNC path reports
+`"source": "vnc"`). It has no text-console analysis and no stale-frame check,
+because those need the raw framebuffer — so keep VNC as the default and reach
+for this only when VNC fails.
+
 ## Optional cloud vision fallback
 
 ```bash
@@ -179,6 +215,36 @@ form of OCR.
 
 A QEMU guest needs `serial0: socket` in its config for this path; cloud-init
 templates in this lab are built with it.
+
+### The stream is guest bytes only
+
+Proxmox puts its own records on the same channel: the websocket auth is
+acknowledged with a bare `OK`, and the process behind `termproxy` announces
+itself (`starting serial terminal on interface serial0 …` for a QEMU serial
+line, `Connected to tty 1` for a container). Those are removed — from `console
+text`, from `--follow`, and from `console bridge` alike — including when a
+record is split across websocket reads, so a saved boot log, a boot-marker
+match, and a debugger's input all see exactly what the guest sent. A genuine
+guest line that merely *starts* with `OK` is left alone.
+
+### Capturing before power-on
+
+```bash
+proxmox-lab console text --vmid 9001 --follow --timeout 900 \
+  --wait-for-guest 300 > run.log 2>&1 &
+proxmox-lab api --lease "$L" --method POST \
+  --path "/nodes/$NODE/qemu/9001/status/start"
+```
+
+Proxmox will not open a terminal for a stopped guest, so a capture started
+before power-on used to fail immediately with `VM 9001 not running` and lose
+exactly the output worth having. `--wait-for-guest SECONDS` retries the attach
+until the serial line exists, then streams. Without the flag the old behaviour
+is unchanged: the first refusal is the answer.
+
+This narrows the gap to one poll interval; it does not close it. For output
+guaranteed from t=0, use `--from-reset` below — the QEMU process and its serial
+socket survive a reset.
 
 ### Kernel debugging and boot capture
 

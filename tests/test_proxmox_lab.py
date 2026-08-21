@@ -1393,5 +1393,322 @@ class ProxmoxLabTests(unittest.TestCase):
         )
 
 
+class UploadTlsTests(unittest.TestCase):
+    """Found live: upload always passed curl --insecure, so an operator who had
+    turned certificate verification on still got an unverified upload."""
+
+    def _argv(self, verify: bool) -> list[str]:
+        with mock.patch.object(LAB, "VERIFY_TLS", verify):
+            return LAB.upload_curl_argv(
+                "/tmp/curl.conf", Path("/tmp/answer.iso"), "iso", "local"
+            )
+
+    def test_verification_on_means_no_insecure_flag(self) -> None:
+        argv = self._argv(True)
+        self.assertNotIn("--insecure", argv)
+        self.assertIn("--config", argv)
+
+    def test_the_self_signed_opt_out_is_still_available(self) -> None:
+        self.assertIn("--insecure", self._argv(False))
+
+    def test_the_token_is_never_in_the_argv(self) -> None:
+        for verify in (True, False):
+            joined = " ".join(self._argv(verify))
+            self.assertNotIn("PVEAPIToken", joined)
+            self.assertIn("/storage/local/upload", joined)
+
+
+class LeaseOwnershipTests(unittest.TestCase):
+    """Expiry cleanup stops and deletes guests, so ownership has to be settled
+    before anything destructive happens."""
+
+    def _lease(self, lease_id: str, *, state: str = "active",
+               expires_in: int = 3600, vmid: int = 9001) -> dict:
+        return {
+            "id": lease_id,
+            "state": state,
+            "kind": "session",
+            "created_at": LAB.iso_now(),
+            "expires_at": LAB.new_expiry(expires_in),
+            "initial_vmids": [],
+            "resources": [{"kind": "qemu", "vmid": vmid, "policy": "delete",
+                           "name": "reactos"}],
+        }
+
+    def _sweep(self, leases: list[dict], *, stop=None, delete=None,
+               extra_args: list[str] | None = None) -> dict:
+        """Run one cleanup-expired sweep over a temporary lease store."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = (LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT)
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            LAB.STATE_ROOT = Path(tmp)
+            try:
+                for lease in leases:
+                    LAB.save_lease(lease)
+                api = mock.Mock()
+                api.reachable.return_value = True
+                args = LAB.parser().parse_args(
+                    ["cleanup-expired", "--no-backup", *(extra_args or [])]
+                )
+                stdout = io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "audit"), \
+                     mock.patch.object(LAB, "stop_guest",
+                                       side_effect=stop) as stopped, \
+                     mock.patch.object(LAB, "delete_guest",
+                                       side_effect=delete) as deleted, \
+                     mock.patch.object(LAB, "shutdown_host",
+                                       return_value=True), \
+                     contextlib.redirect_stdout(stdout):
+                    error = None
+                    try:
+                        LAB.cmd_cleanup_expired(args)
+                    except LAB.LabError as exc:
+                        error = str(exc)
+                return {
+                    "result": json.loads(stdout.getvalue()),
+                    "error": error,
+                    "stopped": stopped,
+                    "deleted": deleted,
+                    "leases": {
+                        lease["id"]: json.loads(
+                            LAB.lease_path(lease["id"]).read_text()
+                        )
+                        for lease in leases
+                    },
+                }
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+
+    def test_an_expired_lease_does_not_delete_a_live_lease_s_guest(self) -> None:
+        """Found live: several 'active' records were already past their expiry
+        and named the same VMID as the newest lease, whose guests were
+        running. A sweep would have destroyed a VM in use."""
+        expired = self._lease("20260821100000-old0", expires_in=-3600)
+        live = self._lease("20260821120000-new0", expires_in=3600)
+        run = self._sweep([expired, live])
+
+        run["stopped"].assert_not_called()
+        run["deleted"].assert_not_called()
+        self.assertEqual(run["leases"][expired["id"]]["state"], "closed")
+        self.assertEqual(
+            run["leases"][expired["id"]]["transferred_resources"],
+            ["qemu/9001"],
+        )
+        self.assertEqual(run["leases"][live["id"]]["state"], "active")
+        self.assertEqual(
+            run["result"]["left_to_another_lease"][expired["id"]],
+            ["qemu/9001"],
+        )
+
+    def test_a_long_term_lease_also_protects_its_guest_from_a_sweep(self) -> None:
+        expired = self._lease("20260821100000-old1", expires_in=-3600)
+        persistent = self._lease("20260821110000-lt01", expires_in=-9999)
+        persistent["kind"] = "long-term"
+        persistent["expires_at"] = None
+        persistent["resources"][0]["policy"] = "retain"
+        run = self._sweep([expired, persistent])
+        run["deleted"].assert_not_called()
+        self.assertEqual(run["leases"][expired["id"]]["state"], "closed")
+
+    def test_two_expired_leases_still_release_the_guest(self) -> None:
+        """Deferring to another lease must not become a way for a guest to be
+        cleaned up by nobody."""
+        first = self._lease("20260821100000-old2", expires_in=-3600)
+        second = self._lease("20260821101000-old3", expires_in=-3600)
+        run = self._sweep([first, second])
+        self.assertTrue(run["deleted"].called)
+        self.assertEqual(run["leases"][first["id"]]["state"], "closed")
+        self.assertEqual(run["leases"][second["id"]]["state"], "closed")
+
+    def test_a_lease_still_cleans_up_a_guest_nobody_else_claims(self) -> None:
+        expired = self._lease("20260821100000-old4", expires_in=-3600)
+        other = self._lease("20260821120000-new1", expires_in=3600, vmid=9002)
+        run = self._sweep([expired, other])
+        self.assertEqual(run["deleted"].call_args.args[2], 9001)
+        self.assertEqual(run["leases"][expired["id"]]["state"], "closed")
+
+    def test_register_refuses_a_guest_a_live_lease_already_owns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = (LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT)
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            LAB.STATE_ROOT = Path(tmp)
+            try:
+                owner = self._lease("20260821120000-own0", expires_in=3600)
+                LAB.save_lease(owner)
+                newcomer = self._lease("20260821130000-new2", expires_in=3600)
+                newcomer["resources"] = []
+                LAB.save_lease(newcomer)
+                args = LAB.parser().parse_args([
+                    "lease-register", "--lease", newcomer["id"],
+                    "--kind", "qemu", "--vmid", "9001",
+                ])
+                with mock.patch.object(LAB, "audit"):
+                    with self.assertRaises(LAB.LabError) as caught:
+                        LAB.cmd_lease_register(args)
+                self.assertIn(owner["id"], str(caught.exception))
+                stored = json.loads(
+                    LAB.lease_path(newcomer["id"]).read_text()
+                )
+                self.assertEqual(stored["resources"], [])
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+
+    def test_an_expired_claim_does_not_block_registration(self) -> None:
+        """A stale record must not make a VMID unusable for ever."""
+        with tempfile.TemporaryDirectory() as tmp:
+            old = (LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT)
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            LAB.STATE_ROOT = Path(tmp)
+            try:
+                stale = self._lease("20260821100000-old5", expires_in=-3600)
+                LAB.save_lease(stale)
+                fresh = self._lease("20260821130000-new3", expires_in=3600)
+                fresh["resources"] = []
+                LAB.save_lease(fresh)
+                args = LAB.parser().parse_args([
+                    "lease-register", "--lease", fresh["id"],
+                    "--kind", "qemu", "--vmid", "9001",
+                ])
+                import contextlib
+                import io
+
+                with mock.patch.object(LAB, "audit"), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    LAB.cmd_lease_register(args)
+                stored = json.loads(LAB.lease_path(fresh["id"]).read_text())
+                self.assertEqual(len(stored["resources"]), 1)
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+
+    def test_a_failed_cleanup_is_retried_by_the_next_sweep(self) -> None:
+        """Found live: a QEMU lock timeout left the lease 'cleanup_failed', and
+        every later sweep skipped it -- so its guests and the host stayed up
+        until someone reran lease-end by hand."""
+        lease = self._lease("20260821100000-lock0", expires_in=-3600)
+
+        first = self._sweep(
+            [lease], stop=LAB.LabError("VM is locked (clone)")
+        )
+        self.assertIn(lease["id"], first["result"]["failed"])
+        self.assertEqual(
+            first["leases"][lease["id"]]["state"], "cleanup_failed"
+        )
+        self.assertIsNotNone(first["error"])
+
+        # The watchdog's next pass, with the lock gone.
+        retried = dict(first["leases"][lease["id"]])
+        second = self._sweep([retried])
+        self.assertEqual(second["result"]["retried"], [lease["id"]])
+        self.assertEqual(second["result"]["cleaned"], [lease["id"]])
+        self.assertEqual(second["result"]["failed"], {})
+        self.assertEqual(second["leases"][lease["id"]]["state"], "closed")
+        self.assertTrue(second["deleted"].called)
+        self.assertIsNone(second["error"])
+
+    def test_a_failed_cleanup_is_retried_even_without_the_all_flag(self) -> None:
+        lease = self._lease("20260821100000-lock1", expires_in=-3600)
+        lease["state"] = "cleanup_failed"
+        lease["failures"] = ["qemu/9001: VM is locked"]
+        run = self._sweep([lease])
+        self.assertEqual(run["result"]["retried"], [lease["id"]])
+        self.assertEqual(run["leases"][lease["id"]]["state"], "closed")
+
+
+class DoctorAuditTests(unittest.TestCase):
+    """Found live: git_sync pointed at a checkout that did not exist on this
+    machine, 1,547 events sat in the local spool, and doctor reported neither."""
+
+    def _doctor(self, audit_overrides: dict, journal_root: Path) -> dict:
+        import contextlib
+        import io
+
+        from proxmox_agent_lab import config as config_module
+
+        args = LAB.parser().parse_args(["doctor"])
+        stdout = io.StringIO()
+        audit = config_module.Section(
+            "audit", {**LAB.CONFIG.audit.as_dict(), **audit_overrides}
+        )
+        with mock.patch.object(LAB.CONFIG, "audit", audit), \
+             mock.patch.object(LAB, "JOURNAL_ROOT", journal_root), \
+             contextlib.redirect_stdout(stdout):
+            try:
+                LAB.cmd_doctor(args)
+            except LAB.LabError:
+                pass
+        return json.loads(stdout.getvalue())
+
+    def test_an_enabled_git_mirror_that_is_missing_is_a_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._doctor(
+                {"git_sync": True, "git_repo": str(Path(tmp) / "absent")},
+                Path(tmp) / "journal",
+            )
+        self.assertFalse(report["audit"]["git_status"]["ok"])
+        self.assertIn("does not exist",
+                      report["audit"]["git_status"]["problem"])
+        self.assertTrue(any("git_sync is enabled" in problem
+                            for problem in report["problems"]))
+        self.assertFalse(report["ok"])
+
+    def test_an_empty_git_repo_setting_is_a_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._doctor(
+                {"git_sync": True, "git_repo": ""}, Path(tmp) / "journal"
+            )
+        self.assertTrue(any("git_repo is empty" in problem
+                            for problem in report["problems"]))
+
+    def test_a_healthy_mirror_is_reported_without_a_problem(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "logs"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "logs", str(repo)],
+                           check=True, stdout=subprocess.DEVNULL)
+            report = self._doctor(
+                {"git_sync": True, "git_repo": str(repo)},
+                Path(tmp) / "journal",
+            )
+        self.assertTrue(report["audit"]["git_status"]["ok"])
+        self.assertFalse(any("git_sync" in problem
+                             for problem in report["problems"]))
+
+    def test_git_sync_off_is_not_checked_at_all(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._doctor(
+                {"git_sync": False, "git_repo": "/nowhere"},
+                Path(tmp) / "journal",
+            )
+        self.assertNotIn("git_status", report["audit"])
+
+    def test_a_local_audit_spool_backlog_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal_root = Path(tmp) / "journal"
+            journal_root.mkdir()
+            (journal_root / "spool.jsonl").write_text(
+                '{"event": "lease-begin"}\n{"event": "lease-end"}\n'
+            )
+            report = self._doctor({"git_sync": False}, journal_root)
+        self.assertEqual(report["audit"]["spooled_records"], 2)
+        self.assertTrue(any("flush-spool" in problem
+                            for problem in report["problems"]))
+
+    def test_an_empty_spool_is_not_a_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._doctor({"git_sync": False}, Path(tmp) / "journal")
+        self.assertEqual(report["audit"]["spooled_records"], 0)
+        self.assertFalse(any("spool" in problem
+                             for problem in report["problems"]))
+
+
 if __name__ == "__main__":
     unittest.main()

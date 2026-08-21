@@ -10,7 +10,8 @@ Two backends:
   `proxmox-lab journal` can answer "what did the last lease do?" without
   anyone writing a JSONL parser.
 * `jsonl` -- one append-only file per day. Plain text, easy to tail, and the
-  right choice if you want to commit the ledger to git.
+  right choice if you want to commit the ledger to git. `query` and `summary`
+  read these files directly, so a JSONL install answers the same questions.
 
 Both are append-only in practice: nothing here updates or deletes.
 """
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -249,6 +251,167 @@ def sync_git(
             time.sleep(SYNC_GIT_RETRY_DELAY)
 
 
+def git_sync_status(repo: Path, branch: str = "logs") -> dict[str, Any]:
+    """Can the configured audit mirror actually receive a record?
+
+    The same preconditions `sync_git` enforces, checked without writing
+    anything: the path exists, is a repository root, is clean, and is
+    writable. Every mutating command only *warns* when a push fails, so
+    without this check a broken private mirror is invisible to a health check
+    -- the local ledger keeps filling while nothing is exported.
+    """
+    result: dict[str, Any] = {
+        "repo": str(repo),
+        "branch": branch,
+        "ok": False,
+        "problem": None,
+    }
+    if not SAFE_BRANCH.fullmatch(branch) or ".." in branch or "@{" in branch:
+        result["problem"] = f"unsafe audit git branch {branch!r}"
+        return result
+    try:
+        resolved = repo.expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        result["problem"] = f"path could not be resolved: {exc}"
+        return result
+    result["repo"] = str(resolved)
+    if not resolved.is_dir():
+        result["problem"] = "directory does not exist"
+        return result
+
+    def git(*args: str) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(resolved), *args],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=30, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["problem"] = f"git could not be run: {exc}"
+            return None
+
+    top = git("rev-parse", "--show-toplevel")
+    if top is None:
+        return result
+    if top.returncode:
+        result["problem"] = "not a git repository"
+        return result
+    try:
+        is_root = Path(top.stdout.strip()).resolve() == resolved
+    except (OSError, RuntimeError):
+        is_root = False
+    if not is_root:
+        result["problem"] = "not the root of its git repository"
+        return result
+    status = git("status", "--porcelain", "--untracked-files=all")
+    if status is None:
+        return result
+    if status.returncode:
+        result["problem"] = f"git status failed: {status.stdout.strip()[:200]}"
+        return result
+    if status.stdout.strip():
+        result["problem"] = (
+            "checkout is dirty; log sync refuses to mix commits"
+        )
+        return result
+    if not os.access(resolved, os.W_OK):
+        result["problem"] = "directory is not writable"
+        return result
+    result["ok"] = True
+    return result
+
+
+def _jsonl_paths(journal_dir: Path) -> list[Path]:
+    """The daily JSONL files, oldest first."""
+    try:
+        return sorted(journal_dir.glob("*.jsonl"))
+    except OSError:
+        return []
+
+
+def _like_matches(pattern: str, value: str) -> bool:
+    """SQL LIKE semantics, so `event=` filters the same on either backend."""
+    translated = re.escape(pattern.replace("*", "%"))
+    translated = translated.replace("%", ".*").replace("_", ".")
+    return re.fullmatch(translated, value, re.IGNORECASE) is not None
+
+
+def _jsonl_records(
+    journal_dir: Path,
+    *,
+    limit: int | None = None,
+    lease: str | None = None,
+    event: str | None = None,
+    since: str | None = None,
+) -> list[dict[str, Any]]:
+    """Matching JSONL events, newest first.
+
+    Files are named by date and appended to in order, so walking them in
+    reverse is the same ordering SQLite's `ORDER BY id DESC` gives. Reading
+    stops as soon as `limit` is satisfied, so a long-running ledger does not
+    have to be loaded in full to answer "what just happened?".
+    """
+    out: list[dict[str, Any]] = []
+    for path in reversed(_jsonl_paths(journal_dir)):
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if lease and record.get("lease") != lease:
+                continue
+            if event and not _like_matches(event, str(record.get("event", ""))):
+                continue
+            if since and str(record.get("timestamp", "")) < since:
+                continue
+            out.append(record)
+            if limit is not None and len(out) >= limit:
+                return out
+    return out
+
+
+def _jsonl_summary(journal_dir: Path) -> dict[str, Any]:
+    paths = _jsonl_paths(journal_dir)
+    if not paths:
+        return {
+            "backend": "jsonl",
+            "journal_dir": str(journal_dir),
+            "exists": False,
+            "events": 0,
+        }
+    records = _jsonl_records(journal_dir)
+    counts: dict[str, int] = {}
+    leases: set[str] = set()
+    timestamps: list[str] = []
+    for record in records:
+        counts[str(record.get("event"))] = counts.get(str(record.get("event")), 0) + 1
+        if record.get("lease"):
+            leases.add(str(record["lease"]))
+        if record.get("timestamp"):
+            timestamps.append(str(record["timestamp"]))
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+    return {
+        "backend": "jsonl",
+        "journal_dir": str(journal_dir),
+        "files": len(paths),
+        "exists": True,
+        "events": len(records),
+        "first_event": min(timestamps) if timestamps else None,
+        "last_event": max(timestamps) if timestamps else None,
+        "distinct_leases": len(leases),
+        "most_common": dict(ranked),
+    }
+
+
 def query(
     journal_dir: Path,
     *,
@@ -268,6 +431,13 @@ def query(
         )
     if backend not in {"sqlite", "jsonl"}:
         raise ValueError(f"unsupported journal backend: {backend}")
+    if backend == "jsonl":
+        # Read what this backend actually wrote. Reading journal.db here made a
+        # configured JSONL ledger look empty, which during an incident review
+        # is worse than an error.
+        return _jsonl_records(
+            journal_dir, limit=limit, lease=lease, event=event, since=since
+        )
     path = database_path(journal_dir)
     if not path.exists():
         return []
@@ -306,6 +476,8 @@ def summary(
         return pocketbase.summary()
     if backend not in {"sqlite", "jsonl"}:
         raise ValueError(f"unsupported journal backend: {backend}")
+    if backend == "jsonl":
+        return _jsonl_summary(journal_dir)
     path = database_path(journal_dir)
     if not path.exists():
         return {"database": str(path), "exists": False, "events": 0}

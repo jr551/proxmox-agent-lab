@@ -33,6 +33,20 @@ available), mounted at `/mnt/pve/<name>`, registered as directory storage and
 set to hold `images,iso,vztmpl,import,backup,snippets`. Use `--content` to
 narrow that.
 
+All of that is the contract, so a partial result **exits non-zero**: if the
+storage is created but setting its content types fails, the JSON is still
+printed (with `content_configured: false` and the reason) and then the command
+fails, because a caller that read exit 0 would go on to upload content the
+storage will not accept. The disk is already formatted at that point, so
+finish it with `storage set-content` rather than rerunning `add-disk`, which
+would erase it again:
+
+```bash
+proxmox-lab storage set-content --lease "$L" --name bulk \
+  --content images,iso,vztmpl,import,backup,snippets \
+  --host-change-authorized
+```
+
 A slow bulk disk such as a USB drive is a good home for install media, imported
 cloud images and backups. Keep running guest disks on `local-lvm`; a USB disk
 is fine for cold storage but will make a booted VM feel slow.

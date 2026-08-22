@@ -519,6 +519,17 @@ def cmd_wait_agent(lab: Any, args: Any) -> None:
 
 
 def _disk_written(lab: Any, api: Any, vmid: int) -> int:
+    """Proxmox's cumulative write counter. Advisory only.
+
+    It has been observed reading 0 for a whole session on a writing qcow2
+    guest over directory-backed storage, so both callers here are deliberately
+    biased the safe way: a stalled counter makes `_kick_installer` keep tapping
+    (harmless) and makes `wait-agent` print a warning while it carries on
+    waiting. Neither may ever be turned into a hard stop on this number. To
+    settle whether a guest is really writing, use 'guest disk-activity
+    --ground-truth', which cross-checks it against QEMU's own block counters
+    and the allocated size of the image file on the host.
+    """
     try:
         status = api.call("GET", f"/nodes/{lab.NODE}/qemu/{vmid}/status/current")
         return int(status.get("diskwrite") or 0)

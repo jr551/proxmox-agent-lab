@@ -31,6 +31,7 @@ import time
 from typing import Any
 
 from . import console
+from . import diskactivity
 
 
 class GuestError(RuntimeError):
@@ -751,6 +752,39 @@ def register(sub: Any, lab: Any) -> None:
     )
     probe_cmd.add_argument("--vmid", type=int, required=True)
     probe_cmd.set_defaults(func=bind(cmd_probe))
+
+    activity_cmd = guest_sub.add_parser(
+        "disk-activity",
+        help="is this guest really writing? (samples twice, compares signals)",
+        description=(
+            "Measures disk writes across an interval instead of trusting the "
+            "Proxmox 'diskwrite' counter, which has been observed reading 0 "
+            "for a whole session on a qcow2 guest that was demonstrably "
+            "writing. Read-only. With --ground-truth it also reads QEMU's own "
+            "block-layer counters over the monitor endpoint and 'du' on the "
+            "backing image file over the opt-in host SSH channel, and names "
+            "any signal that disagrees with the others. A signal that is "
+            "switched off or refused is reported, never fatal."
+        ),
+    )
+    activity_cmd.add_argument("--vmid", type=int, required=True)
+    activity_cmd.add_argument("--lease", help="required with --ground-truth")
+    activity_cmd.add_argument(
+        "--ground-truth", action="store_true",
+        help="also read QEMU blockstats and host-side du, and report which "
+             "signals disagree (needs a lease that owns the guest)",
+    )
+    activity_cmd.add_argument(
+        "--interval", type=float,
+        default=diskactivity.DEFAULT_INTERVAL_SECONDS,
+        help="seconds between the two samples (default: %(default)s)",
+    )
+    activity_cmd.add_argument(
+        "--timeout", type=float,
+        default=diskactivity.DEFAULT_DEADLINE_SECONDS,
+        help="overall deadline for the measurement (default: %(default)s)",
+    )
+    activity_cmd.set_defaults(func=bind(diskactivity.cmd_disk_activity))
 
     run_cmd = guest_sub.add_parser(
         "run", help="run a command, picking the channel automatically"

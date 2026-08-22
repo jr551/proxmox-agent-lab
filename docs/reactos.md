@@ -194,6 +194,47 @@ ReactOS install — stop waiting and report a stall, distinguishing that outcome
 from "reached the target" and from "still progressing when the overall timeout
 expired". Those three outcomes want three different next actions.
 
+### `diskwrite` can read 0 on a guest that is writing hard
+
+**Do not treat a still `diskwrite` as proof of a stall.** On a qcow2 image over
+directory-backed storage the counter has been observed sitting at **0 bytes for
+an entire session** while the guest was demonstrably writing. It is a cached,
+summed value that does not update in real time for every storage backend
+combination, so "the counter did not move" and "the guest did nothing" are two
+different statements and only one of them is measured.
+
+Two further traps in the same area:
+
+- qcow2 growth can be **metadata-only** — L1 and refcount tables allocated for
+  a large sparse image — so a file that grew by megabytes may carry no guest
+  data at all.
+- `ls -la` reports a sparse image's **apparent** size, which for an untouched
+  100 GB qcow2 is 100 GB of I/O that never happened. `du` reports the
+  **allocated** bytes, which is the number you want.
+
+Cross-check before concluding anything, with a command that samples twice and
+compares three independent signals:
+
+```bash
+proxmox-lab guest disk-activity --vmid "$VMID"                    # counter only
+proxmox-lab guest disk-activity --lease "$L" --vmid "$VMID" \
+  --ground-truth --interval 10
+```
+
+`--ground-truth` adds QEMU's own block-layer counters (`info blockstats` over
+the Proxmox monitor endpoint — no SSH needed) and `du --block-size=1` on the
+backing image file (over the opt-in `[memflow]` host SSH channel), then reports
+a `disagreement` list naming any signal that saw nothing while another saw
+bytes. That list is the diagnostically useful part: it is what tells you the
+counter is lying rather than the guest being dead. Either extra signal may be
+unavailable — the monitor endpoint needs a privilege the `PVEVMAdmin` lab token
+does not have, and `du` needs the host SSH opt-in — and the command reports
+that and returns the rest rather than failing.
+
+Without `--ground-truth` the command deliberately reports `"writing": null`
+rather than `false` for a still counter, because that counter on its own cannot
+tell an idle guest from a stalled counter.
+
 A `cpu` reading near **0.5 on a 2-vCPU guest** means exactly one core is
 spinning: the guest is not idle and not making progress, which is the signature
 of a busy-wait such as the KDB keyboard poll described above. To see where it

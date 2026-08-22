@@ -97,7 +97,11 @@ nearly every deliberately-kept guest would be called unowned.
 Ownership comes from the two things the controller actually keeps:
 
 1. **The lease record**, for the life of the lease. This is what
-   `require_lease_resource` checks before any mutation.
+   `require_lease_resource` checks before any mutation. It refuses before the
+   request is sent and names the `lease-register` command that would authorize
+   the guest. A guest write whose path does not resolve to a `(kind, vmid)` —
+   `/nodes/<node>/qemu//9246/sendkey`, say — is refused for the same reason:
+   a path the check cannot read is a check that did not happen.
 2. **The retained registry** (`retained.json` under the state root), for guests
    that outlive their lease on purpose. Written at register time for any
    `policy = retain` resource, never pruned automatically, and cleared when the

@@ -115,41 +115,126 @@ class GptTests(unittest.TestCase):
         self.assertEqual(out["scheme"], "mbr")
 
 
-def _iso(volume_id="TESTISO", el_torito=True, uefi=True, hybrid=False) -> bytes:
-    total = ISO_SECTOR * 40
+ISO_SECTORS = 64          # size of a synthesized image, in 2048-byte sectors
+ROOT_DIR_LBA = 19         # root directory extent
+CATALOG_LBA = 20          # El Torito boot catalog
+BIOS_IMAGE_LBA = 22       # the BIOS boot image the catalog points at
+UEFI_IMAGE_LBA = 24       # the UEFI boot image
+SUBDIR_LBA = 30           # first subdirectory extent
+
+# A tree that only exists on media somebody meant to boot, and one that does
+# not: the difference decides whether a missing boot record is a defect or the
+# intended shape of a data ISO.
+BOOT_TREE = {"LOADER": ["ISOBTRT.BIN", "SETUPLDR.SYS"],
+             "REACTOS": ["NTOSKRNL.EXE"]}
+DATA_TREE = {"DOCS": ["README.TXT"], "ARCHIVE": []}
+
+
+def _dir_record(name: str, is_dir: bool, lba: int, size: int) -> bytes:
+    """One ISO 9660 directory record, padded to an even length."""
+    raw = name.encode("ascii")
+    length = 33 + len(raw)
+    length += length % 2
+    rec = bytearray(length)
+    rec[0] = length
+    struct.pack_into("<I", rec, 2, lba)
+    struct.pack_into(">I", rec, 6, lba)
+    struct.pack_into("<I", rec, 10, size)
+    struct.pack_into(">I", rec, 14, size)
+    rec[25] = 0x02 if is_dir else 0x00
+    struct.pack_into("<H", rec, 28, 1)
+    struct.pack_into(">H", rec, 30, 1)
+    rec[32] = len(raw)
+    rec[33:33 + len(raw)] = raw
+    return bytes(rec)
+
+
+def _validation_entry(platform=0x00, header_id=0x01, checksum=True,
+                      key_bytes=True) -> bytes:
+    """El Torito validation entry; the firmware checks can be broken here."""
+    entry = bytearray(32)
+    entry[0] = header_id
+    entry[1] = platform
+    entry[4:4 + 8] = b"PXLABTST"
+    if key_bytes:
+        entry[30], entry[31] = 0x55, 0xAA
+    if checksum:
+        total = sum(struct.unpack_from("<16H", entry, 0)) & 0xFFFF
+        struct.pack_into("<H", entry, 28, (-total) & 0xFFFF)
+    return bytes(entry)
+
+
+def _boot_entry(bootable=True, media_type=0x00, load_segment=0,
+                load_sectors=4, load_rba=BIOS_IMAGE_LBA) -> bytes:
+    """El Torito initial/default or section entry."""
+    entry = bytearray(32)
+    entry[0] = 0x88 if bootable else 0x00
+    entry[1] = media_type
+    struct.pack_into("<H", entry, 2, load_segment)
+    struct.pack_into("<H", entry, 6, load_sectors)
+    struct.pack_into("<I", entry, 8, load_rba)
+    return bytes(entry)
+
+
+def _iso(volume_id="TESTISO", el_torito=True, uefi=True, hybrid=False,
+         tree=None, catalog_lba=CATALOG_LBA, bios_lba=BIOS_IMAGE_LBA,
+         uefi_lba=UEFI_IMAGE_LBA, bios_sectors=4, uefi_sectors=8,
+         media_type=0x00, load_segment=0, header_id=0x01, checksum=True,
+         key_bytes=True) -> bytes:
+    total = ISO_SECTOR * ISO_SECTORS
     data = bytearray(total)
-    # PVD at sector 16.
+    # PVD at sector 16, volume descriptor set terminator at 18.
     pvd = 16 * ISO_SECTOR
+    data[pvd] = 0x01
     data[pvd + 1:pvd + 6] = b"CD001"
+    data[pvd + 6] = 0x01
     data[pvd + 8:pvd + 40] = b"LINUX".ljust(32)
     data[pvd + 40:pvd + 72] = volume_id.encode().ljust(32)
+    data[18 * ISO_SECTOR] = 0xFF
+    data[18 * ISO_SECTOR + 1:18 * ISO_SECTOR + 6] = b"CD001"
+
+    # Root directory record inside the PVD, then the tree it points at.
+    data[pvd + 156:pvd + 190] = _dir_record(
+        "\x00", True, ROOT_DIR_LBA, ISO_SECTOR)
+    root = bytearray()
+    root += _dir_record("\x00", True, ROOT_DIR_LBA, ISO_SECTOR)
+    root += _dir_record("\x01", True, ROOT_DIR_LBA, ISO_SECTOR)
+    sub_lba = SUBDIR_LBA
+    for name, children in (BOOT_TREE if tree is None else tree).items():
+        root += _dir_record(name, True, sub_lba, ISO_SECTOR)
+        sub = bytearray()
+        sub += _dir_record("\x00", True, sub_lba, ISO_SECTOR)
+        sub += _dir_record("\x01", True, ROOT_DIR_LBA, ISO_SECTOR)
+        for child in children:
+            sub += _dir_record(f"{child};1", False, 50, 512)
+        data[sub_lba * ISO_SECTOR:sub_lba * ISO_SECTOR + len(sub)] = sub
+        sub_lba += 1
+    data[ROOT_DIR_LBA * ISO_SECTOR:
+         ROOT_DIR_LBA * ISO_SECTOR + len(root)] = root
+
     if el_torito:
         brvd = 17 * ISO_SECTOR
         data[brvd] = 0x00
         data[brvd + 1:brvd + 6] = b"CD001"
+        data[brvd + 6] = 0x01
         data[brvd + 7:brvd + 7 + 23] = b"EL TORITO SPECIFICATION"
-        catalog_sector = 20
-        struct.pack_into("<I", data, brvd + 71, catalog_sector)
-        cat = catalog_sector * ISO_SECTOR
-        # Validation entry: id 0x01, platform 0x00 (BIOS).
-        data[cat] = 0x01
-        data[cat + 1] = 0x00
-        # Initial/default entry (BIOS), bootable 0x88.
-        data[cat + 32] = 0x88
-        data[cat + 32 + 1] = 0x00
-        struct.pack_into("<H", data, cat + 32 + 6, 4)
-        struct.pack_into("<I", data, cat + 32 + 8, 100)
-        if uefi:
-            # Final section header (0x91), platform UEFI, 1 entry.
-            sh = cat + 64
-            data[sh] = 0x91
-            data[sh + 1] = 0xEF
-            struct.pack_into("<H", data, sh + 2, 1)
-            # Section entry: bootable UEFI.
-            se = sh + 32
-            data[se] = 0x88
-            data[se + 1] = 0x00
-            struct.pack_into("<I", data, se + 8, 300)
+        struct.pack_into("<I", data, brvd + 71, catalog_lba)
+        cat = catalog_lba * ISO_SECTOR
+        if cat + 128 <= total:
+            data[cat:cat + 32] = _validation_entry(
+                0x00, header_id=header_id, checksum=checksum,
+                key_bytes=key_bytes)
+            data[cat + 32:cat + 64] = _boot_entry(
+                media_type=media_type, load_segment=load_segment,
+                load_sectors=bios_sectors, load_rba=bios_lba)
+            if uefi:
+                # Final section header (0x91), platform UEFI, 1 entry.
+                sh = cat + 64
+                data[sh] = 0x91
+                data[sh + 1] = 0xEF
+                struct.pack_into("<H", data, sh + 2, 1)
+                data[sh + 32:sh + 64] = _boot_entry(
+                    load_sectors=uefi_sectors, load_rba=uefi_lba)
     if hybrid:
         data[0:SECTOR] = _mbr([(0x00, 0x00, 0, ISO_SECTOR // SECTOR)])
     return bytes(data)
@@ -185,6 +270,97 @@ class IsoTests(unittest.TestCase):
         out = bs.parse_iso(_iso(hybrid=True))
         self.assertIsNotNone(out["hybrid"])
         self.assertTrue(out["hybrid"]["has_mbr"])
+
+    def test_validation_entry_is_decoded_and_verified(self) -> None:
+        et = bs.parse_iso(_iso())["el_torito"]
+        self.assertTrue(et["catalog_usable"])
+        self.assertEqual(et["catalog_lba"], CATALOG_LBA)
+        self.assertEqual(et["validation"]["header_id"], "0x01")
+        self.assertEqual(et["validation"]["platform"], "x86-BIOS")
+        self.assertEqual(et["validation"]["id_string"], "PXLABTST")
+        self.assertTrue(et["validation"]["checksum_ok"])
+        self.assertTrue(et["validation"]["key_bytes_ok"])
+        self.assertEqual(et["errors"], [])
+
+    def test_entry_geometry_is_reported(self) -> None:
+        et = bs.parse_iso(_iso(uefi=False, media_type=0x04,
+                               load_segment=0x2000, bios_sectors=63))
+        et = et["el_torito"]
+        entry = et["entries"][0]
+        self.assertEqual(entry["kind"], "initial/default")
+        self.assertEqual(entry["platform_id"], "0x00")
+        self.assertEqual(entry["media_type_name"], "hard-disk-emulation")
+        self.assertEqual(entry["load_segment"], "0x2000")
+        self.assertFalse(entry["load_segment_default"])
+        self.assertEqual(entry["load_sectors"], 63)
+        self.assertEqual(entry["load_rba"], BIOS_IMAGE_LBA)
+        self.assertEqual(entry["image_offset"], BIOS_IMAGE_LBA * ISO_SECTOR)
+        self.assertTrue(entry["image_in_range"])
+
+    def test_default_load_segment_reads_as_0x7c0(self) -> None:
+        entry = bs.parse_iso(_iso())["el_torito"]["entries"][0]
+        self.assertEqual(entry["load_segment"], "0x07C0")
+        self.assertTrue(entry["load_segment_default"])
+        self.assertEqual(entry["media_type_name"], "no-emulation")
+
+    def test_checksum_failure_makes_the_catalog_unusable(self) -> None:
+        et = bs.parse_iso(_iso(checksum=False))["el_torito"]
+        self.assertTrue(et["present"])
+        self.assertFalse(et["catalog_usable"])
+        self.assertFalse(et["validation"]["checksum_ok"])
+        self.assertEqual(et["entries"], [])
+        self.assertTrue(any("checksum" in e for e in et["errors"]))
+
+    def test_missing_key_bytes_make_the_catalog_unusable(self) -> None:
+        et = bs.parse_iso(_iso(key_bytes=False))["el_torito"]
+        self.assertFalse(et["catalog_usable"])
+        self.assertFalse(et["validation"]["key_bytes_ok"])
+        self.assertTrue(any("0x55 0xAA" in e for e in et["errors"]))
+
+    def test_wrong_validation_header_id_is_named(self) -> None:
+        et = bs.parse_iso(_iso(header_id=0x02))["el_torito"]
+        self.assertFalse(et["catalog_usable"])
+        self.assertTrue(any("header id 0x02" in e for e in et["errors"]))
+
+    def test_catalog_lba_past_the_end_of_the_image(self) -> None:
+        et = bs.parse_iso(_iso(catalog_lba=90000))["el_torito"]
+        self.assertTrue(et["present"])
+        self.assertFalse(et["catalog_usable"])
+        self.assertEqual(et["catalog_lba"], 90000)
+        self.assertTrue(any("past the end" in e for e in et["errors"]))
+
+    def test_catalog_lba_zero_is_rejected(self) -> None:
+        et = bs.parse_iso(_iso(catalog_lba=0))["el_torito"]
+        self.assertFalse(et["catalog_usable"])
+        self.assertTrue(any("LBA 0" in e for e in et["errors"]))
+
+    def test_catalog_beyond_the_bytes_read_is_distinguished(self) -> None:
+        image = _iso()
+        # Hand the parser a short slice but the real image size: the catalog
+        # exists, it just was not read.
+        et = bs.parse_iso(image[:19 * ISO_SECTOR], len(image))["el_torito"]
+        self.assertTrue(et["present"])
+        self.assertFalse(et["catalog_usable"])
+        self.assertTrue(any("beyond the bytes read" in e for e in et["errors"]))
+
+    def test_boot_image_past_the_end_of_the_image(self) -> None:
+        et = bs.parse_iso(_iso(uefi=False, bios_lba=90000))["el_torito"]
+        self.assertTrue(et["catalog_usable"])
+        self.assertFalse(et["entries"][0]["image_in_range"])
+
+    def test_bootloader_tree_is_recognized(self) -> None:
+        tree = bs.parse_iso(_iso())["tree"]
+        self.assertTrue(tree["looks_bootable"])
+        self.assertIn("LOADER", tree["boot_markers"])
+        self.assertIn("LOADER/ISOBTRT.BIN", tree["boot_markers"])
+        self.assertIn("REACTOS", tree["boot_markers"])
+        self.assertIn("LOADER/", tree["root_entries"])
+
+    def test_data_tree_is_not_mistaken_for_boot_media(self) -> None:
+        tree = bs.parse_iso(_iso(tree=DATA_TREE))["tree"]
+        self.assertFalse(tree["looks_bootable"])
+        self.assertEqual(tree["boot_markers"], [])
+        self.assertIn("DOCS/", tree["root_entries"])
 
 
 if __name__ == "__main__":

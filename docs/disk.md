@@ -20,6 +20,20 @@ whether it is **hybrid** (carries an MBR/GPT so it can boot when written to a
 USB/disk). The common silent failure — an installer that boots under SeaBIOS
 but not OVMF because it has no UEFI El Torito entry — shows up as a warning.
 
+The catalog itself is decoded, not merely counted: per entry you get the
+platform, the boot media/emulation type, the load segment, the boot-load-size
+and the boot image LBA, and `el_torito_ok` is true only when some entry would
+actually hand control to a bootloader. Three ways an image can be silently
+unbootable are reported by name — a boot record whose catalog fails its
+validation checksum or `0x55 0xAA` key bytes, an entry pointing past the end of
+the file or loading zero sectors, and a bootloader-shaped file tree with no
+boot record over it at all, which is what a hand re-run of `mkisofs` without
+its El Torito options produces. **Run this on every ISO you assembled or
+repaired by hand before attaching it to a guest**; the failure looks like a
+hung guest once it is running. See
+[reactos.md](reactos.md#build-settings-that-break-the-labs-own-channels) for
+the build workflow that produces such an image and the flags to rebuild with.
+
 ## Read partition tables — `disk boot-info`
 
 Parses the MBR and GPT (partition types, GUIDs, the ESP, a GPT protective

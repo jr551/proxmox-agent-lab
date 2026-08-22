@@ -94,6 +94,9 @@ or installer.
 - Prefer a purpose-built template. If a fresh install is required, verify the
   image checksum and keep the installer ISO on bulk storage and the guest disk
   on fast storage.
+- If the ISO was built or reassembled by hand, run `proxmox-lab iso diagnose
+  --path <iso>` first: an image with no El Torito boot record boots to a black
+  screen that is indistinguishable from a hang. See [disk.md](disk.md).
 - Quote API values containing shell metacharacters, especially boot order:
 
   ```bash

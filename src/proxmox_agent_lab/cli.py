@@ -1351,7 +1351,16 @@ def cmd_api(args: argparse.Namespace) -> None:
             )
         password = sys.stdin.readline().rstrip("\r\n")
         if not password:
-            raise LabError("--password-stdin received an empty password")
+            # Deliberately stricter than the guest-console paths. There an
+            # empty password is a fact about a guest that already has none;
+            # here it would be *written* into a Proxmox object, creating a
+            # blank credential nobody asked for. `guest run --password-stdin`
+            # is the command that accepts an empty console password.
+            raise LabError(
+                f"--password-stdin received an empty password for {key}. A "
+                "write would store a blank credential; to log into a guest "
+                "that has no password, use 'guest run --password-stdin'."
+            )
         data[key] = password
     write = method != "GET"
     lease: dict[str, Any] | None = None
@@ -1624,6 +1633,58 @@ def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
     return failures
 
 
+def shared_lease_resources(lease: dict[str, Any]) -> list[dict[str, Any]]:
+    """Guests `lease` would delete that another active lease also registers.
+
+    `finalize_lease` already declines to touch a resource a still-*live* lease
+    owns, and `lease-register` refuses to take one. Neither closes the window
+    this looks at, because both ask "is the other lease live?" and a lease can
+    be `active` while expired -- one heartbeat away from live again. It also
+    only takes one registration path that skips `lease-register` (a module
+    that calls `register_resource` directly, such as an idempotent
+    `memflow ghidra-setup --lxc N` re-run under a second lease) for two live
+    leases to name one guest.
+
+    Reads lease records only, so it costs no network call inside the
+    controller lock. `retain` resources are excluded: this never deletes one,
+    and `finalize_lease` keeps deciding what to do with them.
+    """
+    others = active_leases(excluding=str(lease.get("id")))
+    if not others:
+        return []
+    now = utc_now()
+    shared: list[dict[str, Any]] = []
+    for resource in lease.get("resources", []):
+        if resource.get("policy", "delete") != "delete":
+            continue
+        try:
+            kind = str(resource["kind"])
+            vmid = int(resource["vmid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        for other in others:
+            if not lease_claims(other, kind, vmid):
+                continue
+            shared.append({
+                "resource": f"{kind}/{vmid}",
+                "kind": kind,
+                "vmid": vmid,
+                "lease": str(other.get("id")),
+                "lease_kind": str(other.get("kind") or "session"),
+                "lease_live": lease_is_live(other, now),
+            })
+    return shared
+
+
+def describe_shared_resources(shared: list[dict[str, Any]]) -> str:
+    return ", ".join(
+        f"{item['resource']} (lease {item['lease']}"
+        + ("" if item["lease_live"] else ", expired but still active")
+        + ")"
+        for item in shared
+    )
+
+
 def cmd_lease_end(args: argparse.Namespace) -> None:
     api = ProxmoxAPI()
     with controller_lock():
@@ -1639,6 +1700,31 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
                 "survive. Use 'proxmox-lab lease-destroy --lease "
                 f"{args.lease} --confirm' to remove it and its machines "
                 "for good."
+            )
+        # Strictly before anything is powered on, stopped or deleted. A
+        # warning that arrives next to an already-destroyed guest is worthless.
+        shared = shared_lease_resources(lease)
+        if shared and not getattr(args, "shared_guests_authorized", False):
+            audit(
+                "lease-end-refused-shared-guest",
+                lease=args.lease,
+                shared_with_other_leases=shared,
+            )
+            raise LabError(
+                f"Lease {args.lease} would destroy guest(s) that another "
+                "active lease still registers: "
+                + describe_shared_resources(shared)
+                + ". Deleting one of those stops somebody else's work and is "
+                "not recoverable. End or abandon the other lease first, or "
+                "re-run with --shared-guests-authorized to destroy them "
+                "anyway."
+            )
+        if shared:
+            print(
+                "warning: destroying guest(s) another active lease registers, "
+                "because --shared-guests-authorized was given: "
+                + describe_shared_resources(shared),
+                file=sys.stderr,
             )
         if not api.reachable() and lease_requires_cleanup(lease):
             ensure_on(api)
@@ -1662,6 +1748,7 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
             remaining_active_leases=[x["id"] for x in others],
             long_term_leases=[x["id"] for x in persistent],
             host_powered_off=host_powered_off,
+            shared_with_other_leases=shared,
         )
     result: dict[str, Any] = {
         "lease": args.lease,
@@ -1671,6 +1758,13 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
     }
     if lease.get("transferred_resources"):
         result["left_to_another_lease"] = lease["transferred_resources"]
+    if shared:
+        result["shared_with_other_leases"] = shared
+        result["warning"] = (
+            "--shared-guests-authorized was given, so this lease-end acted on "
+            "guest(s) another active lease also registers: "
+            + describe_shared_resources(shared)
+        )
     if persistent:
         # Say this loudly. A machine left running is the surprise nobody
         # wants on their electricity bill.
@@ -2808,7 +2902,8 @@ def parser() -> argparse.ArgumentParser:
     api.add_argument(
         "--password-stdin",
         action="store_true",
-        help="Read a password value from stdin without exposing it in argv",
+        help="Read a password value from stdin without exposing it in argv. "
+             "It must not be empty: a write stores the credential",
     )
     api.add_argument(
         "--password-key",
@@ -2831,6 +2926,12 @@ def parser() -> argparse.ArgumentParser:
 
     end = sub.add_parser("lease-end")
     end.add_argument("--lease", required=True)
+    end.add_argument(
+        "--shared-guests-authorized", action="store_true",
+        help="destroy a registered guest even though another active lease "
+             "also registers it. Refused by default: that lease may be "
+             "mid-run, and a deleted guest does not come back",
+    )
     end.set_defaults(func=cmd_lease_end)
 
     abandon = sub.add_parser(

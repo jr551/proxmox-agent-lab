@@ -529,8 +529,10 @@ def cmd_leak_test(lab: Any, args: Any) -> None:
 
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
+    # An empty line is a legitimate credential: a stock image can have no
+    # console password at all. Only a missing flag means "none was offered".
     password = _sys.stdin.readline().rstrip("\r\n") if args.password_stdin else None
-    if not password:
+    if password is None:
         raise lab.LabError("provide the guest console password on stdin")
 
     home_ip = _controller_public_ip()
@@ -1046,7 +1048,8 @@ def register(sub: Any, lab: Any) -> None:
                       help="a guest already attached to the lab network")
     leak.add_argument("--user", default="alpine")
     leak.add_argument("--password-stdin", action="store_true", required=True,
-                      help="guest console password, read from stdin")
+                      help="guest console password, read from stdin; an empty "
+                           "line means the guest has no password")
     leak.add_argument("--no-install-tools", dest="install_tools",
                       action="store_false",
                       help="do not install curl in the guest to confirm the exit IP")

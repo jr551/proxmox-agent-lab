@@ -589,6 +589,54 @@ class SerialSessionTests(unittest.TestCase):
         session.expect = fake_expect  # type: ignore[method-assign]
         return session, sent
 
+    def test_login_returns_when_a_guest_never_asks_for_a_password(self) -> None:
+        """A guest with no password set drops straight to a shell.
+
+        The login waited only for "assword:", so such a guest hung for the
+        whole timeout -- which made an empty console password useless even
+        once the channel guards accepted one.
+        """
+        from proxmox_agent_lab import console as lab_console
+
+        session = lab_console.TermSession.__new__(lab_console.TermSession)
+        sent: list[str] = []
+        session.send_line = sent.append  # type: ignore[method-assign]
+        # A getty that prints "login:", takes the user, and shows a prompt.
+        scripted = [TimeoutError, ("login:", ""), ("# ", "")]
+
+        def fake_expect(patterns, timeout=60.0, poke=False):
+            step = scripted.pop(0)
+            if step is TimeoutError:
+                raise TimeoutError("no prompt yet")
+            self.assertIn(step[0], patterns)
+            return step
+
+        session.expect = fake_expect  # type: ignore[method-assign]
+        session.login("root", "")
+
+        self.assertEqual(sent, ["", "root"])
+        self.assertEqual(scripted, [])
+
+    def test_login_still_sends_the_password_when_one_is_asked_for(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        session = lab_console.TermSession.__new__(lab_console.TermSession)
+        sent: list[str] = []
+        session.send_line = sent.append  # type: ignore[method-assign]
+        scripted = [TimeoutError, ("login:", ""), ("assword:", ""), ("$ ", "")]
+
+        def fake_expect(patterns, timeout=60.0, poke=False):
+            step = scripted.pop(0)
+            if step is TimeoutError:
+                raise TimeoutError("no prompt yet")
+            self.assertIn(step[0], patterns)
+            return step
+
+        session.expect = fake_expect  # type: ignore[method-assign]
+        session.login("alpine", "hunter2")
+
+        self.assertEqual(sent, ["", "alpine", "hunter2"])
+
     def test_markers_are_not_matched_by_the_command_echo(self) -> None:
         seen: dict[str, str] = {}
 

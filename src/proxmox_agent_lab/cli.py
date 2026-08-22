@@ -80,6 +80,12 @@ SAFE_WRITE_PREFIXES = (
     f"/nodes/{NODE}/tasks",
     f"/nodes/{NODE}/status",
 )
+# The subset of the safe write surface that addresses an individual guest, and
+# therefore must resolve to a (kind, vmid) the lease owns before it is sent.
+GUEST_PATH_PREFIXES = (
+    f"/nodes/{NODE}/qemu/",
+    f"/nodes/{NODE}/lxc/",
+)
 UPLOAD_STORAGES = tuple(CONFIG.storage.upload_storages)
 HOST_CHANGE_MARKERS = (
     "/access",
@@ -1288,10 +1294,21 @@ def require_lease_resource(
         item.get("kind") == kind and int(item.get("vmid", -1)) == vmid
         for item in lease.get("resources", [])
     ):
-        if vmid in lease.get("initial_vmids", []):
-            raise LabError(f"VMID {vmid} existed before this lease")
+        # Name the remedy. A refusal that only states the rule sends the
+        # operator looking for a broken guest instead of an unregistered one.
+        lease_id = str(lease.get("id") or "<id>")
+        pre_existing = vmid in lease.get("initial_vmids", [])
+        reason = (
+            f"VMID {vmid} existed before this lease"
+            if pre_existing
+            else f"VMID {vmid} is not a {kind} guest registered to this lease"
+        )
+        register = (
+            f"proxmox-lab lease-register --lease {lease_id} --kind {kind} "
+            f"--vmid {vmid}" + (" --allow-existing" if pre_existing else "")
+        )
         raise LabError(
-            f"VMID {vmid} is not a {kind} guest registered to this lease"
+            f"{reason}; register it with '{register}' if you intend to drive it"
         )
 
 
@@ -1369,11 +1386,21 @@ def cmd_api(args: argparse.Namespace) -> None:
         ):
             raise LabError(f"Write path is outside the leased guest surface: {args.path}")
         resource = path_resource(args.path)
-        if resource:
-            require_lease_resource(lease, *resource)
         create_match = re.fullmatch(
             rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
         )
+        if resource:
+            require_lease_resource(lease, *resource)
+        elif not create_match and args.path.startswith(GUEST_PATH_PREFIXES):
+            # A guest path the resource regex cannot read is not a path whose
+            # ownership can be checked. `/nodes/N/qemu//9246/sendkey` reaches
+            # the same guest but parses as no guest at all, so accepting it
+            # would mutate a guest with the ownership check skipped.
+            raise LabError(
+                f"Write path names no readable guest: {args.path}. Use "
+                f"/nodes/{NODE}/<qemu|lxc>/<vmid>/... so the lease ownership "
+                "check can run."
+            )
         if method == "POST" and create_match:
             if "vmid" not in data:
                 raise LabError("Guest creation requires an explicit vmid")

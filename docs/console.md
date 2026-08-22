@@ -4,6 +4,21 @@ Everything here runs through `proxmox-lab console`. Reads need no
 lease; anything that touches a guest (keys, typing, clicks, exec) requires an
 active lease and is audited.
 
+A guest the current lease did not create is not drivable by default, and the
+refusal is raised before anything is transmitted — no keystroke, click, or
+`sendkey` reaches a guest the lease does not own. Reaching for a guest left
+over from an earlier lease therefore fails with the command that fixes it:
+
+```
+VMID 9246 existed before this lease; register it with 'proxmox-lab
+lease-register --lease <id> --kind qemu --vmid 9246 --allow-existing' if you
+intend to drive it
+```
+
+Run that once per lease, then drive the guest normally. `--allow-existing` is
+for a guest that genuinely predates the lease; a guest this lease created is
+registered without it.
+
 ## Choosing a channel
 
 Pick the cheapest channel that answers the question.
@@ -120,6 +135,25 @@ same JSON response, avoiding a separate reconnect and screenshot call:
 ```bash
 proxmox-lab console keys --lease "$L" --vmid 9001 enter --screenshot-after 3
 ```
+
+### Did the input actually arrive?
+
+`keys_sent` and `characters_sent` count what the controller transmitted, not
+what the guest received. With `--screenshot-after`, `keys` and `type` also
+report a delivery signal derived from that capture:
+
+| Field | Meaning |
+|---|---|
+| `screen_changed: true` | the framebuffer differs from the previous capture of this guest at this resolution |
+| `screen_changed: false` | pixel-identical to the previous capture; an `agent_hint` says the input may not have reached the guest and what to check |
+| `screen_changed: null` | there was no earlier capture to compare against, so this run carries no delivery evidence yet |
+
+It is evidence, not proof: a guest can change on its own, and a settled screen
+can legitimately look the same. Nothing here fails or blocks — an unchanged
+screen is a prompt to re-read with `console screenshot` or `console text`
+before sending more input, not an error. Without `--screenshot-after` no
+capture is taken and neither field appears, which means driving a screen with
+no delivery evidence at all; on a graphical guest, pass it.
 
 - `keys` defaults to the VNC path; `--via api` uses Proxmox `sendkey`, which
   works even when RFB input is unavailable.

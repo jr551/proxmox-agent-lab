@@ -2187,3 +2187,266 @@ class StorageClassTests(unittest.TestCase):
             self.assertEqual(lab_storage.storage_class("usb-bulk"), "bulk")
             self.assertEqual(lab_storage.storage_class("local-lvm"), "fast")
             self.assertEqual(lab_storage.storage_class(""), "fast")
+
+
+class ConsoleLeaseGuardTests(unittest.TestCase):
+    """The sequence reported in issue #92, driven against real lease state.
+
+    A guest created and registered under one lease, then reached for under
+    the next one. The report was that the input commands answered
+    `keys_sent: 1` and delivered nothing; these tests pin the actual
+    behaviour -- a refusal raised before any transmission -- and that the
+    refusal names its remedy.
+    """
+
+    VMID = 9246
+
+    def setUp(self) -> None:
+        from proxmox_agent_lab import cli as lab_cli
+
+        self.lab = lab_cli
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, lab_cli, "LEASE_ROOT", lab_cli.LEASE_ROOT)
+        self.addCleanup(setattr, lab_cli, "STATE_ROOT", lab_cli.STATE_ROOT)
+        lab_cli.LEASE_ROOT = root / "leases"
+        lab_cli.STATE_ROOT = root
+
+        # Lease one creates the guest, registers it, and ends.
+        self.first = "20260814120000-aaaaaaaa"
+        lab_cli.save_lease({
+            "id": self.first, "state": "active", "kind": "session",
+            "resources": [], "initial_vmids": [],
+        })
+        lab_cli.register_resource(
+            lab_cli.load_lease(self.first), "qemu", self.VMID, "retain",
+            "probe",
+        )
+        ended = lab_cli.load_lease(self.first)
+        ended["state"] = "ended"
+        lab_cli.save_lease(ended)
+
+        # Lease two begins with that guest already on the node.
+        self.second = "20260814130000-bbbbbbbb"
+        lab_cli.save_lease({
+            "id": self.second, "state": "active", "kind": "session",
+            "resources": [], "initial_vmids": [self.VMID],
+        })
+
+    def _refuses(self, run):
+        api = mock.Mock()
+        with mock.patch.object(self.lab, "ProxmoxAPI", return_value=api), \
+             mock.patch.object(self.lab, "audit"), \
+             mock.patch.object(lab_console, "VncSession") as vnc, \
+             mock.patch("builtins.print") as printed:
+            with self.assertRaises(self.lab.LabError) as caught:
+                run()
+        api.call.assert_not_called()
+        vnc.assert_not_called()
+        printed.assert_not_called()
+        return caught.exception
+
+    def _keys_args(self, lease, via="vnc"):
+        return mock.Mock(
+            lease=lease, vmid=self.VMID, keys=["enter"], via=via, delay=0,
+            screenshot_after=None, screenshot_out=None,
+        )
+
+    def test_keys_type_and_sendkey_refuse_a_previous_lease_guest(self) -> None:
+        def typing() -> None:
+            args = mock.Mock(
+                lease=self.second, vmid=self.VMID, text="hello",
+                text_stdin=False, delay=0, enter=False,
+                screenshot_after=None, screenshot_out=None,
+            )
+            lab_console.cmd_type(self.lab, args)
+
+        def sendkey() -> None:
+            args = self.lab.parser().parse_args([
+                "api", "--lease", self.second, "--method", "PUT",
+                "--path", f"/nodes/{self.lab.NODE}/qemu/{self.VMID}/sendkey",
+                "--data", "key=ret",
+            ])
+            self.lab.cmd_api(args)
+
+        cases = {
+            "keys --via vnc": lambda: lab_console.cmd_keys(
+                self.lab, self._keys_args(self.second, "vnc")),
+            "keys --via api": lambda: lab_console.cmd_keys(
+                self.lab, self._keys_args(self.second, "api")),
+            "type": typing,
+            "api sendkey": sendkey,
+        }
+        for label, run in cases.items():
+            with self.subTest(command=label):
+                error = self._refuses(run)
+                self.assertIn(
+                    f"VMID {self.VMID} existed before this lease", str(error)
+                )
+
+    def test_the_refusal_names_the_command_that_fixes_it(self) -> None:
+        error = self._refuses(
+            lambda: lab_console.cmd_keys(self.lab, self._keys_args(self.second))
+        )
+        self.assertIn(
+            f"proxmox-lab lease-register --lease {self.second} --kind qemu "
+            f"--vmid {self.VMID} --allow-existing",
+            str(error),
+        )
+
+    def test_a_guest_missing_from_the_snapshot_is_still_refused(self) -> None:
+        """The pre-existing branch is not the only guard.
+
+        If the new lease's `initial_vmids` snapshot never saw the guest -- a
+        different controller created it, or the snapshot raced it -- the
+        registration check still has to refuse, and still has to say how to
+        register it.
+        """
+        third = "20260814140000-cccccccc"
+        self.lab.save_lease({
+            "id": third, "state": "active", "kind": "session",
+            "resources": [], "initial_vmids": [],
+        })
+        message = str(self._refuses(
+            lambda: lab_console.cmd_keys(self.lab, self._keys_args(third, "api"))
+        ))
+        self.assertIn(
+            f"VMID {self.VMID} is not a qemu guest registered to this lease",
+            message,
+        )
+        self.assertIn(
+            f"proxmox-lab lease-register --lease {third} --kind qemu "
+            f"--vmid {self.VMID}",
+            message,
+        )
+        # Nothing pre-existed here, so --allow-existing is not the remedy.
+        self.assertNotIn("--allow-existing", message)
+
+    def test_registering_the_guest_lets_the_input_through(self) -> None:
+        """The other half of the guard: once registered, input is sent."""
+        self.lab.register_resource(
+            self.lab.load_lease(self.second), "qemu", self.VMID, "retain",
+            "probe",
+        )
+        api = mock.Mock()
+        with mock.patch.object(self.lab, "ProxmoxAPI", return_value=api), \
+             mock.patch.object(self.lab, "audit"), \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_keys(self.lab, self._keys_args(self.second, "api"))
+        api.call.assert_called_once_with(
+            "PUT", f"/nodes/{self.lab.NODE}/qemu/{self.VMID}/sendkey",
+            {"key": "enter"},
+        )
+        self.assertEqual(json.loads(printed.call_args.args[0])["keys_sent"], 1)
+
+
+class InputDeliverySignalTests(unittest.TestCase):
+    """`keys_sent` counts transmission, not arrival.
+
+    The post-action capture is the only evidence the controller has that the
+    input landed anywhere, so it is reported explicitly rather than left for
+    the caller to derive from a nested screenshot field.
+    """
+
+    def _run(self, command, frames):
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 2, 2
+        session.client.type_text.return_value = 5
+        results = []
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
+            args = mock.Mock(
+                lease="lease-12345678", vmid=7, keys=["enter"], via="vnc",
+                delay=0, text="hello", text_stdin=False, enter=False,
+                screenshot_after=1.0,
+                screenshot_out=str(Path(tmp) / "after.png"),
+            )
+            with mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch("builtins.print") as printed:
+                for frame in frames:
+                    session.client.capture.return_value = frame
+                    command(lab, args)
+                    results.append(json.loads(printed.call_args.args[0]))
+        return results
+
+    BLACK = b"\x00\x00\x00" * 4
+    WHITE = b"\xff\xff\xff" * 4
+
+    def test_keys_reports_an_unchanged_screen_as_possible_non_delivery(self) -> None:
+        first, repeat, changed = self._run(
+            lab_console.cmd_keys, [self.BLACK, self.BLACK, self.WHITE]
+        )
+
+        # The very first capture has nothing to compare against, and a first
+        # capture is not evidence that anything moved.
+        self.assertIsNone(first["screen_changed"])
+        self.assertIn("no earlier capture", first["agent_hint"])
+
+        self.assertFalse(repeat["screen_changed"])
+        self.assertIn("may not have reached the guest", repeat["agent_hint"])
+        self.assertIn("registered to the lease", repeat["agent_hint"])
+        # A signal, never a guard: the command still reports what it sent.
+        self.assertEqual(repeat["keys_sent"], 1)
+
+        self.assertTrue(changed["screen_changed"])
+        self.assertNotIn("agent_hint", changed)
+
+    def test_type_reports_the_same_delivery_signal(self) -> None:
+        _, repeat, changed = self._run(
+            lab_console.cmd_type, [self.BLACK, self.BLACK, self.WHITE]
+        )
+
+        self.assertFalse(repeat["screen_changed"])
+        self.assertIn("typed characters", repeat["agent_hint"])
+        self.assertEqual(repeat["characters_sent"], 5)
+        self.assertTrue(changed["screen_changed"])
+        self.assertNotIn("agent_hint", changed)
+
+    def test_the_signal_is_skipped_without_a_post_action_screenshot(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        args = mock.Mock(
+            lease="lease-12345678", vmid=7, keys=["enter"], via="vnc", delay=0,
+            screenshot_after=None, screenshot_out=None,
+        )
+        with mock.patch.object(lab_console, "VncSession",
+                               return_value=session), \
+             mock.patch.object(lab, "ProxmoxAPI"), \
+             mock.patch("builtins.print") as printed:
+            lab_console.cmd_keys(lab, args)
+        result = json.loads(printed.call_args.args[0])
+
+        self.assertEqual(result["keys_sent"], 1)
+        self.assertNotIn("screen_changed", result)
+        self.assertNotIn("agent_hint", result)
+        self.assertNotIn("screenshot_after", result)
+
+    def test_a_first_capture_is_not_reported_as_a_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            first = lab_console._save_screenshot(
+                7, self.BLACK, 2, 2,
+                override=str(state / "a.png"), state_root=state,
+            )
+            second = lab_console._save_screenshot(
+                7, self.WHITE, 2, 2,
+                override=str(state / "b.png"), state_root=state,
+            )
+
+        self.assertFalse(first["comparable_to_previous_capture"])
+        self.assertTrue(second["comparable_to_previous_capture"])
+        self.assertIsNone(
+            lab_console._delivery_signal(first, "keystrokes")["screen_changed"]
+        )
+        self.assertTrue(
+            lab_console._delivery_signal(second, "keystrokes")["screen_changed"]
+        )
+        self.assertEqual(lab_console._delivery_signal(None, "keystrokes"), {})

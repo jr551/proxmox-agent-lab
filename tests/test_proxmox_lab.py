@@ -357,11 +357,104 @@ class ProxmoxLabTests(unittest.TestCase):
                             with self.assertRaisesRegex(
                                 LAB.LabError,
                                 rf"VMID {vmid} existed before this lease",
-                            ):
+                            ) as caught:
                                 LAB.cmd_api(args)
+                            # The refusal has to name its own remedy: the
+                            # earlier wording sent operators looking for a
+                            # broken guest instead of an unregistered one.
+                            self.assertIn(
+                                f"proxmox-lab lease-register --lease "
+                                f"{lease_id} --kind {kind} --vmid {vmid} "
+                                f"--allow-existing",
+                                str(caught.exception),
+                            )
                             api.call.assert_not_called()
             finally:
                 LAB.LEASE_ROOT = old_lease_root
+
+    def test_a_guest_path_the_regex_cannot_read_is_refused(self) -> None:
+        """A guest write whose vmid does not parse skips no ownership check.
+
+        `/nodes/N/qemu//9000/sendkey` sits inside the safe write surface and
+        reaches the same guest, but `path_resource` reads no vmid from it, so
+        accepting it would send the mutation with the lease check skipped.
+        """
+        lease = {
+            "id": "20260814120000-guard92",
+            "resources": [{"kind": "qemu", "vmid": 9000}],
+            "initial_vmids": [],
+        }
+        api = mock.Mock()
+        for path in (
+            f"/nodes/{LAB.NODE}/qemu//9000/sendkey",
+            f"/nodes/{LAB.NODE}/qemu/vm9000/sendkey",
+            f"/nodes/{LAB.NODE}/lxc//9000/status/start",
+        ):
+            with self.subTest(path=path):
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease["id"], "--method", "PUT",
+                    "--path", path, "--data", "key=ret",
+                ])
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "load_lease", return_value=lease), \
+                     mock.patch.object(LAB, "audit"):
+                    with self.assertRaisesRegex(
+                        LAB.LabError, "names no readable guest"
+                    ):
+                        LAB.cmd_api(args)
+                api.call.assert_not_called()
+
+    def test_guest_creation_and_node_paths_stay_writable(self) -> None:
+        """The readable-guest check must not block the paths that have no vmid."""
+        lease = {
+            "id": "20260814120000-guard93",
+            "resources": [],
+            "initial_vmids": [],
+        }
+        api = mock.Mock()
+        api.call.return_value = None
+        for path, data in (
+            (f"/nodes/{LAB.NODE}/qemu", ["vmid=9000"]),
+            (f"/nodes/{LAB.NODE}/qemu/", ["vmid=9001"]),
+        ):
+            with self.subTest(path=path):
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease["id"], "--method", "POST",
+                    "--path", path, *sum((["--data", d] for d in data), []),
+                ])
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "load_lease", return_value=lease), \
+                     mock.patch.object(LAB, "register_resource"), \
+                     mock.patch.object(LAB, "audit"), \
+                     mock.patch("sys.stdout", io.StringIO()):
+                    LAB.cmd_api(args)
+        self.assertEqual(api.call.call_count, 2)
+
+    def test_require_lease_resource_names_the_registration_command(self) -> None:
+        lease = {
+            "id": "20260814120000-guard94",
+            "resources": [],
+            "initial_vmids": [9246],
+        }
+        with self.assertRaises(LAB.LabError) as pre_existing:
+            LAB.require_lease_resource(lease, "qemu", 9246)
+        self.assertEqual(
+            str(pre_existing.exception),
+            "VMID 9246 existed before this lease; register it with "
+            "'proxmox-lab lease-register --lease 20260814120000-guard94 "
+            "--kind qemu --vmid 9246 --allow-existing' if you intend to "
+            "drive it",
+        )
+
+        with self.assertRaises(LAB.LabError) as unknown:
+            LAB.require_lease_resource(lease, "lxc", 9247)
+        self.assertEqual(
+            str(unknown.exception),
+            "VMID 9247 is not a lxc guest registered to this lease; register "
+            "it with 'proxmox-lab lease-register --lease "
+            "20260814120000-guard94 --kind lxc --vmid 9247' if you intend to "
+            "drive it",
+        )
 
     def test_lease_requires_cleanup(self) -> None:
         self.assertTrue(

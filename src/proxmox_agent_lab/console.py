@@ -557,10 +557,11 @@ def _save_screenshot(vmid: int, rgb: bytes, width: int, height: int,
             "the single-screen decision to a vision-capable model; do not use "
             "Tesseract, OCR, crops, or image filters."
         )
-    identical = _mark_stale_frame(
+    identical, comparable = _mark_stale_frame(
         vmid, rgb, width, height, state_root or DEFAULT_SCREENSHOT_DIR.parent
     )
     result["identical_to_previous_capture"] = identical
+    result["comparable_to_previous_capture"] = comparable
     if identical:
         result["stale_possible"] = (
             "screen unchanged since last capture; if input was sent in "
@@ -570,7 +571,7 @@ def _save_screenshot(vmid: int, rgb: bytes, width: int, height: int,
 
 
 def _mark_stale_frame(vmid: int, rgb: bytes, width: int, height: int,
-                      state_root: Path) -> bool:
+                      state_root: Path) -> tuple[bool, bool]:
     """Compare a capture with the previous one for the same VM+resolution.
 
     QEMU's VNC dirty tracking can hand back the pre-action frame right after
@@ -578,6 +579,11 @@ def _mark_stale_frame(vmid: int, rgb: bytes, width: int, height: int,
     pixel-identical repeat instead of acting on a stale screen.  This is
     best-effort: any store failure degrades to "not identical" rather than
     failing the capture.
+
+    Returns `(identical, comparable)`.  `comparable` is false when there was
+    no earlier frame of this size to compare against, or the store failed --
+    a first capture is not evidence that the screen changed, so callers that
+    read the comparison as a signal must be able to tell the two apart.
     """
     previous_dir = Path(state_root) / "vision-previous"
     key = previous_dir / f"screenshot-vm{vmid}-{width}x{height}.rgb"
@@ -586,15 +592,16 @@ def _mark_stale_frame(vmid: int, rgb: bytes, width: int, height: int,
         previous = key.read_bytes()
     except OSError:
         pass
-    identical = len(previous) == len(rgb) and previous == rgb
+    comparable = len(previous) == len(rgb)
+    identical = comparable and previous == rgb
     try:
         previous_dir.mkdir(parents=True, exist_ok=True)
         temporary = key.with_suffix(".tmp")
         temporary.write_bytes(rgb)
         temporary.replace(key)
     except OSError:
-        return False
-    return identical
+        return False, False
+    return identical, comparable
 
 
 def _capture_after_action(lab: Any, api: Any, args: Any,
@@ -618,6 +625,46 @@ def _capture_after_action(lab: Any, api: Any, args: Any,
         args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
         state_root=lab.STATE_ROOT,
     )
+
+
+def _delivery_signal(screenshot: dict[str, Any] | None,
+                     what: str) -> dict[str, Any]:
+    """Whether the post-action capture shows the input landing anywhere.
+
+    `keys_sent` and `characters_sent` count what this controller transmitted,
+    not what the guest received; an operator reading them as delivery can
+    drive a screen for hours that never moved.  The post-action capture
+    already knows whether the framebuffer differs from the previous one, so
+    report that as an explicit signal.  It is evidence, not proof -- a guest
+    can change on its own, and a settled screen can legitimately look the
+    same -- so nothing here fails or blocks.
+
+    Returns the keys to merge into the command result; empty when no
+    post-action screenshot was taken.
+    """
+    if not screenshot:
+        return {}
+    if not screenshot.get("comparable_to_previous_capture"):
+        return {
+            "screen_changed": None,
+            "agent_hint": (
+                "no earlier capture of this screen to compare against, so "
+                f"the {what} carry no delivery evidence yet; capture again "
+                "with --screenshot-after to get a comparison"
+            ),
+        }
+    if not screenshot.get("identical_to_previous_capture"):
+        return {"screen_changed": True}
+    return {
+        "screen_changed": False,
+        "agent_hint": (
+            "the screen is pixel-identical to the previous capture, so the "
+            f"{what} may not have reached the guest: check that the guest is "
+            "running and awake, that this VMID is registered to the lease, "
+            "and re-read the screen with 'console screenshot' or "
+            "'console text' before sending more input"
+        ),
+    }
 
 
 def _model_frame(lab: Any, lease_id: str, vmid: int, rgb: bytes, width: int,
@@ -947,9 +994,12 @@ def cmd_keys(lab: Any, args: Any) -> None:
             screenshot = _capture_after_action(lab, api, args, session)
     lab.audit("console-keys", lease=args.lease, vmid=args.vmid,
               count=len(combos), via=args.via, sync=False)
-    result = {"vmid": args.vmid, "keys_sent": len(combos), "via": args.via}
+    result: dict[str, Any] = {
+        "vmid": args.vmid, "keys_sent": len(combos), "via": args.via,
+    }
     if screenshot is not None:
         result["screenshot_after"] = screenshot
+    result.update(_delivery_signal(screenshot, "keystrokes"))
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -970,9 +1020,10 @@ def cmd_type(lab: Any, args: Any) -> None:
     # The text itself is never audited: it may contain a password.
     lab.audit("console-type", lease=args.lease, vmid=args.vmid,
               characters=sent, sync=False)
-    result = {"vmid": args.vmid, "characters_sent": sent}
+    result: dict[str, Any] = {"vmid": args.vmid, "characters_sent": sent}
     if screenshot is not None:
         result["screenshot_after"] = screenshot
+    result.update(_delivery_signal(screenshot, "typed characters"))
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -1794,7 +1845,9 @@ def register(sub: Any, lab: Any) -> None:
     def add_after_screenshot(parser: Any) -> None:
         parser.add_argument(
             "--screenshot-after", type=float, metavar="SECONDS",
-            help="after input, wait this long and include a PNG in the result",
+            help="after input, wait this long and include a PNG in the "
+                 "result; 'keys' and 'type' also report screen_changed from "
+                 "it, the only evidence the input reached the guest",
         )
         parser.add_argument(
             "--screenshot-out", "--out", dest="screenshot_out",

@@ -65,6 +65,26 @@ PS/2 keyboard, which that VM does not present.
 `guest probe` reports this as `"keyboard_input": false`. If you are typing at a
 guest and nothing happens, that is why. Use the serial channel instead.
 
+### ⌨️ `keys_sent` is not "the guest got it"
+
+`console keys` answers `keys_sent`, and `console type` answers
+`characters_sent`. Both count what the controller transmitted. Add
+`--screenshot-after SECONDS` and they also report `screen_changed`, compared
+against the previous capture of that guest:
+
+- `screen_changed: true` — the screen moved; carry on.
+- `screen_changed: false` — pixel-identical, and the `agent_hint` says what to
+  check. Stop and re-read the screen instead of sending more input.
+- `screen_changed: null` — nothing to compare against yet; capture again.
+
+It is evidence, not proof, and it never blocks the command. Without
+`--screenshot-after` there is no evidence at all, which is how a guest gets
+driven blind for an hour.
+
+Input to a guest the lease does not own is refused outright, before anything
+is transmitted; the error names the `lease-register` command that fixes it.
+Read it rather than retrying.
+
 ### ISOs that ignore the keyboard at the boot menu
 
 Some legacy install ISOs ignore Tab and typed characters at their boot menu

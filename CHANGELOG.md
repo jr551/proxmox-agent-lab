@@ -4,6 +4,122 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.10.0 - 2026-08-22
+
+Reading a screen is now a vision job. Glyph-matching OCR is gone, which is a
+breaking change to the console surface — see **Removed** for what replaced it
+and how the old flags signpost it.
+
+### Added
+
+- The Kilo Code gateway is a fourth vision route for `console inspect`,
+  alongside NVIDIA and the two OpenRouter models. It asks for
+  `kilo-auto/balanced`, the balanced auto router, rather than a concrete
+  model: the router picks a vision-capable model server-side, so pinning one
+  would break the provider the day that model is retired. The key comes from
+  the new `kilo-api-key` secret or `KILO_API_KEY`. Verified against the lab
+  node — the router answered as `alibaba/qwen3.7-plus` and read a live Arch
+  installer framebuffer correctly.
+- `console screenshot --for-model` hands the screen back inline as a base64
+  PNG for a caller that reads images itself. Bounded and honest about it:
+  box-averaged downscale to a 1280 px longest edge (never below 640 px, where
+  an 80-column line stops being legible), maximum zlib compression, and a
+  1.5 MB cap on the emitted base64, with the scale factor and both the
+  original and emitted dimensions reported. A box average, not
+  nearest-neighbour, because dropping scanlines destroys 8 px glyphs.
+- `console inspect` attaches that same payload when every vision provider
+  fails, so a failed analysis still gives the caller something to look at.
+  `--no-image-fallback` opts out. It is additive — the command still exits
+  non-zero and still reports `vision_error`.
+- `guest disk-activity` samples a running guest's writes twice over a bounded
+  interval and reports the delta, because Proxmox's `diskwrite` is cumulative
+  and has been seen reading 0 for an entire session on a qcow2 guest that was
+  demonstrably writing. `--ground-truth` adds two independent signals — QEMU's
+  own block counters via `info blockstats`, and `du --block-size=1` on the
+  backing image over the opt-in host SSH channel — and names any signal that
+  saw nothing while another saw bytes in an explicit `disagreement` field.
+  Without ground truth the verdict is `null`, never `false`: the counter alone
+  cannot prove a guest idle.
+- `iso diagnose` decodes the El Torito boot catalog instead of merely
+  detecting the boot record: per entry, the platform, emulation type, load
+  segment, boot-load-size and boot image LBA, plus a new `el_torito_ok`.
+  It catches four ways an ISO is silently unbootable — an unusable catalog
+  (bad LBA, failed checksum, missing `0x55 0xAA` key bytes), a boot image past
+  the end of the file, a boot-load-size of zero, and no boot record at all
+  over a bootloader-shaped file tree. The last quotes the mkisofs options to
+  rebuild with, because that ISO boots to a black screen with no keyboard and
+  no error at all.
+- `console keys` and `console type` report `screen_changed` from the
+  `--screenshot-after` capture. `keys_sent` counts what the controller
+  transmitted, not what the guest received, and nothing else in the result
+  distinguished a delivered keystroke from a dropped one.
+- `lease-end --shared-guests-authorized`, for the refusal described below.
+- `docs/reactos.md` documents two ReactOS build settings that break this lab's
+  own channels: `DLL_EXPORT_VERSION=0x600` silencing KDBG serial output on a
+  Debug/KDBG build, and `ENABLE_ROSTESTS=0` breaking ISO assembly into a
+  manual repair that drops the boot record.
+
+### Removed
+
+- **Glyph-matching OCR, in full.** It could only read a guest whose console
+  font this controller already held; a guest carrying its own font decoded to
+  nothing, which is exactly what was reported for the ReactOS installer at
+  confidence 0.003. There is no general fix — bundling one more font only
+  moves the boundary. Gone with it: the font table, the embedded PSF1 font,
+  `console import-font` including its `--from-vmid` guest pull, and the
+  `console-font-imported` audit event.
+
+  `console screenshot --ocr` and `console import-font` are **kept registered**
+  and fail with a message naming the replacement, so an upgrade does not land
+  on `unrecognized arguments`. Both are deleted in 0.11.0. Read a screen with
+  `console screenshot --for-model`, `console inspect`, or `console text` for a
+  real terminal stream.
+
+### Changed
+
+- A refused guest mutation names the remedy instead of only the rule. It now
+  reads `VMID 9246 existed before this lease; register it with 'proxmox-lab
+  lease-register --lease <id> --kind qemu --vmid 9246 --allow-existing' if you
+  intend to drive it`, with the lease, kind and vmid filled in.
+- An explicitly supplied **empty** console password is now a credential rather
+  than an error, so `guest run --password-stdin` and `net leak-test` can drive
+  a legacy or freshly-installed guest that has no password set. Omitting the
+  flag still errors — an empty password is never inferred. `api
+  --password-stdin` and `windows install --password-stdin` still reject one:
+  those write a credential rather than use one.
+- `console preflight` reports which vision providers have a key, instead of
+  whether a console font was installed.
+
+### Fixed
+
+- A guest write whose path resolved to no readable vmid bypassed the lease
+  ownership check entirely. `/nodes/<node>/qemu//9246/sendkey` — note the
+  double slash — sits inside the safe write surface and reaches the guest, but
+  parses as no guest at all, so it was sent to Proxmox unguarded. It is now
+  refused.
+- `lease-end` destroyed guests without first checking whether another active
+  lease still referenced them: other leases were consulted only afterwards,
+  and only to decide whether to power the host off. It now cross-references
+  every resource it would delete against all other active leases — long-term
+  and expired-but-active included — before it powers anything on, stops or
+  deletes anything, and refuses, naming the guest and the other lease.
+  `--shared-guests-authorized` overrides.
+- `TermSession.login` waited only for a password prompt, so a guest with no
+  password set — which never prints one — hung for the full timeout.
+- `windows install --password-stdin` silently replaced an empty password with
+  a generated one, and checked it only after cloning. The check now runs
+  before the clone.
+- `guest disk-activity --ground-truth` told the operator to rerun with
+  `--ground-truth` on a run that already had it. Observed on the lab node,
+  where neither extra signal is available: the monitor endpoint answers 403
+  for the lab token, and the guest's disks are LVM block devices with no file
+  to grow. The note now names the permission and the storage shape each
+  missing signal needs.
+- The Kilo router freely picks a reasoning model, which returned HTTP 200 with
+  empty content after spending the whole token budget on reasoning. The
+  provider now disables reasoning and asks for JSON object mode, and an
+  empty response says why it was empty.
+
 ## 0.9.4 - 2026-08-21
 
 ### Fixed

@@ -1822,6 +1822,16 @@ def guest_load(record: dict[str, Any] | None) -> dict[str, Any]:
 
     Returned with every orphan, busy or not, so the reader can disagree with
     the threshold instead of having to trust it.
+
+    `disk_written_bytes` is **advisory and reported only**. Proxmox's
+    `diskwrite` has been observed reading 0 for an entire session on a qcow2
+    guest over directory-backed storage that was demonstrably writing, so it
+    is not a signal anything here decides on -- in either direction. It is
+    also cumulative, so a non-zero value says the guest wrote at some point
+    since boot, not that it is writing now. For an answer that can be relied
+    on, measure the change over an interval with 'guest disk-activity
+    --ground-truth', which cross-checks it against QEMU's own block counters
+    and the allocated size of the image file on the host.
     """
     if not isinstance(record, dict):
         return {}
@@ -1864,6 +1874,18 @@ def recent_guest_activity(
 
     A guest below the CPU floor is not proven idle, only not proven busy, so
     its measured load is reported either way.
+
+    The disk counter is deliberately **not** one of the signals. `diskwrite`
+    can read 0 on a guest that is writing hard (qcow2 over directory-backed
+    storage is the known case), so reading a zero as "idle" would stop live
+    work; and it is cumulative, so reading a non-zero as "busy" would keep a
+    long-abandoned guest running for ever on one write it did at boot. It
+    travels in `load` for the reader's benefit only, and no branch below
+    consults it. Anything that wants a real answer has to measure the delta,
+    which is what 'guest disk-activity' is for -- and that must never be
+    called from here: it costs a monitor round trip and, for the host-side
+    signal, the opt-in SSH boundary, neither of which belongs on the path
+    that decides whether to leave somebody's guest alone.
     """
     load = guest_load(record)
     if load.get("cpu_percent", 0) >= BUSY_CPU_FRACTION * 100:

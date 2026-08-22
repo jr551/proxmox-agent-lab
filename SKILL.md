@@ -132,7 +132,15 @@ proxmox-lab console keys  --lease "$L" --vmid <id> enter f2
 proxmox-lab console click --lease "$L" --vmid <id> \
   --target "visible label" --x 640 --y 412
 proxmox-lab console type  --lease "$L" --vmid <id> --text-stdin --enter
+proxmox-lab guest disk-activity --vmid <id>                 # is it writing?
 ```
+
+**Never call a guest hung because `diskwrite` did not move.** That counter has
+been seen reading 0 for a whole session on a writing qcow2 guest. `guest
+disk-activity` samples twice and reports the delta; add `--lease "$L"
+--ground-truth` to cross-check it against QEMU's own block counters and `du` on
+the backing image, and read the `disagreement` field. See
+[docs/disk.md](docs/disk.md).
 
 For GUI installers, attach `--screenshot-after 3` to `keys`, `type`, or
 `click`. Make one action, read the returned full PNG, and repeat. After three

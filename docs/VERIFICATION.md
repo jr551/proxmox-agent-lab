@@ -170,6 +170,20 @@ Not yet watched working end to end on hardware:
   real means attaching a disk to a live guest.
 - `backup --retained` actually writing a vzdump archive: refused-while-disabled
   was verified, the write itself was not. It is gigabytes to a slow disk.
+- `guest disk-activity`, in **every** mode. Nothing about it has been run
+  against real hardware. The counter-only sampling, the `info blockstats`
+  parsing, the `du --block-size=1` delta, the graceful degradation when either
+  extra signal is missing and the `disagreement` computation are all covered by
+  unit tests with active fakes and nothing else. Two specific claims are
+  therefore *unverified*: that the `qmp_blockstats` signal is reachable at all
+  on this node — `console screenshot --via monitor` above shows the same
+  monitor endpoint being refused for the `PVEVMAdmin` lab token, so the QMP
+  half may simply be unavailable here — and that the `info blockstats`
+  transcript from this Proxmox/QEMU build matches the shape the parser was
+  written against. The motivating observation itself (a `diskwrite` of 0 across
+  a whole session on a writing qcow2 guest) was reported from a real ReactOS
+  session; the cross-check written in response to it has not been back to the
+  node to confirm it catches that case.
 
 ## 🔁 Reproducing this
 

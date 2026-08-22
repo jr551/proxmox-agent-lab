@@ -114,6 +114,16 @@ creates that failed almost immediately. Deleting them was the right tidy-up and
 reclaimed essentially no space; treating the provisioned figure as free space
 would have made an irreversible act look worthwhile when it was not.
 
+The same gap bites when you go the other way and ask whether a *running* guest
+is writing. A sparse qcow2's apparent size (`ls -la`) is its provisioned size
+and says nothing about I/O; its allocated size (`du --block-size=1`) is what
+actually landed on the disk, and even that can be metadata-only growth — L1 and
+refcount tables — rather than guest data. Proxmox's own `diskwrite` counter is
+no substitute: it has been observed reading 0 for a whole session on a writing
+qcow2 guest over directory-backed storage. Measure the change over an interval
+and compare the signals against each other with `guest disk-activity
+--ground-truth`; see [disk.md](disk.md).
+
 ## Fetching cloud images
 
 The node downloads directly, so a multi-gigabyte image never crosses the

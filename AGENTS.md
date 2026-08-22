@@ -26,7 +26,7 @@ Use it only for systems the operator owns or is authorized to test. The safety m
 
 4. **Guest and protocol channels**
    - `guest.py` probes the guest and prefers qemu-guest-agent for real exit codes, then serial when available; console/VNC is used when the screen is the source of truth.
-   - `console.py`, `rfb.py`, `ws.py`, `des.py`, `png.py`, and `textmode.py` implement the screen, serial, WebSocket, RFB, PNG, and opt-in text OCR paths without third-party runtime packages. Long operations use bounded polling/deadlines and explicit timeouts.
+   - `console.py`, `rfb.py`, `ws.py`, `des.py`, `png.py`, and `textmode.py` implement the screen, serial, WebSocket, RFB, PNG encode/decode/resample, and terminal-text paths without third-party runtime packages. Reading a screen is a vision job: `console inspect` sends one to a configured provider and `console screenshot --for-model` hands a bounded base64 copy back to the caller. Long operations use bounded polling/deadlines and explicit timeouts.
    - `storage.py`, `s3.py`, `share.py`, and `share_server.py` handle transfers, backups, and expiring local console links. `netgw.py` creates fail-closed VPN gateway networking.
    - `memflow.py`, `usb.py`, and `netcap.py` are deliberate exceptions to the API-token boundary: they use opt-in SSH access to host-side tooling or disposable LXCs and require their documented authorization gates.
 

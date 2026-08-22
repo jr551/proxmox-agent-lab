@@ -262,21 +262,32 @@ proxmox-lab secrets set nvidia-api-key
 proxmox-lab console inspect --lease "$L" --vmid 9001
 ```
 
-Add OpenRouter fallback access with:
+Add fallback routes with either or both of:
 
 ```bash
 proxmox-lab secrets set openrouter-api-key
+proxmox-lab secrets set kilo-api-key
 ```
 
-`console inspect` tries NVIDIA, the named Nemotron Omni free endpoint, then
-`openrouter/free`. The OpenRouter response-healing plugin repairs JSON syntax;
-the local wrapper still rejects ambiguous controls and invalid coordinates.
-Ordinary `console screenshot` never uploads anything. Environment fallbacks
-are `PROXMOX_AGENT_LAB_NVIDIA_API_KEY`,
-`PROXMOX_AGENT_LAB_OPENROUTER_API_KEY`, and conventional
-`OPENROUTER_API_KEY`. A project-scoped stored OpenRouter key wins over a stale
-conventional shell value. OpenRouter free providers may log prompts for
-service improvement; do not submit confidential or personal screens.
+`console inspect` races NVIDIA, the named Nemotron Omni free endpoint,
+`openrouter/free`, and the Kilo Code gateway's `kilo-auto/balanced` router,
+taking the first structurally valid answer. `kilo-auto/balanced` is a balanced
+auto router: Kilo picks a vision-capable model server-side, so no concrete
+model is pinned here. The OpenRouter response-healing plugin repairs JSON
+syntax; the local wrapper still rejects ambiguous controls and invalid
+coordinates.
+
+Ordinary `console screenshot` never uploads anything. Environment fallbacks are
+`PROXMOX_AGENT_LAB_NVIDIA_API_KEY`, `PROXMOX_AGENT_LAB_OPENROUTER_API_KEY`,
+`PROXMOX_AGENT_LAB_KILO_API_KEY`, and the conventional `OPENROUTER_API_KEY`
+and `KILO_API_KEY`. A project-scoped stored key wins over a stale conventional
+shell value. OpenRouter free providers may log prompts for service
+improvement; do not submit confidential or personal screens.
+
+No key at all is not a dead end: `console screenshot --for-model` returns the
+screen inline as a bounded base64 PNG, and `console inspect` attaches the same
+thing when every provider fails. `console preflight` reports which routes have
+a key under `vision.provider_keys`.
 - **`env`** — read `PROXMOX_AGENT_LAB_<NAME>`, e.g.
   `PROXMOX_AGENT_LAB_PROXMOX_TOKEN`. Read-only; good for CI and containers.
 - **`file`** — a TOML file that must be `0600`. For headless boxes with no

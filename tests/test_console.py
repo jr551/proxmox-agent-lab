@@ -25,6 +25,7 @@ shutil.rmtree(_TEST_STATE, ignore_errors=True)
 _TEST_STATE.mkdir(parents=True, exist_ok=True)
 os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
 
+import base64
 import io
 import json
 from pathlib import Path
@@ -199,6 +200,114 @@ class PngTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             lab_png.stitch_horizontal([])
 
+    def test_downscale_keeps_the_aspect_ratio_and_bounds_the_long_edge(self) -> None:
+        rgb = b"\x10\x20\x30" * (1920 * 1080)
+        width, height, out = lab_png.downscale_rgb(1920, 1080, rgb, 1280)
+        self.assertEqual((width, height), (1280, 720))
+        self.assertEqual(len(out), 1280 * 720 * 3)
+        # A flat source must survive averaging exactly.
+        self.assertEqual(set(out[i:i + 3] for i in range(0, len(out), 3)),
+                         {b"\x10\x20\x30"})
+
+    def test_downscale_leaves_an_already_small_image_untouched(self) -> None:
+        rgb = b"\x01\x02\x03" * (100 * 80)
+        width, height, out = lab_png.downscale_rgb(100, 80, rgb, 1280)
+        self.assertEqual((width, height), (100, 80))
+        self.assertIs(out, rgb)
+
+    def test_downscale_averages_its_box_rather_than_dropping_pixels(self) -> None:
+        """Nearest-neighbour would return one source pixel; averaging blends.
+
+        A 2x2 image of two black and two white pixels must come back as one
+        mid-grey pixel, not as whichever corner happened to be sampled.
+        """
+        rgb = b"\x00\x00\x00" + b"\xff\xff\xff" + b"\xff\xff\xff" + b"\x00\x00\x00"
+        width, height, out = lab_png.downscale_rgb(2, 2, rgb, 1)
+        self.assertEqual((width, height), (1, 1))
+        self.assertEqual(out, b"\x7f\x7f\x7f")
+
+    def test_downscale_rejects_a_mismatched_buffer_or_zero_edge(self) -> None:
+        with self.assertRaises(ValueError):
+            lab_png.downscale_rgb(4, 4, b"\x00" * 10, 2)
+        with self.assertRaises(ValueError):
+            lab_png.downscale_rgb(4, 4, b"\x00" * 48, 0)
+
+    def test_decode_png_round_trips_every_compression_level(self) -> None:
+        rgb = bytes((x * 5 + y * 11) % 256 for y in range(9) for x in range(7 * 3))
+        for level in (0, 6, 9):
+            encoded = lab_png.encode_png(7, 9, rgb, level=level)
+            self.assertEqual(lab_png.decode_png(encoded), (7, 9, rgb))
+
+    def test_decode_png_reverses_every_scanline_filter(self) -> None:
+        """QEMU's encoder picks filters adaptively, so all five must work."""
+        width, height = 6, 5
+        rgb = bytes((x * 37 + y * 91) % 256
+                    for y in range(height) for x in range(width * 3))
+        stride = width * 3
+        for filter_type in range(5):
+            raw = bytearray()
+            previous = bytes(stride)
+            for row in range(height):
+                line = bytearray(rgb[row * stride:(row + 1) * stride])
+                # Apply the filter, then check the decoder undoes it.
+                if filter_type == 1:
+                    line = bytearray(
+                        (line[i] - (line[i - 3] if i >= 3 else 0)) & 0xFF
+                        for i in range(stride)
+                    )
+                elif filter_type == 2:
+                    line = bytearray(
+                        (line[i] - previous[i]) & 0xFF for i in range(stride)
+                    )
+                elif filter_type in (3, 4):
+                    original = bytes(line)
+                    line = bytearray(stride)
+                    for i in range(stride):
+                        left = original[i - 3] if i >= 3 else 0
+                        up = previous[i]
+                        if filter_type == 3:
+                            predictor = (left + up) >> 1
+                        else:
+                            up_left = (
+                                rgb[(row - 1) * stride + i - 3]
+                                if row and i >= 3 else 0
+                            )
+                            estimate = left + up - up_left
+                            da, db, dc = (abs(estimate - left),
+                                          abs(estimate - up),
+                                          abs(estimate - up_left))
+                            predictor = (
+                                left if da <= db and da <= dc
+                                else up if db <= dc else up_left
+                            )
+                        line[i] = (original[i] - predictor) & 0xFF
+                raw.append(filter_type)
+                raw += line
+                previous = rgb[row * stride:(row + 1) * stride]
+            encoded = (
+                b"\x89PNG\r\n\x1a\n"
+                + lab_png._chunk(b"IHDR", struct.pack(
+                    ">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                + lab_png._chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+                + lab_png._chunk(b"IEND", b"")
+            )
+            self.assertEqual(
+                lab_png.decode_png(encoded), (width, height, rgb),
+                f"filter type {filter_type} did not round-trip",
+            )
+
+    def test_decode_png_refuses_what_it_cannot_read(self) -> None:
+        for candidate in (b"not a png at all........",
+                          b"\x89PNG\r\n\x1a\n" + b"\x00" * 8):
+            with self.assertRaises(ValueError):
+                lab_png.decode_png(candidate)
+        # 16-bit and palette PNGs are refused rather than guessed at.
+        for depth, colour in ((16, 2), (8, 3)):
+            header = lab_png._chunk(b"IHDR", struct.pack(
+                ">IIBBBBB", 2, 2, depth, colour, 0, 0, 0))
+            with self.assertRaises(ValueError):
+                lab_png.decode_png(b"\x89PNG\r\n\x1a\n" + header)
+
     def test_stitch_horizontal_rejects_mismatched_frame_buffer(self) -> None:
         with self.assertRaises(ValueError):
             lab_png.stitch_horizontal([(2, 2, b"\x00" * 3, "")])
@@ -303,90 +412,6 @@ class TextModeTests(unittest.TestCase):
         rgb = b"\x00\x00\x00" * (640 * 400)
         analysis = lab_textmode.analyse(rgb, 640, 400)
         self.assertTrue(analysis["looks_like_text_console"])
-
-    def test_psf2_round_trip_and_screen_decode(self) -> None:
-        # A two-glyph 8x16 PSF2 font: 'A' is a solid block, 'B' a single row.
-        glyph_a = bytes([0xFF] * 16)
-        glyph_b = bytes([0x00] * 8 + [0xFF] + [0x00] * 7)
-        header = struct.pack("<I7I", 0x864AB572, 0, 32, 0, 2, 16, 16, 8)
-        font = lab_textmode.parse_psf(header + glyph_a + glyph_b)
-        self.assertEqual((font["width"], font["height"]), (8, 16))
-        table = lab_textmode.build_font_table(
-            {**font, "characters": ["A", "B"]}
-        )
-        self.assertEqual(table["glyphs"][glyph_a.hex()], "A")
-
-        # Paint one 8x16 cell of 'A' (all foreground) beside two blank cells,
-        # so the screen background is unambiguously black.
-        width, height = 24, 16
-        screen = bytearray(b"\x00\x00\x00" * width * height)
-        for row in range(16):
-            for column in range(8):
-                offset = (row * width + column) * 3
-                screen[offset : offset + 3] = b"\xff\xff\xff"
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "console-font.json"
-            path.write_text(json.dumps(table))
-            with mock.patch.object(lab_textmode, "font_table_path", return_value=path):
-                decoded = lab_textmode.decode_screen(bytes(screen), width, height)
-        self.assertEqual(decoded["text"], "A")
-        self.assertEqual(decoded["confidence"], 1.0)
-        self.assertEqual(decoded["ocr_font"], "imported")
-
-    def test_decode_without_a_table_installs_the_builtin_font(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "absent.json"
-            with mock.patch.object(
-                lab_textmode, "font_table_path", return_value=missing
-            ):
-                result = lab_textmode.decode_screen(
-                    b"\x00" * (8 * 16 * 3), 8, 16
-                )
-            table = json.loads(missing.read_text())
-        self.assertNotIn("error", result)
-        self.assertEqual(result["ocr_font"], "builtin")
-        self.assertEqual((table["width"], table["height"]), (8, 16))
-
-    def test_builtin_font_round_trip_decodes_ascii(self) -> None:
-        # Paint one 8x16 cell of 'A' from the embedded font and check the
-        # exact glyph is recovered when no user table exists yet.
-        table = lab_textmode.builtin_font_table()
-        glyph = bytes.fromhex(
-            next(key for key, value in table["glyphs"].items() if value == "A")
-        )
-        width, height = 8, 16
-        screen = bytearray(b"\x00\x00\x00" * width * height)
-        for row in range(height):
-            for column in range(width):
-                if glyph[row] & (1 << (7 - column)):
-                    offset = (row * width + column) * 3
-                    screen[offset : offset + 3] = b"\xff\xff\xff"
-        with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "absent.json"
-            with mock.patch.object(
-                lab_textmode, "font_table_path", return_value=missing
-            ):
-                decoded = lab_textmode.decode_screen(
-                    bytes(screen), width, height
-                )
-        self.assertEqual(decoded["text"], "A")
-        self.assertEqual(decoded["confidence"], 1.0)
-        self.assertEqual(decoded["ocr_font"], "builtin")
-
-    def test_decode_reports_when_the_builtin_font_cannot_be_saved(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "absent.json"
-            with mock.patch.object(
-                lab_textmode, "font_table_path", return_value=missing
-            ), mock.patch.object(
-                lab_textmode, "_write_font_table",
-                side_effect=OSError("read-only filesystem"),
-            ):
-                result = lab_textmode.decode_screen(
-                    b"\x00" * (8 * 16 * 3), 8, 16
-                )
-        self.assertIn("builtin", result["error"])
-        self.assertIn("import-font", result["error"])
 
 
 class S3Tests(unittest.TestCase):
@@ -964,7 +989,8 @@ class ScreenshotCommandTests(unittest.TestCase):
             lab.STATE_ROOT = Path(tmp)
             out = Path(tmp) / "shot.png"
             args = mock.Mock(vmid=1, out=str(out), settle=0, timeout=5,
-                             upload=False, url_expiry=60, ocr=False)
+                             upload=False, url_expiry=60, ocr=False,
+                             for_model=False)
             with mock.patch.object(lab_console, "VncSession",
                                    return_value=session), \
                  mock.patch.object(lab, "ProxmoxAPI"), \
@@ -972,6 +998,138 @@ class ScreenshotCommandTests(unittest.TestCase):
                 lab_console.cmd_screenshot(lab, args)
             self.assertTrue(out.exists())
             self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
+
+    def _screenshot(self, **overrides: object) -> dict:
+        """Run cmd_screenshot over a fake VNC session, return the JSON."""
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        width = int(overrides.pop("width", 32))
+        height = int(overrides.pop("height", 16))
+        session.client.capture.return_value = bytes(
+            (x * 3 + y * 29) % 256 for y in range(height) for x in range(width * 3)
+        )
+        session.client.width, session.client.height = width, height
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
+            defaults = dict(vmid=1, out=str(Path(tmp) / "shot.png"), settle=0,
+                            timeout=5, upload=False, url_expiry=60, ocr=False,
+                            for_model=False, via="vnc")
+            defaults.update(overrides)
+            args = mock.Mock(**defaults)
+            with mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch("builtins.print") as printed:
+                lab_console.cmd_screenshot(lab, args)
+            self.audited = lab.audit
+            return json.loads(printed.call_args.args[0])
+
+    def test_for_model_returns_a_bounded_base64_copy_of_the_screen(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        result = self._screenshot(for_model=True)
+        image = result["image"]
+        self.assertEqual(image["encoding"], "base64")
+        self.assertEqual(image["mime_type"], "image/png")
+        self.assertEqual((image["original_width"], image["original_height"]),
+                         (32, 16))
+        self.assertEqual(image["scale"], 1.0)
+        decoded = base64.b64decode(image["base64"])
+        self.assertEqual(lab_png.decode_png(decoded)[:2], (32, 16))
+        self.assertLessEqual(image["base64_bytes"],
+                             lab_console.IMAGE_MAX_BASE64_BYTES)
+        # The fact and the size, never the image itself.
+        audited = [call for call in self.audited.call_args_list
+                   if call.args[0] == "console-screenshot-for-model"]
+        self.assertEqual(len(audited), 1)
+        self.assertEqual(audited[0].kwargs["bytes"], image["bytes"])
+        self.assertNotIn("base64", audited[0].kwargs)
+
+    def test_a_plain_screenshot_never_carries_a_base64_blob(self) -> None:
+        result = self._screenshot()
+        self.assertNotIn("image", result)
+        self.assertFalse(
+            [call for call in self.audited.call_args_list
+             if call.args[0] == "console-screenshot-for-model"]
+        )
+
+    def test_the_handback_steps_the_scale_down_until_it_fits(self) -> None:
+        """Incompressible pixels must be shrunk, never emitted unbounded."""
+        import random
+
+        from proxmox_agent_lab import console as lab_console
+
+        width, height = 800, 600
+        rgb = random.Random(11).randbytes(width * height * 3)
+        image = lab_console._image_handback(
+            rgb, width, height, reason="cap test", hint="hint",
+        )
+        self.assertLess(image["scale"], 1.0)
+        self.assertEqual(image["width"], lab_console.IMAGE_MIN_EDGE)
+        self.assertLessEqual(image["base64_bytes"],
+                             lab_console.IMAGE_MAX_BASE64_BYTES)
+        self.assertEqual(len(base64.b64decode(image["base64"])), image["bytes"])
+
+    def test_the_handback_refuses_rather_than_emit_over_the_cap(self) -> None:
+        import random
+
+        from proxmox_agent_lab import console as lab_console
+
+        width, height = 800, 600
+        rgb = random.Random(11).randbytes(width * height * 3)
+        with mock.patch.object(lab_console, "IMAGE_MAX_BASE64_BYTES", 100_000):
+            image = lab_console._image_handback(
+                rgb, width, height, reason="cap test", hint="hint",
+            )
+        self.assertNotIn("base64", image)
+        self.assertIn("over the 100000 byte cap", image["error"])
+        # It still reports what it tried, so the caller knows why.
+        self.assertEqual(image["width"], lab_console.IMAGE_MIN_EDGE)
+
+    def test_a_small_screen_is_never_shrunk_below_the_readability_floor(self) -> None:
+        import random
+
+        from proxmox_agent_lab import console as lab_console
+
+        rgb = random.Random(5).randbytes(200 * 150 * 3)
+        with mock.patch.object(lab_console, "IMAGE_MAX_BASE64_BYTES", 1_000):
+            image = lab_console._image_handback(
+                rgb, 200, 150, reason="floor test", hint="hint",
+            )
+        self.assertEqual((image["width"], image["height"]), (200, 150))
+        self.assertEqual(image["scale"], 1.0)
+        self.assertIn("error", image)
+
+    def test_the_removed_ocr_flag_explains_itself_before_touching_the_guest(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        args = mock.Mock(vmid=1, ocr=True, via="vnc")
+        with mock.patch.object(lab_console, "VncSession") as vnc:
+            with self.assertRaises(RuntimeError) as caught:
+                lab_console.cmd_screenshot(lab, args)
+        message = str(caught.exception)
+        self.assertIn("--ocr was removed", message)
+        self.assertIn("--for-model", message)
+        self.assertIn("console inspect", message)
+        vnc.assert_not_called()
+        lab.ProxmoxAPI.assert_not_called()
+
+    def test_the_removed_import_font_command_explains_itself(self) -> None:
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        with self.assertRaises(RuntimeError) as caught:
+            lab_console.cmd_import_font(lab, mock.Mock())
+        message = str(caught.exception)
+        self.assertIn("import-font", message)
+        self.assertIn("--for-model", message)
 
     def test_cmd_screenshot_burst_stitches_captures_over_time(self) -> None:
         from proxmox_agent_lab import console as lab_console
@@ -1264,15 +1422,77 @@ class ScreenshotCommandTests(unittest.TestCase):
                  mock.patch.object(lab_console.vision, "analyze_png",
                                    side_effect=lab_console.vision.VisionError(
                                        message
-                                   )):
+                                   )), \
+                 mock.patch("builtins.print") as printed:
                 with self.assertRaises(RuntimeError) as caught:
                     lab_console.cmd_inspect(lab, args)
+                payload = json.loads(printed.call_args.args[0])
 
         self.assertEqual(str(caught.exception), message)
+        # The failure is still raised and still reported; the image is
+        # additive, never a way to hide that no provider could read the screen.
+        self.assertEqual(payload["vision_error"], message)
         lab.audit.assert_called_once_with(
             "console-vision-inspect-failed", lease=args.lease, vmid=7,
-            error=message[:200], provider="nvidia", sync=False,
+            error=message[:200], provider="nvidia", image_returned=True,
+            image_bytes=payload["image"]["bytes"], sync=False,
         )
+        self.assertNotIn("base64", lab.audit.call_args.kwargs)
+
+    def _inspect_failure(self, image_fallback: bool) -> dict:
+        """Drive cmd_inspect through a total vision failure, return the JSON."""
+        from proxmox_agent_lab import console as lab_console
+
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.load_lease.return_value = {"resources": [{"kind": "qemu", "vmid": 7}]}
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.client.width, session.client.height = 32, 16
+        session.client.capture.return_value = bytes(
+            (x * 7 + y * 13) % 256
+            for y in range(16) for x in range(32 * 3)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            lab.STATE_ROOT = Path(tmp)
+            args = mock.Mock(
+                lease="lease-12345678", vmid=7, settle=2.0,
+                out=str(Path(tmp) / "inspect.png"), prompt=None, timeout=120,
+                max_tokens=1024, provider="auto", image_fallback=image_fallback,
+            )
+            with mock.patch.object(lab_console, "VncSession",
+                                   return_value=session), \
+                 mock.patch.object(lab, "ProxmoxAPI"), \
+                 mock.patch.object(
+                     lab_console.vision, "analyze_png",
+                     side_effect=lab_console.vision.VisionError("all offline"),
+                 ), \
+                 mock.patch("builtins.print") as printed:
+                with self.assertRaises(RuntimeError):
+                    lab_console.cmd_inspect(lab, args)
+                return json.loads(printed.call_args.args[0])
+
+    def test_total_vision_failure_hands_the_screen_back_as_base64(self) -> None:
+        payload = self._inspect_failure(image_fallback=True)
+        image = payload["image"]
+        self.assertEqual(image["encoding"], "base64")
+        self.assertEqual(image["mime_type"], "image/png")
+        self.assertEqual((image["original_width"], image["original_height"]),
+                         (32, 16))
+        self.assertEqual((image["width"], image["height"]), (32, 16))
+        self.assertEqual(image["scale"], 1.0)
+        self.assertIn("no vision provider", image["reason"])
+        self.assertIn("your own vision", image["agent_hint"])
+        decoded = base64.b64decode(image["base64"])
+        self.assertEqual(lab_png.decode_png(decoded)[:2], (32, 16))
+        self.assertEqual(image["bytes"], len(decoded))
+        self.assertLessEqual(image["base64_bytes"],
+                             lab_console.IMAGE_MAX_BASE64_BYTES)
+
+    def test_no_image_fallback_suppresses_the_blob(self) -> None:
+        payload = self._inspect_failure(image_fallback=False)
+        self.assertNotIn("image", payload)
+        self.assertEqual(payload["vision_error"], "all offline")
 
 
 class ChunkedTransferTests(unittest.TestCase):
@@ -1870,7 +2090,7 @@ class MonitorScreenshotTests(unittest.TestCase):
         import argparse
 
         defaults = dict(vmid=9001, lease="20260821120000-abc0", via="monitor",
-                        out=None, ocr=False, upload=False, timeout=25.0,
+                        out=None, for_model=False, upload=False, timeout=25.0,
                         url_expiry=3600, settle=0.0)
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -2000,11 +2220,41 @@ class MonitorScreenshotTests(unittest.TestCase):
             self._run(lab, mock.Mock(), memflow)
         memflow.require_host_ssh.assert_not_called()
 
-    def test_ocr_is_refused_because_there_is_no_framebuffer(self) -> None:
+    def test_for_model_returns_the_capture_as_bounded_base64(self) -> None:
+        """The monitor path has a PNG, not a framebuffer, so it decodes it."""
         lab = mock.Mock()
         lab.LabError = RuntimeError
-        with self.assertRaisesRegex(RuntimeError, "--ocr"):
-            self._run(lab, mock.Mock(), self._memflow(self._png()), ocr=True)
+        lab.NODE = "aipve"
+        api = mock.Mock()
+        api.call.return_value = ""
+        memflow = self._memflow(self._png())
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._run(lab, api, memflow, for_model=True,
+                               out=str(Path(tmp) / "shot.png"))
+        image = result["image"]
+        self.assertEqual(image["mime_type"], "image/png")
+        self.assertEqual((image["original_width"], image["original_height"]),
+                         (2, 1))
+        decoded = base64.b64decode(image["base64"])
+        self.assertTrue(decoded.startswith(b"\x89PNG"))
+        self.assertEqual(lab_png.decode_png(decoded)[:2], (2, 1))
+        # The fact and the size are audited; the pixels never are.
+        audited = [call for call in lab.audit.call_args_list
+                   if call.args[0] == "console-screenshot-for-model"]
+        self.assertEqual(len(audited), 1)
+        self.assertEqual(audited[0].kwargs["bytes"], image["bytes"])
+        self.assertNotIn("base64", audited[0].kwargs)
+
+    def test_a_screenshot_without_for_model_carries_no_base64(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        api = mock.Mock()
+        api.call.return_value = ""
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._run(lab, api, self._memflow(self._png()),
+                               out=str(Path(tmp) / "shot.png"))
+        self.assertNotIn("image", result)
 
 
 class StorageGarbageCollectionTests(unittest.TestCase):

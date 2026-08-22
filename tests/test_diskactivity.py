@@ -439,6 +439,21 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(list(result["written_bytes"]), ["proxmox_diskwrite"])
         self.assertIsNone(result["writing"])
 
+    def test_the_remedy_is_not_the_flag_that_was_already_passed(self) -> None:
+        """Observed on the lab node, where the monitor is 403 for the lab
+        token and every disk is LVM: the note told the operator to rerun with
+        --ground-truth on a run that already had it."""
+        api = FakeAPI(diskwrite=[0, 0], monitor_error="HTTP 403")
+        with mock.patch.object(memflow, "ENABLED", False):
+            asked = self._measure(api, ground_truth=True)
+        self.assertNotIn("rerun with --ground-truth", asked["note"])
+        self.assertIn("Sys.Audit", asked["note"])
+        # ...and the plain run must still name the flag that would help.
+        self.assertIn(
+            "rerun with --ground-truth",
+            self._measure(FakeAPI(diskwrite=[0, 0]))["note"],
+        )
+
     def test_a_counter_that_went_backwards_is_flagged(self) -> None:
         result = self._measure(FakeAPI(diskwrite=[9000, 10]))
         signal = result["signals"]["proxmox_diskwrite"]

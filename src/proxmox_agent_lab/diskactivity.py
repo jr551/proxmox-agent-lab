@@ -492,11 +492,24 @@ def measure(
             "rather than as write volume."
         )
     if writing is None:
+        # Telling an operator to "rerun with --ground-truth" when they already
+        # passed it wastes the run that just proved the signals are missing.
+        remedy = (
+            "rerun with --ground-truth."
+            if not ground_truth
+            else (
+                "--ground-truth was asked for and neither extra signal was "
+                "available on this install: see each signal's reason above. "
+                "qmp_blockstats needs an API token with Sys.Audit on the "
+                "guest, and host_image_du needs file-backed storage -- a disk "
+                "on LVM or ZFS is a block device with no file to grow."
+            )
+        )
         notes.append(
             "Only the Proxmox diskwrite counter answered. It has been seen "
             "reading 0 for an entire session on a writing qcow2 guest, so "
             "this run cannot tell an idle guest from a stalled counter; "
-            "rerun with --ground-truth."
+            + remedy
         )
     if notes:
         result["note"] = " ".join(notes)

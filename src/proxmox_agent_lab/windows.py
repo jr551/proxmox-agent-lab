@@ -357,6 +357,20 @@ def cmd_install(lab: Any, args: Any) -> None:
         raise lab.LabError(f"VMID {args.vmid} existed before this lease")
     name = args.name or f"win{args.version}-lab-{args.vmid}"
     driver_branch = _driver_branch(args.version, args.driver_branch)
+    # Read and check the Administrator password before anything is cloned.
+    # Unlike a console login this *creates* the credential, so an empty one
+    # would build a blank-password account into the answer file; it is refused
+    # rather than quietly replaced, and omitting the flag is how you ask for a
+    # generated password. Checked here so the guard cannot fire after a clone
+    # has already left a half-built guest behind.
+    supplied_password: str | None = None
+    if args.unattended and args.password_stdin:
+        supplied_password = sys.stdin.readline().strip()
+        if not supplied_password:
+            raise lab.LabError(
+                "--password-stdin received an empty Administrator password; "
+                "omit the flag to have a strong one generated"
+            )
 
     upid = _clone(lab, api, template_vmid, args.vmid, name,
                   args.full_clone, args.storage)
@@ -381,8 +395,7 @@ def cmd_install(lab: Any, args: Any) -> None:
 
     password: str | None = None
     if args.unattended:
-        password = sys.stdin.readline().strip() if args.password_stdin else None
-        password = password or generate_password()
+        password = supplied_password or generate_password()
         xml = render_unattend(
             locale=args.locale,
             timezone=args.timezone,
@@ -519,6 +532,17 @@ def cmd_wait_agent(lab: Any, args: Any) -> None:
 
 
 def _disk_written(lab: Any, api: Any, vmid: int) -> int:
+    """Proxmox's cumulative write counter. Advisory only.
+
+    It has been observed reading 0 for a whole session on a writing qcow2
+    guest over directory-backed storage, so both callers here are deliberately
+    biased the safe way: a stalled counter makes `_kick_installer` keep tapping
+    (harmless) and makes `wait-agent` print a warning while it carries on
+    waiting. Neither may ever be turned into a hard stop on this number. To
+    settle whether a guest is really writing, use 'guest disk-activity
+    --ground-truth', which cross-checks it against QEMU's own block counters
+    and the allocated size of the image file on the host.
+    """
     try:
         status = api.call("GET", f"/nodes/{lab.NODE}/qemu/{vmid}/status/current")
         return int(status.get("diskwrite") or 0)
@@ -648,7 +672,9 @@ def register(sub: Any, lab: Any) -> None:
     install.add_argument("--unattended", action="store_true",
                          help="generate and attach an autounattend answer ISO")
     install.add_argument("--password-stdin", action="store_true",
-                         help="read the Administrator password from stdin")
+                         help="read the Administrator password from stdin; it "
+                              "must not be empty, since this creates the "
+                              "account rather than logging into one")
     install.add_argument("--image-index", type=int, default=DEFAULT_IMAGE_INDEX)
     install.add_argument(
         "--driver-branch",

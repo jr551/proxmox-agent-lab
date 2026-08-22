@@ -10,8 +10,6 @@ runtime/
 *.env
 *.secret
 *.token
-# Generated from a console font whose licence is not this repository's to carry
-assets/console-font.json
 
 # Runtime state and anything describing a specific site
 journal/

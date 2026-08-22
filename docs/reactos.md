@@ -53,6 +53,11 @@ remain available for comparison in the same ISO. The synthesised entries are
 only meaningful in a `KDBG=1` build, so make the build fail closed when they
 are requested without it rather than discover it an hour later.
 
+Getting the boot flags right is necessary but not sufficient: one build
+setting switches the whole serial channel off while leaving the guest
+apparently healthy. Before concluding that a silent COM1 means a dead guest,
+read *Build settings that break the lab's own channels* below.
+
 ## Check where the disks actually are before benchmarking
 
 The rule is ISO on bulk storage, guest disk on fast storage. A live
@@ -109,6 +114,11 @@ bytes. Stop a running capture before starting another one or before using
 `--send`. If a capture comes back empty, the first hypothesis should always be
 that it never attached, not that the guest printed nothing; force some traffic
 and check again before writing anything down.
+
+The second hypothesis is that the build genuinely has no serial output —
+`DLL_EXPORT_VERSION=0x600` does exactly that to a Debug + `KDBG=1` build, with
+no other visible effect. See *Build settings that break the lab's own
+channels*.
 
 ## Driving KDB safely
 
@@ -194,6 +204,47 @@ ReactOS install — stop waiting and report a stall, distinguishing that outcome
 from "reached the target" and from "still progressing when the overall timeout
 expired". Those three outcomes want three different next actions.
 
+### `diskwrite` can read 0 on a guest that is writing hard
+
+**Do not treat a still `diskwrite` as proof of a stall.** On a qcow2 image over
+directory-backed storage the counter has been observed sitting at **0 bytes for
+an entire session** while the guest was demonstrably writing. It is a cached,
+summed value that does not update in real time for every storage backend
+combination, so "the counter did not move" and "the guest did nothing" are two
+different statements and only one of them is measured.
+
+Two further traps in the same area:
+
+- qcow2 growth can be **metadata-only** — L1 and refcount tables allocated for
+  a large sparse image — so a file that grew by megabytes may carry no guest
+  data at all.
+- `ls -la` reports a sparse image's **apparent** size, which for an untouched
+  100 GB qcow2 is 100 GB of I/O that never happened. `du` reports the
+  **allocated** bytes, which is the number you want.
+
+Cross-check before concluding anything, with a command that samples twice and
+compares three independent signals:
+
+```bash
+proxmox-lab guest disk-activity --vmid "$VMID"                    # counter only
+proxmox-lab guest disk-activity --lease "$L" --vmid "$VMID" \
+  --ground-truth --interval 10
+```
+
+`--ground-truth` adds QEMU's own block-layer counters (`info blockstats` over
+the Proxmox monitor endpoint — no SSH needed) and `du --block-size=1` on the
+backing image file (over the opt-in `[memflow]` host SSH channel), then reports
+a `disagreement` list naming any signal that saw nothing while another saw
+bytes. That list is the diagnostically useful part: it is what tells you the
+counter is lying rather than the guest being dead. Either extra signal may be
+unavailable — the monitor endpoint needs a privilege the `PVEVMAdmin` lab token
+does not have, and `du` needs the host SSH opt-in — and the command reports
+that and returns the rest rather than failing.
+
+Without `--ground-truth` the command deliberately reports `"writing": null`
+rather than `false` for a still counter, because that counter on its own cannot
+tell an idle guest from a stalled counter.
+
 A `cpu` reading near **0.5 on a 2-vCPU guest** means exactly one core is
 spinning: the guest is not idle and not making progress, which is the signature
 of a busy-wait such as the KDB keyboard poll described above. To see where it
@@ -237,6 +288,10 @@ The rest of the shape:
   see [network.md](network.md).
 - Keep the ISO on bulk storage and the guest disk on fast storage, as in
   [storage.md](storage.md).
+- Run `proxmox-lab iso diagnose --path <iso>` on any ISO that was assembled or
+  repaired by hand before attaching it. A missing El Torito boot record looks
+  exactly like a hang once the guest is running — see *Build settings that
+  break the lab's own channels*.
 
 ## Build-loop discipline
 
@@ -261,6 +316,166 @@ Release build does not link, failing on undefined references to
 `ExpKdbgExtIrpFind` and `ExpKdbgExtHandle`, which exist only in Debug. Since
 `/KDSERIAL` needs `KDBG=1`, any run you intend to drive through KDB is a Debug
 build. Have the build script reject the combination up front.
+
+Two further build settings are worth their own section, because neither of them
+surfaces as a build failure — both of them surface here, in the lab, as
+something else.
+
+## Build settings that break the lab's own channels
+
+The ReactOS build system is not part of this repository, so nothing here can be
+enforced by `proxmox-lab`. It is documented here because each of these two
+settings produces a *lab-side* symptom that looks like something else entirely
+— a guest that crashed, and a guest that hung — and in both cases neither the
+build nor the lab prints a word about the real cause.
+
+### `DLL_EXPORT_VERSION=0x600` silences KDBG serial
+
+The reason to set it is a real one. Building C++ targets against mingw's libgcc
+fails to link on undefined `__imp_InitializeConditionVariable`, and raising
+`DLL_EXPORT_VERSION` to `0x600` widens the exported surface enough to resolve
+it. The build then succeeds and the ISO boots normally, all the way to a
+desktop.
+
+What it costs is the entire serial channel. A `BUILD_TYPE=Debug KDBG=1` build
+booted with `/DEBUGPORT=COM1 /KDSERIAL` produces **zero bytes on COM1** — not
+fewer messages, none: no FreeLoader debug output, no kernel `DPRINT`, no KDB
+prompt, no break banner. Because the guest itself is healthy, the only thing
+the lab observes is an empty capture, which is indistinguishable from a guest
+that died before serial init.
+
+In this harness that means `console text` returns nothing, and so does
+`console text --follow --from-reset`. An operator who has read *The serial
+socket has no scrollback* above will correctly suspect a late attach, reattach
+earlier and earlier, keep getting nothing, and eventually report a hung guest.
+It is not hung. Two ways to tell the cases apart:
+
+- **Screenshot it first.** It costs no lease. A guest that has painted the
+  FreeLoader menu or a desktop while COM1 stays silent is a mute *build*; a
+  guest that genuinely died before serial init has not painted either.
+- **Compare two builds off the same ref**, which is the definitive test:
+
+  ```bash
+  # Build A — no DLL_EXPORT_VERSION: serial output present
+  REACTOS_REF="$REF" ARCH=amd64 BUILD_TYPE=Debug KDBG=1 ./scripts/build.sh
+  # Build B — DLL_EXPORT_VERSION=0x600: zero bytes on COM1
+  DLL_EXPORT_VERSION=0x600 \
+    REACTOS_REF="$REF" ARCH=amd64 BUILD_TYPE=Debug KDBG=1 ./scripts/build.sh
+  ```
+
+  Boot both with the same VM shape and the same capture command. If A prints
+  and B does not, the build is mute. If *neither* prints, the fault is on this
+  side: a late attach, a VM without `serial0: socket`, or a second
+  `console text` session on the same guest holding all the bytes.
+
+The rule: **do not combine `DLL_EXPORT_VERSION=0x600` with
+`BUILD_TYPE=Debug KDBG=1`** on any build you intend to debug over serial. Fix
+the C++ link error some other way, or accept a build you cannot serially debug
+and record that in the run notes so the next person does not spend a lease
+rediscovering it. There is a second reason to keep the two apart: the wider
+0x600 export surface also changes behaviour on the PnP and device-start paths,
+so a build made to get a link to succeed is not the build whose driver bring-up
+you were measuring.
+
+### `ENABLE_ROSTESTS=0` breaks ISO assembly — and the obvious repair loses the boot record
+
+Turning the test suite off is a reasonable thing to want; it is a large part of
+the build. But the ISO manifests are generated without regard for it, so
+`bootcd.<config>.lst` and `reactos.dff` still name winetest binaries that were
+never built, and the final `ninja` step dies at the ISO-assembly phase:
+
+```
+mkisofs: No such file or directory. Cannot open '.../ntdll_winetest.exe'.
+```
+
+Everything before that point succeeded — kernel, drivers, the loader, the whole
+staging tree — so the natural repair is to strip the winetest lines out of the
+list and re-run mkisofs by hand over the staging directory. **That repair is
+where the lab time goes.** A plain `mkisofs -o out.iso <staging>` produces a
+completely valid ISO 9660 image containing the entire ReactOS tree and **no El
+Torito boot record**. mkisofs says nothing. The image mounts, the file tree is
+complete, attaching it to a guest works, and the guest starts — and then
+SeaBIOS finds nothing to boot and shows a black screen with no keyboard
+response, no display output and no error. From the lab there is nothing to
+distinguish it from a guest hung in early boot.
+
+So the El Torito options are mandatory on any manual reassembly:
+
+```bash
+mkisofs -o reactos.iso \
+  -eltorito-platform x86 -eltorito-boot loader/isobtrt.bin \
+  -no-emul-boot -boot-load-size 4 \
+  <staging-dir>
+```
+
+Take the boot image path out of the `ninja` command line that failed rather
+than trusting the one above: `loader/isobtrt.bin` is what the amd64 bootcd
+staging tree uses, and it is build-specific. The rest is not negotiable.
+Without `-eltorito-boot` there is no boot record at all; without
+`-no-emul-boot` the firmware tries floppy emulation on a file that is not a
+floppy image; `-boot-load-size 4` states the sector count explicitly instead of
+leaving it to whichever default your mkisofs build happens to use.
+
+**Then check it before it ever reaches a guest.** `iso diagnose` is local, takes
+no lease and no host, and reads the same structures the firmware reads:
+
+```bash
+proxmox-lab iso diagnose --path ./reactos.iso
+```
+
+The field that proves the boot record survived is `el_torito_ok`, and the
+catalog it is derived from is printed alongside it (abridged and reordered here
+from the full sorted output):
+
+```json
+"bootable_bios": true,
+"el_torito_ok": true,
+"el_torito": {
+  "catalog_lba": 33,
+  "catalog_usable": true,
+  "validation": { "checksum_ok": true, "key_bytes_ok": true },
+  "entries": [
+    {
+      "kind": "initial/default",
+      "platform": "x86-BIOS",
+      "media_type_name": "no-emulation",
+      "load_segment": "0x07C0",
+      "load_sectors": 4,
+      "load_rba": 34,
+      "bootable": true,
+      "image_in_range": true
+    }
+  ]
+}
+```
+
+An image assembled the wrong way reports `"el_torito_ok": false` and says so in
+`warnings`, naming the flags to rebuild with:
+
+```
+no El Torito boot record at all, but the file tree is bootloader-shaped
+(LOADER, LOADER/ISOBTRT.BIN, REACTOS): this is what plain mkisofs produces
+when the boot options are omitted, and the guest will sit at a black screen
+with no keyboard and no error. Reassemble with the mandatory options:
+-eltorito-platform x86 -eltorito-boot loader/isobtrt.bin -no-emul-boot
+-boot-load-size 4 (the boot image path is build-specific)
+```
+
+The same command also catches the ways a boot record can be present and still
+useless: a catalog that the boot record points at outside the image or at LBA
+0, a validation entry that fails its 16-bit checksum or is missing its
+`0x55 0xAA` key bytes (all of these give `catalog_usable: false`), an entry
+naming a boot image past the end of the file (`image_in_range: false`), and an
+entry with a boot-load-size of zero (`load_sectors: 0`), which loads nothing
+and jumps into it. Every one of those boots exactly as silently as no boot
+record at all, which is why the check is worth running every time rather than
+only when something already looks wrong.
+
+The build-side fixes belong upstream — filter the winetest entries out of
+`bootcd.*.lst` and `reactos.dff` during configure when `ENABLE_ROSTESTS=0`, and
+fail with the name of the flag that controls the missing files instead of
+dying inside mkisofs. This lab cannot make those changes. What it can do is
+refuse to let a boot-record-less ISO reach a guest unnoticed.
 
 ## Reading results
 

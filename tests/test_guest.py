@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -299,6 +300,96 @@ class DetachedRunTests(unittest.TestCase):
                 "guest-snapshot-rollback", lease="L1", kind="qemu", vmid=7,
                 name="before-kernel", sync=False,
             )
+
+
+class EmptyConsolePasswordTests(unittest.TestCase):
+    """A guest with no password set must still be drivable over serial.
+
+    ReactOS, a stock installer, a rescue shell and a blank-root appliance all
+    have no console password. Treating "" as falsy made them unreachable: the
+    serial channel was refused even though the credential was correct.
+    """
+
+    def _serial_only(self) -> lab_guest.GuestCapabilities:
+        return lab_guest.GuestCapabilities(7, "qemu", agent=False, serial=True)
+
+    def test_an_explicit_empty_password_enables_the_serial_channel(self) -> None:
+        session = lab_guest.GuestSession(
+            mock.Mock(), mock.Mock(), 7, password="",
+            capabilities=self._serial_only(),
+        )
+        self.assertEqual(session.channel, "serial")
+
+    def test_no_password_at_all_still_refuses_the_serial_channel(self) -> None:
+        with self.assertRaises(lab_guest.GuestError) as caught:
+            lab_guest.GuestSession(
+                mock.Mock(), mock.Mock(), 7,
+                capabilities=self._serial_only(),
+            )
+        message = str(caught.exception)
+        self.assertIn("Pass a console password", message)
+        self.assertIn("no password set is supported", message)
+
+    def test_an_empty_password_reaches_the_login_as_an_empty_string(self) -> None:
+        session = lab_guest.GuestSession(
+            mock.Mock(), mock.Mock(), 7, password="",
+            capabilities=self._serial_only(),
+        )
+        with mock.patch.object(lab_console, "TermSession") as term_class:
+            session._terminal()
+        term_class.return_value.login.assert_called_once_with("root", "")
+
+    def _run_capturing_password(self, tmp: str, stdin: str,
+                                *extra: str) -> object:
+        lab = _lab(tmp)
+        capabilities = self._serial_only()
+        with mock.patch.object(lab_guest, "probe", return_value=capabilities), \
+             mock.patch.object(lab_guest, "GuestSession") as session_class, \
+             mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+            session = session_class.return_value.__enter__.return_value
+            session.run_argv.return_value = lab_guest.CommandResult(
+                stdout="", stderr="", exit_code=0, channel="serial",
+            )
+            lab_guest.cmd_run(
+                lab,
+                _args(lab, "guest", "run", "--lease", "L1", "--vmid", "7",
+                      *extra, "--", "uname", "-a"),
+            )
+        return session_class.call_args.kwargs["password"]
+
+    def test_cmd_run_forwards_an_empty_password_from_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                self._run_capturing_password(tmp, "\n", "--password-stdin"),
+                "",
+            )
+
+    def test_cmd_run_forwards_none_when_the_flag_is_absent(self) -> None:
+        """A caller who forgot the flag must not get a blank-password login."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(self._run_capturing_password(tmp, "secret\n"))
+
+    def test_cmd_run_still_forwards_a_real_password(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                self._run_capturing_password(tmp, "hunter2\n",
+                                             "--password-stdin"),
+                "hunter2",
+            )
+
+    def test_probe_advice_says_a_passwordless_guest_is_supported(self) -> None:
+        import contextlib
+        import json
+
+        lab = mock.Mock()
+        lab.NODE = "aipve"
+        stdout = io.StringIO()
+        with mock.patch.object(lab_guest, "probe",
+                               return_value=self._serial_only()), \
+             contextlib.redirect_stdout(stdout):
+            lab_guest.cmd_probe(lab, mock.Mock(vmid=7))
+        advice = " ".join(json.loads(stdout.getvalue())["advice"])
+        self.assertIn("no password set works too", advice)
 
 
 if __name__ == "__main__":

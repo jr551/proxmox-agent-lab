@@ -3,16 +3,18 @@ serial/LXC terminal text, guest-agent execution, and file transfer.
 
 Design notes
 ------------
-* Screenshots are PNG. Multimodal models read them directly, so OCR is never
-  applied automatically -- see `lab_textmode` for the opt-in text-mode decoder.
+* Screenshots are PNG. A screen is read by a vision model: `console inspect`
+  sends one to a configured provider, and `console screenshot --for-model`
+  hands the pixels back to the caller for its own vision instead.
 * When a guest really is a terminal, prefer `console text`: Proxmox hands over
-  the actual character stream, which is exact where any OCR is a guess.
+  the actual character stream, which is exact where any pixel read is a guess.
 * File transfer goes through the S3 scratch bucket using presigned URLs. No
   credential ever reaches the guest, the command line, or the audit ledger.
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 from pathlib import Path
@@ -46,6 +48,34 @@ MAX_CHUNK_PARTS = 256
 
 def _api_error(lab: Any, message: str) -> Exception:
     return lab.LabError(message)
+
+
+# Removal signposts. Glyph-matching OCR was removed because it can only read a
+# guest whose console font the controller happens to hold, and a guest is free
+# to ship its own -- which is exactly what made it unusable in practice. These
+# two entry points stay registered so an upgrade fails with an explanation
+# instead of argparse's bare "unrecognized arguments". Delete both in 0.11.0.
+OCR_REMOVED = (
+    "--ocr was removed: glyph-matching OCR could only read a guest whose "
+    "console font this controller already had, and a guest with its own font "
+    "decoded to nothing. A screen is read by a vision model now -- use "
+    "'console screenshot --for-model' to get the screen back as a compressed "
+    "base64 PNG for your own vision, 'console inspect' to send it to a "
+    "configured vision provider, or 'console text' for a real terminal stream."
+)
+IMPORT_FONT_REMOVED = (
+    "'console import-font' was removed along with glyph-matching OCR: there "
+    "is no font table left to import into. A screen is read by a vision model "
+    "now -- use 'console screenshot --for-model' to get the screen back as a "
+    "compressed base64 PNG for your own vision, 'console inspect' to send it "
+    "to a configured vision provider, or 'console text' for a real terminal "
+    "stream."
+)
+
+
+def cmd_import_font(lab: Any, args: Any) -> None:
+    """Removal signpost for the deleted OCR font import. Delete in 0.11.0."""
+    raise _api_error(lab, IMPORT_FONT_REMOVED)
 
 
 def _kind_of(lab: Any, api: Any, vmid: int) -> str:
@@ -393,7 +423,14 @@ class TermSession:
             pass
         self.expect(("login:",), timeout=timeout, poke=True)
         self.send_line(user)
-        self.expect(("assword:",), timeout=60)
+        # A guest with no password set -- an installer, a rescue shell, a
+        # stock appliance -- drops straight to a shell and never prints a
+        # password prompt. Waiting only for "assword:" hung there for the full
+        # timeout, which made an empty password useless even once it was
+        # allowed through.
+        matched, _ = self.expect(("assword:", "$ ", "# "), timeout=60)
+        if matched in ("$ ", "# "):
+            return
         self.send_line(password)
         matched, transcript = self.expect(
             ("$ ", "# ", "Login incorrect"), timeout=60
@@ -548,19 +585,20 @@ def _save_screenshot(vmid: int, rgb: bytes, width: int, height: int,
     }
     if analysis["looks_like_text_console"]:
         result["agent_hint"] = (
-            "Prefer console text for exact characters; use --ocr only for a "
-            "VGA text grid"
+            "This looks like a character-cell screen: prefer console text for "
+            "exact characters when the guest has a real terminal"
         )
     else:
         result["agent_hint"] = (
-            "Read this PNG with vision. If this model has no vision, delegate "
-            "the single-screen decision to a vision-capable model; do not use "
-            "Tesseract, OCR, crops, or image filters."
+            "Read this PNG with vision. If this model has no vision, add "
+            "--for-model to get the screen back as compressed base64, or use "
+            "console inspect; do not build a crop-and-filter loop."
         )
-    identical = _mark_stale_frame(
+    identical, comparable = _mark_stale_frame(
         vmid, rgb, width, height, state_root or DEFAULT_SCREENSHOT_DIR.parent
     )
     result["identical_to_previous_capture"] = identical
+    result["comparable_to_previous_capture"] = comparable
     if identical:
         result["stale_possible"] = (
             "screen unchanged since last capture; if input was sent in "
@@ -570,7 +608,7 @@ def _save_screenshot(vmid: int, rgb: bytes, width: int, height: int,
 
 
 def _mark_stale_frame(vmid: int, rgb: bytes, width: int, height: int,
-                      state_root: Path) -> bool:
+                      state_root: Path) -> tuple[bool, bool]:
     """Compare a capture with the previous one for the same VM+resolution.
 
     QEMU's VNC dirty tracking can hand back the pre-action frame right after
@@ -578,6 +616,11 @@ def _mark_stale_frame(vmid: int, rgb: bytes, width: int, height: int,
     pixel-identical repeat instead of acting on a stale screen.  This is
     best-effort: any store failure degrades to "not identical" rather than
     failing the capture.
+
+    Returns `(identical, comparable)`.  `comparable` is false when there was
+    no earlier frame of this size to compare against, or the store failed --
+    a first capture is not evidence that the screen changed, so callers that
+    read the comparison as a signal must be able to tell the two apart.
     """
     previous_dir = Path(state_root) / "vision-previous"
     key = previous_dir / f"screenshot-vm{vmid}-{width}x{height}.rgb"
@@ -586,15 +629,114 @@ def _mark_stale_frame(vmid: int, rgb: bytes, width: int, height: int,
         previous = key.read_bytes()
     except OSError:
         pass
-    identical = len(previous) == len(rgb) and previous == rgb
+    comparable = len(previous) == len(rgb)
+    identical = comparable and previous == rgb
     try:
         previous_dir.mkdir(parents=True, exist_ok=True)
         temporary = key.with_suffix(".tmp")
         temporary.write_bytes(rgb)
         temporary.replace(key)
     except OSError:
-        return False
-    return identical
+        return False, False
+    return identical, comparable
+
+
+# --- handing the screen back to the caller -------------------------------
+#
+# When no vision provider can read a screen, the agent calling this CLI often
+# can. Returning a bounded, downscaled, maximally-compressed PNG as base64 in
+# the JSON beats returning nothing at all.
+#
+# 1280px on the longest edge is the default bound. It leaves an 80-column VGA
+# text screen at roughly 16 pixels per glyph and turns a 1920x1080 desktop
+# into 1280x720 -- still comfortably enough to name an installer page and read
+# its on-screen text -- while cutting the pixel count of a 1080p capture by
+# 56%. Below 640px an 80-column line falls under 8 pixels per glyph and stops
+# being reliably readable, so that is the floor the stepping loop will not go
+# past. The base64 cap is 1.5 MB: large enough that a real screen never hits
+# it, small enough that no caller is handed an unbounded blob.
+IMAGE_MAX_EDGE = 1280
+IMAGE_MIN_EDGE = 640
+IMAGE_MAX_BASE64_BYTES = 1_500_000
+IMAGE_STEP_NUMERATOR, IMAGE_STEP_DENOMINATOR = 3, 4
+
+
+def _image_handback(rgb: bytes, width: int, height: int, *, reason: str,
+                    hint: str) -> dict[str, Any]:
+    """Compress one framebuffer into a bounded base64 PNG for the caller.
+
+    Downscales only when needed, re-encodes with maximum zlib compression, and
+    steps the bound down until the encoded base64 fits `IMAGE_MAX_BASE64_BYTES`
+    or the readability floor is reached. The result always states what it is:
+    emitted and original dimensions, the scale factor, and the byte sizes.
+    """
+    longest = max(width, height)
+    # Start at whichever is smaller: the bound, or the image itself. An image
+    # already under the floor is never shrunk at all.
+    edge = min(IMAGE_MAX_EDGE, longest)
+    floor = min(IMAGE_MIN_EDGE, longest)
+    while True:
+        out_width, out_height, scaled = png_module.downscale_rgb(
+            width, height, rgb, edge
+        )
+        encoded = png_module.encode_png(out_width, out_height, scaled, level=9)
+        blob = base64.b64encode(encoded).decode("ascii")
+        if len(blob) <= IMAGE_MAX_BASE64_BYTES or edge <= floor:
+            break
+        edge = max(
+            floor, edge * IMAGE_STEP_NUMERATOR // IMAGE_STEP_DENOMINATOR
+        )
+    payload: dict[str, Any] = {
+        "encoding": "base64",
+        "mime_type": "image/png",
+        "width": out_width,
+        "height": out_height,
+        "original_width": width,
+        "original_height": height,
+        "scale": round(out_width / width, 4) if width else 1.0,
+        "bytes": len(encoded),
+        "base64_bytes": len(blob),
+        "reason": reason,
+        "agent_hint": hint,
+    }
+    if len(blob) > IMAGE_MAX_BASE64_BYTES:
+        # Refuse rather than emit an unbounded blob. Only a pathologically
+        # noisy framebuffer reaches this; a real screen compresses far below.
+        payload["error"] = (
+            f"the screen still needs {len(blob)} base64 bytes at the "
+            f"{edge}px readability floor, over the {IMAGE_MAX_BASE64_BYTES} "
+            "byte cap; read the PNG written to disk instead"
+        )
+        return payload
+    payload["base64"] = blob
+    return payload
+
+
+def _image_handback_from_png(data: bytes, *, reason: str,
+                             hint: str) -> dict[str, Any]:
+    """Same handback, for a path that already holds an encoded PNG."""
+    try:
+        width, height, rgb = png_module.decode_png(data)
+    except ValueError as exc:
+        return {
+            "encoding": "base64",
+            "mime_type": "image/png",
+            "error": f"could not decode the captured PNG to resize it: {exc}",
+            "reason": reason,
+        }
+    return _image_handback(rgb, width, height, reason=reason, hint=hint)
+
+
+NO_VISION_HINT = (
+    "No vision provider could read this screen, so the screenshot itself is "
+    "returned here: base64-decode it into a PNG and read it with your own "
+    "vision rather than acting blind."
+)
+FOR_MODEL_HINT = (
+    "This is the screen as a base64 PNG for a caller that reads images "
+    "directly. Decode it and look at it; coordinates in it are scaled by "
+    "'scale' from the original framebuffer."
+)
 
 
 def _capture_after_action(lab: Any, api: Any, args: Any,
@@ -602,7 +744,7 @@ def _capture_after_action(lab: Any, api: Any, args: Any,
     """Optionally capture the settled screen as part of an input command.
 
     Keeping input and observation in one command avoids the common agent loop
-    of click, reconnect, screenshot, crop, OCR, and repeat.
+    of click, reconnect, screenshot, crop, and repeat.
     """
     settle = getattr(args, "screenshot_after", None)
     if settle is None:
@@ -618,6 +760,46 @@ def _capture_after_action(lab: Any, api: Any, args: Any,
         args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
         state_root=lab.STATE_ROOT,
     )
+
+
+def _delivery_signal(screenshot: dict[str, Any] | None,
+                     what: str) -> dict[str, Any]:
+    """Whether the post-action capture shows the input landing anywhere.
+
+    `keys_sent` and `characters_sent` count what this controller transmitted,
+    not what the guest received; an operator reading them as delivery can
+    drive a screen for hours that never moved.  The post-action capture
+    already knows whether the framebuffer differs from the previous one, so
+    report that as an explicit signal.  It is evidence, not proof -- a guest
+    can change on its own, and a settled screen can legitimately look the
+    same -- so nothing here fails or blocks.
+
+    Returns the keys to merge into the command result; empty when no
+    post-action screenshot was taken.
+    """
+    if not screenshot:
+        return {}
+    if not screenshot.get("comparable_to_previous_capture"):
+        return {
+            "screen_changed": None,
+            "agent_hint": (
+                "no earlier capture of this screen to compare against, so "
+                f"the {what} carry no delivery evidence yet; capture again "
+                "with --screenshot-after to get a comparison"
+            ),
+        }
+    if not screenshot.get("identical_to_previous_capture"):
+        return {"screen_changed": True}
+    return {
+        "screen_changed": False,
+        "agent_hint": (
+            "the screen is pixel-identical to the previous capture, so the "
+            f"{what} may not have reached the guest: check that the guest is "
+            "running and awake, that this VMID is registered to the lease, "
+            "and re-read the screen with 'console screenshot' or "
+            "'console text' before sending more input"
+        ),
+    }
 
 
 def _model_frame(lab: Any, lease_id: str, vmid: int, rgb: bytes, width: int,
@@ -709,11 +891,6 @@ def _screenshot_via_monitor(lab: Any, api: Any, args: Any) -> dict[str, Any]:
 
     if not getattr(args, "lease", None):
         raise _api_error(lab, "console screenshot --via monitor requires --lease")
-    if getattr(args, "ocr", False):
-        raise _api_error(
-            lab,
-            "--ocr needs the raw framebuffer; use the default --via vnc for it",
-        )
     _require_owned_qemu(lab, args.lease, args.vmid)
     memflow.require_host_ssh(lab)
     remote = _monitor_remote_path(args.lease, args.vmid)
@@ -755,15 +932,23 @@ def _screenshot_via_monitor(lab: Any, api: Any, args: Any) -> dict[str, Any]:
         "bytes": len(data),
         "host_file_removed": removed,
         "agent_hint": (
-            "Read this PNG with vision. This capture came from QEMU, not VNC, "
-            "so it carries no text-console analysis and no stale-frame check "
-            "-- prefer the default --via vnc unless VNC itself is the problem."
+            "Read this PNG with vision, or re-run with --for-model to get it "
+            "back as base64. This capture came from QEMU, not VNC, so it "
+            "carries no screen analysis and no stale-frame check -- prefer "
+            "the default --via vnc unless VNC itself is the problem."
         ),
     }
     if not removed:
         result["host_file_warning"] = (
             f"could not delete {remote} on the host; remove it manually"
         )
+    if getattr(args, "for_model", False):
+        result["image"] = _image_handback_from_png(
+            data, reason="requested with --for-model", hint=FOR_MODEL_HINT,
+        )
+        lab.audit("console-screenshot-for-model", lease=args.lease,
+                  vmid=args.vmid, source="monitor",
+                  bytes=result["image"].get("bytes", 0), sync=False)
     if getattr(args, "upload", False):
         key = f"screens/vm{args.vmid}-{int(time.time())}.png"
         s3.put_bytes(key, data, "image/png")
@@ -773,6 +958,10 @@ def _screenshot_via_monitor(lab: Any, api: Any, args: Any) -> dict[str, Any]:
 
 
 def cmd_screenshot(lab: Any, args: Any) -> None:
+    # Guard before anything is opened or captured: a removed flag must fail
+    # with an explanation, not halfway through a console session.
+    if getattr(args, "ocr", False):
+        raise _api_error(lab, OCR_REMOVED)
     api = lab.ProxmoxAPI()
     if getattr(args, "via", "vnc") == "monitor":
         print(json.dumps(
@@ -788,20 +977,19 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
     result["source"] = "vnc"
     target = Path(result["path"])
     png = target.read_bytes()
-    analysis = textmode.analyse(rgb, width, height)
     if args.upload:
         key = f"screens/vm{args.vmid}-{int(time.time())}.png"
         s3.put_bytes(key, png, "image/png")
         result["s3_key"] = key
         result["s3_url"] = s3.presign(key, expires=args.url_expiry)
-    if args.ocr:
-        if not analysis["looks_like_text_console"]:
-            result["ocr_error"] = (
-                "screen is not a text console; read the PNG directly, or use "
-                "'console text' for a real terminal stream"
-            )
-        else:
-            result["ocr"] = textmode.decode_screen(rgb, width, height)
+    if getattr(args, "for_model", False):
+        result["image"] = _image_handback(
+            rgb, width, height, reason="requested with --for-model",
+            hint=FOR_MODEL_HINT,
+        )
+        # The fact and the size, never the pixels: a screen can show anything.
+        lab.audit("console-screenshot-for-model", vmid=args.vmid, source="vnc",
+                  bytes=result["image"].get("bytes", 0), sync=False)
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -903,20 +1091,43 @@ def cmd_inspect(lab: Any, args: Any) -> None:
             provider=args.provider,
         )
     except (vision.VisionError, secrets_store.SecretError) as exc:
+        reason = str(exc)
+        # Last resort: no provider could read the screen, but the agent that
+        # called this may have vision of its own. Hand the pixels back rather
+        # than leaving it blind. This is additive -- the failure is still
+        # audited, still reported, and the command still exits non-zero.
+        handback = None
+        if getattr(args, "image_fallback", True):
+            handback = _image_handback(
+                rgb, width, height,
+                reason=f"no vision provider could read this screen: {reason}"[:300],
+                hint=NO_VISION_HINT,
+            )
         lab.audit(
             "console-vision-inspect-failed", lease=args.lease, vmid=args.vmid,
-            error=str(exc)[:200], provider=args.provider or "auto", sync=False,
+            error=reason[:200], provider=args.provider or "auto",
+            # The fact and the size of the handback, never its pixels.
+            image_returned=handback is not None,
+            image_bytes=(handback or {}).get("bytes", 0), sync=False,
         )
-        raise _api_error(lab, str(exc)) from None
+        failure: dict[str, Any] = {
+            "vmid": args.vmid,
+            "screenshot": screenshot,
+            "model_input": model_input,
+            "vision_error": reason,
+        }
+        if handback is not None:
+            failure["image"] = handback
+        print(json.dumps(failure, indent=2, sort_keys=True))
+        raise _api_error(lab, reason) from None
     lab.audit(
         "console-vision-inspect", lease=args.lease, vmid=args.vmid,
         provider=analysis["provider"], model=analysis["model"], sync=False,
     )
-    destination = (
-        "integrate.api.nvidia.com"
-        if analysis["provider"] == "nvidia"
-        else "openrouter.ai"
-    )
+    destination = {
+        "nvidia": "integrate.api.nvidia.com",
+        "kilo": "api.kilo.ai",
+    }.get(analysis["provider"], "openrouter.ai")
     print(json.dumps({
         "vmid": args.vmid,
         "screenshot": screenshot,
@@ -947,9 +1158,12 @@ def cmd_keys(lab: Any, args: Any) -> None:
             screenshot = _capture_after_action(lab, api, args, session)
     lab.audit("console-keys", lease=args.lease, vmid=args.vmid,
               count=len(combos), via=args.via, sync=False)
-    result = {"vmid": args.vmid, "keys_sent": len(combos), "via": args.via}
+    result: dict[str, Any] = {
+        "vmid": args.vmid, "keys_sent": len(combos), "via": args.via,
+    }
     if screenshot is not None:
         result["screenshot_after"] = screenshot
+    result.update(_delivery_signal(screenshot, "keystrokes"))
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -970,9 +1184,10 @@ def cmd_type(lab: Any, args: Any) -> None:
     # The text itself is never audited: it may contain a password.
     lab.audit("console-type", lease=args.lease, vmid=args.vmid,
               characters=sent, sync=False)
-    result = {"vmid": args.vmid, "characters_sent": sent}
+    result: dict[str, Any] = {"vmid": args.vmid, "characters_sent": sent}
     if screenshot is not None:
         result["screenshot_after"] = screenshot
+    result.update(_delivery_signal(screenshot, "typed characters"))
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -1356,7 +1571,7 @@ def _attach_term(lab: Any, api: Any, kind: str, vmid: int, *,
 
 
 def cmd_text(lab: Any, args: Any) -> None:
-    """Read the real terminal stream -- exact text, no OCR involved."""
+    """Read the real terminal stream -- exact characters, not pixels."""
     api = lab.ProxmoxAPI()
     wait = float(getattr(args, "wait_for_guest", 0.0) or 0.0)
     # A stopped guest still answers status/current, so the kind is resolvable
@@ -1778,7 +1993,12 @@ def cmd_preflight(lab: Any, args: Any) -> None:
                 name for name, value in node_scope.items() if value
             ),
             "s3": s3_state,
-            "font_table_installed": textmode.font_table_path().exists(),
+            # Screen-reading readiness is now a question about vision keys,
+            # not about an installed console font.
+            "vision": {
+                "any_provider_key": vision.available(lab.CONFIG),
+                "provider_keys": vision.provider_keys(lab.CONFIG),
+            },
         },
         indent=2,
         sort_keys=True,
@@ -1794,7 +2014,9 @@ def register(sub: Any, lab: Any) -> None:
     def add_after_screenshot(parser: Any) -> None:
         parser.add_argument(
             "--screenshot-after", type=float, metavar="SECONDS",
-            help="after input, wait this long and include a PNG in the result",
+            help="after input, wait this long and include a PNG in the "
+                 "result; 'keys' and 'type' also report screen_changed from "
+                 "it, the only evidence the input reached the guest",
         )
         parser.add_argument(
             "--screenshot-out", "--out", dest="screenshot_out",
@@ -1813,8 +2035,18 @@ def register(sub: Any, lab: Any) -> None:
     shot.add_argument("--upload", action="store_true",
                       help="also store the PNG in the S3 scratch bucket")
     shot.add_argument("--url-expiry", type=int, default=3600)
-    shot.add_argument("--ocr", action="store_true",
-                      help="decode text-mode screens; refused on graphical screens")
+    shot.add_argument(
+        "--for-model", dest="for_model", action="store_true",
+        help="also return the screen as a bounded, downscaled base64 PNG in "
+             "the JSON, for a caller that reads images with its own vision",
+    )
+    # Removal signpost, not a working flag. Listed rather than hidden so
+    # --help itself points at the replacement. Delete in 0.11.0.
+    shot.add_argument(
+        "--ocr", action="store_true",
+        help="removed: glyph-matching OCR could not read a guest's own font; "
+             "use --for-model or 'console inspect'",
+    )
     shot.add_argument(
         "--via", choices=("vnc", "monitor"), default="vnc",
         help="capture path: 'vnc' (default) reads pixels over the console; "
@@ -1853,9 +2085,15 @@ def register(sub: Any, lab: Any) -> None:
     inspect.add_argument("--prompt")
     inspect.add_argument(
         "--provider",
-        choices=("auto", "nvidia", "openrouter-nemotron", "openrouter-free"),
+        choices=("auto", "nvidia", "openrouter-nemotron", "openrouter-free",
+                 "kilo"),
         default="auto",
         help="provider override; auto uses the guarded fallback chain",
+    )
+    inspect.add_argument(
+        "--no-image-fallback", dest="image_fallback", action="store_false",
+        help="do not return the screen as base64 when every vision provider "
+             "fails; error with no image instead",
     )
     inspect.set_defaults(func=bind(cmd_inspect))
 
@@ -1933,7 +2171,7 @@ def register(sub: Any, lab: Any) -> None:
     terminal_lockup.set_defaults(func=bind(cmd_has_terminal_locked_up))
 
     text = console_sub.add_parser(
-        "text", help="read the real terminal stream (preferred over OCR)"
+        "text", help="read the real terminal stream (exact characters)"
     )
     text.add_argument("--vmid", type=int, required=True)
     text.add_argument("--kind", choices=("qemu", "lxc"))
@@ -1995,7 +2233,17 @@ def register(sub: Any, lab: Any) -> None:
     )
     preflight.set_defaults(func=bind(cmd_preflight))
 
-    textmode.register(console_sub, lab)
+    # Removal signpost, not a working command. Its old arguments are still
+    # accepted and entirely ignored, so the explanation below is what an
+    # upgraded caller sees instead of "unrecognized arguments". Delete in
+    # 0.11.0.
+    import_font = console_sub.add_parser(
+        "import-font",
+        help="removed: a screen is read by a vision model, not a font table",
+    )
+    for ignored in ("--file", "--from-vmid", "--guest-path", "--lease"):
+        import_font.add_argument(ignored, help=argparse.SUPPRESS)
+    import_font.set_defaults(func=bind(cmd_import_font))
 
     push = sub.add_parser("push", help="copy a local file into a guest")
     push.add_argument("--lease", required=True)

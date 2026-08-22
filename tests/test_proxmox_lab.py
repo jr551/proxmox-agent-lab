@@ -357,11 +357,104 @@ class ProxmoxLabTests(unittest.TestCase):
                             with self.assertRaisesRegex(
                                 LAB.LabError,
                                 rf"VMID {vmid} existed before this lease",
-                            ):
+                            ) as caught:
                                 LAB.cmd_api(args)
+                            # The refusal has to name its own remedy: the
+                            # earlier wording sent operators looking for a
+                            # broken guest instead of an unregistered one.
+                            self.assertIn(
+                                f"proxmox-lab lease-register --lease "
+                                f"{lease_id} --kind {kind} --vmid {vmid} "
+                                f"--allow-existing",
+                                str(caught.exception),
+                            )
                             api.call.assert_not_called()
             finally:
                 LAB.LEASE_ROOT = old_lease_root
+
+    def test_a_guest_path_the_regex_cannot_read_is_refused(self) -> None:
+        """A guest write whose vmid does not parse skips no ownership check.
+
+        `/nodes/N/qemu//9000/sendkey` sits inside the safe write surface and
+        reaches the same guest, but `path_resource` reads no vmid from it, so
+        accepting it would send the mutation with the lease check skipped.
+        """
+        lease = {
+            "id": "20260814120000-guard92",
+            "resources": [{"kind": "qemu", "vmid": 9000}],
+            "initial_vmids": [],
+        }
+        api = mock.Mock()
+        for path in (
+            f"/nodes/{LAB.NODE}/qemu//9000/sendkey",
+            f"/nodes/{LAB.NODE}/qemu/vm9000/sendkey",
+            f"/nodes/{LAB.NODE}/lxc//9000/status/start",
+        ):
+            with self.subTest(path=path):
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease["id"], "--method", "PUT",
+                    "--path", path, "--data", "key=ret",
+                ])
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "load_lease", return_value=lease), \
+                     mock.patch.object(LAB, "audit"):
+                    with self.assertRaisesRegex(
+                        LAB.LabError, "names no readable guest"
+                    ):
+                        LAB.cmd_api(args)
+                api.call.assert_not_called()
+
+    def test_guest_creation_and_node_paths_stay_writable(self) -> None:
+        """The readable-guest check must not block the paths that have no vmid."""
+        lease = {
+            "id": "20260814120000-guard93",
+            "resources": [],
+            "initial_vmids": [],
+        }
+        api = mock.Mock()
+        api.call.return_value = None
+        for path, data in (
+            (f"/nodes/{LAB.NODE}/qemu", ["vmid=9000"]),
+            (f"/nodes/{LAB.NODE}/qemu/", ["vmid=9001"]),
+        ):
+            with self.subTest(path=path):
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease["id"], "--method", "POST",
+                    "--path", path, *sum((["--data", d] for d in data), []),
+                ])
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "load_lease", return_value=lease), \
+                     mock.patch.object(LAB, "register_resource"), \
+                     mock.patch.object(LAB, "audit"), \
+                     mock.patch("sys.stdout", io.StringIO()):
+                    LAB.cmd_api(args)
+        self.assertEqual(api.call.call_count, 2)
+
+    def test_require_lease_resource_names_the_registration_command(self) -> None:
+        lease = {
+            "id": "20260814120000-guard94",
+            "resources": [],
+            "initial_vmids": [9246],
+        }
+        with self.assertRaises(LAB.LabError) as pre_existing:
+            LAB.require_lease_resource(lease, "qemu", 9246)
+        self.assertEqual(
+            str(pre_existing.exception),
+            "VMID 9246 existed before this lease; register it with "
+            "'proxmox-lab lease-register --lease 20260814120000-guard94 "
+            "--kind qemu --vmid 9246 --allow-existing' if you intend to "
+            "drive it",
+        )
+
+        with self.assertRaises(LAB.LabError) as unknown:
+            LAB.require_lease_resource(lease, "lxc", 9247)
+        self.assertEqual(
+            str(unknown.exception),
+            "VMID 9247 is not a lxc guest registered to this lease; register "
+            "it with 'proxmox-lab lease-register --lease "
+            "20260814120000-guard94 --kind lxc --vmid 9247' if you intend to "
+            "drive it",
+        )
 
     def test_lease_requires_cleanup(self) -> None:
         self.assertTrue(
@@ -839,7 +932,38 @@ class ProxmoxLabTests(unittest.TestCase):
             finally:
                 LAB.LEASE_ROOT = old_lease_root
 
-
+    def test_api_password_stdin_still_refuses_an_empty_password(self) -> None:
+        """Deliberately unlike the guest console. There an empty password
+        describes a guest that has none; here it would be *written* into a
+        Proxmox object as a blank credential."""
+        with tempfile.TemporaryDirectory() as tmp:
+            old_lease_root = LAB.LEASE_ROOT
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            try:
+                lease_id = "20260822120000-apipw01"
+                LAB.save_lease({
+                    "id": lease_id, "state": "active", "kind": "session",
+                    "resources": [{"kind": "qemu", "vmid": 9092}],
+                    "initial_vmids": [],
+                })
+                api = mock.Mock()
+                args = LAB.parser().parse_args([
+                    "api", "--lease", lease_id, "--method", "PUT",
+                    "--path", f"/nodes/{LAB.NODE}/qemu/9092/config",
+                    "--password-stdin", "--password-key", "cipassword",
+                ])
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB.sys, "stdin", io.StringIO("\n")), \
+                     mock.patch.object(LAB, "audit"):
+                    with self.assertRaises(LAB.LabError) as caught:
+                        LAB.cmd_api(args)
+                self.assertIn("empty password for cipassword",
+                              str(caught.exception))
+                self.assertIn("guest run --password-stdin",
+                              str(caught.exception))
+                api.call.assert_not_called()
+            finally:
+                LAB.LEASE_ROOT = old_lease_root
 
     def test_lease_end_hints_on_rapid_reuse(self) -> None:
         """A lease ended seconds after it began gets a reuse hint."""
@@ -1628,6 +1752,197 @@ class LeaseOwnershipTests(unittest.TestCase):
         run = self._sweep([lease])
         self.assertEqual(run["result"]["retried"], [lease["id"]])
         self.assertEqual(run["leases"][lease["id"]]["state"], "closed")
+
+
+class LeaseEndCrossReferenceTests(unittest.TestCase):
+    """lease-end used to consult other leases only *after* finalize_lease had
+    already destroyed this lease's guests, so a guest another active lease
+    still registered could be deleted with nothing said in advance."""
+
+    def _lease(self, lease_id: str, *, vmid: int = 9001,
+               expires_in: int = 3600, kind: str = "session",
+               policy: str = "delete", state: str = "active") -> dict:
+        return {
+            "id": lease_id,
+            "state": state,
+            "kind": kind,
+            "created_at": LAB.iso_now(),
+            "expires_at": None if kind == "long-term"
+            else LAB.new_expiry(expires_in),
+            "initial_vmids": [],
+            "resources": [{"kind": "qemu", "vmid": vmid, "policy": policy,
+                           "name": "ghidra-lab"}],
+        }
+
+    def _end(self, leases: list[dict], ending: str,
+             *extra_args: str) -> dict:
+        """Run one lease-end over a temporary lease store."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = (LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT)
+            LAB.LEASE_ROOT = Path(tmp) / "leases"
+            LAB.LOCK_PATH = Path(tmp) / "controller.lock"
+            LAB.STATE_ROOT = Path(tmp)
+            try:
+                for lease in leases:
+                    LAB.save_lease(lease)
+                api = mock.Mock()
+                api.reachable.return_value = True
+                args = LAB.parser().parse_args(
+                    ["lease-end", "--lease", ending, *extra_args]
+                )
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                     mock.patch.object(LAB, "ensure_on") as powered_on, \
+                     mock.patch.object(LAB, "stop_guest") as stopped, \
+                     mock.patch.object(LAB, "delete_guest") as deleted, \
+                     mock.patch.object(LAB, "shutdown_host",
+                                       return_value=True), \
+                     mock.patch.object(LAB, "audit") as audited, \
+                     contextlib.redirect_stdout(stdout), \
+                     contextlib.redirect_stderr(stderr):
+                    error = None
+                    try:
+                        LAB.cmd_lease_end(args)
+                    except LAB.LabError as exc:
+                        error = str(exc)
+                payload = stdout.getvalue()
+                return {
+                    "result": json.loads(payload) if payload else None,
+                    "error": error,
+                    "stderr": stderr.getvalue(),
+                    "stopped": stopped,
+                    "deleted": deleted,
+                    "powered_on": powered_on,
+                    "audit": audited,
+                    "leases": {
+                        lease["id"]: json.loads(
+                            LAB.lease_path(lease["id"]).read_text()
+                        )
+                        for lease in leases
+                    },
+                }
+            finally:
+                LAB.LEASE_ROOT, LAB.LOCK_PATH, LAB.STATE_ROOT = old
+
+    def _events(self, audited: mock.Mock) -> list[str]:
+        return [call.args[0] for call in audited.call_args_list]
+
+    def test_a_guest_another_active_lease_registers_blocks_the_end(self) -> None:
+        """Reachable: an idempotent 'memflow ghidra-setup --lxc N' re-run
+        registers the same container under a second lease without going
+        through lease-register's guard."""
+        ending = self._lease("20260822100000-endme0")
+        other = self._lease("20260822110000-other0")
+        run = self._end([ending, other], ending["id"])
+
+        self.assertIn("would destroy guest(s)", run["error"])
+        self.assertIn("qemu/9001", run["error"])
+        self.assertIn(other["id"], run["error"])
+        self.assertIn("--shared-guests-authorized", run["error"])
+        # The whole point: nothing was touched before the refusal.
+        run["stopped"].assert_not_called()
+        run["deleted"].assert_not_called()
+        run["powered_on"].assert_not_called()
+        self.assertEqual(run["leases"][ending["id"]]["state"], "active")
+        self.assertIn("lease-end-refused-shared-guest",
+                      self._events(run["audit"]))
+
+    def test_the_refusal_also_covers_an_expired_but_active_lease(self) -> None:
+        """An expired claim does not shield a guest from a *sweep*, but the
+        lease record is one heartbeat from live again, so an operator ending
+        another lease by hand must be told before the guest is destroyed."""
+        ending = self._lease("20260822100000-endme1")
+        stale = self._lease("20260822090000-stale1", expires_in=-3600)
+        run = self._end([ending, stale], ending["id"])
+
+        self.assertIn("expired but still active", run["error"])
+        run["deleted"].assert_not_called()
+
+    def test_a_long_term_lease_s_guest_is_named_in_the_refusal(self) -> None:
+        ending = self._lease("20260822100000-endme2")
+        persistent = self._lease("20260822080000-lt0002", kind="long-term",
+                                 policy="retain")
+        run = self._end([ending, persistent], ending["id"])
+
+        self.assertIn(persistent["id"], run["error"])
+        run["deleted"].assert_not_called()
+
+    def test_the_override_flag_proceeds_and_reports_loudly(self) -> None:
+        ending = self._lease("20260822100000-endme3")
+        stale = self._lease("20260822090000-stale3", expires_in=-3600)
+        run = self._end([ending, stale], ending["id"],
+                        "--shared-guests-authorized")
+
+        self.assertIsNone(run["error"])
+        run["deleted"].assert_called_once()
+        shared = run["result"]["shared_with_other_leases"]
+        self.assertEqual(shared[0]["resource"], "qemu/9001")
+        self.assertEqual(shared[0]["lease"], stale["id"])
+        self.assertFalse(shared[0]["lease_live"])
+        self.assertIn("--shared-guests-authorized", run["result"]["warning"])
+        self.assertIn("warning: destroying guest(s)", run["stderr"])
+        end_event = next(
+            call for call in run["audit"].call_args_list
+            if call.args[0] == "lease-end"
+        )
+        self.assertEqual(
+            end_event.kwargs["shared_with_other_leases"][0]["lease"],
+            stale["id"],
+        )
+
+    def test_the_override_still_defers_to_a_live_lease_inside_finalize(self) -> None:
+        """The override lets the command run; it does not disable the
+        per-resource check finalize_lease already makes."""
+        ending = self._lease("20260822100000-endme4")
+        live = self._lease("20260822110000-live04")
+        run = self._end([ending, live], ending["id"],
+                        "--shared-guests-authorized")
+
+        run["deleted"].assert_not_called()
+        self.assertEqual(run["result"]["left_to_another_lease"], ["qemu/9001"])
+
+    def test_a_retained_resource_keeps_todays_behaviour(self) -> None:
+        """This lease never deletes a retained guest, so sharing one is not a
+        destroy hazard and must not start refusing."""
+        ending = self._lease("20260822100000-endme5", policy="retain")
+        stale = self._lease("20260822090000-stale5", expires_in=-3600)
+        run = self._end([ending, stale], ending["id"])
+
+        self.assertIsNone(run["error"])
+        self.assertNotIn("shared_with_other_leases", run["result"])
+        run["deleted"].assert_not_called()
+        run["stopped"].assert_called_once()
+
+    def test_a_different_guest_in_another_lease_is_not_cross_referenced(self) -> None:
+        ending = self._lease("20260822100000-endme6", vmid=9001)
+        other = self._lease("20260822110000-other6", vmid=9002)
+        run = self._end([ending, other], ending["id"])
+
+        self.assertIsNone(run["error"])
+        self.assertNotIn("shared_with_other_leases", run["result"])
+        run["deleted"].assert_called_once()
+
+    def test_the_ordinary_single_lease_path_is_unchanged(self) -> None:
+        ending = self._lease("20260822100000-endme7")
+        run = self._end([ending], ending["id"])
+
+        self.assertIsNone(run["error"])
+        self.assertEqual(run["result"]["failures"], [])
+        self.assertTrue(run["result"]["host_powered_off"])
+        self.assertNotIn("shared_with_other_leases", run["result"])
+        run["deleted"].assert_called_once()
+
+    def test_a_closed_lease_never_cross_references_anything(self) -> None:
+        """Only 'active' records can be mid-run; a closed one is bookkeeping."""
+        ending = self._lease("20260822100000-endme8")
+        closed = self._lease("20260822090000-closed8", state="closed")
+        run = self._end([ending, closed], ending["id"])
+
+        self.assertIsNone(run["error"])
+        run["deleted"].assert_called_once()
 
 
 class DoctorAuditTests(unittest.TestCase):

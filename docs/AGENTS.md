@@ -20,6 +20,11 @@ Put `lease-end` in a trap, a `finally`, or the equivalent, so it runs even when
 the work fails. It must print `"host_powered_off": true`; if it does not, say
 so plainly rather than reporting success.
 
+`lease-end` refuses before it touches anything if a guest it would destroy is
+still registered to another active lease, naming the guest and that lease. Do
+not reach for `--shared-guests-authorized` to get past it: end or abandon the
+other lease instead, unless the user has said that guest is theirs to delete.
+
 `lease-begin` powers the machine on. Expect it to take a minute or two. Omit
 `--timeout` so the configured boot budget is used. A cold-start override below
 90 seconds is rejected; a short timeout creates duplicate leases and false
@@ -48,6 +53,11 @@ whether VNC keystrokes will land, and what to do about it. Then:
 `guest run` picks between the first two automatically. Prefer it over calling
 `console exec` or `console text` directly unless you need something specific.
 
+A guest with **no password at all** — a stock installer, a rescue shell, a
+blank-root appliance — still uses the serial channel: pass `--password-stdin`
+and feed it an empty line (`</dev/null`, or `<<< ''`). What is refused is
+*forgetting* the flag, which is not the same statement.
+
 **Prefer text over pixels.** If a guest can hand you real characters, take
 them. A screenshot of a terminal is strictly worse than its output: you cannot
 grep it, and you might misread it.
@@ -65,6 +75,26 @@ PS/2 keyboard, which that VM does not present.
 `guest probe` reports this as `"keyboard_input": false`. If you are typing at a
 guest and nothing happens, that is why. Use the serial channel instead.
 
+### ⌨️ `keys_sent` is not "the guest got it"
+
+`console keys` answers `keys_sent`, and `console type` answers
+`characters_sent`. Both count what the controller transmitted. Add
+`--screenshot-after SECONDS` and they also report `screen_changed`, compared
+against the previous capture of that guest:
+
+- `screen_changed: true` — the screen moved; carry on.
+- `screen_changed: false` — pixel-identical, and the `agent_hint` says what to
+  check. Stop and re-read the screen instead of sending more input.
+- `screen_changed: null` — nothing to compare against yet; capture again.
+
+It is evidence, not proof, and it never blocks the command. Without
+`--screenshot-after` there is no evidence at all, which is how a guest gets
+driven blind for an hour.
+
+Input to a guest the lease does not own is refused outright, before anything
+is transmitted; the error names the `lease-register` command that fixes it.
+Read it rather than retrying.
+
 ### ISOs that ignore the keyboard at the boot menu
 
 Some legacy install ISOs ignore Tab and typed characters at their boot menu
@@ -76,17 +106,23 @@ screenshot/keyboard loop instead (see
 after install — for example an upstart getty plus `console=ttyS0` on the
 kernel line — for later text access.
 
-## 🔤 OCR
+## 👁️ Reading a screen
 
-Off by default, and it should usually stay off:
+A screen is read by a model. Work down this list:
 
-1. You can read the PNG. A model looking at a screenshot beats any decoder here.
-2. Where a guest is a real terminal, `console text` gives exact characters, and
-   a guess is worse than the truth.
+1. **Guest is a terminal** — `console text`. Proxmox hands over the guest's
+   real character stream; exact beats any look at pixels.
+2. **You can see images** — `console screenshot`, then read the PNG it wrote.
+3. **You cannot see images** — `console inspect` when a vision key is stored,
+   otherwise `console screenshot --for-model`, which returns the screen inline
+   as a bounded base64 PNG for you to decode and look at. `console inspect`
+   attaches the same base64 copy automatically when every provider fails, so a
+   vision outage never leaves you with nothing to read.
 
-`console screenshot --ocr` exists for the narrow case both of those miss: a
-VGA text-mode screen reachable only over VNC. It refuses on graphical screens
-and needs a font table installed first.
+There is no OCR. Glyph matching only worked on a guest whose console font the
+controller already had; `--ocr` and `console import-font` now error with a
+pointer here and are deleted in 0.11.0. Never substitute Tesseract, crops, or
+image filters for actually looking at the screen.
 
 ## 🩺 When something fails
 
@@ -132,6 +168,7 @@ unless the user asked for that specific change:
 | Formatting a disk | `--wipe-confirmed` plus `--expect-serial` | Irreversible, and device names move between boots |
 | Preparing a host for memflow, or USB passthrough | `--host-change-authorized` | Installs a toolchain / hands host hardware to a guest |
 | Writing live guest memory (`memflow write`, `memflow phys-write`) | `--i-understand` | A wrong byte crashes or compromises the running guest |
+| Ending a lease that shares a guest with another active lease | `--shared-guests-authorized` | The other lease may be mid-run, and a deleted guest does not come back |
 | Deleting a guest the lease did not create | *not possible* | Refused outright |
 
 Before anything destructive, **look at the target**. A disk that "should be
@@ -149,9 +186,10 @@ empty" may not be — check before you wipe, and report what you found.
   images, painful to boot from.
 - **For GUI installers, use the bounded checkpoint loop.** One action can
   return its settled screenshot with `--screenshot-after 3`; do not create
-  external OCR/Pillow crop loops. Use `console inspect` first when an optional
+  external crop-and-filter loops. Use `console inspect` first when an optional
   cloud vision key is configured. Otherwise, if the current model has no
-  vision, delegate the single-screen decision to one that does. See
+  vision, get the screen inline with `console screenshot --for-model`, or
+  delegate the single-screen decision to a model that can see. See
   [gui-installers.md](gui-installers.md).
 
 ## 📝 A worked example

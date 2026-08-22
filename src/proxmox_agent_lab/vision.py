@@ -1,9 +1,13 @@
-"""Optional NVIDIA vision analysis for graphical lab screenshots.
+"""Optional cloud vision analysis for graphical lab screenshots.
 
 The runtime remains standard-library only. Images are sent only by the
 explicit ``console inspect`` command; merely taking a screenshot never uploads
-it. The API key is fetched from the configured secret backend and is never
+it. API keys are fetched from the configured secret backend and are never
 included in output or errors.
+
+Three routes are wired in: NVIDIA, OpenRouter, and the Kilo Code gateway. All
+three speak the same OpenAI-compatible chat/completions shape, so one payload
+builder and one response reader serve them.
 """
 
 from __future__ import annotations
@@ -29,11 +33,24 @@ OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
 OPENROUTER_FREE_MODEL = "openrouter/free"
 OPENROUTER_SECRET_ACCOUNT = "openrouter-api-key"
+KILO_ENDPOINT = "https://api.kilo.ai/api/gateway/v1/chat/completions"
+# The balanced auto router: Kilo picks a vision-capable model server-side.
+# Pinning a concrete model here would silently break this provider the day
+# that model is retired or loses vision, so the router chooses and the
+# result records whichever model actually answered.
+KILO_MODEL = "kilo-auto/balanced"
+KILO_SECRET_ACCOUNT = "kilo-api-key"
 MODEL = NVIDIA_MODEL  # compatibility for callers and older audit assertions
 SECRET_ACCOUNT = NVIDIA_SECRET_ACCOUNT
 REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{1,36}$")
+# Redaction shapes, so a leaked key cannot reach stdout or an error string.
+# NVIDIA and OpenRouter keys carry a vendor prefix; a Kilo gateway key is a
+# three-segment JWT, matched only in full (header, payload and signature all
+# present) so ordinary prose can never trip it.
 API_KEY_SHAPE = re.compile(
-    r"(?:nvapi-|sk-or-v1-)[A-Za-z0-9_-]+", re.IGNORECASE
+    r"(?:nvapi-|sk-or-v1-)[A-Za-z0-9_-]+"
+    r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+    re.IGNORECASE,
 )
 
 DEFAULT_PROMPT = """Analyze this operating-system GUI screenshot. Return only JSON:
@@ -61,12 +78,25 @@ class VisionError(RuntimeError):
     pass
 
 
+def provider_keys(config: Any) -> dict[str, bool]:
+    """Which vision routes have a key available. Never reveals a key."""
+    return {
+        "nvidia": bool(
+            secrets_store.get(config, NVIDIA_SECRET_ACCOUNT, required=False)
+        ),
+        "openrouter": bool(
+            secrets_store.get(config, OPENROUTER_SECRET_ACCOUNT, required=False)
+            or os.environ.get("OPENROUTER_API_KEY")
+        ),
+        "kilo": bool(
+            secrets_store.get(config, KILO_SECRET_ACCOUNT, required=False)
+            or os.environ.get("KILO_API_KEY")
+        ),
+    }
+
+
 def available(config: Any) -> bool:
-    return bool(
-        secrets_store.get(config, NVIDIA_SECRET_ACCOUNT, required=False)
-        or os.environ.get("OPENROUTER_API_KEY")
-        or secrets_store.get(config, OPENROUTER_SECRET_ACCOUNT, required=False)
-    )
+    return any(provider_keys(config).values())
 
 
 def _http_json(req: request.Request, timeout: float,
@@ -103,6 +133,13 @@ def _content(value: dict[str, Any]) -> str:
     except (KeyError, IndexError, TypeError):
         raise VisionError("vision response has no assistant content") from None
     if not isinstance(content, str) or not content.strip():
+        message = value.get("choices", [{}])[0].get("message") or {}
+        thinking = message.get("reasoning") or message.get("reasoning_content")
+        if isinstance(thinking, str) and thinking.strip():
+            raise VisionError(
+                "vision response spent its whole token budget on reasoning and "
+                "returned no answer; raise --max-tokens or use another provider"
+            )
         raise VisionError("vision response has empty assistant content")
     return content.strip()
 
@@ -354,6 +391,60 @@ def _openrouter(config: Any, image: bytes, task: str, *, model: str,
     )
 
 
+def _kilo_key(config: Any) -> str:
+    # Same precedence rule as OpenRouter: a project-scoped key deliberately
+    # stored through `proxmox-lab secrets` wins over an inherited shell value,
+    # which may be stale or belong to a different tool. The conventional
+    # variable stays a compatibility fallback for installs whose selected
+    # secret backend has no stored key.
+    stored = secrets_store.get(config, KILO_SECRET_ACCOUNT, required=False)
+    fallback = os.environ.get("KILO_API_KEY")
+    key = stored or fallback
+    if not key:
+        raise secrets_store.SecretError(
+            "secret 'kilo-api-key' is not stored; run "
+            "'proxmox-lab secrets set kilo-api-key' or export KILO_API_KEY"
+        )
+    return key
+
+
+def _kilo(config: Any, image: bytes, task: str, *, width: int, height: int,
+          timeout: int, max_tokens: int) -> dict[str, Any]:
+    """Ask the Kilo Code gateway's balanced router to read one screenshot.
+
+    The gateway is OpenAI-compatible, so the shared payload builder and
+    response reader apply unchanged. The router picks the concrete model, and
+    `_result` records which one actually answered under ``model`` while
+    ``requested_model`` stays the router id.
+    """
+    payload = _payload(image, task, KILO_MODEL, max_tokens)
+    # The router freely resolves to a reasoning model. Left alone, such a model
+    # spends the whole `max_tokens` budget thinking and returns HTTP 200 with
+    # empty assistant content -- observed against the live gateway. Asking for
+    # a JSON object and disabling reasoning keeps the budget on the answer.
+    # `_validate_analysis` remains the authoritative schema and coordinate
+    # check regardless of what comes back.
+    payload["response_format"] = {"type": "json_object"}
+    payload["reasoning"] = {"enabled": False}
+    req = request.Request(
+        KILO_ENDPOINT,
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {_kilo_key(config)}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    status, value = _http_json(req, timeout, "Kilo")
+    if status != 200:
+        raise VisionError(f"Kilo vision returned HTTP {status}")
+    return _result(
+        value, provider="kilo", requested_model=KILO_MODEL,
+        width=width, height=height,
+    )
+
+
 def _accepted(result: dict[str, Any]) -> bool:
     validation = result.get("validation")
     return bool(
@@ -486,6 +577,10 @@ def analyze_png(config: Any, image: bytes, *, width: int, height: int,
         "openrouter-free": lambda: _openrouter(
             config, image, task, model=OPENROUTER_FREE_MODEL, width=width,
             height=height, timeout=timeout, max_tokens=max_tokens,
+        ),
+        "kilo": lambda: _kilo(
+            config, image, task, width=width, height=height,
+            timeout=timeout, max_tokens=max_tokens,
         ),
     }
     if provider != "auto" and provider not in providers:

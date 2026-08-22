@@ -31,6 +31,7 @@ import time
 from typing import Any
 
 from . import console
+from . import diskactivity
 
 
 class GuestError(RuntimeError):
@@ -158,6 +159,11 @@ class GuestSession:
         self.api = api
         self.vmid = vmid
         self.user = user
+        # `None` and `""` are different credentials here. `None` means no
+        # password was offered at all; `""` means the caller looked and this
+        # guest has none -- an installer, a rescue shell, a stock appliance
+        # with a blank root account. The second is a usable serial login, so
+        # every test below asks `is None`, never truthiness.
         self._password = password
         self.capabilities = capabilities or probe(lab, api, vmid)
         self._term: console.TermSession | None = None
@@ -165,7 +171,7 @@ class GuestSession:
         options = []
         if self.capabilities.agent:
             options.append("agent")
-        if self.capabilities.serial and password:
+        if self.capabilities.serial and password is not None:
             options.append("serial")
         if not options:
             raise GuestError(self._no_channel_message())
@@ -176,11 +182,12 @@ class GuestSession:
 
     def _no_channel_message(self) -> str:
         caps = self.capabilities
-        if caps.serial and not self._password:
+        if caps.serial and self._password is None:
             return (
                 f"VMID {self.vmid} has a serial console but no guest agent. "
                 "Pass a console password to use the serial channel, or "
-                "install qemu-guest-agent in the guest."
+                "install qemu-guest-agent in the guest. A guest with no "
+                "password set is supported: supply an empty one explicitly."
             )
         return (
             f"no way in to VMID {self.vmid}: no guest agent is answering and "
@@ -195,6 +202,9 @@ class GuestSession:
             self._term = console.TermSession(
                 self.lab, self.api, self.capabilities.kind, self.vmid
             )
+            # `_password` is never None on this path: the constructor only
+            # offers the serial channel once a password -- possibly empty --
+            # has been supplied.
             self._term.login(self.user or "root", self._password or "")
         return self._term
 
@@ -425,7 +435,9 @@ def cmd_probe(lab: Any, args: Any) -> None:
         advice.append("use 'guest run' or 'console exec' -- real exit codes")
     elif caps.serial:
         advice.append("no agent: use 'guest run --password-stdin', or "
-                      "'console text --send' for one-off lines")
+                      "'console text --send' for one-off lines. A guest with "
+                      "no password set works too -- pass --password-stdin and "
+                      "feed it an empty line")
     if caps.graphical_console:
         advice.append("VNC keyboard and pointer work on this guest")
     else:
@@ -583,6 +595,9 @@ def cmd_run(lab: Any, args: Any) -> None:
     lease = lab.load_lease(args.lease)
     caps = probe(lab, api, args.vmid)
     lab.require_lease_resource(lease, caps.kind, args.vmid)
+    # Without the flag this is None: "no credential offered", and the serial
+    # channel stays refused. With the flag an empty line is a real answer --
+    # "this guest has no password" -- and must reach the login as "".
     password = sys.stdin.readline().rstrip("\r\n") if args.password_stdin else None
     if args.detach:
         command = shlex.join(args.command)
@@ -752,6 +767,39 @@ def register(sub: Any, lab: Any) -> None:
     probe_cmd.add_argument("--vmid", type=int, required=True)
     probe_cmd.set_defaults(func=bind(cmd_probe))
 
+    activity_cmd = guest_sub.add_parser(
+        "disk-activity",
+        help="is this guest really writing? (samples twice, compares signals)",
+        description=(
+            "Measures disk writes across an interval instead of trusting the "
+            "Proxmox 'diskwrite' counter, which has been observed reading 0 "
+            "for a whole session on a qcow2 guest that was demonstrably "
+            "writing. Read-only. With --ground-truth it also reads QEMU's own "
+            "block-layer counters over the monitor endpoint and 'du' on the "
+            "backing image file over the opt-in host SSH channel, and names "
+            "any signal that disagrees with the others. A signal that is "
+            "switched off or refused is reported, never fatal."
+        ),
+    )
+    activity_cmd.add_argument("--vmid", type=int, required=True)
+    activity_cmd.add_argument("--lease", help="required with --ground-truth")
+    activity_cmd.add_argument(
+        "--ground-truth", action="store_true",
+        help="also read QEMU blockstats and host-side du, and report which "
+             "signals disagree (needs a lease that owns the guest)",
+    )
+    activity_cmd.add_argument(
+        "--interval", type=float,
+        default=diskactivity.DEFAULT_INTERVAL_SECONDS,
+        help="seconds between the two samples (default: %(default)s)",
+    )
+    activity_cmd.add_argument(
+        "--timeout", type=float,
+        default=diskactivity.DEFAULT_DEADLINE_SECONDS,
+        help="overall deadline for the measurement (default: %(default)s)",
+    )
+    activity_cmd.set_defaults(func=bind(diskactivity.cmd_disk_activity))
+
     run_cmd = guest_sub.add_parser(
         "run", help="run a command, picking the channel automatically"
     )
@@ -759,7 +807,9 @@ def register(sub: Any, lab: Any) -> None:
     run_cmd.add_argument("--vmid", type=int, required=True)
     run_cmd.add_argument("--user", help="console user, for the serial channel")
     run_cmd.add_argument("--password-stdin", action="store_true",
-                         help="console password on stdin, enabling serial")
+                         help="console password on stdin, enabling serial. "
+                              "An empty line means the guest has no password "
+                              "and is accepted; omitting the flag is not")
     run_cmd.add_argument("--prefer", choices=("agent", "serial"),
                          default="agent")
     run_cmd.add_argument("--timeout", type=int, default=300)

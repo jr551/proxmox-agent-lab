@@ -15,6 +15,8 @@ Read it as a statement of confidence, not a feature list. Anything marked
 | Audit ledger | Every mutating call recorded; secrets redacted (see below) |
 | VNC console | Screenshots of a graphical desktop, `keys`, `click` and `type` driving a real Windows installer |
 | Guarded GUI vision | On Haiku VM 9060, automatic parallel vision returned a valid OpenRouter Nemotron result in 2.7-4.5s provider time; temporal inputs highlighted measured local deltas while preserving the untouched capture; repeated cursor checkpoints independently accepted each named control before clicking |
+| Kilo vision provider | Verified against the live `api.kilo.ai` gateway, not a fake: HTTP 200 with a structurally valid, `actionable` analysis of a synthetic 400x300 screen. The `kilo-auto/balanced` router resolved to `alibaba/qwen3.7-plus` on one call and `moonshotai/kimi-k2.7-code` on others, which is why no concrete model is pinned. A router-chosen reasoning model was observed answering HTTP 200 with **empty** content after spending the whole `max_tokens` budget thinking; the provider now asks for a JSON object with reasoning disabled, which fixed it. The key never appeared in any result or error. Not yet run against a real guest screen over VNC |
+| Compressed image handback | A 1920x1080 synthetic screen with 10-pixel-tall numeric labels went through the real `--for-model` encoder in 0.31s: 1280x720 at scale 0.667, 17 KB of PNG, 23 KB of base64. A vision model reading only that base64 copy recovered **every** grid label (0 through 1900) correctly, which is the evidence behind the 1280px bound. Not yet run against a real guest screen over VNC |
 | Serial console | Text read back from a Linux guest without VNC |
 | S3 scratch | `health`, `put`, `list`, `get` — byte-identical round trip |
 | File transfer | 200 KB pushed into a guest and verified by SHA-256 inside it, then pulled back byte-identical |
@@ -139,6 +141,13 @@ because it costs time to rediscover.
 Not yet watched working end to end on hardware:
 
 - Windows **2025** (2022 is the version that was installed)
+- `console screenshot --for-model` and `console inspect`'s image fallback
+  against a **real guest framebuffer**. The encoder, the bound, the cap and
+  the readability were all measured (see above), but on synthetic pixels; no
+  lab guest screen has been handed back this way yet
+- `console screenshot --for-model --via monitor`, which decodes QEMU's own PNG
+  before resizing. It is unit-tested against a generated PNG only, and the
+  monitor path itself is still blocked on the node (see below)
 - Weekly backups of long-term leases (`backup`)
 - `storage add-disk` against a **second** unfamiliar disk
 - ngrok as the share tunnel (cloudflared is the tested default)
@@ -170,6 +179,20 @@ Not yet watched working end to end on hardware:
   real means attaching a disk to a live guest.
 - `backup --retained` actually writing a vzdump archive: refused-while-disabled
   was verified, the write itself was not. It is gigabytes to a slow disk.
+- `guest disk-activity`, in **every** mode. Nothing about it has been run
+  against real hardware. The counter-only sampling, the `info blockstats`
+  parsing, the `du --block-size=1` delta, the graceful degradation when either
+  extra signal is missing and the `disagreement` computation are all covered by
+  unit tests with active fakes and nothing else. Two specific claims are
+  therefore *unverified*: that the `qmp_blockstats` signal is reachable at all
+  on this node — `console screenshot --via monitor` above shows the same
+  monitor endpoint being refused for the `PVEVMAdmin` lab token, so the QMP
+  half may simply be unavailable here — and that the `info blockstats`
+  transcript from this Proxmox/QEMU build matches the shape the parser was
+  written against. The motivating observation itself (a `diskwrite` of 0 across
+  a whole session on a writing qcow2 guest) was reported from a real ReactOS
+  session; the cross-check written in response to it has not been back to the
+  node to confirm it catches that case.
 
 ## 🔁 Reproducing this
 

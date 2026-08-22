@@ -71,7 +71,8 @@ agent lab.
 |---|---|---|
 | 🖥️ | Create throwaway VMs and containers | `api`, clone a template |
 | 👀 | **See and drive the screen** (input + settled PNG) | `console screenshot`, `--screenshot-after` |
-| 🧠 | Guarded NVIDIA → OpenRouter free vision fallback | `console inspect` |
+| 🧠 | Guarded NVIDIA / OpenRouter / Kilo vision race | `console inspect` |
+| 🖼️ | Hand the screen to your own vision as base64 | `console screenshot --for-model` |
 | ⌨️ | **Type and click** | `console type`, `keys`, `click` |
 | 🔧 | **Run commands** (picks the channel for you) | `guest run` |
 | 📄 | Read a console as exact text | `console text` |
@@ -260,6 +261,16 @@ proxmox-lab lease-end --lease "$L"          # destroy the clone, power off
 the clone is gone. That round trip — on, clone, work, destroy, off — is the
 whole point.
 
+### Reading a screen
+
+A screen is read by a model, never by glyph matching. `console text` when the
+guest is a real terminal — it returns the guest's exact character stream.
+`console screenshot` when you can look at images yourself. When you cannot,
+`console inspect` sends one lease-owned screen to a configured vision provider,
+and `console screenshot --for-model` returns the screen inline as a bounded
+base64 PNG for your own vision to decode. There is no OCR: glyph matching only
+ever worked on a guest whose console font this controller already had.
+
 ## Point your agent at it
 
 `SKILL.md` is a ready-made skill for Claude Code and Codex — drop it in your
@@ -274,7 +285,7 @@ traps that cost real debugging time.
 | 📘 [INSTALL.md](docs/INSTALL.md) | Bare PC → working lab |
 | ⚙️ [CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting and secret |
 | 🤖 [AGENTS.md](docs/AGENTS.md) | How an agent should drive it |
-| 👀 [console.md](docs/console.md) | Screens, keyboard, serial, OCR |
+| 👀 [console.md](docs/console.md) | Screens, keyboard, serial, reading a screen |
 | 📦 [storage.md](docs/storage.md) | Disks, images, file transfer |
 | 🧪 [oci.md](docs/oci.md) | Experimental OCI LXC: limits and guardrails |
 | 🔒 [network.md](docs/network.md) | VPN egress and leak testing |

@@ -34,12 +34,16 @@ proxmox-lab console inspect --lease "$L" --vmid "$VMID"
 
 It keeps one untouched full PNG locally and sends a separate, same-size copy
 with labelled 100-pixel X/Y axes to NVIDIA, the named OpenRouter Nemotron Omni
-free endpoint, and OpenRouter's free router concurrently. On later frames,
-unchanged pixels are dimmed while changed regions stay bright and outlined.
-Grid coordinates map directly to the original framebuffer. Treat its
-recommended action as a proposal, not permission. Ordinary screenshots stay
-local. Do not send
-confidential or personal screens to free providers.
+free endpoint, OpenRouter's free router, and the Kilo Code gateway's balanced
+router concurrently. On later frames, unchanged pixels are dimmed while changed
+regions stay bright and outlined. Grid coordinates map directly to the original
+framebuffer. Treat its recommended action as a proposal, not permission.
+Ordinary screenshots stay local. Do not send confidential or personal screens
+to free providers.
+
+If every provider fails, `console inspect` still errors — but it also returns
+the screen as a bounded base64 PNG under `image`, so you can read it yourself
+rather than driving blind.
 
 Ordinary `console click` commands name the visible `--target` and provide its
 proposed coordinates. The harness moves the cursor, captures a full checkpoint,
@@ -55,17 +59,20 @@ For a popup menu or combobox opened by a verified click, use arrow keys and
 `enter` to choose the visibly highlighted item. Haiku's menus preserve
 keyboard selection more reliably than a second coordinate click.
 
-Do not crop, sharpen, recolour, or run external OCR over a graphical installer.
-Those transformations discard context and turn one uncertain observation into
-dozens of guesses. `console screenshot --ocr` is only for a VGA text grid and
-will refuse a graphical screen.
+Do not crop, sharpen, recolour, or run an external text recogniser over a
+graphical installer. Those transformations discard context and turn one
+uncertain observation into dozens of guesses. This project has no OCR of its
+own either, and for the same reason: glyph matching only ever read a guest
+whose console font the controller already had.
 
 If the active model cannot see images, use `console inspect` first when its key
-is configured. Otherwise delegate **only the current full-screen checkpoint**
-to a vision-capable model and ask it for the screen name, relevant controls,
-and safest single next action. Keep lease ownership and all mutations in the
-primary agent. Tesseract is not a substitute for vision on a graphical desktop
-or installer.
+is configured. Otherwise get the screen inline with
+`proxmox-lab console screenshot --vmid "$VMID" --for-model`, which returns a
+bounded, downscaled base64 PNG in the JSON for a vision-capable model to read
+directly. Failing both, delegate **only the current full-screen checkpoint** to
+a vision-capable model and ask it for the screen name, relevant controls, and
+safest single next action. Keep lease ownership and all mutations in the
+primary agent.
 
 ## Hard limits
 
@@ -94,6 +101,9 @@ or installer.
 - Prefer a purpose-built template. If a fresh install is required, verify the
   image checksum and keep the installer ISO on bulk storage and the guest disk
   on fast storage.
+- If the ISO was built or reassembled by hand, run `proxmox-lab iso diagnose
+  --path <iso>` first: an image with no El Torito boot record boots to a black
+  screen that is indistinguishable from a hang. See [disk.md](disk.md).
 - Quote API values containing shell metacharacters, especially boot order:
 
   ```bash

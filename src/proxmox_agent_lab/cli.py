@@ -80,6 +80,12 @@ SAFE_WRITE_PREFIXES = (
     f"/nodes/{NODE}/tasks",
     f"/nodes/{NODE}/status",
 )
+# The subset of the safe write surface that addresses an individual guest, and
+# therefore must resolve to a (kind, vmid) the lease owns before it is sent.
+GUEST_PATH_PREFIXES = (
+    f"/nodes/{NODE}/qemu/",
+    f"/nodes/{NODE}/lxc/",
+)
 UPLOAD_STORAGES = tuple(CONFIG.storage.upload_storages)
 HOST_CHANGE_MARKERS = (
     "/access",
@@ -1288,10 +1294,21 @@ def require_lease_resource(
         item.get("kind") == kind and int(item.get("vmid", -1)) == vmid
         for item in lease.get("resources", [])
     ):
-        if vmid in lease.get("initial_vmids", []):
-            raise LabError(f"VMID {vmid} existed before this lease")
+        # Name the remedy. A refusal that only states the rule sends the
+        # operator looking for a broken guest instead of an unregistered one.
+        lease_id = str(lease.get("id") or "<id>")
+        pre_existing = vmid in lease.get("initial_vmids", [])
+        reason = (
+            f"VMID {vmid} existed before this lease"
+            if pre_existing
+            else f"VMID {vmid} is not a {kind} guest registered to this lease"
+        )
+        register = (
+            f"proxmox-lab lease-register --lease {lease_id} --kind {kind} "
+            f"--vmid {vmid}" + (" --allow-existing" if pre_existing else "")
+        )
         raise LabError(
-            f"VMID {vmid} is not a {kind} guest registered to this lease"
+            f"{reason}; register it with '{register}' if you intend to drive it"
         )
 
 
@@ -1351,7 +1368,16 @@ def cmd_api(args: argparse.Namespace) -> None:
             )
         password = sys.stdin.readline().rstrip("\r\n")
         if not password:
-            raise LabError("--password-stdin received an empty password")
+            # Deliberately stricter than the guest-console paths. There an
+            # empty password is a fact about a guest that already has none;
+            # here it would be *written* into a Proxmox object, creating a
+            # blank credential nobody asked for. `guest run --password-stdin`
+            # is the command that accepts an empty console password.
+            raise LabError(
+                f"--password-stdin received an empty password for {key}. A "
+                "write would store a blank credential; to log into a guest "
+                "that has no password, use 'guest run --password-stdin'."
+            )
         data[key] = password
     write = method != "GET"
     lease: dict[str, Any] | None = None
@@ -1369,11 +1395,21 @@ def cmd_api(args: argparse.Namespace) -> None:
         ):
             raise LabError(f"Write path is outside the leased guest surface: {args.path}")
         resource = path_resource(args.path)
-        if resource:
-            require_lease_resource(lease, *resource)
         create_match = re.fullmatch(
             rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
         )
+        if resource:
+            require_lease_resource(lease, *resource)
+        elif not create_match and args.path.startswith(GUEST_PATH_PREFIXES):
+            # A guest path the resource regex cannot read is not a path whose
+            # ownership can be checked. `/nodes/N/qemu//9246/sendkey` reaches
+            # the same guest but parses as no guest at all, so accepting it
+            # would mutate a guest with the ownership check skipped.
+            raise LabError(
+                f"Write path names no readable guest: {args.path}. Use "
+                f"/nodes/{NODE}/<qemu|lxc>/<vmid>/... so the lease ownership "
+                "check can run."
+            )
         if method == "POST" and create_match:
             if "vmid" not in data:
                 raise LabError("Guest creation requires an explicit vmid")
@@ -1624,6 +1660,58 @@ def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
     return failures
 
 
+def shared_lease_resources(lease: dict[str, Any]) -> list[dict[str, Any]]:
+    """Guests `lease` would delete that another active lease also registers.
+
+    `finalize_lease` already declines to touch a resource a still-*live* lease
+    owns, and `lease-register` refuses to take one. Neither closes the window
+    this looks at, because both ask "is the other lease live?" and a lease can
+    be `active` while expired -- one heartbeat away from live again. It also
+    only takes one registration path that skips `lease-register` (a module
+    that calls `register_resource` directly, such as an idempotent
+    `memflow ghidra-setup --lxc N` re-run under a second lease) for two live
+    leases to name one guest.
+
+    Reads lease records only, so it costs no network call inside the
+    controller lock. `retain` resources are excluded: this never deletes one,
+    and `finalize_lease` keeps deciding what to do with them.
+    """
+    others = active_leases(excluding=str(lease.get("id")))
+    if not others:
+        return []
+    now = utc_now()
+    shared: list[dict[str, Any]] = []
+    for resource in lease.get("resources", []):
+        if resource.get("policy", "delete") != "delete":
+            continue
+        try:
+            kind = str(resource["kind"])
+            vmid = int(resource["vmid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        for other in others:
+            if not lease_claims(other, kind, vmid):
+                continue
+            shared.append({
+                "resource": f"{kind}/{vmid}",
+                "kind": kind,
+                "vmid": vmid,
+                "lease": str(other.get("id")),
+                "lease_kind": str(other.get("kind") or "session"),
+                "lease_live": lease_is_live(other, now),
+            })
+    return shared
+
+
+def describe_shared_resources(shared: list[dict[str, Any]]) -> str:
+    return ", ".join(
+        f"{item['resource']} (lease {item['lease']}"
+        + ("" if item["lease_live"] else ", expired but still active")
+        + ")"
+        for item in shared
+    )
+
+
 def cmd_lease_end(args: argparse.Namespace) -> None:
     api = ProxmoxAPI()
     with controller_lock():
@@ -1639,6 +1727,31 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
                 "survive. Use 'proxmox-lab lease-destroy --lease "
                 f"{args.lease} --confirm' to remove it and its machines "
                 "for good."
+            )
+        # Strictly before anything is powered on, stopped or deleted. A
+        # warning that arrives next to an already-destroyed guest is worthless.
+        shared = shared_lease_resources(lease)
+        if shared and not getattr(args, "shared_guests_authorized", False):
+            audit(
+                "lease-end-refused-shared-guest",
+                lease=args.lease,
+                shared_with_other_leases=shared,
+            )
+            raise LabError(
+                f"Lease {args.lease} would destroy guest(s) that another "
+                "active lease still registers: "
+                + describe_shared_resources(shared)
+                + ". Deleting one of those stops somebody else's work and is "
+                "not recoverable. End or abandon the other lease first, or "
+                "re-run with --shared-guests-authorized to destroy them "
+                "anyway."
+            )
+        if shared:
+            print(
+                "warning: destroying guest(s) another active lease registers, "
+                "because --shared-guests-authorized was given: "
+                + describe_shared_resources(shared),
+                file=sys.stderr,
             )
         if not api.reachable() and lease_requires_cleanup(lease):
             ensure_on(api)
@@ -1662,6 +1775,7 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
             remaining_active_leases=[x["id"] for x in others],
             long_term_leases=[x["id"] for x in persistent],
             host_powered_off=host_powered_off,
+            shared_with_other_leases=shared,
         )
     result: dict[str, Any] = {
         "lease": args.lease,
@@ -1671,6 +1785,13 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
     }
     if lease.get("transferred_resources"):
         result["left_to_another_lease"] = lease["transferred_resources"]
+    if shared:
+        result["shared_with_other_leases"] = shared
+        result["warning"] = (
+            "--shared-guests-authorized was given, so this lease-end acted on "
+            "guest(s) another active lease also registers: "
+            + describe_shared_resources(shared)
+        )
     if persistent:
         # Say this loudly. A machine left running is the surprise nobody
         # wants on their electricity bill.
@@ -1822,6 +1943,16 @@ def guest_load(record: dict[str, Any] | None) -> dict[str, Any]:
 
     Returned with every orphan, busy or not, so the reader can disagree with
     the threshold instead of having to trust it.
+
+    `disk_written_bytes` is **advisory and reported only**. Proxmox's
+    `diskwrite` has been observed reading 0 for an entire session on a qcow2
+    guest over directory-backed storage that was demonstrably writing, so it
+    is not a signal anything here decides on -- in either direction. It is
+    also cumulative, so a non-zero value says the guest wrote at some point
+    since boot, not that it is writing now. For an answer that can be relied
+    on, measure the change over an interval with 'guest disk-activity
+    --ground-truth', which cross-checks it against QEMU's own block counters
+    and the allocated size of the image file on the host.
     """
     if not isinstance(record, dict):
         return {}
@@ -1864,6 +1995,18 @@ def recent_guest_activity(
 
     A guest below the CPU floor is not proven idle, only not proven busy, so
     its measured load is reported either way.
+
+    The disk counter is deliberately **not** one of the signals. `diskwrite`
+    can read 0 on a guest that is writing hard (qcow2 over directory-backed
+    storage is the known case), so reading a zero as "idle" would stop live
+    work; and it is cumulative, so reading a non-zero as "busy" would keep a
+    long-abandoned guest running for ever on one write it did at boot. It
+    travels in `load` for the reader's benefit only, and no branch below
+    consults it. Anything that wants a real answer has to measure the delta,
+    which is what 'guest disk-activity' is for -- and that must never be
+    called from here: it costs a monitor round trip and, for the host-side
+    signal, the opt-in SSH boundary, neither of which belongs on the path
+    that decides whether to leave somebody's guest alone.
     """
     load = guest_load(record)
     if load.get("cpu_percent", 0) >= BUSY_CPU_FRACTION * 100:
@@ -2808,7 +2951,8 @@ def parser() -> argparse.ArgumentParser:
     api.add_argument(
         "--password-stdin",
         action="store_true",
-        help="Read a password value from stdin without exposing it in argv",
+        help="Read a password value from stdin without exposing it in argv. "
+             "It must not be empty: a write stores the credential",
     )
     api.add_argument(
         "--password-key",
@@ -2831,6 +2975,12 @@ def parser() -> argparse.ArgumentParser:
 
     end = sub.add_parser("lease-end")
     end.add_argument("--lease", required=True)
+    end.add_argument(
+        "--shared-guests-authorized", action="store_true",
+        help="destroy a registered guest even though another active lease "
+             "also registers it. Refused by default: that lease may be "
+             "mid-run, and a deleted guest does not come back",
+    )
     end.set_defaults(func=cmd_lease_end)
 
     abandon = sub.add_parser(

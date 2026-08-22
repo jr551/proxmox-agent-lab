@@ -20,6 +20,11 @@ Put `lease-end` in a trap, a `finally`, or the equivalent, so it runs even when
 the work fails. It must print `"host_powered_off": true`; if it does not, say
 so plainly rather than reporting success.
 
+`lease-end` refuses before it touches anything if a guest it would destroy is
+still registered to another active lease, naming the guest and that lease. Do
+not reach for `--shared-guests-authorized` to get past it: end or abandon the
+other lease instead, unless the user has said that guest is theirs to delete.
+
 `lease-begin` powers the machine on. Expect it to take a minute or two. Omit
 `--timeout` so the configured boot budget is used. A cold-start override below
 90 seconds is rejected; a short timeout creates duplicate leases and false
@@ -47,6 +52,11 @@ whether VNC keystrokes will land, and what to do about it. Then:
 
 `guest run` picks between the first two automatically. Prefer it over calling
 `console exec` or `console text` directly unless you need something specific.
+
+A guest with **no password at all** — a stock installer, a rescue shell, a
+blank-root appliance — still uses the serial channel: pass `--password-stdin`
+and feed it an empty line (`</dev/null`, or `<<< ''`). What is refused is
+*forgetting* the flag, which is not the same statement.
 
 **Prefer text over pixels.** If a guest can hand you real characters, take
 them. A screenshot of a terminal is strictly worse than its output: you cannot
@@ -152,6 +162,7 @@ unless the user asked for that specific change:
 | Formatting a disk | `--wipe-confirmed` plus `--expect-serial` | Irreversible, and device names move between boots |
 | Preparing a host for memflow, or USB passthrough | `--host-change-authorized` | Installs a toolchain / hands host hardware to a guest |
 | Writing live guest memory (`memflow write`, `memflow phys-write`) | `--i-understand` | A wrong byte crashes or compromises the running guest |
+| Ending a lease that shares a guest with another active lease | `--shared-guests-authorized` | The other lease may be mid-run, and a deleted guest does not come back |
 | Deleting a guest the lease did not create | *not possible* | Refused outright |
 
 Before anything destructive, **look at the target**. A disk that "should be

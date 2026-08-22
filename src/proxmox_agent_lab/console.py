@@ -393,7 +393,14 @@ class TermSession:
             pass
         self.expect(("login:",), timeout=timeout, poke=True)
         self.send_line(user)
-        self.expect(("assword:",), timeout=60)
+        # A guest with no password set -- an installer, a rescue shell, a
+        # stock appliance -- drops straight to a shell and never prints a
+        # password prompt. Waiting only for "assword:" hung there for the full
+        # timeout, which made an empty password useless even once it was
+        # allowed through.
+        matched, _ = self.expect(("assword:", "$ ", "# "), timeout=60)
+        if matched in ("$ ", "# "):
+            return
         self.send_line(password)
         matched, transcript = self.expect(
             ("$ ", "# ", "Login incorrect"), timeout=60

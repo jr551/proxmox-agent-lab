@@ -184,7 +184,7 @@ thread, and enforces the eight-hour MCP-idle shutdown threshold. A lease
 heartbeat prevents cleanup and idle shutdown during legitimate long-running
 work.
 
-Two properties of that sweep matter enough to state:
+Three properties of the cleanup path matter enough to state:
 
 - **It retries a failed cleanup.** A lease left in `cleanup_failed` — say a
   QEMU lock timed out while stopping one guest — is picked up by every later
@@ -198,6 +198,25 @@ Two properties of that sweep matter enough to state:
   `left_to_another_lease`. An expired claim does not shield a guest, so two
   stale leases cannot leave one running for ever. `lease-register` also refuses
   outright to take a guest that a live lease already owns.
+- **`lease-end` refuses up front when a guest is cross-referenced.** The two
+  checks above are per-resource and ask whether the *other* lease is live, and
+  `lease-register` is not the only way a guest gets registered — an idempotent
+  setup command (`memflow ghidra-setup --lxc N`, `netcap mitm-setup --lxc N`)
+  calls `register_resource` directly. So before `lease-end` powers anything on,
+  stops anything, or deletes anything, it cross-references every guest it would
+  *delete* against the resources of every other `active` lease, including
+  long-term ones and ones that are past their expiry. If any match, the command
+  refuses, naming the guest and the other lease id, and records
+  `lease-end-refused-shared-guest` in the audit journal. The check reads lease
+  records only, so it adds no network call inside the controller lock.
+
+  `--shared-guests-authorized` proceeds anyway. It does not disable the
+  per-resource check inside cleanup, so a guest a still-live lease owns is
+  still left alone and reported as `left_to_another_lease`; what the flag
+  allows through is a guest claimed only by an expired-but-`active` record.
+  Either way the shared guests are named in `shared_with_other_leases`, in the
+  `lease-end` audit event, and on stderr. A `retain` resource is out of scope:
+  `lease-end` never deletes one, so its behaviour is unchanged.
 
 If an ordinary lease is stale but every registered guest is already stopped,
 use `proxmox-lab lease-abandon --lease <id> --confirm`. It verifies those

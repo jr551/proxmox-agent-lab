@@ -61,6 +61,11 @@ are also registered with policy `retain`, so ordinary cleanup skips them.
 You cannot end a long-term lease with `lease-end`; it refuses and points you
 at `lease-destroy`. Two different intentions deserve two different commands.
 
+The protection runs the other way too. If an *ordinary* lease has registered a
+guest that a long-term lease also registers — an idempotent setup command run
+under both, say — `lease-end` on the ordinary lease refuses before it touches
+anything, naming the guest and the long-term lease.
+
 To close the lease while preserving every guest registered with policy
 `retain`, use the distinct release operation:
 

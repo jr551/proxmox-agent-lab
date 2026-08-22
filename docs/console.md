@@ -360,9 +360,35 @@ supports driving a getty directly:
 
 - `expect(patterns, poke=True)` — read until a pattern appears, nudging an idle
   console with newlines so it redraws a prompt drawn before we attached;
-- `login(user, password)` — log in without echoing the password anywhere;
+- `login(user, password)` — log in without echoing the password anywhere. It
+  accepts an empty password, and returns as soon as a shell prompt appears, so
+  a guest that never asks for one (an installer, a rescue shell, a blank-root
+  appliance) logs in rather than waiting out the timeout;
 - `run(command)` — run one command, using an echoed sentinel so completion is
   unambiguous even when the command prints nothing.
 
 This is how the VPN gateway bootstraps its agent, and how `net leak-test` runs
 inside an Alpine guest that has no agent at all.
+
+### An empty console password is a credential
+
+`guest run --password-stdin` and `net leak-test --password-stdin` distinguish
+*no password was supplied* from *an empty password was supplied*. The second is
+a real credential — plenty of guests have no password at all — and is accepted,
+but only when the flag says so explicitly:
+
+```bash
+proxmox-lab guest run --lease "$L" --vmid 9001 --password-stdin \
+  -- uname -a </dev/null
+```
+
+Omitting `--password-stdin` on `guest run` still refuses the serial channel
+with the old message rather than silently trying a blank login, so a caller who
+simply forgot the flag is not quietly given one. (`net leak-test` requires the
+flag, so there the only question is what is fed to it.)
+
+The commands that *create* a credential are deliberately stricter and reject an
+empty one: `api --password-stdin` would write a blank password into a Proxmox
+object, and `windows install --password-stdin` would build a blank-password
+Administrator account into the answer file. Omit the flag there to have a
+strong password generated instead.

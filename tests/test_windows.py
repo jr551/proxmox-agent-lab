@@ -19,6 +19,7 @@ _TEST_STATE = Path(tempfile.gettempdir()) / "proxmox-agent-lab-test-state"
 shutil.rmtree(_TEST_STATE, ignore_errors=True)
 _TEST_STATE.mkdir(parents=True, exist_ok=True)
 os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
+import io  # noqa: E402
 import sys  # noqa: E402
 import re  # noqa: E402
 import time  # noqa: E402
@@ -304,3 +305,47 @@ class DriverPathTests(unittest.TestCase):
             owner="o", image_index=2, driver_branch="2k22")
         keys = re.findall(r'wcm:keyValue="(\d+)"', xml)
         self.assertEqual(len(keys), len(set(keys)))
+
+
+class AdministratorPasswordTests(unittest.TestCase):
+    """The answer file *creates* the account, so an empty password is refused.
+
+    That is deliberately the opposite of a guest console login, where an empty
+    password is a fact about a guest that already has none.
+    """
+
+    def _args(self, **overrides: object) -> mock.Mock:
+        defaults = dict(
+            lease="L1", vmid=9060, version="2022", template_vmid=None,
+            name=None, driver_branch=None, unattended=True,
+            password_stdin=True,
+        )
+        defaults.update(overrides)
+        return mock.Mock(**defaults)
+
+    def _lab(self) -> mock.Mock:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        lab.CONFIG = LAB.CONFIG
+        lab.load_lease.return_value = {"resources": [], "initial_vmids": []}
+        return lab
+
+    def test_an_empty_password_is_refused_before_the_clone(self) -> None:
+        lab = self._lab()
+        with mock.patch.object(windows, "_clone") as clone, \
+             mock.patch.object(sys, "stdin", io.StringIO("\n")):
+            with self.assertRaises(RuntimeError) as caught:
+                windows.cmd_install(lab, self._args())
+        self.assertIn("empty Administrator password", str(caught.exception))
+        clone.assert_not_called()
+        lab.register_resource.assert_not_called()
+
+    def test_omitting_the_flag_still_generates_a_password(self) -> None:
+        lab = self._lab()
+        with mock.patch.object(windows, "_clone",
+                               side_effect=RuntimeError("clone reached")), \
+             mock.patch.object(sys, "stdin", io.StringIO("")):
+            with self.assertRaises(RuntimeError) as caught:
+                windows.cmd_install(lab, self._args(password_stdin=False))
+        self.assertEqual(str(caught.exception), "clone reached")

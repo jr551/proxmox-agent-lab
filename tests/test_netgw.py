@@ -13,6 +13,7 @@ import sys
 sys.path.insert(0, str(SRC))
 
 import base64
+import io
 
 from proxmox_agent_lab import console as lab_console  # noqa: E402
 from proxmox_agent_lab import netgw as lab_netgw  # noqa: E402
@@ -145,6 +146,40 @@ class DhcpTftpTests(unittest.TestCase):
                                "--file", str(source),
                                "--name", "../evil.bin")
                 )
+
+
+class LeakTestPasswordTests(unittest.TestCase):
+    """A stock lab image can have no console password; that is still a login."""
+
+    def _run(self, stdin: str) -> mock.Mock:
+        lab = _lab(tempfile.gettempdir())
+        term = mock.MagicMock()
+        term.__enter__.return_value = term
+        term.run.return_value = "UNREACHABLE"
+        with mock.patch.object(lab_netgw.console, "TermSession",
+                               return_value=term), \
+             mock.patch.object(lab_netgw, "_controller_public_ip",
+                               return_value="203.0.113.9"), \
+             mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+             mock.patch("builtins.print"):
+            # The fake guest reports no egress, so the check itself fails at
+            # the end. Irrelevant here: the login has already happened.
+            with self.assertRaises(RuntimeError):
+                lab_netgw.cmd_leak_test(
+                    lab,
+                    _args(lab, "net", "leak-test", "--lease", "L1",
+                          "--vmid", "9001", "--password-stdin",
+                          "--no-install-tools"),
+                )
+        return term
+
+    def test_an_explicit_empty_password_is_accepted(self) -> None:
+        term = self._run("\n")
+        term.login.assert_called_once_with("alpine", "")
+
+    def test_a_real_password_is_still_forwarded(self) -> None:
+        term = self._run("hunter2\n")
+        term.login.assert_called_once_with("alpine", "hunter2")
 
 
 def _args(lab: mock.Mock, *argv: str):

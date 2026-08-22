@@ -76,17 +76,23 @@ screenshot/keyboard loop instead (see
 after install — for example an upstart getty plus `console=ttyS0` on the
 kernel line — for later text access.
 
-## 🔤 OCR
+## 👁️ Reading a screen
 
-Off by default, and it should usually stay off:
+A screen is read by a model. Work down this list:
 
-1. You can read the PNG. A model looking at a screenshot beats any decoder here.
-2. Where a guest is a real terminal, `console text` gives exact characters, and
-   a guess is worse than the truth.
+1. **Guest is a terminal** — `console text`. Proxmox hands over the guest's
+   real character stream; exact beats any look at pixels.
+2. **You can see images** — `console screenshot`, then read the PNG it wrote.
+3. **You cannot see images** — `console inspect` when a vision key is stored,
+   otherwise `console screenshot --for-model`, which returns the screen inline
+   as a bounded base64 PNG for you to decode and look at. `console inspect`
+   attaches the same base64 copy automatically when every provider fails, so a
+   vision outage never leaves you with nothing to read.
 
-`console screenshot --ocr` exists for the narrow case both of those miss: a
-VGA text-mode screen reachable only over VNC. It refuses on graphical screens
-and needs a font table installed first.
+There is no OCR. Glyph matching only worked on a guest whose console font the
+controller already had; `--ocr` and `console import-font` now error with a
+pointer here and are deleted in 0.11.0. Never substitute Tesseract, crops, or
+image filters for actually looking at the screen.
 
 ## 🩺 When something fails
 
@@ -149,9 +155,10 @@ empty" may not be — check before you wipe, and report what you found.
   images, painful to boot from.
 - **For GUI installers, use the bounded checkpoint loop.** One action can
   return its settled screenshot with `--screenshot-after 3`; do not create
-  external OCR/Pillow crop loops. Use `console inspect` first when an optional
+  external crop-and-filter loops. Use `console inspect` first when an optional
   cloud vision key is configured. Otherwise, if the current model has no
-  vision, delegate the single-screen decision to one that does. See
+  vision, get the screen inline with `console screenshot --for-model`, or
+  delegate the single-screen decision to a model that can see. See
   [gui-installers.md](gui-installers.md).
 
 ## 📝 A worked example

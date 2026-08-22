@@ -1,7 +1,8 @@
-"""Minimal stdlib-only PNG writer.
+"""Minimal stdlib-only PNG writer, reader and resampler.
 
-The controller must run under the system interpreter, so image output cannot
-depend on Pillow or numpy.
+The controller must run under the system interpreter, so image handling cannot
+depend on Pillow or numpy. `zlib` plus a few loops is enough for the shapes
+this project produces and consumes: 8-bit, non-interlaced PNGs.
 """
 
 from __future__ import annotations
@@ -84,11 +85,17 @@ def _chunk(tag: bytes, payload: bytes) -> bytes:
     )
 
 
-def encode_png(width: int, height: int, rgb: bytes) -> bytes:
-    """Encode a packed RGB buffer (3 bytes per pixel, top-down) as a PNG."""
+def encode_png(width: int, height: int, rgb: bytes, level: int = 6) -> bytes:
+    """Encode a packed RGB buffer (3 bytes per pixel, top-down) as a PNG.
+
+    `level` is the zlib compression level. The default keeps ordinary captures
+    fast to write; callers that must fit an image inside a byte budget pass 9.
+    """
     expected = width * height * 3
     if len(rgb) != expected:
         raise ValueError(f"expected {expected} RGB bytes, got {len(rgb)}")
+    if not 0 <= level <= 9:
+        raise ValueError("zlib compression level must be between 0 and 9")
     stride = width * 3
     raw = bytearray()
     for row in range(height):
@@ -97,9 +104,161 @@ def encode_png(width: int, height: int, rgb: bytes) -> bytes:
     return (
         b"\x89PNG\r\n\x1a\n"
         + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + _chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + _chunk(b"IDAT", zlib.compress(bytes(raw), level))
         + _chunk(b"IEND", b"")
     )
+
+
+def downscale_rgb(width: int, height: int, rgb: bytes,
+                  max_edge: int) -> tuple[int, int, bytes]:
+    """Shrink a packed RGB buffer so its longest edge fits `max_edge`.
+
+    Every source pixel contributes to exactly one destination pixel and each
+    destination pixel is the average of its box, so small text stays legible.
+    Nearest-neighbour sampling would drop whole scanlines and columns, which
+    is precisely what destroys 8-pixel-wide glyphs. An image already within
+    `max_edge` is returned untouched, buffer and all.
+    """
+    expected = width * height * 3
+    if len(rgb) != expected:
+        raise ValueError(f"expected {expected} RGB bytes, got {len(rgb)}")
+    if max_edge < 1:
+        raise ValueError("max_edge must be at least 1 pixel")
+    longest = max(width, height)
+    if longest <= max_edge:
+        return width, height, rgb
+    # Round to nearest so the aspect ratio survives; the longest edge lands
+    # exactly on max_edge because a half-pixel can never carry it past.
+    new_width = max(1, (width * max_edge + longest // 2) // longest)
+    new_height = max(1, (height * max_edge + longest // 2) // longest)
+    columns = [x * new_width // width for x in range(width)]
+    totals = [0] * (new_width * new_height * 3)
+    counts = [0] * (new_width * new_height)
+    for y in range(height):
+        row_base = (y * new_height // height) * new_width
+        offset = y * width * 3
+        for x in range(width):
+            cell = row_base + columns[x]
+            counts[cell] += 1
+            target = cell * 3
+            totals[target] += rgb[offset]
+            totals[target + 1] += rgb[offset + 1]
+            totals[target + 2] += rgb[offset + 2]
+            offset += 3
+    out = bytearray(new_width * new_height * 3)
+    for cell, count in enumerate(counts):
+        if not count:
+            continue
+        target = cell * 3
+        out[target] = totals[target] // count
+        out[target + 1] = totals[target + 1] // count
+        out[target + 2] = totals[target + 2] // count
+    return new_width, new_height, bytes(out)
+
+
+def _unfilter_row(line: bytearray, previous: bytes, filter_type: int,
+                  bpp: int) -> None:
+    """Reverse one PNG scanline filter in place (RFC 2083 section 6)."""
+    if filter_type == 0:
+        return
+    if filter_type == 1:  # Sub
+        for index in range(bpp, len(line)):
+            line[index] = (line[index] + line[index - bpp]) & 0xFF
+    elif filter_type == 2:  # Up
+        for index in range(len(line)):
+            line[index] = (line[index] + previous[index]) & 0xFF
+    elif filter_type == 3:  # Average
+        for index in range(len(line)):
+            left = line[index - bpp] if index >= bpp else 0
+            line[index] = (
+                line[index] + ((left + previous[index]) >> 1)
+            ) & 0xFF
+    elif filter_type == 4:  # Paeth
+        for index in range(len(line)):
+            left = line[index - bpp] if index >= bpp else 0
+            up = previous[index]
+            up_left = previous[index - bpp] if index >= bpp else 0
+            estimate = left + up - up_left
+            da, db, dc = (
+                abs(estimate - left), abs(estimate - up), abs(estimate - up_left)
+            )
+            if da <= db and da <= dc:
+                predictor = left
+            elif db <= dc:
+                predictor = up
+            else:
+                predictor = up_left
+            line[index] = (line[index] + predictor) & 0xFF
+    else:
+        raise ValueError(f"unknown PNG filter type {filter_type}")
+
+
+def decode_png(data: bytes) -> tuple[int, int, bytes]:
+    """Decode an 8-bit non-interlaced PNG into a packed RGB buffer.
+
+    Enough of the format to read back what this project writes and what QEMU's
+    `screendump -f png` produces: greyscale, RGB, and either of those with an
+    alpha channel, which is discarded. Palette and 16-bit images are refused
+    rather than guessed at.
+    """
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    header: tuple[int, ...] | None = None
+    compressed = bytearray()
+    position = 8
+    while position + 8 <= len(data):
+        length = struct.unpack(">I", data[position:position + 4])[0]
+        tag = data[position + 4:position + 8]
+        payload = data[position + 8:position + 8 + length]
+        if len(payload) != length:
+            raise ValueError("truncated PNG chunk")
+        position += 12 + length
+        if tag == b"IHDR":
+            header = struct.unpack(">IIBBBBB", payload)
+        elif tag == b"IDAT":
+            compressed += payload
+        elif tag == b"IEND":
+            break
+    if header is None:
+        raise ValueError("PNG has no IHDR chunk")
+    width, height, depth, colour, compression, filtering, interlace = header
+    if depth != 8:
+        raise ValueError(f"only 8-bit PNGs are supported, got {depth}-bit")
+    if compression or filtering or interlace:
+        raise ValueError("only non-interlaced deflate PNGs are supported")
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(colour)
+    if channels is None:
+        raise ValueError(f"unsupported PNG colour type {colour}")
+    if not width or not height:
+        raise ValueError("PNG has no pixels")
+    try:
+        raw = zlib.decompress(bytes(compressed))
+    except zlib.error as exc:
+        raise ValueError(f"PNG pixel data will not inflate: {exc}") from None
+    stride = width * channels
+    if len(raw) != (stride + 1) * height:
+        raise ValueError("PNG pixel data has the wrong length")
+    out = bytearray(width * height * 3)
+    previous = bytes(stride)
+    position = 0
+    for row in range(height):
+        filter_type = raw[position]
+        line = bytearray(raw[position + 1:position + 1 + stride])
+        position += stride + 1
+        _unfilter_row(line, previous, filter_type, channels)
+        base = row * width * 3
+        if channels == 3:
+            out[base:base + stride] = line
+        elif channels == 4:
+            for x in range(width):
+                out[base + x * 3:base + x * 3 + 3] = line[x * 4:x * 4 + 3]
+        else:  # 1 or 2 channels: greyscale, alpha discarded
+            for x in range(width):
+                grey = line[x * channels]
+                target = base + x * 3
+                out[target] = out[target + 1] = out[target + 2] = grey
+        previous = bytes(line)
+    return width, height, bytes(out)
 
 
 def _draw_label(out: bytearray, width: int, height: int, value: str,

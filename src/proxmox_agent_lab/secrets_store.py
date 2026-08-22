@@ -38,6 +38,7 @@ KNOWN_SECRETS = {
     "ngrok-authtoken": "ngrok authtoken, for sharing a guest console",
     "nvidia-api-key": "NVIDIA API key for opt-in screenshot vision analysis",
     "openrouter-api-key": "OpenRouter API key for fallback vision analysis",
+    "kilo-api-key": "Kilo Code gateway key for fallback vision analysis",
 }
 
 

@@ -136,25 +136,27 @@ proxmox-lab console type  --lease "$L" --vmid <id> --text-stdin --enter
 
 For GUI installers, attach `--screenshot-after 3` to `keys`, `type`, or
 `click`. Make one action, read the returned full PNG, and repeat. After three
-unchanged attempts, stop and diagnose; never build an ad-hoc Pillow/Tesseract
-crop loop. If the active model has no vision, delegate the single-screen
-decision to a vision-capable model while keeping all mutations in the primary
-agent. Follow [docs/gui-installers.md](docs/gui-installers.md), including its
-Haiku checkpoint map.
+unchanged attempts, stop and diagnose; never build an ad-hoc crop-and-filter
+loop. If the active model has no vision, get the screen inline with
+`console screenshot --for-model` or delegate the single-screen decision to a
+vision-capable model, keeping all mutations in the primary agent. Follow
+[docs/gui-installers.md](docs/gui-installers.md), including its Haiku
+checkpoint map.
 
 When `proxmox-lab secrets list` reports a vision key stored, prefer `console
 inspect --lease "$L" --vmid <id>` for the first graphical read. It explicitly
 sends one lease-owned PNG concurrently through NVIDIA Nemotron Nano 12B v2 VL,
-the named OpenRouter Nemotron Omni free endpoint, and `openrouter/free`, using
-the first structurally valid proposal. Every configured route receives the
-screen in automatic mode. The provider sees a same-size copy with labelled
-100-pixel X/Y axes; later frames dim stable pixels while changes stay bright
-and outlined. The original screenshot remains untouched.
-Never treat model output as
-authorization or bypass the click-calibration guard. OpenRouter free providers
-may retain prompts for service improvement; do not send confidential or
-personal screens. Without a key, use native vision or the single-screen
-delegation above.
+the named OpenRouter Nemotron Omni free endpoint, `openrouter/free`, and the
+Kilo Code gateway's `kilo-auto/balanced` router, using the first structurally
+valid proposal. Every configured route receives the screen in automatic mode.
+The provider sees a same-size copy with labelled 100-pixel X/Y axes; later
+frames dim stable pixels while changes stay bright and outlined. The original
+screenshot remains untouched. Never treat model output as authorization or
+bypass the click-calibration guard. OpenRouter free providers may retain
+prompts for service improvement; do not send confidential or personal screens.
+If every provider fails, `console inspect` still errors but also returns the
+screen as a bounded base64 PNG under `image`, so read that rather than driving
+blind (`--no-image-fallback` suppresses it).
 
 `console click` requires a visible target label. The harness moves the cursor,
 captures a full checkpoint, and clicks only when cloud vision independently
@@ -170,9 +172,20 @@ read the PNG when a screen is the truth. **A guest whose display is the serial
 console accepts screenshots but silently ignores VNC keystrokes** — probe
 reports that as `keyboard_input: false`.
 
-OCR is opt-in (`console screenshot --ocr`), only meaningful on VGA text-mode
-screens, and refuses on graphical ones. Never reach for it when `console text`
-can answer the same question.
+### Reading a screen
+
+A screen is read by a model, never by glyph matching. In order: `console text`
+when the guest is a real terminal (exact characters straight from Proxmox);
+`console screenshot` and read the PNG when you can see images; `console
+inspect` or `console screenshot --for-model` when you cannot. `--for-model`
+adds an `image` object to the JSON holding the screen as a bounded, downscaled
+base64 PNG with its `scale` factor and original dimensions, for a caller that
+reads images but cannot open a file here.
+
+There is no OCR. It only ever read a guest whose console font this controller
+already had, and a guest shipping its own font decoded to noise. `--ocr` and
+`console import-font` now error with a pointer to the above and are deleted in
+0.11.0.
 
 ## 🔗 Sharing a console with a person
 

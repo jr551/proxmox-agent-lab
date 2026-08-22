@@ -13,7 +13,28 @@ Pick the cheapest channel that answers the question.
 | Guest is a Linux shell, LXC, or has a serial console | `console text` | Returns the exact character stream from Proxmox |
 | Guest runs qemu-guest-agent | `console exec` | Real exit codes, stdout and stderr |
 | Graphical screen: installer, desktop, BIOS, boot menu | `console screenshot` | A multimodal model reads the PNG directly |
-| Text-mode screen reachable only over VNC | `console screenshot --ocr` | Opt-in glyph decoding; see below |
+| You cannot see images yourself | `console screenshot --for-model` or `console inspect` | Hands the screen to a model that can |
+
+## Reading a screen
+
+A screen is read by a model, never by glyph matching. Three ways, in the order
+you should reach for them:
+
+1. **The guest is a terminal** — `console text`. Proxmox hands over the guest's
+   real character stream. Exact, cheap, always better than looking at pixels.
+2. **You can see images** — `console screenshot`, then read the PNG it wrote.
+3. **You cannot see images** — either `console inspect`, which sends one
+   lease-owned screen to a configured cloud vision provider, or
+   `console screenshot --for-model`, which returns the screen inline as a
+   bounded base64 PNG for your own vision to decode. `console inspect` also
+   falls back to that base64 copy automatically when every provider fails, so
+   a missing or broken vision key never leaves you with nothing to look at.
+
+There is no OCR. Glyph matching only ever worked on a guest whose console font
+this controller already had, and a guest that ships its own font decoded to
+noise — see [issue #95](https://github.com/jr551/proxmox-agent-lab/issues/95).
+`--ocr` and `console import-font` still exist as errors that point here; they
+are deleted in 0.11.0.
 
 ## Screenshots
 
@@ -28,6 +49,41 @@ path, dimensions, and whether the screen looks like a text console. Add
 The capture path is a self-contained RFB client: Proxmox `vncproxy`, a
 WebSocket upgrade, RFB 3.8 with VNC authentication, and Raw/Zlib/CopyRect
 decoding into a PNG written with `zlib` alone. No Pillow, numpy, or noVNC.
+
+### Getting the pixels back inline: `--for-model`
+
+```bash
+proxmox-lab console screenshot --vmid 9001 --for-model
+```
+
+Adds an `image` object to the JSON holding the screen as a base64 PNG, for a
+caller that reads images itself but cannot open a file on this machine. It is
+opt-in on purpose — an unrequested megabyte of base64 in every screenshot
+would be hostile — and works on both `--via vnc` and `--via monitor`.
+
+The image is compressed but deliberately not over-compressed:
+
+| Field | Meaning |
+|---|---|
+| `encoding`, `mime_type` | Always `base64` and `image/png` |
+| `width`, `height` | What was actually emitted |
+| `original_width`, `original_height` | The real framebuffer |
+| `scale` | Emitted width ÷ original width; multiply coordinates back by it |
+| `bytes`, `base64_bytes` | PNG size and encoded size |
+| `base64` | The image. Absent if the cap could not be met — `error` says why |
+
+A screen already within 1280 pixels on its longest edge is sent untouched at
+`scale: 1.0`. Anything larger is box-averaged down to 1280 (a 1920x1080
+desktop becomes 1280x720) and re-encoded at maximum zlib compression. Averaging
+matters: nearest-neighbour resampling drops whole scanlines and destroys
+8-pixel glyphs, which is the entire point of keeping the text readable. If the
+result still exceeds a 1.5 MB base64 cap, the bound steps down until it fits,
+never below 640 pixels — under that an 80-column line falls below 8 pixels per
+glyph and stops being readable. A screen that cannot fit even at the floor
+returns `error` instead of an unbounded blob; read the written PNG instead.
+
+Only the fact and the byte size are audited. The image itself never enters the
+journal.
 
 ### Watching something slow: `screenshot-burst`
 
@@ -82,7 +138,7 @@ The result carries `"source": "monitor"` (the default VNC path reports
 because those need the raw framebuffer — so keep VNC as the default and reach
 for this only when VNC fails.
 
-## Optional cloud vision fallback
+## Optional cloud vision: `console inspect`
 
 ```bash
 proxmox-lab console inspect --lease "$L" --vmid 9001
@@ -91,13 +147,36 @@ proxmox-lab console inspect --lease "$L" --vmid 9001
 This stores the untouched PNG locally and overlays a labelled 100-pixel X/Y
 grid on a separate same-size model-input PNG. Later frames dim unchanged pixels
 while changed regions stay bright with a magenta boundary. Automatic mode
-races NVIDIA Nemotron Nano 12B v2 VL, the named OpenRouter Nemotron Omni free
-endpoint, and `openrouter/free`, returning the first structurally valid answer.
+races four routes and returns the first structurally valid answer:
+
+| `--provider` | Route |
+|---|---|
+| `nvidia` | NVIDIA Nemotron Nano 12B v2 VL |
+| `openrouter-nemotron` | The named OpenRouter Nemotron Omni free endpoint |
+| `openrouter-free` | `openrouter/free` |
+| `kilo` | The Kilo Code gateway's `kilo-auto/balanced` router |
+
 Use `--provider` to test one stage. Automatic mode sends the screen to every
-configured route concurrently. The guest must be registered to the
-given lease. The command audits the selected provider/model but never the
-image, prompt, or key. Free OpenRouter providers may log prompts for service
+configured route concurrently. The guest must be registered to the given
+lease. The command audits the selected provider/model but never the image,
+prompt, or key. Free OpenRouter providers may log prompts for service
 improvement, so do not submit confidential or personal screens.
+
+`kilo-auto/balanced` is Kilo's balanced auto router: it picks a vision-capable
+model on Kilo's side rather than pinning one here, so the provider does not
+break the day a specific model is retired. The result records the router id
+under `requested_model` and whichever concrete model actually answered under
+`model`.
+
+### When every provider fails
+
+`console inspect` still exits non-zero and still audits the failure — a vision
+outage is never quietly reported as success. But it also prints the screen as
+a base64 PNG under `image`, in the same shape and with the same bounds as
+[`--for-model`](#getting-the-pixels-back-inline---for-model), so a caller with
+its own vision can read the screen instead of acting blind. `vision_error`
+carries the reason. Pass `--no-image-fallback` to suppress the blob and get
+the error alone.
 
 This is intentionally separate from `screenshot`: external image transmission
 must be explicit. The model's coordinates are advisory and still pass through
@@ -210,8 +289,8 @@ proxmox-lab console text --vmid 9001 --send "ip -br a" --seconds 4
 
 Attaches to the Proxmox terminal (`termproxy`) for an LXC container or a QEMU
 guest that has a serial device, optionally sends one line, and returns the
-output with escape sequences stripped. This is exact text. Prefer it over any
-form of OCR.
+output with escape sequences stripped. This is exact text. Prefer it over
+looking at pixels whenever the guest has a real terminal.
 
 A QEMU guest needs `serial0: socket` in its config for this path; cloud-init
 templates in this lab are built with it.
@@ -272,35 +351,19 @@ proxmox-lab console text --vmid 9001 --send-raw "cont" --lease "$L"
 the guest — so `nc 127.0.0.1 <port>` is a full interactive serial terminal; a
 read-only `socat -u` fallback is not needed.
 
-## OCR policy
+## Why there is no OCR
 
-OCR is **off by default and only meaningful for text-mode screens**. The
-reasoning:
+Earlier versions decoded VGA text screens by matching each character cell
+against a font table. It is gone. The decoder could only read a guest whose
+console font the controller happened to hold; a guest shipping its own font —
+ReactOS setup, for one — decoded to a wall of replacement characters at 0.003
+confidence, which is worse than useless because it looks like an answer. The
+general fix does not exist: any guest can draw any glyph it likes.
 
-1. Models driving this lab are multimodal, so a graphical screen is better read
-   from the PNG than from any decoder here.
-2. Where a guest is genuinely a terminal, Proxmox already hands over the real
-   characters, and a guess is strictly worse than the truth.
-
-That leaves one real gap: a VGA text-mode screen reachable only over VNC — a
-boot menu, BIOS setup, the Windows Setup text phase, a kernel panic. Those are
-a strict grid of fixed-size glyphs in a tiny palette, so `--ocr` does exact
-glyph lookup rather than fuzzy recognition. It reports `confidence` and warns
-below 0.5. On a graphical screen it refuses and says so.
-
-Lookup needs a font table, which is not shipped:
-
-```bash
-# from any local PSF console font
-proxmox-lab console import-font --file /path/to/Lat15-VGA16.psf.gz
-
-# or read one out of a running Linux guest
-proxmox-lab console import-font --lease "$L" --from-vmid 9001 \
-  --guest-path /usr/share/consolefonts/Lat15-VGA16.psf.gz
-```
-
-PSF1 and PSF2, plain or gzipped, with or without a Unicode table. The table is
-written to `assets/console-font.json` and is deliberately not committed.
+So reading a screen is a model's job now. See [Reading a screen](#reading-a-screen)
+above. `console screenshot --ocr` and `console import-font` remain registered
+only so that an upgrade fails with an explanation rather than
+`unrecognized arguments`; both are deleted in 0.11.0.
 
 ## Preflight
 
@@ -318,6 +381,12 @@ Granting a missing privilege is a host-level access change and needs the user's
 explicit authorization for that exact change. Note that an API token with
 privilege separation does not inherit its user's grants — ACLs must be set for
 both `agent@pve` and `agent@pve!lab`.
+
+It also reports screen-reading readiness under `vision`: `any_provider_key`,
+plus a `provider_keys` breakdown of which of `nvidia`, `openrouter` and `kilo`
+have a key this install can reach. Only whether a key is present — never the
+key. With none of them, use `console screenshot --for-model` and read the
+image yourself.
 
 ## Serial login on agentless guests
 

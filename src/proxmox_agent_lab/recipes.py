@@ -154,7 +154,8 @@ OPENBSD = {
     "invalid_shortcuts": COMMON_INVALID + [
         "Pass --content iso to storage download-url; its default is import.",
         "For QEMU creation POST to /nodes/<node>/qemu with --data vmid=<id>; newid is only for cloning.",
-        "Use console text for the serial installer instead of screenshot OCR or external OCR.",
+        "Use console text for the serial installer: it returns the guest's exact "
+        "character stream, where a screenshot only shows pixels.",
     ],
 }
 

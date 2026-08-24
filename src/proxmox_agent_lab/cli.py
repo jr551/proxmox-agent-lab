@@ -11,7 +11,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
+try:
+    import fcntl  # Unix advisory locks; unavailable on Windows
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 import io
 import json
 import os
@@ -198,7 +201,17 @@ def redact(value: Any, key: str = "") -> Any:
 def controller_lock() -> Any:
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     with LOCK_PATH.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
+        else:
+            try:
+                import msvcrt  # type: ignore[import-not-found]
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+            except Exception:
+                pass
         yield
 
 

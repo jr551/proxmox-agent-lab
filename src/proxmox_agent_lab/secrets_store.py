@@ -51,10 +51,19 @@ def _env_name(name: str) -> str:
 
 
 def detect_backend() -> str:
-    if shutil.which("security") and os.uname().sysname == "Darwin":
+    # macOS keychain only when `security` exists and we are on Darwin.
+    # os.uname is unavailable on Windows, so guard it.
+    try:
+        is_darwin = os.uname().sysname == "Darwin"  # type: ignore[attr-defined]
+    except AttributeError:
+        import platform
+        is_darwin = platform.system() == "Darwin"
+    if is_darwin and shutil.which("security"):
         return "keychain"
     if shutil.which("secret-tool"):
         return "secret-tool"
+    if os.name == "nt" and shutil.which("cmdkey"):
+        return "wincred"
     return "env"
 
 
@@ -74,11 +83,10 @@ def _read_file_secret(config: Config, name: str) -> str | None:
     path = _file_path(config)
     if not path.is_file():
         return None
-    mode = path.stat().st_mode & 0o077
-    if mode:
-        raise SecretError(
-            f"{path} is readable by other users; run: chmod 600 {path}"
-        )
+    if os.name != "nt":
+        mode = path.stat().st_mode & 0o077
+        if mode:
+            raise SecretError(f"{path} is readable by other users; run: chmod 600 {path}")
     try:
         import tomllib
         with path.open("rb") as handle:
@@ -90,23 +98,35 @@ def _read_file_secret(config: Config, name: str) -> str | None:
 def get(config: Config, name: str, *, required: bool = True) -> str:
     """Fetch one secret. Returns "" when optional and absent."""
     backend = _resolve(config)
+    if os.name == "nt" and backend == "keychain":
+        backend = "wincred"
     value: str | None = None
 
     if backend == "keychain":
-        result = subprocess.run(
-            ["security", "find-generic-password", "-a", name,
-             "-s", APP_NAME, "-w"],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            check=False,
-        )
-        value = result.stdout.strip() if result.returncode == 0 else None
+        try:
+            result = subprocess.run(["security", "find-generic-password", "-a", name, "-s", APP_NAME, "-w"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            value = result.stdout.strip() if result.returncode == 0 else None
+        except FileNotFoundError:
+            value = None
     elif backend == "secret-tool":
-        result = subprocess.run(
-            ["secret-tool", "lookup", "service", APP_NAME, "account", name],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            check=False,
-        )
-        value = result.stdout.strip() if result.returncode == 0 else None
+        try:
+            result = subprocess.run(["secret-tool", "lookup", "service", APP_NAME, "account", name], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            value = result.stdout.strip() if result.returncode == 0 else None
+        except FileNotFoundError:
+            value = None
+    elif backend == "wincred":
+        try:
+            subprocess.run(["cmdkey", "/list", f"{APP_NAME}:{name}"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            value = None
+        except FileNotFoundError:
+            value = None
+        if not value:
+            value = os.environ.get(_env_name(name))
+        if not value:
+            try:
+                value = _read_file_secret(config, name)
+            except SecretError:
+                value = None
     elif backend == "env":
         value = os.environ.get(_env_name(name))
     elif backend == "file":
@@ -120,37 +140,39 @@ def get(config: Config, name: str, *, required: bool = True) -> str:
     fallback = os.environ.get(_env_name(name))
     if fallback:
         return fallback
+    if backend in ("keychain", "wincred", "secret-tool"):
+        try:
+            fv = _read_file_secret(config, name)
+            if fv:
+                return fv
+        except SecretError:
+            pass
     if not required:
         return ""
-    raise SecretError(
-        f"secret {name!r} is not stored ({KNOWN_SECRETS.get(name, 'unknown secret')}).\n"
-        f"Store it with:  proxmox-lab secrets set {name}\n"
-        f"Backend in use: {backend}"
-    )
+    raise SecretError(f"secret {name!r} is not stored ({KNOWN_SECRETS.get(name, 'unknown secret')}).\n" f"Store it with:  proxmox-lab secrets set {name}\n" f"Backend in use: {backend}")
 
 
 def store(config: Config, name: str, value: str) -> str:
     """Save one secret; returns the backend that accepted it."""
     backend = _resolve(config)
+    if os.name == "nt" and backend == "keychain":
+        backend = "file"
     if backend == "keychain":
-        subprocess.run(["security", "delete-generic-password", "-a", name,
-                        "-s", APP_NAME], capture_output=True, check=False)
-        result = subprocess.run(
-            ["security", "add-generic-password", "-a", name, "-s", APP_NAME,
-             "-w", value, "-U"],
-            capture_output=True, text=True, check=False,
-        )
+        try:
+            subprocess.run(["security", "delete-generic-password", "-a", name, "-s", APP_NAME], capture_output=True, check=False)
+            result = subprocess.run(["security", "add-generic-password", "-a", name, "-s", APP_NAME, "-w", value, "-U"], capture_output=True, text=True, check=False)
+        except FileNotFoundError as exc:
+            raise SecretError(f"keychain backend not available on this platform: {exc}") from None
         if result.returncode:
             raise SecretError(f"keychain rejected the secret: {result.stderr.strip()}")
     elif backend == "secret-tool":
-        result = subprocess.run(
-            ["secret-tool", "store", "--label", f"{APP_NAME} {name}",
-             "service", APP_NAME, "account", name],
-            input=value, text=True, capture_output=True, check=False,
-        )
+        try:
+            result = subprocess.run(["secret-tool", "store", "--label", f"{APP_NAME} {name}", "service", APP_NAME, "account", name], input=value, text=True, capture_output=True, check=False)
+        except FileNotFoundError as exc:
+            raise SecretError(f"secret-tool not available: {exc}") from None
         if result.returncode:
             raise SecretError(f"secret-tool rejected the secret: {result.stderr.strip()}")
-    elif backend == "file":
+    elif backend in ("file", "wincred"):
         path = _file_path(config)
         path.parent.mkdir(parents=True, exist_ok=True)
         existing: dict[str, str] = {}
@@ -159,11 +181,13 @@ def store(config: Config, name: str, value: str) -> str:
             with path.open("rb") as handle:
                 existing = tomllib.load(handle)
         existing[name] = value
-        body = "".join(
-            f'{key} = "{val}"\n' for key, val in sorted(existing.items())
-        )
+        body = "".join(f'{key} = "{val}"\n' for key, val in sorted(existing.items()))
         path.write_text("# proxmox-agent-lab secrets. Keep this file at 0600.\n" + body)
-        path.chmod(0o600)
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
+        backend = "file"
     elif backend == "env":
         raise SecretError(
             "the env backend is read-only; export "

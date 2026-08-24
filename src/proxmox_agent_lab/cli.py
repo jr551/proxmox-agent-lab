@@ -1446,49 +1446,56 @@ def cmd_api(args: argparse.Namespace) -> None:
             data=data,
         )
     result = api.call(method, args.path, data)
-    task_status = None
-    if args.wait_task and isinstance(result, str) and result.startswith("UPID:"):
-        task_status = wait_task(api, result, timeout=args.task_timeout)
-    if write and lease:
-        create_match = re.fullmatch(
+    # Register the created guest BEFORE waiting on its task: if the wait
+    # times out or errors, the guest already exists and must belong to this
+    # lease, or lease-end leaves it behind as an orphan (audit 2026-08-24).
+    registered_early = False
+    if write and lease and method == "POST":
+        create_match_early = re.fullmatch(
             rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
         )
-        if method == "POST" and create_match:
-            kind_created = create_match.group(1)
-            created_vmid = int(data["vmid"])
+        if create_match_early and str(data.get("vmid", "")).isdigit():
+            kind_created = create_match_early.group(1)
             policy = "retain" if is_long_term(lease) else args.policy
-            # Reload inside the lock: the snapshot taken before api.call is
-            # stale, and an unlocked save clobbers concurrent creations'
-            # registrations. Every other lease mutator serializes here too.
             with controller_lock():
                 fresh = load_lease(args.lease)
                 register_resource(
-                    fresh, kind_created, created_vmid, policy,
+                    fresh, kind_created, int(data["vmid"]), policy,
                     data.get("name") or data.get("hostname"),
                 )
-            if is_long_term(lease):
-                from . import longterm
-                try:
-                    longterm.set_protection(
-                        _module(), api, kind_created, created_vmid, True
-                    )
-                except LabError as exc:
-                    print(f"warning: could not protect {created_vmid}: {exc}",
-                          file=sys.stderr)
-        report = {"data": result, "task_status": task_status}
-        try:
-            audit(
-                "proxmox-api-write",
-                lease=args.lease,
-                method=method,
-                path=args.path,
-                data=data,
-                result=result,
-                task_status=task_status,
-            )
-        except (LabError, OSError, journal_module.sqlite3.Error) as exc:
-            report["operation_succeeded"] = True
-            report["audit_recording_failed"] = str(exc)
+            registered_early = True
+    task_status = None
+    if args.wait_task and isinstance(result, str) and result.startswith("UPID:"):
+        task_status = wait_task(api, result, timeout=args.task_timeout)
+    if write and lease and method == "POST" and registered_early:
+        create_match = re.fullmatch(
+            rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
+        )
+        kind_created = create_match.group(1)
+        created_vmid = int(data["vmid"])
+        if is_long_term(lease):
+            from . import longterm
+            try:
+                longterm.set_protection(
+                    _module(), api, kind_created, created_vmid, True
+                )
+            except LabError as exc:
+                print(f"warning: could not protect {created_vmid}: {exc}",
+                      file=sys.stderr)
+    report: dict[str, Any] = {"data": result, "task_status": task_status}
+    try:
+        audit(
+            "proxmox-api-write",
+            lease=args.lease,
+            method=method,
+            path=args.path,
+            data=data,
+            result=result,
+            task_status=task_status,
+        )
+    except (LabError, OSError, journal_module.sqlite3.Error) as exc:
+        report["operation_succeeded"] = True
+        report["audit_recording_failed"] = str(exc)
     if write and method == "PUT" and "boot" in data:
         config_match = re.fullmatch(
             rf"/nodes/{re.escape(NODE)}/qemu/(\d+)/config", args.path
@@ -1631,6 +1638,15 @@ def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
             )
             continue
         try:
+            # The unattended answer ISO holds the Administrator password in
+            # plain text. An install abandoned before `windows finish` would
+            # otherwise leave it on shared storage for good (audit 2026-08-24).
+            if kind == "qemu" and resource.get("policy", "delete") == "delete":
+                try:
+                    from . import windows as windows_module
+                    windows_module._shred_answer_iso(_module(), api, vmid)
+                except Exception:  # noqa: BLE001 - best-effort, same as finish
+                    pass
             stop_guest(api, kind, vmid)
             if resource.get("policy", "delete") == "delete":
                 delete_guest(api, kind, vmid)

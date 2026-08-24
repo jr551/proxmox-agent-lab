@@ -363,6 +363,10 @@ def cmd_processes(lab: Any, args: Any) -> None:
 def cmd_read(lab: Any, args: Any) -> None:
     """Read raw bytes from the guest's kernel virtual address space."""
     _require_enabled(lab)
+    if args.len <= 0 or args.len > 16 * 1024 * 1024:
+        # Same cap as `dump`: the host-side helper allocates the full buffer
+        # as root, so an oversized request could OOM it (audit 2026-08-24).
+        raise lab.LabError("--len must be between 1 and 16777216 bytes")
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     _require_running_qemu(lab, api, args.vmid)
@@ -423,6 +427,10 @@ def cmd_phys_read(lab: Any, args: Any) -> None:
     works on Linux guests too. Useful once `scan` has located an address.
     """
     _require_enabled(lab)
+    if args.len <= 0 or args.len > 16 * 1024 * 1024:
+        # Same cap as `dump`: the host-side helper allocates the full buffer
+        # as root, so an oversized request could OOM it (audit 2026-08-24).
+        raise lab.LabError("--len must be between 1 and 16777216 bytes")
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     _require_running_qemu(lab, api, args.vmid)

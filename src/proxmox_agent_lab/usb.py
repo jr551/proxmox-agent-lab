@@ -165,6 +165,14 @@ def cmd_attach(lab: Any, args: Any) -> None:
 def cmd_detach(lab: Any, args: Any) -> None:
     """Remove a USB passthrough slot from a guest, returning it to the host."""
     _require_enabled(lab)
+    if not args.host_change_authorized:
+        # Symmetric with attach (audit 2026-08-24): handing a device back to
+        # the host is the same class of passthrough change.
+        raise lab.LabError(
+            "Detaching hands the device back to the host and is a passthrough "
+            "change. Re-run with --host-change-authorized once the user has "
+            "asked for that exact device."
+        )
     api = lab.ProxmoxAPI()
     lab.require_lease_resource(lab.load_lease(args.lease), "qemu", args.vmid)
     if not re.fullmatch(r"usb[0-4]", args.slot):
@@ -258,6 +266,7 @@ def register(sub: Any, lab: Any) -> None:
     detach.add_argument("--lease", required=True)
     detach.add_argument("--vmid", type=int, required=True)
     detach.add_argument("--slot", required=True, help="usb0..usb4")
+    detach.add_argument("--host-change-authorized", action="store_true")
     detach.set_defaults(func=bind(cmd_detach))
 
     sniff = usb_sub.add_parser(

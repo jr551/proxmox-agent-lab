@@ -596,26 +596,33 @@ def cmd_leak_test(lab: Any, args: Any) -> None:
 
         if args.gateway_vmid:
             # Kill-switch: with the tunnel down, egress must stop entirely
-            # rather than fall back to the home WAN.
-            _exec(lab, api, args.gateway_vmid, "systemctl stop wg-quick@wg0",
-                  timeout=120)
-            time.sleep(3)
-            during = term.run(_ping()).strip()
-            checks["icmp_with_tunnel_down"] = during or "NO RESULT"
-            # Only UNREACHABLE proves the kill switch held. An empty result
-            # means the probe itself failed, which must never be reported as
-            # either a pass or a leak.
-            checks["fails_closed"] = (
-                True if during == "UNREACHABLE"
-                else False if during == "REACHABLE"
-                else None
-            )
-            _exec(lab, api, args.gateway_vmid, "systemctl start wg-quick@wg0",
-                  timeout=120)
-            time.sleep(8)
-            after = term.run(_ping()).strip()
-            checks["icmp_after_tunnel_returns"] = after
-            checks["recovers_after_tunnel_returns"] = after == "REACHABLE"
+            # rather than fall back to the home WAN. The restart runs in a
+            # finally block: an exception mid-test must never leave the
+            # gateway tunnel down for the rest of the lease (audit 2026-08-24).
+            try:
+                _exec(lab, api, args.gateway_vmid,
+                      "systemctl stop wg-quick@wg0", timeout=120)
+                time.sleep(3)
+                during = term.run(_ping()).strip()
+                checks["icmp_with_tunnel_down"] = during or "NO RESULT"
+                # Only UNREACHABLE proves the kill switch held. An empty result
+                # means the probe itself failed, which must never be reported as
+                # either a pass or a leak.
+                checks["fails_closed"] = (
+                    True if during == "UNREACHABLE"
+                    else False if during == "REACHABLE"
+                    else None
+                )
+            finally:
+                try:
+                    _exec(lab, api, args.gateway_vmid,
+                          "systemctl start wg-quick@wg0", timeout=120)
+                except Exception as exc:  # noqa: BLE001 - surfaced in the report
+                    checks["tunnel_restart"] = f"failed: {exc}"
+                time.sleep(8)
+                after = term.run(_ping()).strip()
+                checks["icmp_after_tunnel_returns"] = after
+                checks["recovers_after_tunnel_returns"] = after == "REACHABLE"
 
     failures = []
     if not checks["icmp_egress_works"]:
@@ -679,8 +686,11 @@ def cmd_attach(lab: Any, args: Any) -> None:
             f"bridge={LAB_BRIDGE}" if part.startswith("bridge=") else part
         )
     updated = ",".join(replaced)
+    m = re.fullmatch(r"net(\d+)", args.nic)
+    if not m:
+        raise lab.LabError("--nic must be netN (e.g. net0)")
     api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
-             {args.nic: updated, f"ipconfig{args.nic[-1]}": "ip=dhcp"})
+             {args.nic: updated, f"ipconfig{m.group(1)}": "ip=dhcp"})
     lab.audit("vpn-guest-attached", lease=args.lease, vmid=args.vmid,
               nic=args.nic, bridge=LAB_BRIDGE, sync=False)
     print(json.dumps(

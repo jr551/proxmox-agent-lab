@@ -4,6 +4,56 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.11.0 - 2026-08-24
+
+A security-audit release: every shipped-code finding from the 2026-08-24 audit
+(`docs/AUDIT-2026-08-24.md`) is fixed here, plus agent quick-start recipes and
+a macOS guest recipe.
+
+### Fixed — security
+
+- **Command injection via share label** (`share.py`): `share create`/`revoke`
+  interpolated a caller-supplied label into a root `bash -c` string on the
+  share worker; `$()` or backticks executed as root on a machine holding a
+  Proxmox token. All worker calls now pass argv lists through the guest agent.
+- **Console WebSocket TLS** (`ws.py`, `console.py`): console websockets now
+  verify certificates by default; `[proxmox] verify_tls = false` is the only
+  way to disable (closes the websocket half of #72).
+- **Path traversal in share static handler** (`share_server.py`): guard now
+  uses `relative_to()`, so prefix-sibling directories cannot satisfy it.
+- **Stored XSS via share label** (`share_server.py`): labels are HTML-escaped
+  in the viewer page.
+- **Secrets on argv** (`secrets_store.py`): keychain writes feed `-w` from
+  stdin instead of argv (visible in `ps`); `-U` ordered before `-w`.
+  Round-trip verified against the real macOS keychain.
+- **File-backend TOML corruption** (`secrets_store.py`): values written as
+  JSON/TOML strings, so quotes/backslashes no longer corrupt other entries.
+- **netcap injection** (`netcap.py`): `--iface` whitelisted to plain interface
+  names; BPF filter single-quote escaped before reaching the root shell.
+
+### Fixed — correctness and invariants
+
+- **Orphaned guests on clone timeout** (`cli.py`): created guests register
+  into their lease BEFORE `--wait-task`, so a task timeout can no longer leave
+  an unowned VM behind at lease-end. Reload-under-lock behavior preserved.
+- **Answer ISO outlives abandoned installs** (`cli.py`): lease finalization
+  shreds `autounattend-<vmid>.iso` for each deleted qemu resource.
+- **USB detach gate** (`usb.py`): detach requires `--host-change-authorized`,
+  symmetric with attach and with the module's documentation.
+- **memflow read OOM** (`memflow.py`): `read`/`phys-read` capped at the same
+  16 MiB as `dump`; the host helper allocates the full buffer as root.
+- **Kill-switch test stranded guests offline** (`netgw.py`): wg0 restart moved
+  to a `finally` block; a failed restart is reported in the check output.
+- **NIC index parsing** (`netgw.py`): `net attach --nic net12` configured
+  `ipconfig2`; index parsed properly with a clear error for non-`netN`.
+
+### Added
+
+- **Agent quick-start recipes** (`docs/RECIPES.md`) — eight copy-paste recipes,
+  every command line machine-validated against the live parser.
+- **macOS guest recipe** (`docs/macos.md`) — OSX-PROXMOX-based macOS VMs inside
+  lab leases: host prep, TSC check, look→act loop, gotchas.
+
 ## 0.10.0 - 2026-08-22
 
 Reading a screen is now a vision job. Glyph-matching OCR is gone, which is a

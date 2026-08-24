@@ -14,6 +14,7 @@ Backends, in order of preference when `backend = "auto"`:
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -135,9 +136,14 @@ def store(config: Config, name: str, value: str) -> str:
     if backend == "keychain":
         subprocess.run(["security", "delete-generic-password", "-a", name,
                         "-s", APP_NAME], capture_output=True, check=False)
+        # `-w` with no value prompts twice ("password data" + "retype"),
+        # reading both from stdin; passing the secret as an argument would
+        # leave it visible in `ps` output for the life of the process.
+        # `-U` must come before `-w`, or it is swallowed as the password.
         result = subprocess.run(
             ["security", "add-generic-password", "-a", name, "-s", APP_NAME,
-             "-w", value, "-U"],
+             "-U", "-w"],
+            input=f"{value}\n{value}\n",
             capture_output=True, text=True, check=False,
         )
         if result.returncode:
@@ -159,8 +165,12 @@ def store(config: Config, name: str, value: str) -> str:
             with path.open("rb") as handle:
                 existing = tomllib.load(handle)
         existing[name] = value
+        # json.dumps yields a valid TOML basic string (escapes " and \), so
+        # a secret containing quotes can no longer corrupt the whole store
+        # (audit 2026-08-24).
         body = "".join(
-            f'{key} = "{val}"\n' for key, val in sorted(existing.items())
+            f'{key} = {json.dumps(val)}\n'
+            for key, val in sorted(existing.items())
         )
         path.write_text("# proxmox-agent-lab secrets. Keep this file at 0600.\n" + body)
         path.chmod(0o600)

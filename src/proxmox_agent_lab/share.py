@@ -167,9 +167,12 @@ def _worker(lab: Any) -> int:
     return WORKER_VMID
 
 
-def _run(lab: Any, api: Any, command: str, timeout: int = 120) -> str:
-    result = console.agent_exec(lab, api, _worker(lab), ["/bin/bash", "-c",
-                                                         command],
+def _run(lab: Any, api: Any, command: list[str], timeout: int = 120) -> str:
+    """Run argv inside the worker via the guest agent. Never build shell
+    strings here: the worker runs as root and holds a Proxmox token, so
+    every caller-supplied value must travel as an argv element (audit
+    2026-08-24)."""
+    result = console.agent_exec(lab, api, _worker(lab), command,
                                 timeout=timeout)
     if result["exitcode"] not in (0, None):
         raise ShareError(
@@ -204,14 +207,22 @@ def base_url(lab: Any, api: Any) -> tuple[str, str]:
         # cloudflared announces its quick-tunnel hostname in the log and
         # offers no API to ask, so the log is the only place to read it.
         found = _run(lab, api,
-                     "journalctl -u pxl-tunnel --no-pager -n 200 2>/dev/null "
-                     "| grep -oE 'https://[a-z0-9-]+\\.trycloudflare\\.com' "
-                     "| tail -1 || true")
+                     ["/bin/bash", "-o", "pipefail", "-c",
+                      "journalctl -u pxl-tunnel --no-pager -n 200 2>/dev/null "
+                      "| grep -oE 'https://[a-z0-9-]+\\.trycloudflare\\.com' "
+                      "| tail -1 || true"])
         if found:
             return found.strip().rstrip("/"), "public"
+        return lan_url(lab, api), "lan"
     elif TUNNEL == "ngrok":
-        raw = _run(lab, api, "curl -fsS --max-time 8 "
-                             "http://127.0.0.1:4040/api/tunnels || true")
+        try:
+            raw = _run(lab, api,
+                       ["/usr/bin/curl", "-fsS", "--max-time", "8",
+                        "http://127.0.0.1:4040/api/tunnels"]) or ""
+        except ShareError:
+            # No local ngrok API: fall through to the LAN URL like the old
+            # `|| true` shell fallback did.
+            raw = ""
         tunnels: list[dict[str, Any]] = []
         if raw:
             try:
@@ -359,10 +370,12 @@ def cmd_create(lab: Any, args: Any) -> None:
     ensure_worker(lab, api)
 
     label = args.label or f"VM {args.vmid}"
-    once = "--once" if args.once else ""
-    raw = _run(lab, api,
-               f"pxl-share add --vmid {int(args.vmid)} --kind {args.kind} "
-               f"--minutes {minutes} --label {json.dumps(label)} {once}")
+    command = ["pxl-share", "add", "--vmid", str(int(args.vmid)),
+               "--kind", args.kind, "--minutes", str(minutes),
+               "--label", label]
+    if args.once:
+        command.append("--once")
+    raw = _run(lab, api, command)
     session = json.loads(raw)
     base, reach = base_url(lab, api)
     url = f"{base}/v/{session['token']}/"
@@ -390,7 +403,7 @@ def cmd_create(lab: Any, args: Any) -> None:
 def cmd_list(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     ensure_worker(lab, api)
-    print(json.dumps(json.loads(_run(lab, api, "pxl-share list") or "[]"),
+    print(json.dumps(json.loads(_run(lab, api, ["pxl-share", "list"]) or "[]"),
                      indent=2, sort_keys=True))
 
 
@@ -398,8 +411,8 @@ def cmd_revoke(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     ensure_worker(lab, api)
-    command = "pxl-share revoke --all" if args.all else \
-        f"pxl-share revoke --token {json.dumps(args.token)}"
+    command = ["pxl-share", "revoke", "--all"] if args.all else \
+        ["pxl-share", "revoke", "--token", args.token]
     result = json.loads(_run(lab, api, command))
     lab.audit("share-revoked", lease=args.lease, count=result.get("revoked"))
     print(json.dumps(result, indent=2))
@@ -429,7 +442,7 @@ def cmd_status(lab: Any, args: Any) -> None:
                 except ShareError as exc:
                     report["base_url"] = f"unavailable: {exc}"
                 report["active_links"] = len(
-                    json.loads(_run(lab, api, "pxl-share list") or "[]"))
+                    json.loads(_run(lab, api, ["pxl-share", "list"]) or "[]"))
         except (lab.LabError, ShareError) as exc:
             report["error"] = str(exc)[:200]
     print(json.dumps(report, indent=2, sort_keys=True))

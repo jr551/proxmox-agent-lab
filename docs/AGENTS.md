@@ -1,7 +1,7 @@
 # 🤖 Driving this lab as an agent
 
 Guidance for an AI agent using `proxmox-lab`. Read [safety-policy.md](safety-policy.md)
-for the rules enforced in code; this is about doing the job well.
+for the rules enforced in code; this is about doing the job well. Copy-paste starting points for common jobs are in [RECIPES.md](RECIPES.md).
 
 ## 🔑 The one rule
 

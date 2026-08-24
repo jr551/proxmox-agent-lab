@@ -94,6 +94,13 @@ def _resolve_iface(lab: Any, vmid: int, nic: str, override: str | None) -> str:
     message instead of an empty capture.
     """
     if override:
+        # The interface name reaches a root shell command on the host; only
+        # accept plain interface names (audit 2026-08-24).
+        if not re.fullmatch(r"[A-Za-z0-9.@:_-]{1,15}", override):
+            raise lab.LabError(
+                "--iface must be a plain interface name (letters, digits, "
+                "dot, colon, dash, underscore)"
+            )
         candidates = [override]
     else:
         m = re.fullmatch(r"net(\d+)", nic)
@@ -131,14 +138,15 @@ def cmd_capture(lab: Any, args: Any) -> None:
     _running_qemu(lab, api, args.vmid)
     iface = _resolve_iface(lab, args.vmid, args.nic, args.iface)
     remote_pcap = f"/tmp/pxl-net-{args.vmid}-{iface}.pcap"
-    limit = f"-c {args.count}" if args.count else ""
-    # A BPF expression, kept as one shell word so it reaches tcpdump intact; the
-    # whole command runs on the host under `timeout`, and a timeout-killed
-    # tcpdump still flushes a valid pcap.
+    limit = f"-c {int(args.count)}" if args.count else ""
+    # A BPF expression is kept as one shell word so it reaches tcpdump intact.
+    # It is user-supplied and runs under root on the host, so it is POSIX
+    # single-quote escaped rather than interpolated raw (audit 2026-08-24).
     bpf = args.filter or ""
+    bpf_sh = "'" + bpf.replace("'", "'\\''") + "'"
     script = (
         f"timeout {args.seconds} tcpdump -i {iface} -w {remote_pcap} {limit} "
-        f"-U {bpf} >/dev/null 2>&1 || true; "
+        f"-U {bpf_sh} >/dev/null 2>&1 || true; "
         f"pkts=$(tcpdump -r {remote_pcap} 2>/dev/null | wc -l); "
         f"echo \"PKTS=$pkts\"; base64 {remote_pcap}; rm -f {remote_pcap}"
     )

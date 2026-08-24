@@ -299,6 +299,9 @@ traps that cost real debugging time.
 | 🔌 [usb.md](docs/usb.md) | USB passthrough & traffic sniffing |
 | 🕸️ [netcap.md](docs/netcap.md) | Network capture, SSL inspection & MITM relay |
 | 🛡️ [safety-policy.md](docs/safety-policy.md) | The rules enforced in code |
+| 🍳 [RECIPES.md](docs/RECIPES.md) | Quick-start recipes for agents (browse, build, test) |
+| 🍎 [macos.md](docs/macos.md) | macOS guests via OSX-PROXMOX |
+| 🔍 [AUDIT-2026-08-24.md](docs/AUDIT-2026-08-24.md) | Security audit report (fixed in 0.11.0) |
 
 ## Status
 

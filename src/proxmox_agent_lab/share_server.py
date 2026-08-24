@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import os
 from pathlib import Path
@@ -78,13 +79,34 @@ class Sessions:
             pass
 
     def _persist(self) -> None:
+        """Write the whole store atomically.
+
+        `add`/`revoke` run as separate processes racing this server's writes;
+        a plain write_text can interleave or leave a truncated file behind.
+        Write to a unique temp file, fsync, then os.replace (atomic on POSIX)
+        so a reader always sees one complete store (audit 2026-08-24).
+        """
+        tmp = None
         try:
             STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            STATE_PATH.write_text(json.dumps(self._sessions))
+            tmp = STATE_PATH.with_name(
+                f".{STATE_PATH.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+            with open(tmp, "w") as fh:
+                fh.write(json.dumps(self._sessions))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, STATE_PATH)
+            tmp = None
             STATE_PATH.chmod(0o600)
             self._mtime = STATE_PATH.stat().st_mtime
         except OSError:
             pass
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def add(self, vmid: int, minutes: int, kind: str = "qemu",
             label: str = "", once: bool = False) -> dict[str, Any]:
@@ -405,8 +427,14 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) > 2 and parts[2] != "ws":
             relative = "/".join(parts[2:])
             target = (NOVNC_ROOT / relative).resolve()
-            if not str(target).startswith(str(NOVNC_ROOT.resolve())) \
-                    or not target.is_file():
+            try:
+                # relative_to rejects prefix-siblings like /opt/novnc-backup
+                # that startswith() would accept (audit 2026-08-24).
+                target.relative_to(NOVNC_ROOT.resolve())
+            except ValueError:
+                self._deny("Not found.")
+                return
+            if not target.is_file():
                 self._deny("Not found.")
                 return
             kinds = {".js": "text/javascript", ".css": "text/css",
@@ -420,7 +448,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         label = session["label"] or f"VM {session['vmid']}"
-        self._send(200, PAGE.format(label=label, view_only="false").encode(),
+        safe_label = html.escape(label, quote=True)
+        self._send(200,
+                   PAGE.format(label=safe_label, view_only="false").encode(),
                    "text/html; charset=utf-8")
 
     def _websocket(self, token: str, session: dict[str, Any]) -> None:

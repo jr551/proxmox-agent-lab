@@ -17,10 +17,25 @@ OpenCore, downloads recovery images, and patches QEMU args. That is exactly
 what the lab's `--host-change-authorized` gate exists for — run it deliberately,
 once, with the user's explicit OK:
 
-```bash
-# on the Proxmox host (SSH as root), NOT via proxmox-lab:
-/bin/bash -c "$(curl -fsSL https://install.osx-proxmox.com)"
-```
+### How an agent should run this installer
+
+The installer is **interactive** (full-screen menu, per-step prompts). Do not
+drive it through a live SSH session and do not answer its prompts blind.
+Instead:
+
+1. **Fetch and read it first** — it is ~1500 lines of shell; audit what it
+   touches (repos, packages, network config, `/etc/pve`) before running:
+   ```bash
+   curl -fsSL https://install.osx-proxmox.com -o /tmp/osx-proxmox-install.sh
+   less /tmp/osx-proxmox-install.sh        # or grep for apt/interactions
+   ```
+2. **Hand it to a subagent** to run on the host over SSH. The subagent's job:
+   pre-seed every menu answer as environment/expect input where the script
+   supports it, otherwise drive the TTY prompts one at a time, capture the
+   full transcript, and stop at the first unexpected prompt rather than
+   guessing. Interactive installers punish blind `printf | bash`.
+3. **Report back** what was installed (OpenCore ISO, recovery images, VMs
+   created, repos added) before any lab lease touches the host again.
 
 The interactive menu lets you pick a macOS version (High Sierra → Sequoia),
 CPU vendor profile, cores/RAM/disk, storage and bridge. It creates the VM for

@@ -13,11 +13,11 @@ ROOT = Path(__file__).parents[1]
 class GuidedSetupTests(unittest.TestCase):
     def test_scripts_have_valid_bash_syntax(self) -> None:
         for script in (
-            "install.sh", "pocketbase-host-setup.sh", "minio-host-setup.sh",
+            "install.sh", "mariadb-host-setup.sh", "minio-host-setup.sh",
         ):
             subprocess.run(["bash", "-n", str(ROOT / script)], check=True)
 
-    def test_noninteractive_pocketbase_setup_writes_a_safe_config(self) -> None:
+    def test_noninteractive_setup_writes_a_safe_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bin_dir = root / "bin"
@@ -35,11 +35,10 @@ class GuidedSetupTests(unittest.TestCase):
                 "[proxmox]\n"
                 "host = \"\"\nnode = \"\"\ntoken_user = \"\"\ntoken_name = \"\"\n"
                 "[power]\nmac = \"\"\nbroadcast = \"\"\n"
-                "[audit]\nbackend = \"sqlite\"\npocketbase_url = \"\"\n"
-                "pocketbase_collection = \"proxmox_lab_events\"\n"
-                "pocketbase_token_secret = \"audit-token\"\nEOF\n"
+                "[audit]\nhost = \"\"\nport = 3306\n"
+                "database = \"proxmox_lab\"\nuser = \"proxmox_lab\"\nEOF\n"
                 "  ;;\n"
-                "  secrets) printf '{\"proxmox-token\": true, \"audit-token\": true}\\n' ;;\n"
+                "  secrets) printf '{\"proxmox-token\": true}\\n' ;;\n"
                 "  doctor) exit 0 ;;\n"
                 "esac\n"
             )
@@ -55,10 +54,6 @@ class GuidedSetupTests(unittest.TestCase):
                 "PXL_TOKEN_USER": "agent@pve",
                 "PXL_TOKEN_NAME": "lab",
                 "PXL_MAC": "aa:bb:cc:dd:ee:ff",
-                "PXL_AUDIT_BACKEND": "pocketbase",
-                "PXL_PB_URL": "https://pocketbase.example",
-                "PXL_PB_COLLECTION": "audit_events",
-                "PXL_PB_TOKEN_NAME": "audit-token",
             }
             result = subprocess.run(
                 ["/bin/bash", str(ROOT / "install.sh"), "--yes"],
@@ -73,10 +68,9 @@ class GuidedSetupTests(unittest.TestCase):
 
         self.assertIn('host = "192.0.2.9"', text)
         self.assertIn('token_user = "agent@pve"', text)
-        self.assertIn('backend = "pocketbase"', text)
-        self.assertIn('pocketbase_url = "https://pocketbase.example"', text)
-        self.assertIn('pocketbase_collection = "audit_events"', text)
-        self.assertNotIn("PXL_PB_TOKEN_SECRET", text)
+        # The install no longer asks about audit backends at all: the ledger is
+        # provisioned once with 'journal host-setup' and shared from there.
+        self.assertNotIn("pocketbase", text)
 
     def _stub_bin_dir(self, root: Path, *, secrets_json: str) -> Path:
         bin_dir = root / "bin"

@@ -29,6 +29,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install ISO test tooling
         run: sudo apt-get update && sudo apt-get install --yes xorriso
+      - name: Install the package and its dependencies
+        run: python -m pip install --upgrade pip && python -m pip install .
       - name: Run warning-clean tests
         env:
           PYTHONWARNINGS: error

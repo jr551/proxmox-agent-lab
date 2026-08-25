@@ -25,7 +25,7 @@ from urllib import error, request
 from . import secrets_store
 
 NVIDIA_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
-ENDPOINT = NVIDIA_ENDPOINT  # compatibility for callers
+ENDPOINT = NVIDIA_ENDPOINT  # compat for tests
 STATUS_ENDPOINT = "https://integrate.api.nvidia.com/v1/status/{request_id}"
 NVIDIA_MODEL = "nvidia/nemotron-nano-12b-v2-vl"
 NVIDIA_SECRET_ACCOUNT = "nvidia-api-key"
@@ -40,8 +40,8 @@ KILO_ENDPOINT = "https://api.kilo.ai/api/gateway/v1/chat/completions"
 # result records whichever model actually answered.
 KILO_MODEL = "kilo-auto/balanced"
 KILO_SECRET_ACCOUNT = "kilo-api-key"
-MODEL = NVIDIA_MODEL  # compatibility for callers and older audit assertions
-SECRET_ACCOUNT = NVIDIA_SECRET_ACCOUNT
+MODEL = NVIDIA_MODEL  # compat for tests
+SECRET_ACCOUNT = NVIDIA_SECRET_ACCOUNT  # compat for tests
 REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{1,36}$")
 # Redaction shapes, so a leaked key cannot reach stdout or an error string.
 # NVIDIA and OpenRouter keys carry a vendor prefix; a Kilo gateway key is a
@@ -308,18 +308,10 @@ def _nvidia(config: Any, image: bytes, task: str, *, width: int,
     api_key = secrets_store.get(config, NVIDIA_SECRET_ACCOUNT)
     payload = _payload(image, task, NVIDIA_MODEL, max_tokens)
     payload["messages"].insert(0, {"role": "system", "content": "/no_think"})
-    req = request.Request(
-        NVIDIA_ENDPOINT,
-        data=json.dumps(payload, separators=(",", ":")).encode(),
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
     deadline = time.monotonic() + timeout
-    status, value = _http_json(req, timeout, "NVIDIA")
+    status, value = _chat_request(
+        NVIDIA_ENDPOINT, api_key, payload, "NVIDIA", timeout
+    )
     while status == 202:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -341,23 +333,40 @@ def _nvidia(config: Any, image: bytes, task: str, *, width: int,
     )
 
 
-def _openrouter_key(config: Any) -> str:
-    # A project-scoped key deliberately stored through `proxmox-lab secrets`
-    # wins over an inherited shell value, which may be stale or belong to a
-    # different tool. The conventional variable remains a compatibility
-    # fallback for installs whose selected secret backend has no stored key.
-    stored = secrets_store.get(
-        config, OPENROUTER_SECRET_ACCOUNT, required=False
-    )
-    fallback = os.environ.get("OPENROUTER_API_KEY")
+def _gateway_key(config: Any, account: str, env_var: str) -> str:
+    """Stored key wins over env var (see audit: stale shell vs project scope)."""
+    stored = secrets_store.get(config, account, required=False)
+    fallback = os.environ.get(env_var)
     key = stored or fallback
     if not key:
         raise secrets_store.SecretError(
-            "secret 'openrouter-api-key' is not stored; run "
-            "'proxmox-lab secrets set openrouter-api-key' or export "
-            "OPENROUTER_API_KEY"
+            f"secret '{account}' is not stored; run "
+            f"'proxmox-lab secrets set {account}' or export {env_var}"
         )
     return key
+
+
+def _openrouter_key(config: Any) -> str:
+    return _gateway_key(config, OPENROUTER_SECRET_ACCOUNT, "OPENROUTER_API_KEY")
+
+
+def _kilo_key(config: Any) -> str:
+    return _gateway_key(config, KILO_SECRET_ACCOUNT, "KILO_API_KEY")
+
+
+def _chat_request(endpoint: str, api_key: str, payload: dict[str, Any],
+                  label: str, timeout: float) -> tuple[int, dict[str, Any]]:
+    req = request.Request(
+        endpoint,
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    return _http_json(req, timeout, label)
 
 
 def _openrouter(config: Any, image: bytes, task: str, *, model: str,
@@ -372,40 +381,16 @@ def _openrouter(config: Any, image: bytes, task: str, *, model: str,
     payload["plugins"] = [{"id": "response-healing"}]
     if model == OPENROUTER_MODEL:
         payload["reasoning"] = {"enabled": True}
-    req = request.Request(
-        OPENROUTER_ENDPOINT,
-        data=json.dumps(payload, separators=(",", ":")).encode(),
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {_openrouter_key(config)}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
+    api_key = _openrouter_key(config)
+    status, value = _chat_request(
+        OPENROUTER_ENDPOINT, api_key, payload, "OpenRouter", timeout
     )
-    status, value = _http_json(req, timeout, "OpenRouter")
     if status != 200:
         raise VisionError(f"OpenRouter vision returned HTTP {status}")
     return _result(
         value, provider="openrouter", requested_model=model,
         width=width, height=height,
     )
-
-
-def _kilo_key(config: Any) -> str:
-    # Same precedence rule as OpenRouter: a project-scoped key deliberately
-    # stored through `proxmox-lab secrets` wins over an inherited shell value,
-    # which may be stale or belong to a different tool. The conventional
-    # variable stays a compatibility fallback for installs whose selected
-    # secret backend has no stored key.
-    stored = secrets_store.get(config, KILO_SECRET_ACCOUNT, required=False)
-    fallback = os.environ.get("KILO_API_KEY")
-    key = stored or fallback
-    if not key:
-        raise secrets_store.SecretError(
-            "secret 'kilo-api-key' is not stored; run "
-            "'proxmox-lab secrets set kilo-api-key' or export KILO_API_KEY"
-        )
-    return key
 
 
 def _kilo(config: Any, image: bytes, task: str, *, width: int, height: int,
@@ -426,17 +411,9 @@ def _kilo(config: Any, image: bytes, task: str, *, width: int, height: int,
     # check regardless of what comes back.
     payload["response_format"] = {"type": "json_object"}
     payload["reasoning"] = {"enabled": False}
-    req = request.Request(
-        KILO_ENDPOINT,
-        data=json.dumps(payload, separators=(",", ":")).encode(),
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {_kilo_key(config)}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
+    status, value = _chat_request(
+        KILO_ENDPOINT, _kilo_key(config), payload, "Kilo", timeout
     )
-    status, value = _http_json(req, timeout, "Kilo")
     if status != 200:
         raise VisionError(f"Kilo vision returned HTTP {status}")
     return _result(
@@ -555,6 +532,33 @@ def _attempt_summary(item: dict[str, Any]) -> str:
     return f"{item['provider']}: {item['status']} ({detail})"
 
 
+def _record_attempt(
+    attempts: list[dict[str, Any]],
+    provider: str,
+    status: str,
+    *,
+    elapsed_ms: int,
+    error: str | None = None,
+    validation: Any = None,
+    reason: str | None = None,
+) -> None:
+    entry: dict[str, Any] = {
+        "provider": provider, "status": status, "elapsed_ms": elapsed_ms,
+    }
+    if error is not None:
+        entry["error"] = error
+    if validation is not None:
+        entry["validation"] = validation
+    if reason is not None:
+        entry["reason"] = reason
+    attempts.append(entry)
+
+
+def _raise_no_valid_provider(attempts: list[dict[str, Any]]) -> None:
+    summary = "; ".join(_attempt_summary(item) for item in attempts)
+    raise VisionError(f"no vision provider returned a valid analysis: {summary}")
+
+
 def analyze_png(config: Any, image: bytes, *, width: int, height: int,
                 prompt: str | None = None, timeout: int = 120,
                 max_tokens: int = 1024, provider: str = "auto") -> dict[str, Any]:
@@ -594,31 +598,27 @@ def analyze_png(config: Any, image: bytes, *, width: int, height: int,
         try:
             result = providers[name]()
         except (VisionError, secrets_store.SecretError) as exc:
-            attempts.append({
-                "provider": name, "status": "failed", "error": str(exc),
-                "elapsed_ms": round((time.monotonic() - started) * 1000),
-            })
+            _record_attempt(
+                attempts, name, "failed",
+                error=str(exc),
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
             continue
         if not _accepted(result):
-            attempts.append({
-                "provider": name,
-                "status": "rejected",
-                "validation": result.get("validation"),
-                "reason": _rejection_reason(result),
-                "elapsed_ms": round((time.monotonic() - started) * 1000),
-            })
+            _record_attempt(
+                attempts, name, "rejected",
+                validation=result.get("validation"),
+                reason=_rejection_reason(result),
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
             continue
         elapsed_ms = round((time.monotonic() - started) * 1000)
-        attempts.append({
-            "provider": name, "status": "selected",
-            "elapsed_ms": elapsed_ms,
-        })
+        _record_attempt(attempts, name, "selected", elapsed_ms=elapsed_ms)
         result["strategy"] = "single-provider"
         result["elapsed_ms"] = elapsed_ms
         result["provider_chain"] = attempts
         return result
-    summary = "; ".join(_attempt_summary(item) for item in attempts)
-    raise VisionError(f"no vision provider returned a valid analysis: {summary}")
+    _raise_no_valid_provider(attempts)
 
 
 def _race_providers(providers: dict[str, Any], timeout: int) -> dict[str, Any]:
@@ -650,32 +650,28 @@ def _race_providers(providers: dict[str, Any], timeout: int) -> dict[str, Any]:
         remaining -= 1
         elapsed_ms = round(elapsed * 1000)
         if exc is not None:
-            attempts.append({
-                "provider": name, "status": "failed", "error": str(exc),
-                "elapsed_ms": elapsed_ms,
-            })
+            _record_attempt(
+                attempts, name, "failed", error=str(exc), elapsed_ms=elapsed_ms
+            )
             continue
         assert result is not None
         if not _accepted(result):
-            attempts.append({
-                "provider": name, "status": "rejected",
-                "validation": result.get("validation"),
-                "reason": _rejection_reason(result),
-                "elapsed_ms": elapsed_ms,
-            })
+            _record_attempt(
+                attempts, name, "rejected",
+                validation=result.get("validation"),
+                reason=_rejection_reason(result),
+                elapsed_ms=elapsed_ms,
+            )
             continue
-        attempts.append({
-            "provider": name, "status": "selected", "elapsed_ms": elapsed_ms,
-        })
+        _record_attempt(attempts, name, "selected", elapsed_ms=elapsed_ms)
         result["provider_chain"] = attempts
         result["strategy"] = "parallel-first-valid"
         result["elapsed_ms"] = elapsed_ms
         return result
     for name in providers:
         if not any(item["provider"] == name for item in attempts):
-            attempts.append({
-                "provider": name, "status": "timed_out",
-                "elapsed_ms": round(timeout * 1000),
-            })
-    summary = "; ".join(_attempt_summary(item) for item in attempts)
-    raise VisionError(f"no vision provider returned a valid analysis: {summary}")
+            _record_attempt(
+                attempts, name, "timed_out",
+                elapsed_ms=round(timeout * 1000),
+            )
+    _raise_no_valid_provider(attempts)

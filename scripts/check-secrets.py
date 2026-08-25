@@ -38,6 +38,10 @@ PATTERNS = (
 ALLOWED = (
     # Microsoft's public assembly key token, present in every unattend.xml.
     "31bf3856ad364e35",
+    # The *name* of the audit ledger secret, not its value. It appears in the
+    # config template, in KNOWN_SECRETS and in docs; the patterns cannot tell a
+    # secret's name from a secret.
+    "mariadb-password",
 )
 SKIP_DIRS = {".git", ".venv", "__pycache__"}
 SKIP_NAMES = {"check-secrets.py"}

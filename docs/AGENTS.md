@@ -1,20 +1,14 @@
 # 🤖 Driving this lab as an agent
 
-Guidance for an AI agent using `proxmox-lab`. Read [safety-policy.md](safety-policy.md)
-for the rules enforced in code; this is about doing the job well. Copy-paste starting points for common jobs are in [RECIPES.md](RECIPES.md).
+> **Audience:** AI agents that already know the lease shape from `SKILL.md`.
+> **Scope:** Deep operational guidance — probe decision table, screen ladder, permissions, worked example, and builders. For quick-ref copy-paste, read `SKILL.md`; for enforced invariants, read `safety-policy.md`.
 
+Guidance for an AI agent using `proxmox-lab`. Read [safety-policy.md](safety-policy.md) for the rules enforced in code; this is about doing the job well. Copy-paste starting points for common jobs are in [RECIPES.md](RECIPES.md). Subsystem hardware coverage is tracked in [VERIFICATION.md](VERIFICATION.md).
 ## 🔑 The one rule
 
-**Every run is a lease, and every lease ends.**
+**Every run is a lease, and every lease ends.** Canonical copy-paste block (trap, timing, takeover) lives in [`SKILL.md`](../SKILL.md) § Every task follows this shape — use it verbatim. Host-setup one-liners live in [INSTALL.md](INSTALL.md).
 
-```bash
-L=$(proxmox-lab lease-begin --purpose "<what you are doing>" \
-    | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
-
-# ... work ...
-
-proxmox-lab lease-end --lease "$L"
-```
+Deep notes beyond the quick-ref:
 
 Put `lease-end` in a trap, a `finally`, or the equivalent, so it runs even when
 the work fails. It must print `"host_powered_off": true`; if it does not, say
@@ -160,16 +154,16 @@ concluding the network is broken; a minimal image often has no `curl` at all.
 ## 🛑 Things that need explicit permission
 
 The tool refuses these unless you pass a flag, and you should not pass the flag
-unless the user asked for that specific change:
+unless the user asked for that specific change. Canonical command+flag pairs and scopes live in [safety-policy.md](safety-policy.md#commands) — do not invent flags not listed there.
 
-| Action | Flag | Why it is gated |
-|---|---|---|
-| Host networking, storage, permissions | `--host-change-authorized` | Outlives the lease; affects the machine itself |
-| Formatting a disk | `--wipe-confirmed` plus `--expect-serial` | Irreversible, and device names move between boots |
-| Preparing a host for memflow, or USB passthrough | `--host-change-authorized` | Installs a toolchain / hands host hardware to a guest |
-| Writing live guest memory (`memflow write`, `memflow phys-write`) | `--i-understand` | A wrong byte crashes or compromises the running guest |
-| Ending a lease that shares a guest with another active lease | `--shared-guests-authorized` | The other lease may be mid-run, and a deleted guest does not come back |
-| Deleting a guest the lease did not create | *not possible* | Refused outright |
+Summary of gated categories (see safety-policy for exact commands):
+
+- Host networking, storage, permissions, USB passthrough, memflow host-setup → `--host-change-authorized` (persistent host changes; see also `--slow-storage-accepted` for bulk-disk API writes)
+- Formatting a disk → `--wipe-confirmed` plus `--expect-serial` (and `--expect-size-gb` — irreversible, device names move)
+- Preparing a host for memflow or handing USB hardware to a guest → `--host-change-authorized`
+- Writing live guest memory (`memflow write`, `memflow phys-write`) or offline guest filesystem (`disk write`) → `--i-understand`
+- Ending a lease that shares a guest with another active lease → `--shared-guests-authorized`
+- Deleting a guest the lease did not create → *not possible* — refused outright
 
 Before anything destructive, **look at the target**. A disk that "should be
 empty" may not be — check before you wipe, and report what you found.

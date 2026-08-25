@@ -4,12 +4,23 @@ Secrets are never written to the config file, passed on a command line, or
 recorded in the audit journal. They are fetched at the moment of use and kept
 only in memory.
 
-Backends, in order of preference when `backend = "auto"`:
+Secrets live in the environment, and are shared between controllers by the
+audit ledger. One credential is handed to a machine directly -- the ledger
+password -- and every other secret is read from the shared store behind it, so
+adding a controller is one export rather than a repeat of the whole setup.
 
-* `keychain`    -- macOS `security`
-* `secret-tool` -- Linux, libsecret (GNOME Keyring, KWallet)
-* `env`         -- environment variables, for CI and containers
-* `file`        -- a 0600 TOML file, for headless hosts with no keyring
+Lookup order, first hit wins:
+
+1. the configured backend (`env` by default)
+2. the matching `PROXMOX_AGENT_LAB_*` environment variable, so any secret can
+   be overridden locally without touching the shared store
+3. the shared store in the audit ledger
+An OS keystore (`keychain`, `secret-tool`) can still be named explicitly as
+the backend, and a controller upgrading from one has its secrets copied into
+the shared store when the ledger is provisioned.
+
+Backends that may be set explicitly: `env`, `file` (a 0600 TOML file),
+`keychain` (macOS) and `secret-tool` (libsecret). The last two are legacy.
 """
 
 from __future__ import annotations
@@ -24,13 +35,9 @@ from .config import APP_NAME, Config
 
 # The names this tool asks for. Documented so `secrets list` can show them.
 KNOWN_SECRETS = {
+    "mariadb-password": "Audit ledger password -- the one secret a new controller needs",
     "proxmox-token": "Proxmox API token secret (the UUID shown once on creation)",
     "home-assistant-token": "Home Assistant long-lived token (power mode only)",
-    "audit-token": "PocketBase API token for audit storage",
-    "pocketbase-superuser-email": "PocketBase superuser email for agent provisioning",
-    "pocketbase-superuser-password": "PocketBase superuser password for agent provisioning",
-    "pocketbase-agent-email": "PocketBase restricted audit agent email",
-    "pocketbase-agent-password": "PocketBase restricted audit agent password",
     "s3-key-id": "S3 access key id (scratch bucket)",
     "s3-secret-key": "S3 secret access key (scratch bucket)",
     "wg-private-key": "WireGuard client private key",
@@ -52,11 +59,76 @@ def _env_name(name: str) -> str:
 
 
 def detect_backend() -> str:
+    """The environment, everywhere.
+
+    Secrets travel as environment variables so a controller is reproducible
+    and portable -- the same config works on a laptop, in CI and on a box with
+    no desktop keyring at all. An OS keystore is still read as a fallback (see
+    `get`) so a controller that predates this keeps working untouched.
+    """
+    return "env"
+
+
+def legacy_keystore() -> str:
+    """The OS keystore this machine would have used before secrets moved to
+    the environment. Read-only fallback; nothing new is written here."""
     if shutil.which("security") and os.uname().sysname == "Darwin":
         return "keychain"
     if shutil.which("secret-tool"):
         return "secret-tool"
-    return "env"
+    return ""
+
+
+def read_legacy(backend: str, name: str) -> str | None:
+    """Read one secret from the pre-environment OS keystore.
+
+    Explicit, never an implicit fallback inside `get`. An automatic fallback
+    reached past the configured backend into whatever the desktop keyring
+    happened to hold -- including, in tests, the developer's real secrets --
+    which made a "missing" secret unpredictable. Seeding the shared store
+    (`journal host-setup`) reads through here on purpose instead.
+    """
+    if backend == "keychain":
+        argv = ["security", "find-generic-password", "-a", name,
+                "-s", APP_NAME, "-w"]
+    elif backend == "secret-tool":
+        argv = ["secret-tool", "lookup", "service", APP_NAME, "account", name]
+    else:
+        return None
+    result = subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+# The one credential a controller must be given directly. Everything else is
+# handed out by the shared store once this one works.
+BOOTSTRAP_SECRET = "mariadb-password"
+
+
+def _read_shared(config: Config, name: str) -> str | None:
+    """Look one secret up in the shared store on the lab host.
+
+    Best effort by design: the lab host is powered off between leases, and a
+    missing shared store must fall through to the local ones rather than
+    turning every command into an error.
+    """
+    # No bootstrap credential means nothing to authenticate with, so there is
+    # nothing to ask. Checked first because it is a dict lookup, where trying
+    # the connection anyway would block until the socket timed out on every
+    # secret read -- including in tests and on a laptop away from the lab.
+    if not os.environ.get(_env_name(BOOTSTRAP_SECRET)):
+        return None
+    try:
+        from . import journal as _journal
+
+        settings = _journal.settings_from_config(config)
+        if settings is None:
+            return None
+        from . import mariadb as _mariadb
+
+        return _mariadb.get_secret(settings, name)
+    except Exception:
+        return None
 
 
 def _resolve(config: Config) -> str:
@@ -121,6 +193,14 @@ def get(config: Config, name: str, *, required: bool = True) -> str:
     fallback = os.environ.get(_env_name(name))
     if fallback:
         return fallback
+    # The shared store on the lab host. This is what makes a second machine a
+    # one-liner: give it the bootstrap password and it inherits every other
+    # secret the first controller set up. Skipped for the bootstrap password
+    # itself, which would otherwise need itself to be read.
+    if name != BOOTSTRAP_SECRET:
+        shared = _read_shared(config, name)
+        if shared:
+            return shared
     if not required:
         return ""
     raise SecretError(

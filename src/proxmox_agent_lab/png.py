@@ -261,21 +261,22 @@ def decode_png(data: bytes) -> tuple[int, int, bytes]:
     return width, height, bytes(out)
 
 
-def _draw_label(out: bytearray, width: int, height: int, value: str,
-                x: int, y: int, scale: int = 2) -> None:
-    """Stamp a short digit label into a mutable RGB buffer, in place."""
+def _blend_pixel(buf: bytearray, w: int, h: int, x: int, y: int,
+                 colour: tuple[int, int, int], alpha: int = 255) -> None:
+    """Alpha-blend one pixel into a mutable RGB buffer, in place."""
+    if not (0 <= x < w and 0 <= y < h):
+        return
+    offset = (y * w + x) * 3
+    inverse = 255 - alpha
+    for channel, target in enumerate(colour):
+        buf[offset + channel] = (
+            buf[offset + channel] * inverse + target * alpha
+        ) // 255
 
-    def pixel(px: int, py: int, colour: tuple[int, int, int],
-              alpha: int = 255) -> None:
-        if not (0 <= px < width and 0 <= py < height):
-            return
-        offset = (py * width + px) * 3
-        inverse = 255 - alpha
-        for channel, target in enumerate(colour):
-            out[offset + channel] = (
-                out[offset + channel] * inverse + target * alpha
-            ) // 255
 
+def _stamp_glyph(buf: bytearray, w: int, h: int, value: str, x: int, y: int,
+                 scale: int = 2) -> None:
+    """Stamp a short label (digits/X/Y) into a mutable RGB buffer, in place."""
     cursor = x
     for character in value:
         glyph = _GLYPHS.get(character)
@@ -284,15 +285,22 @@ def _draw_label(out: bytearray, width: int, height: int, value: str,
             continue
         for py in range(y - 1, y + 5 * scale + 1):
             for px in range(cursor - 1, cursor + 3 * scale + 1):
-                pixel(px, py, (0, 0, 0), 190)
+                _blend_pixel(buf, w, h, px, py, (0, 0, 0), 190)
         for row, bits in enumerate(glyph):
             for column, bit in enumerate(bits):
                 if bit == "1":
                     for dy in range(scale):
                         for dx in range(scale):
-                            pixel(cursor + column * scale + dx,
-                                  y + row * scale + dy, (255, 255, 255))
+                            _blend_pixel(buf, w, h,
+                                         cursor + column * scale + dx,
+                                         y + row * scale + dy, (255, 255, 255))
         cursor += 4 * scale
+
+
+def _draw_label(out: bytearray, width: int, height: int, value: str,
+                x: int, y: int, scale: int = 2) -> None:
+    """Stamp a short digit label into a mutable RGB buffer, in place."""
+    _stamp_glyph(out, width, height, value, x, y, scale)
 
 
 def stitch_horizontal(
@@ -347,56 +355,26 @@ def overlay_coordinate_grid(width: int, height: int, rgb: bytes,
         raise ValueError("grid step must be at least 20 pixels")
     out = bytearray(rgb)
 
-    def pixel(x: int, y: int, colour: tuple[int, int, int],
-              alpha: int = 255) -> None:
-        if not (0 <= x < width and 0 <= y < height):
-            return
-        offset = (y * width + x) * 3
-        inverse = 255 - alpha
-        for channel, target in enumerate(colour):
-            out[offset + channel] = (
-                out[offset + channel] * inverse + target * alpha
-            ) // 255
-
     grid = (0, 255, 255)
     axis = (255, 224, 0)
     for x in range(0, width, step):
         for y in range(height):
-            pixel(x, y, grid, 96)
+            _blend_pixel(out, width, height, x, y, grid, 96)
     for y in range(0, height, step):
         for x in range(width):
-            pixel(x, y, grid, 96)
+            _blend_pixel(out, width, height, x, y, grid, 96)
     for x in range(width):
-        pixel(x, 0, axis)
-        pixel(x, 1, axis)
+        _blend_pixel(out, width, height, x, 0, axis)
+        _blend_pixel(out, width, height, x, 1, axis)
     for y in range(height):
-        pixel(0, y, axis)
-        pixel(1, y, axis)
-
-    def text(value: str, x: int, y: int, scale: int = 2) -> None:
-        cursor = x
-        for character in value:
-            glyph = _GLYPHS.get(character)
-            if glyph is None:
-                cursor += 4 * scale
-                continue
-            # Dark backing keeps coordinates legible on bright installers.
-            for py in range(y - 1, y + 5 * scale + 1):
-                for px in range(cursor - 1, cursor + 3 * scale + 1):
-                    pixel(px, py, (0, 0, 0), 190)
-            for row, bits in enumerate(glyph):
-                for column, bit in enumerate(bits):
-                    if bit == "1":
-                        for dy in range(scale):
-                            for dx in range(scale):
-                                pixel(cursor + column * scale + dx,
-                                      y + row * scale + dy, (255, 255, 255))
-            cursor += 4 * scale
+        _blend_pixel(out, width, height, 0, y, axis)
+        _blend_pixel(out, width, height, 1, y, axis)
 
     for x in range(0, width, step):
-        text(str(x), min(x + 3, max(3, width - len(str(x)) * 8)), 4)
+        _stamp_glyph(out, width, height, str(x),
+                     min(x + 3, max(3, width - len(str(x)) * 8)), 4)
     for y in range(step, height, step):
-        text(str(y), 4, min(y + 3, height - 12))
-    text("X", max(3, width - 10), 18)
-    text("Y", 4, max(4, height - 12))
+        _stamp_glyph(out, width, height, str(y), 4, min(y + 3, height - 12))
+    _stamp_glyph(out, width, height, "X", max(3, width - 10), 18)
+    _stamp_glyph(out, width, height, "Y", 4, max(4, height - 12))
     return bytes(out)

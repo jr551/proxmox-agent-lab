@@ -29,7 +29,6 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
-import time
 from typing import Any
 from urllib import error, request
 
@@ -152,8 +151,7 @@ def setup_script() -> str:
             .replace("__NOVNC__", NOVNC_VERSION)
             .replace("__PORT__", str(PORT))
             .replace("__TUNNEL_CMD__", tunnel_command())
-            .replace("__TUNNEL__", TUNNEL)
-            .replace("__REGION__", f"--region {REGION}" if REGION else ""))
+            .replace("__TUNNEL__", TUNNEL))
 
 
 def _worker(lab: Any) -> int:
@@ -243,60 +241,37 @@ def ensure_worker(lab: Any, api: Any) -> None:
     if status.get("status") != "running":
         upid = api.call("POST", f"/nodes/{lab.NODE}/qemu/{vmid}/status/start")
         lab.wait_task(api, upid, timeout=180)
-        deadline = time.monotonic() + 240
-        while time.monotonic() < deadline:
-            if console.agent_ready(lab, api, vmid):
-                break
-            time.sleep(5)
-        else:
+        if not console.wait_agent_ready(lab, api, vmid, 240):
             raise ShareError(f"share worker {vmid} did not come up")
 
 
 # --- commands -------------------------------------------------------------
 
 
-def cmd_setup(lab: Any, args: Any) -> None:
-    """Build the share worker: noVNC, ngrok, and the relay."""
-    api = lab.ProxmoxAPI()
-    lease = lab.load_lease(args.lease)
-    if args.vmid in lease["initial_vmids"]:
-        raise ShareError(f"VMID {args.vmid} existed before this lease")
-    template = args.template or int(
-        _CONFIG.network.get("gateway_template_vmid") or 0
-    )
-    if not template:
-        raise ShareError("pass --template <vmid> of a cloud-init image")
-
+def _provision_worker_vm(lab: Any, api: Any, lease: dict[str, Any], args: Any,
+                         template: int) -> tuple[str, str]:
+    """Clone and cloud-init the share worker. Returns (name, password)."""
     name = args.name or f"share-{args.vmid}"
     upid = api.call("POST", f"/nodes/{lab.NODE}/qemu/{template}/clone",
                     {"newid": args.vmid, "name": name, "full": 1,
                      "target": lab.NODE})
     lab.wait_task(api, upid, timeout=args.clone_timeout)
     lab.register_resource(lease, "qemu", args.vmid, args.policy, name)
+    _, password = console.prepare_cloudinit_worker(
+        lab, api, args.vmid, template,
+        {
+            "cores": args.cores,
+            "memory": args.memory,
+            "ipconfig0": "ip=dhcp",
+            "tags": f"codex-lab;lease-{args.lease};share",
+        },
+        agent_timeout=120,
+    )
+    return name, password
 
-    import secrets as _secrets
-    password = _secrets.token_urlsafe(18)
-    template_config = api.call("GET", f"/nodes/{lab.NODE}/qemu/{template}/config")
-    cloud_user = template_config.get("ciuser") or "debian"
-    api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config", {
-        "cores": args.cores, "memory": args.memory,
-        "ciuser": cloud_user, "cipassword": password,
-        "ipconfig0": "ip=dhcp", "agent": "enabled=1", "onboot": 0,
-        "tags": f"codex-lab;lease-{args.lease};share",
-    })
-    start = api.call("POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/start")
-    lab.wait_task(api, start, timeout=180)
 
-    deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
-        if console.agent_ready(lab, api, args.vmid):
-            break
-        time.sleep(5)
-    else:
-        console.bootstrap_guest_agent(lab, api, args.vmid, cloud_user, password)
-
-    # The relay needs its own Proxmox credentials, because it mints a console
-    # ticket per connection. Written 0600, never on a command line.
+def _install_relay(lab: Any, api: Any, vmid: int, setup_timeout: int) -> None:
+    """Write the relay, config, ngrok token and run the setup script."""
     worker_config = {
         "host": lab.HOST, "port": lab.PORT, "node": lab.NODE,
         "token_user": lab.TOKEN_USER, "token_name": lab.TOKEN_NAME,
@@ -306,28 +281,26 @@ def cmd_setup(lab: Any, args: Any) -> None:
     server_source = (Path(__file__).parent / "share_server.py").read_text()
     for path, body in (("/tmp/pxl-share.py", server_source),
                        ("/tmp/pxl-share-setup.sh", setup_script())):
-        api.call("POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/agent/file-write",
+        api.call("POST", f"/nodes/{lab.NODE}/qemu/{vmid}/agent/file-write",
                  {"file": path,
                   "content": base64.b64encode(body.encode()).decode(),
                   "encode": 0})
-
-    console.agent_exec(lab, api, args.vmid,
+    console.agent_exec(lab, api, vmid,
                        ["/bin/bash", "-c", "install -d -m 0700 /etc/pxl-share"],
                        timeout=60)
-    api.call("POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/agent/file-write",
+    api.call("POST", f"/nodes/{lab.NODE}/qemu/{vmid}/agent/file-write",
              {"file": "/etc/pxl-share/config.json",
               "content": base64.b64encode(
                   json.dumps(worker_config).encode()).decode(),
               "encode": 0})
     console.agent_exec(
-        lab, api, args.vmid,
+        lab, api, vmid,
         ["/bin/bash", "-c", "chmod 600 /etc/pxl-share/config.json"], timeout=60)
-
     token = (secrets_store.get(_CONFIG, "ngrok-authtoken", required=False)
              if TUNNEL == "ngrok" else "")
     if token:
         console.agent_exec(
-            lab, api, args.vmid,
+            lab, api, vmid,
             ["/bin/bash", "-c",
              'mkdir -p /root/.config/ngrok && '
              'HOME=/root ngrok config add-authtoken "$0" '
@@ -335,20 +308,26 @@ def cmd_setup(lab: Any, args: Any) -> None:
              'chmod 600 /root/.config/ngrok/ngrok.yml',
              token],
             timeout=60)
-
-    result = console.agent_exec(lab, api, args.vmid,
+    result = console.agent_exec(lab, api, vmid,
                                 ["/bin/bash", "/tmp/pxl-share-setup.sh"],
-                                timeout=args.setup_timeout)
+                                timeout=setup_timeout)
     if result["exitcode"] not in (0, None):
         raise ShareError("share worker setup failed: "
                          + (result["stderr"] or result["stdout"])[-600:])
 
-    try:
-        api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
-                 {"delete": "cipassword"})
-    except lab.LabError:
-        pass
 
+def cmd_setup(lab: Any, args: Any) -> None:
+    """Build the share worker: noVNC, ngrok, and the relay."""
+    api = lab.ProxmoxAPI()
+    lease = lab.load_lease(args.lease)
+    if args.vmid in lease["initial_vmids"]:
+        raise ShareError(f"VMID {args.vmid} existed before this lease")
+    template = args.template or int(_CONFIG.network.get("gateway_template_vmid") or 0)
+    if not template:
+        raise ShareError("pass --template <vmid> of a cloud-init image")
+    name, _ = _provision_worker_vm(lab, api, lease, args, template)
+    _install_relay(lab, api, args.vmid, args.setup_timeout)
+    console.clear_bootstrap_password(lab, api, args.vmid)
     lab.audit("share-worker-provisioned", lease=args.lease, vmid=args.vmid)
     print(json.dumps({
         "vmid": args.vmid, "name": name,
@@ -356,7 +335,6 @@ def cmd_setup(lab: Any, args: Any) -> None:
                  f"  worker_vmid = {args.vmid}",
                  "then: proxmox-lab share status"],
     }, indent=2, sort_keys=True))
-
 
 def cmd_create(lab: Any, args: Any) -> None:
     """Mint a disposable link to one guest's console."""
@@ -433,7 +411,7 @@ def cmd_status(lab: Any, args: Any) -> None:
             if status.get("status") == "running":
                 report["services"] = _run(
                     lab, api,
-                    "systemctl is-active pxl-share pxl-tunnel || true"
+                    ["/bin/sh", "-c", "systemctl is-active pxl-share pxl-tunnel || true"]
                 ).split()
                 try:
                     base, reach = base_url(lab, api)
@@ -464,8 +442,8 @@ def cmd_down(lab: Any, args: Any) -> None:
 
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     share = sub.add_parser(
         "share", help="disposable links to a guest console, via noVNC")
@@ -482,7 +460,7 @@ def register(sub: Any, lab: Any) -> None:
                        default="retain")
     build.add_argument("--clone-timeout", type=int, default=1800)
     build.add_argument("--setup-timeout", type=int, default=1200)
-    build.set_defaults(func=bind(cmd_setup))
+    build.set_defaults(func=_bind(lab, cmd_setup))
 
     create = share_sub.add_parser("create", help="mint a link to one console")
     create.add_argument("--lease", required=True)
@@ -492,19 +470,19 @@ def register(sub: Any, lab: Any) -> None:
     create.add_argument("--label")
     create.add_argument("--once", action="store_true",
                         help="revoke after the first connection")
-    create.set_defaults(func=bind(cmd_create))
+    create.set_defaults(func=_bind(lab, cmd_create))
 
     share_sub.add_parser("list", help="live links"
-                         ).set_defaults(func=bind(cmd_list))
+                         ).set_defaults(func=_bind(lab, cmd_list))
     share_sub.add_parser("status", help="worker and public address"
-                         ).set_defaults(func=bind(cmd_status))
+                         ).set_defaults(func=_bind(lab, cmd_status))
 
     revoke = share_sub.add_parser("revoke", help="kill a link, or all of them")
     revoke.add_argument("--lease", required=True)
     revoke.add_argument("--token")
     revoke.add_argument("--all", action="store_true")
-    revoke.set_defaults(func=bind(cmd_revoke))
+    revoke.set_defaults(func=_bind(lab, cmd_revoke))
 
     stop = share_sub.add_parser("down", help="stop the worker; revokes all")
     stop.add_argument("--lease", required=True)
-    stop.set_defaults(func=bind(cmd_down))
+    stop.set_defaults(func=_bind(lab, cmd_down))

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -462,3 +463,26 @@ class VisionApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RaceFastFailRegressionTests(unittest.TestCase):
+    """The race must stop as soon as every provider has reported.
+
+    Regression: a dedup pass deleted the `remaining -= 1` decrement while the
+    loop still read `while remaining:`, so once all providers had failed the
+    loop sat on an empty queue until the full timeout expired (120s by
+    default) instead of raising immediately.
+    """
+
+    def test_all_providers_failing_raises_without_waiting_for_the_timeout(self):
+        def boom() -> dict:
+            raise vision.VisionError("provider down")
+
+        providers = {"nvidia": boom, "openrouter": boom, "kilo": boom}
+        started = time.monotonic()
+        with self.assertRaises(vision.VisionError) as caught:
+            vision._race_providers(providers, timeout=30)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5, "race waited for the timeout instead of failing fast")
+        for name in providers:
+            self.assertIn(name, str(caught.exception))

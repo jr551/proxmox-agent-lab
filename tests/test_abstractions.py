@@ -27,6 +27,9 @@ from unittest import mock  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
+import json  # noqa: E402
+import sqlite3  # noqa: E402
+
 from proxmox_agent_lab import config as config_module  # noqa: E402
 from proxmox_agent_lab import guest as guest_module  # noqa: E402
 from proxmox_agent_lab import inventory as inventory_module  # noqa: E402
@@ -243,308 +246,102 @@ class SecretsTests(unittest.TestCase):
                 )
 
 
+journal = journal_module
+config = config_module
+
+
 class JournalTests(unittest.TestCase):
+    """The ledger layer: spooling, deterministic ids, and legacy migration.
+
+    The MariaDB side itself is covered against a real server in
+    test_mariadb.py; these cover the logic that must hold with the ledger
+    unreachable, which is most of the time.
+    """
+
     def _event(self, name: str, **fields: object) -> dict[str, object]:
         return {"timestamp": "2026-01-01T00:00:00Z", "event": name, **fields}
 
-    def test_sqlite_round_trip_and_ordering(self) -> None:
+    def test_an_unreachable_ledger_spools_instead_of_failing(self) -> None:
+        """The lab host is off between leases; an action must not fail for it."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for index in range(3):
-                journal_module.append(
-                    root, "sqlite",
-                    {"timestamp": f"2026-01-0{index + 1}T00:00:00Z",
-                     "event": "lease-begin", "lease": f"L{index}"},
-                )
-            events = journal_module.query(root, limit=10)
-            self.assertEqual(len(events), 3)
-            self.assertEqual(events[0]["lease"], "L2", "newest first")
+            outcome = journal.record(None, root, self._event("lease-begin"))
+            self.assertEqual(outcome, "spooled")
+            self.assertEqual(len(journal.read_spool(root)), 1)
+
+    def test_a_spooled_event_keeps_its_controller_and_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            journal.record(None, root, self._event("x"), controller="pc-1")
+            entry = journal.read_spool(root)[0]
+            self.assertEqual(entry["controller"], "pc-1")
+            self.assertTrue(entry["event_id"])
+
+    def test_event_ids_are_derived_from_content(self) -> None:
+        """Deterministic, so replaying a spool or re-running a migration is a
+        no-op against the unique index rather than duplicated history."""
+        a = self._event("guest-run", vmid=1)
+        b = self._event("guest-run", vmid=1)
+        c = self._event("guest-run", vmid=2)
+        self.assertEqual(journal.event_id_for(a), journal.event_id_for(b))
+        self.assertNotEqual(journal.event_id_for(a), journal.event_id_for(c))
+
+    def test_an_explicit_event_id_is_kept(self) -> None:
+        given = self._event("x", event_id="abc123")
+        self.assertEqual(journal.event_id_for(given), "abc123")
+
+    def test_legacy_sqlite_and_jsonl_are_found_for_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.mkdir(exist_ok=True)
+            connection = sqlite3.connect(journal.legacy_database_path(root))
+            connection.execute(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "timestamp TEXT, event TEXT, lease TEXT, vmid INTEGER, data TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO events (timestamp, event, data) VALUES (?, ?, ?)",
+                ("2026-01-01T00:00:00Z", "old",
+                 json.dumps(self._event("old"), sort_keys=True)),
+            )
+            connection.commit()
+            connection.close()
+            (root / "2026-01-02.jsonl").write_text(
+                json.dumps(self._event("older"), sort_keys=True) + "\n"
+            )
             self.assertEqual(
-                journal_module.query(root, lease="L1")[0]["lease"], "L1"
+                journal.legacy_counts(root), {"sqlite": 1, "jsonl": 1}
             )
 
-    def test_event_wildcard_filter(self) -> None:
+    def test_the_spool_is_not_mistaken_for_a_legacy_jsonl_ledger(self) -> None:
+        """The spool is also .jsonl; importing it as history would double it."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            journal_module.append(root, "sqlite", self._event("lease-begin"))
-            journal_module.append(root, "sqlite", self._event("lease-end"))
-            journal_module.append(root, "sqlite", self._event("guest-run"))
-            self.assertEqual(len(journal_module.query(root, event="lease-*")), 2)
+            journal.record(None, root, self._event("pending"))
+            self.assertEqual(journal.legacy_counts(root)["jsonl"], 0)
 
-    def test_query_on_a_fresh_install_is_empty_not_an_error(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(journal_module.query(Path(tmp)), [])
-            self.assertFalse(journal_module.summary(Path(tmp))["exists"])
-
-    def test_jsonl_backend_still_works(self) -> None:
+    def test_migration_marker_stops_it_running_twice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            journal_module.append(root, "jsonl", self._event("lease-begin"))
-            written = list(root.glob("*.jsonl"))
-            self.assertEqual(len(written), 1)
-            self.assertIn("lease-begin", written[0].read_text())
+            self.assertFalse(journal.migration_done(root))
+            journal.mark_migrated(root, {"legacy_events": 0})
+            self.assertTrue(journal.migration_done(root))
+            self.assertIsNone(journal.auto_migrate(None, root))
 
-    def test_git_sync_pushes_only_the_daily_log(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            remote = root / "remote.git"
-            repo = root / "logs"
-            subprocess.run(["git", "init", "--bare", str(remote)], check=True,
-                           stdout=subprocess.DEVNULL)
-            subprocess.run(["git", "init", "-b", "logs", str(repo)], check=True,
-                           stdout=subprocess.DEVNULL)
-            for key, value in (("user.name", "Test"),
-                               ("user.email", "test@example.invalid")):
-                subprocess.run(
-                    ["git", "-C", str(repo), "config", key, value], check=True
-                )
-            (repo / "README.md").write_text("private audit logs\n")
-            subprocess.run(["git", "-C", str(repo), "add", "README.md"],
-                           check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
-                           check=True, stdout=subprocess.DEVNULL)
-            subprocess.run(
-                ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(repo), "push", "-u", "origin", "logs"],
-                check=True, stdout=subprocess.DEVNULL,
-            )
+    def test_settings_fall_back_to_the_proxmox_host(self) -> None:
+        """The ledger runs on the lab host, so that is the sensible default."""
+        cfg = config.Config({
+            "proxmox": {"host": "192.0.2.10"},
+            "audit": {},
+        }, None, Path("/nonexistent"))
+        settings = journal.settings_from_config(cfg, "pw")
+        self.assertEqual(settings.host, "192.0.2.10")
+        self.assertEqual(settings.port, 3306)
 
-            journal_module.sync_git(
-                repo, self._event("lease-begin", vmid=9001), "lease-begin"
-            )
-            logged = subprocess.run(
-                ["git", "--git-dir", str(remote), "show",
-                 "logs:journal/2026-01-01.jsonl"],
-                check=True, text=True, stdout=subprocess.PIPE,
-            ).stdout
-            self.assertIn('"event": "lease-begin"', logged)
-            changed = subprocess.run(
-                ["git", "--git-dir", str(remote), "diff-tree", "--no-commit-id",
-                 "--name-only", "-r", "logs"],
-                check=True, text=True, stdout=subprocess.PIPE,
-            ).stdout.splitlines()
-            self.assertEqual(changed, ["journal/2026-01-01.jsonl"])
-
-    def test_git_sync_retries_a_rejected_non_fast_forward_push(self) -> None:
-        # A competing writer that pushes between our fetch and our push leaves
-        # the rebase against a stale origin; the push is then rejected as
-        # non-fast-forward and sync_git must refetch, rebase and retry.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            remote = root / "remote.git"
-            repo = root / "logs"
-            subprocess.run(["git", "init", "--bare", str(remote)], check=True,
-                           stdout=subprocess.DEVNULL)
-            subprocess.run(["git", "init", "-b", "logs", str(repo)], check=True,
-                           stdout=subprocess.DEVNULL)
-            for key, value in (("user.name", "Test"),
-                               ("user.email", "test@example.invalid")):
-                subprocess.run(
-                    ["git", "-C", str(repo), "config", key, value], check=True
-                )
-            (repo / "README.md").write_text("private audit logs\n")
-            subprocess.run(["git", "-C", str(repo), "add", "README.md"],
-                           check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
-                           check=True, stdout=subprocess.DEVNULL)
-            subprocess.run(
-                ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(repo), "push", "-u", "origin", "logs"],
-                check=True, stdout=subprocess.DEVNULL,
-            )
-
-            competing = root / "competing"
-            subprocess.run(["git", "clone", "-q", str(remote), str(competing)],
-                           check=True, stdout=subprocess.DEVNULL)
-            for key, value in (("user.name", "Test"),
-                               ("user.email", "test@example.invalid")):
-                subprocess.run(
-                    ["git", "-C", str(competing), "config", key, value],
-                    check=True,
-                )
-            subprocess.run(
-                ["git", "-C", str(competing), "checkout", "-b", "logs",
-                 "origin/logs"],
-                check=True, stdout=subprocess.DEVNULL,
-            )
-
-            real_run = subprocess.run
-            injected = {"done": False}
-
-            def push_with_competing_writer(command, **kwargs):
-                # On sync_git's first push attempt, land a conflicting commit
-                # on origin first so the push is rejected as non-fast-forward.
-                if not injected["done"] and command[:2] == ["git", "-C"] \
-                        and command[3:4] == ["push"]:
-                    injected["done"] = True
-                    log = competing / "journal" / "2026-01-02.jsonl"
-                    log.parent.mkdir(parents=True, exist_ok=True)
-                    log.write_text('{"event": "competing"}\n')
-                    real_run(["git", "-C", str(competing), "add",
-                              "journal/2026-01-02.jsonl"], check=True,
-                             stdout=subprocess.DEVNULL)
-                    real_run(["git", "-C", str(competing), "commit",
-                              "-m", "competing"], check=True,
-                             stdout=subprocess.DEVNULL)
-                    real_run(["git", "-C", str(competing), "push",
-                              "origin", "logs"], check=True,
-                             stdout=subprocess.DEVNULL)
-                return real_run(command, **kwargs)
-
-            with mock.patch.object(journal_module.subprocess, "run",
-                                   side_effect=push_with_competing_writer), \
-                 mock.patch.object(journal_module, "SYNC_GIT_RETRY_DELAY", 0):
-                journal_module.sync_git(
-                    repo, self._event("lease-begin", vmid=9001), "lease-begin"
-                )
-            self.assertTrue(injected["done"], "the competing push never ran")
-            logged = subprocess.run(
-                ["git", "--git-dir", str(remote), "show",
-                 "logs:journal/2026-01-01.jsonl"],
-                check=True, text=True, stdout=subprocess.PIPE,
-            ).stdout
-            self.assertIn('"event": "lease-begin"', logged)
-            competing_log = subprocess.run(
-                ["git", "--git-dir", str(remote), "show",
-                 "logs:journal/2026-01-02.jsonl"],
-                check=True, text=True, stdout=subprocess.PIPE,
-            ).stdout
-            self.assertIn('"event": "competing"', competing_log)
-
-    def test_git_sync_refuses_a_mixed_purpose_checkout(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            subprocess.run(["git", "init", "-b", "logs", str(repo)], check=True,
-                           stdout=subprocess.DEVNULL)
-            (repo / "source.py").write_text("do_not_commit = True\n")
-            with self.assertRaisesRegex(RuntimeError, "dirty"):
-                journal_module.sync_git(
-                    repo, self._event("lease-begin"), "lease-begin"
-                )
-            self.assertFalse((repo / "journal").exists())
-
-    def test_legacy_jsonl_can_be_imported(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            journal_module.append(root, "jsonl", self._event("lease-begin"))
-            journal_module.append(root, "jsonl", self._event("lease-end"))
-            self.assertEqual(journal_module.import_jsonl(root), 2)
-            self.assertEqual(len(journal_module.query(root)), 2)
-
-    def test_jsonl_query_reads_what_the_jsonl_backend_wrote(self) -> None:
-        """Found live: query() opened journal.db whatever the backend was, so a
-        configured JSONL ledger reported no events at all -- worst of all
-        during an incident review."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for index in range(3):
-                journal_module.append(
-                    root, "jsonl",
-                    {"timestamp": f"2026-01-0{index + 1}T00:00:00Z",
-                     "event": "lease-begin", "lease": f"L{index}", "vmid": 1},
-                )
-            events = journal_module.query(root, backend="jsonl")
-            self.assertEqual(len(events), 3)
-            self.assertEqual(events[0]["lease"], "L2", "newest first")
-            self.assertFalse(journal_module.database_path(root).exists())
-
-    def test_jsonl_query_applies_the_same_filters_as_sqlite(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for backend in ("sqlite", "jsonl"):
-                journal_module.append(
-                    root, backend,
-                    {"timestamp": "2026-01-01T00:00:00Z",
-                     "event": "lease-begin", "lease": "L1"},
-                )
-                journal_module.append(
-                    root, backend,
-                    {"timestamp": "2026-01-02T00:00:00Z",
-                     "event": "lease-end", "lease": "L2"},
-                )
-                journal_module.append(
-                    root, backend,
-                    {"timestamp": "2026-01-03T00:00:00Z",
-                     "event": "guest-run", "lease": "L1"},
-                )
-            for backend in ("sqlite", "jsonl"):
-                with self.subTest(backend=backend):
-                    self.assertEqual(
-                        len(journal_module.query(root, lease="L1",
-                                                 backend=backend)), 2)
-                    self.assertEqual(
-                        len(journal_module.query(root, event="lease-*",
-                                                 backend=backend)), 2)
-                    self.assertEqual(
-                        len(journal_module.query(root, since="2026-01-02",
-                                                 backend=backend)), 2)
-                    self.assertEqual(
-                        len(journal_module.query(root, limit=1,
-                                                 backend=backend)), 1)
-
-    def test_jsonl_summary_counts_the_jsonl_records(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.assertFalse(
-                journal_module.summary(root, backend="jsonl")["exists"]
-            )
-            for _ in range(4):
-                journal_module.append(root, "jsonl",
-                                      self._event("guest-run", lease="L1"))
-            summary = journal_module.summary(root, backend="jsonl")
-            self.assertTrue(summary["exists"])
-            self.assertEqual(summary["events"], 4)
-            self.assertEqual(summary["distinct_leases"], 1)
-            self.assertEqual(summary["most_common"]["guest-run"], 4)
-            self.assertEqual(summary["backend"], "jsonl")
-
-    def test_git_sync_status_reports_an_unusable_mirror(self) -> None:
-        """Found live: git_sync pointed at a path that did not exist, every
-        command printed a warning nobody read, and doctor said nothing."""
-        with tempfile.TemporaryDirectory() as tmp:
-            missing = journal_module.git_sync_status(Path(tmp) / "nope")
-            self.assertFalse(missing["ok"])
-            self.assertIn("does not exist", missing["problem"])
-
-            plain = Path(tmp) / "plain"
-            plain.mkdir()
-            not_a_repo = journal_module.git_sync_status(plain)
-            self.assertFalse(not_a_repo["ok"])
-            self.assertIn("not a git repository", not_a_repo["problem"])
-
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            subprocess.run(["git", "init", "-b", "logs", str(repo)], check=True,
-                           stdout=subprocess.DEVNULL)
-            self.assertTrue(journal_module.git_sync_status(repo)["ok"])
-
-            (repo / "source.py").write_text("do_not_commit = True\n")
-            dirty = journal_module.git_sync_status(repo)
-            self.assertFalse(dirty["ok"])
-            self.assertIn("dirty", dirty["problem"])
-
-    def test_git_sync_status_refuses_an_unsafe_branch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            status = journal_module.git_sync_status(Path(tmp), "logs/../../x")
-            self.assertFalse(status["ok"])
-            self.assertIn("unsafe", status["problem"])
-
-    def test_summary_counts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for _ in range(4):
-                journal_module.append(root, "sqlite",
-                                      self._event("guest-run", lease="L1"))
-            summary = journal_module.summary(root)
-            self.assertEqual(summary["events"], 4)
-            self.assertEqual(summary["distinct_leases"], 1)
-            self.assertEqual(summary["most_common"]["guest-run"], 4)
+    def test_no_host_anywhere_means_no_ledger(self) -> None:
+        cfg = config.Config({"proxmox": {}, "audit": {}}, None,
+                            Path("/nonexistent"))
+        self.assertIsNone(journal.settings_from_config(cfg, "pw"))
 
 
 class GuestChannelTests(unittest.TestCase):

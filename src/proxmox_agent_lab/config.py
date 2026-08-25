@@ -138,18 +138,14 @@ DEFAULTS: dict[str, Any] = {
         "file_path": "",
     },
     "audit": {
-        "backend": "sqlite",   # sqlite | jsonl | pocketbase
-        "journal_dir": "",     # defaults to <state>/journal
-        "git_sync": False,     # copy redacted events to a private git repo
-        "git_repo": "",
-        "git_branch": "logs",
+        "host": "",            # defaults to the [proxmox] host
+        "port": 3306,
+        "database": "proxmox_lab",
+        "user": "proxmox_lab",
+        "password_secret": "mariadb-password",
+        "timeout_seconds": 10,
+        "journal_dir": "",     # local spool only
         "controller_id": "",
-        "pocketbase_url": "",
-        "pocketbase_collection": "proxmox_lab_events",
-        "pocketbase_token_secret": "audit-token",
-        "pocketbase_timeout_seconds": 10,
-        "pocketbase_auth_refresh_before_seconds": 300,
-        "pocketbase_agent_collection": "proxmox_lab_agents",
     },
 }
 
@@ -418,15 +414,14 @@ template_2022_vmid = 0
 backend = "auto"             # auto | keychain | secret-tool | env | file
 
 [audit]
-backend = "sqlite"           # sqlite | jsonl | pocketbase
-git_sync = false             # copy redacted events to a private git repo
-git_repo = ""                # dedicated private logging checkout
-git_branch = "logs"
+# The shared ledger: MariaDB on the Proxmox host. Provision it once with
+# 'proxmox-lab journal host-setup'. Leave host empty to use the [proxmox]
+# host, which is where that container runs.
+host = ""                    # defaults to the [proxmox] host
+port = 3306
+database = "proxmox_lab"
+user = "proxmox_lab"
+password_secret = "mariadb-password"   # read from the environment
+timeout_seconds = 10
 controller_id = ""           # defaults to the controller hostname
-pocketbase_url = ""          # e.g. https://rowedb.example
-pocketbase_collection = "proxmox_lab_events"
-pocketbase_token_secret = "audit-token"
-pocketbase_timeout_seconds = 10
-pocketbase_auth_refresh_before_seconds = 300
-pocketbase_agent_collection = "proxmox_lab_agents"
 """

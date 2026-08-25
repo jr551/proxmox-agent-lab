@@ -19,88 +19,61 @@ Run that once per lease, then drive the guest normally. `--allow-existing` is
 for a guest that genuinely predates the lease; a guest this lease created is
 registered without it.
 
-## Choosing a channel
+## 1. Choosing a channel
 
-Pick the cheapest channel that answers the question.
+Pick the cheapest channel that answers the question. This is the only channel
+table; the reading and writing sections below expand it without repeating it.
 
 | Situation | Use | Why |
 |---|---|---|
 | Guest is a Linux shell, LXC, or has a serial console | `console text` | Returns the exact character stream from Proxmox |
-| Guest runs qemu-guest-agent | `console exec` | Real exit codes, stdout and stderr |
+| Guest runs qemu-guest-agent | `console exec` | Real exit codes, stdout and stderr (§2.4) |
 | Graphical screen: installer, desktop, BIOS, boot menu | `console screenshot` | A multimodal model reads the PNG directly |
-| You cannot see images yourself | `console screenshot --for-model` or `console inspect` | Hands the screen to a model that can |
+| You cannot see images yourself | `console screenshot --for-model` or `console inspect` | Hands the screen to a model that can (§2.3) |
 
-## Reading a screen
+There is no OCR. For the one-paragraph explanation and the removal schedule see the [appendix](#appendix-why-there-is-no-ocr).
 
-A screen is read by a model, never by glyph matching. Three ways, in the order
-you should reach for them:
+## 2. Reading a screen
 
-1. **The guest is a terminal** — `console text`. Proxmox hands over the guest's
-   real character stream. Exact, cheap, always better than looking at pixels.
-2. **You can see images** — `console screenshot`, then read the PNG it wrote.
-3. **You cannot see images** — either `console inspect`, which sends one
-   lease-owned screen to a configured cloud vision provider, or
-   `console screenshot --for-model`, which returns the screen inline as a
-   bounded base64 PNG for your own vision to decode. `console inspect` also
-   falls back to that base64 copy automatically when every provider fails, so
-   a missing or broken vision key never leaves you with nothing to look at.
+A screen is read by a model, never by glyph matching. Three paths, in the
+order you should reach for them. The fourth row in the table above, `console
+exec`, is a command channel, not a screen read — see §2.4.
 
-There is no OCR. Glyph matching only ever worked on a guest whose console font
-this controller already had, and a guest that ships its own font decoded to
-noise — see [issue #95](https://github.com/jr551/proxmox-agent-lab/issues/95).
-`--ocr` and `console import-font` still exist as errors that point here; they
-are deleted in 0.11.0.
+### 2.1 The guest is a terminal — `console text`
 
-## Screenshots
+Exact, cheap, always better than looking at pixels. Proxmox hands over the
+guest's real character stream; no model needed.
+
+```bash
+proxmox-lab console text --vmid 9001 --send "ip -br a" --seconds 4
+```
+
+A QEMU guest needs `serial0: socket` in its config for this path; cloud-init
+templates in this lab are built with it. Full `text` flags and the
+`--follow`/`--from-reset`/`--wait-for-guest`/`bridge` modes are in §5 — this
+subsection is the quick pointer.
+
+### 2.2 The guest is graphical — `console screenshot`
 
 ```bash
 proxmox-lab console screenshot --vmid 9001 --settle 2
 ```
 
 Writes a PNG to `~/.local/state/proxmox-agent-lab/screens/` and prints its
-path, dimensions, and whether the screen looks like a text console. Add
-`--upload` to also place it in the S3 scratch bucket and print a presigned URL.
+path, dimensions, and whether the screen looks like a text console. Flags:
+
+* `--vmid` (required), `--out` (override path), `--settle` seconds to wait
+  before capturing (default `0.0`), `--timeout` (default `25.0`), `--upload` to
+  also place the PNG in the S3 scratch bucket and print a presigned URL
+  (`--url-expiry` default `3600`), `--via vnc|monitor` (default `vnc`), `--lease`
+  (required with `--via monitor`), and `--for-model` (see §2.3). `--ocr` is a
+  removal signpost — see the appendix.
 
 The capture path is a self-contained RFB client: Proxmox `vncproxy`, a
 WebSocket upgrade, RFB 3.8 with VNC authentication, and Raw/Zlib/CopyRect
 decoding into a PNG written with `zlib` alone. No Pillow, numpy, or noVNC.
 
-### Getting the pixels back inline: `--for-model`
-
-```bash
-proxmox-lab console screenshot --vmid 9001 --for-model
-```
-
-Adds an `image` object to the JSON holding the screen as a base64 PNG, for a
-caller that reads images itself but cannot open a file on this machine. It is
-opt-in on purpose — an unrequested megabyte of base64 in every screenshot
-would be hostile — and works on both `--via vnc` and `--via monitor`.
-
-The image is compressed but deliberately not over-compressed:
-
-| Field | Meaning |
-|---|---|
-| `encoding`, `mime_type` | Always `base64` and `image/png` |
-| `width`, `height` | What was actually emitted |
-| `original_width`, `original_height` | The real framebuffer |
-| `scale` | Emitted width ÷ original width; multiply coordinates back by it |
-| `bytes`, `base64_bytes` | PNG size and encoded size |
-| `base64` | The image. Absent if the cap could not be met — `error` says why |
-
-A screen already within 1280 pixels on its longest edge is sent untouched at
-`scale: 1.0`. Anything larger is box-averaged down to 1280 (a 1920x1080
-desktop becomes 1280x720) and re-encoded at maximum zlib compression. Averaging
-matters: nearest-neighbour resampling drops whole scanlines and destroys
-8-pixel glyphs, which is the entire point of keeping the text readable. If the
-result still exceeds a 1.5 MB base64 cap, the bound steps down until it fits,
-never below 640 pixels — under that an 80-column line falls below 8 pixels per
-glyph and stops being readable. A screen that cannot fit even at the floor
-returns `error` instead of an unbounded blob; read the written PNG instead.
-
-Only the fact and the byte size are audited. The image itself never enters the
-journal.
-
-### Watching something slow: `screenshot-burst`
+#### Watching something slow: `screenshot-burst`
 
 ```bash
 proxmox-lab console screenshot-burst --vmid 9001 --count 6 --interval 10
@@ -114,10 +87,10 @@ default run spans about a minute), then stitches them left to right into a
 single PNG with each frame's elapsed seconds stamped in its corner. Frames
 are never scaled or cropped to match, so a resolution change mid-sequence
 (a boot menu switching to a desktop, for instance) is preserved rather than
-distorted. Takes `--out` and `--upload` like `screenshot`. Prefer this over a
-manual sleep-then-screenshot loop.
+distorted. Takes `--out` and `--upload` (and `--timeout`, `--url-expiry`)
+like `screenshot`. Prefer this over a manual sleep-then-screenshot loop.
 
-### If VNC itself is the problem: `--via monitor`
+#### If VNC itself is the problem: `--via monitor`
 
 ```bash
 proxmox-lab console screenshot --vmid 9001 --via monitor --lease "$L"
@@ -153,16 +126,63 @@ The result carries `"source": "monitor"` (the default VNC path reports
 because those need the raw framebuffer — so keep VNC as the default and reach
 for this only when VNC fails.
 
-## Optional cloud vision: `console inspect`
+### 2.3 You cannot see images — `--for-model` and `console inspect`
+
+Both hand pixels to a vision model instead of to you. They share one bounded
+image shape described once here; every other reference points back to this
+table.
+
+#### Getting the pixels back inline: `screenshot --for-model`
+
+```bash
+proxmox-lab console screenshot --vmid 9001 --for-model
+```
+
+Adds an `image` object to the JSON holding the screen as a base64 PNG, for a
+caller that reads images itself but cannot open a file on this machine. It is
+opt-in on purpose — an unrequested megabyte of base64 in every screenshot
+would be hostile — and works on both `--via vnc` and `--via monitor`.
+
+The image is compressed but deliberately not over-compressed. This is the
+canonical shape (also used by `console inspect`'s fallback):
+
+| Field | Meaning |
+|---|---|
+| `encoding`, `mime_type` | Always `base64` and `image/png` |
+| `width`, `height` | What was actually emitted |
+| `original_width`, `original_height` | The real framebuffer |
+| `scale` | Emitted width ÷ original width; multiply coordinates back by it |
+| `bytes`, `base64_bytes` | PNG size and encoded size |
+| `base64` | The image. Absent if the cap could not be met — `error` says why |
+
+A screen already within 1280 pixels on its longest edge is sent untouched at
+`scale: 1.0`. Anything larger is box-averaged down to 1280 (a 1920x1080
+desktop becomes 1280x720) and re-encoded at maximum zlib compression. Averaging
+matters: nearest-neighbour resampling drops whole scanlines and destroys
+8-pixel glyphs, which is the entire point of keeping the text readable. If the
+result still exceeds a 1.5 MB base64 cap, the bound steps down until it fits,
+never below 640 pixels — under that an 80-column line falls below 8 pixels per
+glyph and stops being readable. A screen that cannot fit even at the floor
+returns `error` instead of an unbounded blob; read the written PNG instead.
+
+Only the fact and the byte size are audited. The image itself never enters the
+journal.
+
+#### Optional cloud vision: `console inspect`
 
 ```bash
 proxmox-lab console inspect --lease "$L" --vmid 9001
 ```
 
-This stores the untouched PNG locally and overlays a labelled 100-pixel X/Y
+Stores the untouched PNG locally and overlays a labelled 100-pixel X/Y
 grid on a separate same-size model-input PNG. Later frames dim unchanged pixels
-while changed regions stay bright with a magenta boundary. Automatic mode
-races four routes and returns the first structurally valid answer:
+while changed regions stay bright with a magenta boundary. Flags: `--lease` and
+`--vmid` (required), `--out`, `--settle` (default `2.0`), `--timeout` (default
+`120`), `--max-tokens` (default `1024`), `--prompt`, `--provider
+auto|nvidia|openrouter-nemotron|openrouter-free|kilo` (default `auto`), and
+`--no-image-fallback` (see below).
+
+Automatic mode races four routes and returns the first structurally valid answer:
 
 | `--provider` | Route |
 |---|---|
@@ -183,23 +203,43 @@ break the day a specific model is retired. The result records the router id
 under `requested_model` and whichever concrete model actually answered under
 `model`.
 
-### When every provider fails
+*Fallback shape.* `console inspect` still exits non-zero and still audits the
+failure when every provider fails — a vision outage is never quietly reported
+as success. But it also prints the screen as a base64 PNG under `image` in
+exactly the [canonical shape above](#getting-the-pixels-back-inline-screenshot---for-model),
+with the same bounds and cap. `vision_error` carries the reason. Pass
+`--no-image-fallback` to suppress the blob and get the error alone.
 
-`console inspect` still exits non-zero and still audits the failure — a vision
-outage is never quietly reported as success. But it also prints the screen as
-a base64 PNG under `image`, in the same shape and with the same bounds as
-[`--for-model`](#getting-the-pixels-back-inline---for-model), so a caller with
-its own vision can read the screen instead of acting blind. `vision_error`
-carries the reason. Pass `--no-image-fallback` to suppress the blob and get
-the error alone.
+This handback is intentionally separate from `screenshot`: external image
+transmission must be explicit. The model's coordinates are advisory and still
+pass through the cursor-calibration workflow before any click occurs.
+Accordingly, a vision response recommending a click always reports
+`actionable: false` and `requires_cursor_calibration: true`, even when its
+JSON is structurally valid.
 
-This is intentionally separate from `screenshot`: external image transmission
-must be explicit. The model's coordinates are advisory and still pass through
-the cursor-calibration workflow before any click occurs. Accordingly, a vision
-response recommending a click always reports `actionable: false` and
-`requires_cursor_calibration: true`, even when its JSON is structurally valid.
+### 2.4 Running a command inside the guest — `console exec`
 
-## Input
+When the guest runs `qemu-guest-agent`, the cheapest path is not a screen at
+all — it is `console exec`, which runs a process inside the guest over the
+agent channel and returns real `exitcode`, `stdout`, and `stderr` as JSON.
+
+```bash
+proxmox-lab console exec --lease "$L" --vmid 9001 -- uname -a
+proxmox-lab console exec --lease "$L" --vmid 9001 --shell -- "echo $HOME && ls -la"
+proxmox-lab console exec --lease "$L" --vmid 9010 --windows -- "dir C:\\"
+```
+
+Flags: `--lease` and `--vmid` (required), `--shell` (wrap the command as
+`/bin/sh -c "…"` or `cmd.exe /c "…"` with `--windows`), `--windows` (Windows
+guest quoting), `--timeout` seconds (default `300`), then the command as
+positional `command …`. The guest must be owned by the lease; the fact of the
+execution (argv0, exit code) is audited, not the output. For long-lived or
+file-oriented work, `guest run`/`push`/`pull` remain the bulk-transfer path;
+`console exec` is the single-command analogue that lives under `console`
+because it shares the same lease-owned, audited surface. Registration is at
+[`src/proxmox_agent_lab/console.py:2222`](../src/proxmox_agent_lab/console.py#L2222).
+
+## 3. Writing to the guest: `keys`, `type`, `click`
 
 ```bash
 proxmox-lab console keys  --lease "$L" --vmid 9001 enter f2 ctrl-alt-delete
@@ -214,6 +254,26 @@ same JSON response, avoiding a separate reconnect and screenshot call:
 ```bash
 proxmox-lab console keys --lease "$L" --vmid 9001 enter --screenshot-after 3
 ```
+
+### Flags
+
+* `keys`: `--lease`/`--vmid` (required), positional `keys …` (e.g.
+  `ctrl-alt-delete f2 enter`), `--via vnc|api` (default `vnc`; `api` uses
+  Proxmox `sendkey` when RFB input is unavailable), `--delay` (default `0.08`),
+  `--screenshot-after SECONDS`, `--screenshot-out PATH` (also spelled `--out`).
+* `type`: `--lease`/`--vmid`, `--text TEXT` or `--text-stdin` (read from stdin
+  so a password never appears in `argv`, shell history, or the audit ledger;
+  only the character count is recorded), `--enter`, `--delay` (default `0.012`),
+  `--screenshot-after`, `--screenshot-out`/`--out`.
+* `click`: `--lease`/`--vmid`/`--x`/`--y` (required), `--target` (short visible
+  label of the intended control), `--empty-space` (click a known empty
+  coordinate without target verification — omit `--target`), `--button
+  1|2|3` (default `1`), `--double`, `--calibration-settle` (default `1.0`),
+  `--vision-timeout` (default `45`), `--provider
+  auto|nvidia|openrouter-nemotron|openrouter-free` (default `auto`),
+  `--screenshot-after`, `--screenshot-out`/`--out`.
+
+Clicks are refused outside the current screen bounds.
 
 ### Did the input actually arrive?
 
@@ -233,14 +293,6 @@ screen is a prompt to re-read with `console screenshot` or `console text`
 before sending more input, not an error. Without `--screenshot-after` no
 capture is taken and neither field appears, which means driving a screen with
 no delivery evidence at all; on a graphical guest, pass it.
-
-- `keys` defaults to the VNC path; `--via api` uses Proxmox `sendkey`, which
-  works even when RFB input is unavailable.
-- `type` takes `--text-stdin` so a password never appears in `argv`, the shell
-  history, or the audit ledger. Only the character count is recorded.
-- Clicks are refused outside the current screen bounds.
-- `--screenshot-out PATH` (or the shorter `--out PATH`) gives the post-input
-  PNG a stable checkpoint name.
 
 By default, every click names its visible target. The harness moves the cursor,
 captures a full checkpoint, and asks cloud vision to independently match the
@@ -273,14 +325,14 @@ should use with installers, including Haiku. A model without image vision
 should delegate the current full-screen decision to a vision-capable model,
 not run Tesseract over crops.
 
-## Is it actually frozen?
+## 4. Liveness probes: `has-gui-locked-up`, `has-terminal-locked-up`
 
-Two best-effort liveness probes, for when a screen has looked the same for a
-while and you need to know whether it's genuinely stuck or just quiet:
+Two best-effort probes, for when a screen has looked the same for a while and
+you need to know whether it's genuinely stuck or just quiet:
 
 ```bash
 proxmox-lab console has-gui-locked-up --lease "$L" --vmid 9001
-proxmox-lab console has-terminal-locked-up --vmid 9001
+proxmox-lab console has-terminal-locked-up --vmid 9001 --samples 4 --interval 0.6
 ```
 
 `has-gui-locked-up` moves the pointer to two different points a moment apart
@@ -290,10 +342,20 @@ This client declares no support for RFB's Cursor pseudo-encoding, so a
 compliant server (QEMU's among them) draws the pointer into the framebuffer
 itself rather than compositing it client-side; `console click`'s own
 verification already depends on this same fact. `has-terminal-locked-up`
-sends no input at all — it samples a text console several times over about
-two seconds and checks whether anything changed, since a live console's
-cursor normally blinks on its own; it refuses a screen `console screenshot`
-would not call text-mode.
+sends no input at all — it samples a text console several times and checks
+whether anything changed, since a live console's cursor normally blinks on its
+own; it refuses a screen `console screenshot` would not call text-mode.
+
+Flags:
+
+* `has-gui-locked-up`: `--lease`/`--vmid` (required), `--settle` (default
+  `0.3`), `--timeout` (default `25.0`), `--threshold` per-channel change to
+  count a pixel as different (default `24`).
+* `has-terminal-locked-up`: `--vmid` (required; no `--lease` — it is a passive
+  read), `--samples` number of passive captures (default `4`, minimum `2`),
+  `--interval` seconds between captures (default `0.6`), `--timeout` (default
+  `25.0`), `--threshold` (default `24`). The defaults sample for about
+  two seconds; raise `--samples` or `--interval` for a longer window.
 
 Both return `"locked_up"` as a bool alongside the raw per-sample pixel
 deltas, plus a `"caveat"` when the verdict is `true`: a static screen is good
@@ -308,14 +370,15 @@ they only reach the guest when the VM has a graphical display.
 
 - `vga: serial0` (the Linux cloud templates): VNC shows a *rendering* of the
   serial output, and screenshots work, but typing goes nowhere. Drive these
-  with `console text --send`.
+  with `console text --send` (§5).
 - `vga: std` and Windows guests: VNC keyboard and pointer work normally.
 
 Check with `qm config <vmid> | grep vga`, or just try `console text` first. A
 template can be switched with `--data vga=std`, but the change needs a full
-stop and start — a reset keeps the old display device.
+stop and start — a reset keeps the old display device. This is the only
+`vga: serial0` note in this file; input sections elsewhere point here.
 
-## Terminal text
+## 5. Serial text in depth: `console text`, `bridge`, and early-boot capture
 
 ```bash
 proxmox-lab console text --vmid 9001 --send "ip -br a" --seconds 4
@@ -328,6 +391,19 @@ looking at pixels whenever the guest has a real terminal.
 
 A QEMU guest needs `serial0: socket` in its config for this path; cloud-init
 templates in this lab are built with it.
+
+### Flags
+
+`--vmid` (required), `--kind qemu|lxc` (auto-detected if omitted), `--seconds`
+(default `3.0`), `--timeout` (seconds to follow; default until Ctrl+C),
+`--follow` (stream continuously), `--send` (send this line first, then read),
+`--send-raw` (send exactly these characters with no trailing newline — for
+kernel-debugger prompts such as KDB that act on bare characters), `--nudge`
+(send a bare newline to redraw the prompt), `--from-reset` (with `--follow`:
+attach first, then reset the guest, so output from t=0 is captured; requires
+`--lease`; QEMU only), `--wait-for-guest SECONDS` (wait up to this long for
+the serial terminal to exist, so a capture can be started before the guest is
+powered on), `--lease` (optional; required with `--from-reset`).
 
 ### The stream is guest bytes only
 
@@ -385,21 +461,21 @@ proxmox-lab console text --vmid 9001 --send-raw "cont" --lease "$L"
 the guest — so `nc 127.0.0.1 <port>` is a full interactive serial terminal; a
 read-only `socat -u` fallback is not needed.
 
-## Why there is no OCR
+```bash
+proxmox-lab console bridge --lease "$L" --vmid 9001 --port 0
+# flags: --lease/--vmid (required), --kind qemu|lxc (default qemu),
+#        --host (default 127.0.0.1), --port (default 0 = pick a free one)
+```
 
-Earlier versions decoded VGA text screens by matching each character cell
-against a font table. It is gone. The decoder could only read a guest whose
-console font the controller happened to hold; a guest shipping its own font —
-ReactOS setup, for one — decoded to a wall of replacement characters at 0.003
-confidence, which is worse than useless because it looks like an answer. The
-general fix does not exist: any guest can draw any glyph it likes.
+Bidirectional pipe between a local TCP port and the guest serial console: bytes
+you type reach the guest (e.g. a KDB prompt), and guest output streams back.
+Tip: `reset` restarts only the guest — the QEMU process and its serial socket
+stay alive, so a connected bridge survives resets and captures output from t=0.
+A stop/start replaces the QEMU process and drops the bridge.
 
-So reading a screen is a model's job now. See [Reading a screen](#reading-a-screen)
-above. `console screenshot --ocr` and `console import-font` remain registered
-only so that an upgrade fails with an explanation rather than
-`unrecognized arguments`; both are deleted in 0.11.0.
+## 6. Preflight and agentless serial login
 
-## Preflight
+### Preflight
 
 ```bash
 proxmox-lab console preflight
@@ -422,7 +498,7 @@ have a key this install can reach. Only whether a key is present — never the
 key. With none of them, use `console screenshot --for-model` and read the
 image yourself.
 
-## Serial login on agentless guests
+### Serial login on agentless guests
 
 Generic cloud images ship without qemu-guest-agent. `TermSession` therefore
 supports driving a getty directly:
@@ -439,7 +515,7 @@ supports driving a getty directly:
 This is how the VPN gateway bootstraps its agent, and how `net leak-test` runs
 inside an Alpine guest that has no agent at all.
 
-### An empty console password is a credential
+#### An empty console password is a credential
 
 `guest run --password-stdin` and `net leak-test --password-stdin` distinguish
 *no password was supplied* from *an empty password was supplied*. The second is
@@ -461,3 +537,19 @@ empty one: `api --password-stdin` would write a blank password into a Proxmox
 object, and `windows install --password-stdin` would build a blank-password
 Administrator account into the answer file. Omit the flag there to have a
 strong password generated instead.
+
+## Appendix: Why there is no OCR
+
+Earlier versions decoded VGA text screens by matching each character cell
+against a font table. It is gone; see
+[issue #95](https://github.com/jr551/proxmox-agent-lab/issues/95). The decoder
+could only read a guest whose console font the controller happened to hold; a
+guest shipping its own font — ReactOS setup, for one — decoded to a wall of
+replacement characters at 0.003 confidence, which is worse than useless because
+it looks like an answer. The general fix does not exist: any guest can draw
+any glyph it likes. So reading a screen is a model's job now — see §2.
+
+`console screenshot --ocr` and `console import-font` remain registered only so
+that an upgrade fails with an explanation rather than `unrecognized arguments`;
+both are deleted in 0.11.0.
+

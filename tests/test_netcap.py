@@ -135,7 +135,7 @@ class CaptureTests(unittest.TestCase):
              mock.patch.object(netcap, "_ssh", side_effect=fake_ssh), \
              mock.patch.object(netcap, "_running_qemu"), \
              mock.patch.object(LAB, "audit",
-                               lambda e, *, sync=True, **f: audited.update(
+                               lambda e, **f: audited.update(
                                    {"event": e, "fields": f})), \
              mock.patch("builtins.print"):
             api.return_value = mock.Mock()

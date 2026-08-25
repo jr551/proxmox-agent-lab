@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "proxmox-agent-lab"
-version = "0.11.0"
+version = "0.12.0"
 description = "Turn an old computer into a disposable AI research lab that cleans up and powers itself off."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,10 +33,14 @@ classifiers = [
     "Topic :: Security",
 ]
 
-# No runtime dependencies, on purpose. The controller talks HTTPS, speaks the
-# RFB and WebSocket protocols, signs S3 requests and writes PNGs using nothing
-# but the standard library, so it runs under any system Python 3.11+.
-dependencies = []
+# The audit ledger is a shared MariaDB on the Proxmox host, which needs a
+# client protocol the standard library does not provide. PyMySQL is pure
+# Python, so this still installs without a compiler on any Python 3.11+;
+# cryptography covers MariaDB's sha256 auth plugins.
+dependencies = [
+    "PyMySQL>=1.1",
+    "cryptography>=41",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]

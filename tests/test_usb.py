@@ -105,7 +105,7 @@ class SniffTests(unittest.TestCase):
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(usb, "_ssh", side_effect=fake_ssh), \
              mock.patch.object(LAB, "audit",
-                               lambda e, *, sync=True, **f: audited.update(
+                               lambda e, **f: audited.update(
                                    {"event": e, "fields": f})), \
              mock.patch("builtins.print") as printed:
             usb.cmd_sniff(LAB, Args(lease="L", device="04e8:61b6",

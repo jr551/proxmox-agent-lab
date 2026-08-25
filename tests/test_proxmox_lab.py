@@ -284,23 +284,6 @@ class ProxmoxLabTests(unittest.TestCase):
         self.assertIn(rfb.RFBError, LAB._EXPECTED_ERRORS)
         self.assertIn(ws.WebSocketError, LAB._EXPECTED_ERRORS)
 
-    def test_sqlite_audit_can_export_redacted_jsonl_to_git(self) -> None:
-        """The local query backend and remote logging transport are separate."""
-        record = {"timestamp": "2026-08-08T12:00:00Z", "event": "test"}
-        config = mock.Mock()
-        config.audit.get.side_effect = lambda key, default=None: {
-            "git_sync": True,
-            "git_repo": "/tmp/dedicated-audit-repo",
-            "git_branch": "logs",
-        }.get(key, default)
-        with mock.patch.object(LAB, "CONFIG", config), \
-             mock.patch.object(LAB, "AUDIT_BACKEND", "sqlite"), \
-             mock.patch.object(LAB.journal_module, "sync_git") as sync:
-            LAB.sync_repo(record, "test")
-        sync.assert_called_once_with(
-            Path("/tmp/dedicated-audit-repo"), record, "test", "logs"
-        )
-
     def test_redacts_nested_secrets(self) -> None:
         value = {
             "ok": "visible",
@@ -645,52 +628,6 @@ class ProxmoxLabTests(unittest.TestCase):
                 api.call.assert_called_once_with(
                     "GET", "/cluster/resources", {"type": "vm"}
                 )
-    def test_pocketbase_audit_auth_rejection_spools_the_event(self) -> None:
-        """Losing audit credentials mid-session must not abort the action:
-        the event is spooled locally for a later 'journal --flush-spool'."""
-        import contextlib
-        import io
-
-        rejected = LAB.pocketbase_module.PocketBaseError(
-            "PocketBase HTTP 403: Only superusers can perform this action.",
-            status=403,
-        )
-        stderr = io.StringIO()
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
-                 mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
-                 mock.patch.object(LAB, "pocketbase_client"), \
-                 mock.patch.object(
-                     LAB.journal_module, "append", side_effect=rejected,
-                 ), \
-                 contextlib.redirect_stderr(stderr):
-                LAB.audit("lease-begin", sync=False)
-            spool = Path(tmp) / "spool.jsonl"
-            self.assertTrue(spool.exists())
-            record = json.loads(spool.read_text().splitlines()[0])
-        self.assertEqual(record["event"], "lease-begin")
-        self.assertIn("event_id", record)
-        self.assertIn("--flush-spool", stderr.getvalue())
-
-    def test_pocketbase_audit_expired_token_spools_instead_of_failing(self) -> None:
-        import contextlib
-        import io
-
-        stderr = io.StringIO()
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
-                 mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
-                 mock.patch.object(
-                     LAB, "pocketbase_client",
-                     side_effect=LAB.LabError("token is expired"),
-                 ), \
-                 mock.patch.object(LAB.journal_module, "append") as append, \
-                 contextlib.redirect_stderr(stderr):
-                LAB.audit("guest-exec", sync=False)
-            append.assert_not_called()
-            self.assertTrue((Path(tmp) / "spool.jsonl").exists())
-        self.assertIn("token is expired", stderr.getvalue())
-
     def test_journal_flush_spool_uploads_and_clears_the_backlog(self) -> None:
         import contextlib
         import io
@@ -703,23 +640,26 @@ class ProxmoxLabTests(unittest.TestCase):
             )
             args = LAB.parser().parse_args(["journal", "--flush-spool"])
             stdout = io.StringIO()
-            with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
-                 mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
-                 mock.patch.object(LAB, "pocketbase_client"), \
-                 mock.patch.object(LAB.journal_module, "append") as append, \
+            settings = mock.Mock()
+            with mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
+                 mock.patch.object(LAB, "ledger", return_value=settings), \
+                 mock.patch.object(
+                     LAB.mariadb_module, "append_many", return_value=2
+                 ) as append_many, \
                  contextlib.redirect_stdout(stdout):
                 LAB.cmd_journal(args)
-            self.assertEqual(append.call_count, 2)
+            self.assertEqual(len(append_many.call_args.args[1]), 2)
             self.assertFalse(spool.exists())
             result = json.loads(stdout.getvalue())
         self.assertEqual(result["uploaded"], 2)
-        self.assertEqual(result["remaining"], 0)
+        self.assertEqual(result["already_present"], 0)
 
     def test_journal_flush_spool_keeps_events_after_a_hard_failure(self) -> None:
+        """A failed upload must not lose the backlog."""
         import contextlib
         import io
 
-        boom = LAB.pocketbase_module.PocketBaseError("down", status=500)
+        boom = LAB.mariadb_module.MariaDBError("ledger down")
         with tempfile.TemporaryDirectory() as tmp:
             spool = Path(tmp) / "spool.jsonl"
             spool.write_text(
@@ -727,15 +667,14 @@ class ProxmoxLabTests(unittest.TestCase):
                 '{"event": "b", "event_id": "2", "timestamp": "t"}\n'
             )
             args = LAB.parser().parse_args(["journal", "--flush-spool"])
-            stdout = io.StringIO()
-            with mock.patch.object(LAB, "AUDIT_BACKEND", "pocketbase"), \
-                 mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
-                 mock.patch.object(LAB, "pocketbase_client"), \
+            settings = mock.Mock()
+            with mock.patch.object(LAB, "JOURNAL_ROOT", Path(tmp)), \
+                 mock.patch.object(LAB, "ledger", return_value=settings), \
                  mock.patch.object(
-                     LAB.journal_module, "append", side_effect=boom,
+                     LAB.mariadb_module, "append_many", side_effect=boom,
                  ), \
-                 contextlib.redirect_stdout(stdout):
-                with self.assertRaises(LAB.LabError):
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(LAB.mariadb_module.MariaDBError):
                     LAB.cmd_journal(args)
             self.assertEqual(len(spool.read_text().splitlines()), 2)
 
@@ -1283,248 +1222,6 @@ class ProxmoxLabTests(unittest.TestCase):
             "lab-power-on-requested", mode="wake-on-lan"
         )
 
-    def test_audit_through_boot_retries_while_the_hosted_backend_wakes_up(self) -> None:
-        audit = mock.Mock(side_effect=[
-            LAB.pocketbase_module.PocketBaseError("connection refused"),
-            LAB.pocketbase_module.PocketBaseError("connection refused"),
-            None,
-        ])
-        with mock.patch.object(LAB, "audit", audit), \
-             mock.patch.object(LAB, "time") as fake_time:
-            fake_time.monotonic.side_effect = [0, 1, 2, 3, 4]
-            fake_time.sleep.return_value = None
-            LAB._audit_through_boot("lab-power-on-verified", host="h", node="n")
-        self.assertEqual(audit.call_count, 3)
-
-    def test_audit_through_boot_warns_and_gives_up_after_the_retry_window(self) -> None:
-        audit = mock.Mock(
-            side_effect=LAB.pocketbase_module.PocketBaseError("still down")
-        )
-        with mock.patch.object(LAB, "audit", audit), \
-             mock.patch.object(LAB, "time") as fake_time, \
-             mock.patch("builtins.print") as printed:
-            fake_time.monotonic.side_effect = [0, 1, 31, 32]
-            fake_time.sleep.return_value = None
-            LAB._audit_through_boot("lab-power-on-requested", mode="wake-on-lan")
-        warning = printed.call_args[0][0]
-        self.assertIn("lab-power-on-requested", warning)
-        self.assertIn("still down", warning)
-
-    def test_pocketbase_client_converts_a_superuser_token_to_an_agent(self) -> None:
-        """A superuser token pasted into the audit slot is converted once
-        into a permanent least-privileged agent whose token replaces it."""
-        import base64
-        import contextlib
-        import io
-        import json
-
-        payload = base64.urlsafe_b64encode(json.dumps({
-            "collectionId": "_superusers",
-            "exp": 1_000_000,
-        }).encode()).decode().rstrip("=")
-        token = f"header.{payload}.signature"
-        audit_config = {
-            "pocketbase_url": "https://pb.example",
-            "pocketbase_collection": "events",
-            "pocketbase_token_secret": "audit-token",
-            "pocketbase_timeout_seconds": 10,
-            "pocketbase_auth_refresh_before_seconds": 300,
-        }
-        provisioned = {
-            "token": "agent-token",
-            "agent_collection": "proxmox_lab_agents",
-        }
-        stderr = io.StringIO()
-        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
-             mock.patch.object(LAB.secrets_store, "get", return_value=token), \
-             mock.patch.object(
-                 LAB, "_provision_pocketbase_agent", return_value=provisioned,
-             ) as provision, \
-             mock.patch.object(LAB.time, "time", return_value=800), \
-             contextlib.redirect_stderr(stderr):
-            client = LAB.pocketbase_client()
-        self.assertEqual(client.token, "agent-token")
-        self.assertEqual(provision.call_args[0][0].token, token)
-        self.assertIn("superuser token", stderr.getvalue())
-        self.assertIn("proxmox_lab_agents", stderr.getvalue())
-
-    def test_pocketbase_client_refreshes_a_near_expiry_agent_token(self) -> None:
-        import base64
-        import json
-
-        payload = base64.urlsafe_b64encode(json.dumps({
-            "collectionId": "agents",
-            "exp": 1_000,
-        }).encode()).decode().rstrip("=")
-        token = f"header.{payload}.signature"
-        audit_config = {
-            "pocketbase_url": "https://pb.example",
-            "pocketbase_collection": "events",
-            "pocketbase_token_secret": "audit-token",
-            "pocketbase_timeout_seconds": 10,
-            "pocketbase_auth_refresh_before_seconds": 300,
-        }
-        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
-             mock.patch.object(
-                 LAB.secrets_store, "get", return_value=token
-             ), \
-             mock.patch.object(LAB.secrets_store, "store") as store, \
-             mock.patch.object(
-                 LAB.pocketbase_module.Client,
-                 "refresh_auth_token",
-                 return_value="refreshed-token",
-             ) as refresh, \
-             mock.patch.object(LAB.time, "time", return_value=800):
-            client = LAB.pocketbase_client()
-        refresh.assert_called_once_with("agents")
-        store.assert_called_once_with(LAB.CONFIG, "audit-token", "refreshed-token")
-        self.assertEqual(client.token, "refreshed-token")
-
-    def test_pocketbase_client_reauthenticates_an_expired_agent_token(self) -> None:
-        import base64
-        import json
-
-        payload = base64.urlsafe_b64encode(json.dumps({
-            "collectionId": "agents",
-            "exp": 1_000,
-        }).encode()).decode().rstrip("=")
-        token = f"header.{payload}.signature"
-        audit_config = {
-            "pocketbase_url": "https://pb.example",
-            "pocketbase_collection": "events",
-            "pocketbase_token_secret": "audit-token",
-            "pocketbase_timeout_seconds": 10,
-            "pocketbase_auth_refresh_before_seconds": 300,
-        }
-        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
-             mock.patch.object(
-                 LAB.secrets_store,
-                 "get",
-                 side_effect=[token, "agent@lab.invalid", "agent-password"],
-             ), \
-             mock.patch.object(LAB.secrets_store, "store") as store, \
-             mock.patch.object(
-                 LAB.pocketbase_module.Client,
-                 "refresh_auth_token",
-                 side_effect=LAB.pocketbase_module.PocketBaseError(
-                     "expired", status=401
-                 ),
-             ), \
-             mock.patch.object(
-                 LAB.pocketbase_module.Client,
-                 "authenticate_password",
-                 return_value="reauthenticated-token",
-             ) as authenticate, \
-             mock.patch.object(LAB.time, "time", return_value=800):
-            client = LAB.pocketbase_client()
-        authenticate.assert_called_once_with(
-            "https://pb.example",
-            "agents",
-            "agent@lab.invalid",
-            "agent-password",
-            timeout=10,
-        )
-        store.assert_called_once_with(
-            LAB.CONFIG, "audit-token", "reauthenticated-token"
-        )
-        self.assertEqual(client.token, "reauthenticated-token")
-
-    def _nonrenewable_token(self, exp: int) -> str:
-        import base64
-        import json
-
-        payload = base64.urlsafe_b64encode(json.dumps({
-            "collectionId": "agents",
-            "exp": exp,
-            "refreshable": False,
-        }).encode()).decode().rstrip("=")
-        return f"header.{payload}.signature"
-
-    def _pocketbase_client_stderr(self, token: str) -> str:
-        import contextlib
-        import io
-
-        audit_config = {
-            "pocketbase_url": "https://pb.example",
-            "pocketbase_collection": "events",
-            "pocketbase_token_secret": "audit-token",
-            "pocketbase_timeout_seconds": 10,
-            "pocketbase_auth_refresh_before_seconds": 300,
-        }
-        stderr = io.StringIO()
-        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
-             mock.patch.object(LAB.secrets_store, "get", return_value=token), \
-             mock.patch.object(LAB.time, "time", return_value=800), \
-             contextlib.redirect_stderr(stderr):
-            LAB.pocketbase_client()
-        return stderr.getvalue()
-
-    def test_pocketbase_client_warns_before_nonrenewable_token_lapses(self) -> None:
-        output = self._pocketbase_client_stderr(
-            self._nonrenewable_token(800 + 3600)
-        )
-        self.assertIn("nonrenewable", output)
-        self.assertIn("--provision-pocketbase-agent", output)
-
-    def test_pocketbase_client_stays_quiet_for_distant_expiry(self) -> None:
-        output = self._pocketbase_client_stderr(
-            self._nonrenewable_token(800 + 60 * 24 * 3600)
-        )
-        self.assertEqual(output, "")
-
-    def test_agent_provision_stores_reauth_credentials_and_token(self) -> None:
-        import contextlib
-        import io
-        import json
-
-        args = LAB.parser().parse_args(["journal", "--provision-pocketbase-agent"])
-        provisioner = mock.Mock()
-        provisioner.provision_agent.return_value = {
-            "agent_collection": "agents",
-            "agent_created": True,
-            "audit_collection": {"created": True},
-            "token": "agent-token",
-        }
-        audit_config = {
-            "pocketbase_url": "https://pb.example",
-            "pocketbase_collection": "events",
-            "pocketbase_token_secret": "audit-token",
-            "pocketbase_timeout_seconds": 10,
-            "pocketbase_auth_refresh_before_seconds": 300,
-            "pocketbase_agent_collection": "agents",
-        }
-        output = io.StringIO()
-        with mock.patch.dict(LAB.CONFIG.audit._values, audit_config), \
-             mock.patch.object(
-                 LAB.secrets_store, "get", return_value=""
-             ), \
-             mock.patch.object(
-                 LAB.pocketbase_module.Client,
-                 "new_agent_credentials",
-                 return_value=("agent@lab.invalid", "agent-password"),
-             ), \
-             mock.patch.object(LAB.secrets_store, "store") as store, \
-             mock.patch.object(
-                 LAB, "pocketbase_superuser_client", return_value=provisioner
-             ), \
-             contextlib.redirect_stdout(output):
-            LAB.cmd_journal(args)
-        provisioner.provision_agent.assert_called_once_with(
-            "agents",
-            "agent@lab.invalid",
-            "agent-password",
-            rotate_existing=True,
-        )
-        self.assertEqual(
-            [call.args[1] for call in store.call_args_list],
-            ["pocketbase-agent-email", "pocketbase-agent-password", "audit-token"],
-        )
-        self.assertNotIn("agent-token", output.getvalue())
-        self.assertEqual(
-            json.loads(output.getvalue())["credential_mode"],
-            "password-reauthentication",
-        )
-
 
 class UploadTlsTests(unittest.TestCase):
     """Found live: upload always passed curl --insecure, so an operator who had
@@ -1946,8 +1643,10 @@ class LeaseEndCrossReferenceTests(unittest.TestCase):
 
 
 class DoctorAuditTests(unittest.TestCase):
-    """Found live: git_sync pointed at a checkout that did not exist on this
-    machine, 1,547 events sat in the local spool, and doctor reported neither."""
+    """Found live: 1,547 events sat in the local spool and doctor said nothing.
+
+    The ledger is unreachable whenever the lab host is off, which is most of
+    the time, so a growing backlog is the thing worth reporting."""
 
     def _doctor(self, audit_overrides: dict, journal_root: Path) -> dict:
         import contextlib
@@ -1969,51 +1668,6 @@ class DoctorAuditTests(unittest.TestCase):
                 pass
         return json.loads(stdout.getvalue())
 
-    def test_an_enabled_git_mirror_that_is_missing_is_a_problem(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            report = self._doctor(
-                {"git_sync": True, "git_repo": str(Path(tmp) / "absent")},
-                Path(tmp) / "journal",
-            )
-        self.assertFalse(report["audit"]["git_status"]["ok"])
-        self.assertIn("does not exist",
-                      report["audit"]["git_status"]["problem"])
-        self.assertTrue(any("git_sync is enabled" in problem
-                            for problem in report["problems"]))
-        self.assertFalse(report["ok"])
-
-    def test_an_empty_git_repo_setting_is_a_problem(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            report = self._doctor(
-                {"git_sync": True, "git_repo": ""}, Path(tmp) / "journal"
-            )
-        self.assertTrue(any("git_repo is empty" in problem
-                            for problem in report["problems"]))
-
-    def test_a_healthy_mirror_is_reported_without_a_problem(self) -> None:
-        import subprocess
-
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "logs"
-            repo.mkdir()
-            subprocess.run(["git", "init", "-b", "logs", str(repo)],
-                           check=True, stdout=subprocess.DEVNULL)
-            report = self._doctor(
-                {"git_sync": True, "git_repo": str(repo)},
-                Path(tmp) / "journal",
-            )
-        self.assertTrue(report["audit"]["git_status"]["ok"])
-        self.assertFalse(any("git_sync" in problem
-                             for problem in report["problems"]))
-
-    def test_git_sync_off_is_not_checked_at_all(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            report = self._doctor(
-                {"git_sync": False, "git_repo": "/nowhere"},
-                Path(tmp) / "journal",
-            )
-        self.assertNotIn("git_status", report["audit"])
-
     def test_a_local_audit_spool_backlog_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             journal_root = Path(tmp) / "journal"
@@ -2021,14 +1675,14 @@ class DoctorAuditTests(unittest.TestCase):
             (journal_root / "spool.jsonl").write_text(
                 '{"event": "lease-begin"}\n{"event": "lease-end"}\n'
             )
-            report = self._doctor({"git_sync": False}, journal_root)
+            report = self._doctor({}, journal_root)
         self.assertEqual(report["audit"]["spooled_records"], 2)
         self.assertTrue(any("flush-spool" in problem
                             for problem in report["problems"]))
 
     def test_an_empty_spool_is_not_a_problem(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            report = self._doctor({"git_sync": False}, Path(tmp) / "journal")
+            report = self._doctor({}, Path(tmp) / "journal")
         self.assertEqual(report["audit"]["spooled_records"], 0)
         self.assertFalse(any("spool" in problem
                              for problem in report["problems"]))
@@ -2627,3 +2281,45 @@ class StateIsolationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InfrastructureGuestTests(unittest.TestCase):
+    """The audit ledger runs on the host and outlives every lease.
+
+    Found live: the first lease-end after provisioning it refused to power the
+    host off, naming the ledger container as an untracked running guest. Left
+    alone that means the machine can never power itself off again, which is
+    the entire point of it.
+    """
+
+    def _resources(self) -> list[dict]:
+        return [
+            {"vmid": 9310, "status": "running", "tags": "codex-lab-infra"},
+            {"vmid": 9001, "status": "running", "tags": "codex-lab;lease-x"},
+            {"vmid": 9002, "status": "stopped", "tags": ""},
+        ]
+
+    def test_the_ledger_container_is_not_an_untracked_guest(self) -> None:
+        api = mock.Mock()
+        api.call.return_value = self._resources()
+        self.assertEqual(LAB.running_guest_vmids(api), [9001])
+
+    def test_an_ordinary_running_guest_still_blocks_power_off(self) -> None:
+        api = mock.Mock()
+        api.call.return_value = [
+            {"vmid": 9001, "status": "running", "tags": "codex-lab;lease-x"},
+        ]
+        self.assertEqual(LAB.running_guest_vmids(api), [9001])
+
+    def test_comma_separated_tags_are_understood(self) -> None:
+        """Proxmox has used both separators; the guard must not depend on it."""
+        api = mock.Mock()
+        api.call.return_value = [
+            {"vmid": 9310, "status": "running", "tags": "codex-lab-infra,other"},
+        ]
+        self.assertEqual(LAB.running_guest_vmids(api), [])
+
+    def test_a_guest_with_no_tags_is_still_counted(self) -> None:
+        api = mock.Mock()
+        api.call.return_value = [{"vmid": 9005, "status": "running"}]
+        self.assertEqual(LAB.running_guest_vmids(api), [9005])

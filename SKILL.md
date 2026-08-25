@@ -5,6 +5,9 @@ description: Turn an old computer into a leased, disposable AI research lab that
 
 # Old Computer AI Lab
 
+> **Audience:** AI agents and operators that drive this lab from a lease.
+> **Scope:** Skill entrypoint and operational quick-ref (copy-paste lease shape and per-subsystem commands). For deep probes, screen ladder, and builders see `docs/AGENTS.md`; for enforced invariants see `docs/safety-policy.md`.
+
 The `proxmox-agent-lab` engine turns spare hardware into a leased, auditable,
 fail-closed research host. Experiment freely inside a lease; never leave the
 machine running after it ends.
@@ -29,13 +32,12 @@ watchdog clean up after you.
 
 Run `proxmox-lab doctor` first if anything about the setup is unclear — it
 reports the config in use, whether the host answers, and any missing
-privileges.
+privileges. Host-setup one-liners (`proxmox-host-setup.sh`, `install.sh`) live in `docs/INSTALL.md`.
 
 An unreachable host with `ok: true`, a populated `config_file`, and
 `proxmox_token_stored: true` usually means the spare PC is simply powered off;
 continue with `lease-begin` so the configured power path can wake it. Do not
 ask the user to re-enter configuration that `doctor` already found.
-
 ## 🔑 Every task follows this shape
 
 Never call standalone `power-on` for agent work. It deliberately refuses

@@ -806,8 +806,29 @@ class VpnGatewayTests(unittest.TestCase):
             self.assertNotIn('"eth1"', rendered)
 
     def test_bootstrap_password_is_cleared_after_use(self) -> None:
-        source = (SCRIPTS / "netgw.py").read_text()
-        self.assertIn('{"delete": "cipassword"}', source)
+        """The one-time cipassword must not survive provisioning.
+
+        Asserts the behaviour, not the source text: the implementation is
+        shared in console.clear_bootstrap_password, so grepping netgw.py for
+        the payload would pass on a comment and fail on a working refactor.
+        """
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        api = mock.Mock()
+        self.assertTrue(lab_netgw._clear_bootstrap_password(lab, api, 101))
+        api.call.assert_called_once_with(
+            "PUT", "/nodes/aipve/qemu/101/config", {"delete": "cipassword"}
+        )
+
+    def test_bootstrap_password_clear_failure_is_reported(self) -> None:
+        """A failed clear must return False, never silently claim success."""
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        api = mock.Mock()
+        api.call.side_effect = RuntimeError("boom")
+        self.assertFalse(lab_netgw._clear_bootstrap_password(lab, api, 101))
 
     def test_verify_requires_a_lease_and_checks_handshake_age(self) -> None:
         source = (SCRIPTS / "netgw.py").read_text()
@@ -969,7 +990,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         self.assertIn("X increases right", analyze.call_args.kwargs["prompt"])
         lab.audit.assert_called_once_with(
             "console-vision-inspect", lease=args.lease, vmid=7,
-            provider="nvidia", model=lab_console.vision.MODEL, sync=False,
+            provider="nvidia", model=lab_console.vision.MODEL,
         )
 
     def test_cmd_screenshot_writes_a_file(self) -> None:
@@ -1283,7 +1304,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         analyze.assert_not_called()
         lab.audit.assert_called_once_with(
             "console-click-unverified", lease="lease-12345678", vmid=1,
-            x=1, y=1, button=3, sync=False,
+            x=1, y=1, button=3,
         )
         payload = json.loads(printed.call_args.args[0])
         self.assertEqual(payload["clicked"], [1, 1])
@@ -1314,7 +1335,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         self.assertIn("caveat", payload)
         lab.audit.assert_called_once_with(
             "console-has-gui-locked-up", lease="lease-1", vmid=1,
-            locked_up=True, sync=False,
+            locked_up=True,
         )
 
     def test_has_gui_locked_up_false_when_a_probe_sees_change(self) -> None:
@@ -1435,7 +1456,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         lab.audit.assert_called_once_with(
             "console-vision-inspect-failed", lease=args.lease, vmid=7,
             error=message[:200], provider="nvidia", image_returned=True,
-            image_bytes=payload["image"]["bytes"], sync=False,
+            image_bytes=payload["image"]["bytes"],
         )
         self.assertNotIn("base64", lab.audit.call_args.kwargs)
 

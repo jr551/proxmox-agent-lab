@@ -1,176 +1,100 @@
 # Debugging ReactOS guests
 
-ReactOS is one of the harder guests to drive from here. It has no
-qemu-guest-agent, no SSH, and no answer-file equivalent, so the only two
-channels that work are the graphical console and a serial port — and the
-serial port is useless unless the guest was built and booted to use it.
+ReactOS is one of the harder guests to drive from here. It has no qemu-guest-agent, no SSH, and no answer-file equivalent, so the only two channels that work are the graphical console and a serial port — and the serial port is useless unless the guest was built and booted to use it.
 
-This page collects the operating knowledge from one intensive workstream:
-bringing up VirtIO storage and graphics drivers on an amd64 ReactOS build and
-getting it to install under both UEFI and legacy BIOS. It is not an exhaustive
-ReactOS debugging manual, and it says nothing about ReactOS internals beyond
-what the lab has to know. Treat it as the set of traps that have already cost
-lab time, so the next person spends theirs on the actual bug.
+This page collects the operating knowledge from one intensive workstream: bringing up VirtIO storage and graphics drivers on an amd64 ReactOS build and getting it to install under both UEFI and legacy BIOS. It is not an exhaustive ReactOS debugging manual, and it says nothing about ReactOS internals beyond what the lab has to know. Treat it as the set of traps that have already cost lab time, so the next person spends theirs on the actual bug.
 
-Everything here assumes the ordinary rules: a lease for every mutation,
-heartbeats while a long run is in progress, and guests that egress only through
-the VPN gateway on `vmbr1`. See [AGENTS.md](AGENTS.md) and
-[safety-policy.md](safety-policy.md).
+Everything here assumes the ordinary rules: a lease for every mutation, heartbeats while a long run is in progress, and guests that egress only through the VPN gateway on `vmbr1`. See [AGENTS.md](AGENTS.md) and [safety-policy.md](safety-policy.md).
 
-## Getting ReactOS to talk
+## Contents
 
-Serial is the primary debugging channel. A ReactOS boot entry with
-`/DEBUGPORT=COM1` routes the kernel debugger's *output* to COM1, which
-`console text` can read as exact characters. That is enough for boot messages,
-`DPRINT` output and assertion text, and it should be the default for every
-run: a graphical screenshot of a driver failure tells you far less than the
-serial log printed alongside it.
+- **Walkthrough (linear steps)** — the ordered loop to bring up and debug a ReactOS guest.
+  - [1. Getting ReactOS to talk](#1-getting-reactos-to-talk-serial--kdserial)
+  - [2. VM shapes that work](#2-vm-shapes-that-work)
+  - [3. Build-loop discipline](#3-build-loop-discipline)
+  - [4. Driving the guest UI](#4-driving-the-guest-ui)
+  - [5. Driving KDB safely](#5-driving-kdb-safely)
+  - [6. Telling a hung guest from a waiting one](#6-telling-a-hung-guest-from-a-waiting-one)
+  - [7. Reading results](#7-reading-results)
+- **Reference appendix** — deep traps that read as a hung/crashed guest but are lab/build misconfiguration.
+  - [A. The serial socket has no scrollback](#a-the-serial-socket-has-no-scrollback)
+  - [B. Check where the disks actually are before benchmarking](#b-check-where-the-disks-actually-are-before-benchmarking)
+  - [C. Build settings that break the lab's own channels](#c-build-settings-that-break-the-labs-own-channels)
+  - [D. Evidence discipline, and three diagnoses that were wrong](#d-evidence-discipline-and-three-diagnoses-that-were-wrong)
+- [Commands quick reference](#commands-quick-reference) — every `proxmox-lab` invocation on this page, flags verified against `src/proxmox_agent_lab/`.
 
-Output alone is not enough once the kernel actually breaks into KDB. KDB reads
-its *input* from the PS/2 keyboard unless `/KDSERIAL` is also set —
-`ntoskrnl/kd/kdterminal.c` gates serial input on `KD_DEBUG_KDSERIAL`. Without
-that flag a break is close to invisible and completely undrivable:
+---
 
-- Under a graphics-mode framebuffer the prompt is never painted, because KDB
-  writes to the legacy text buffer at `0xB8000`, which reads back as zeros.
-- Keys injected over VNC do not reach it either. RFB key events are delivered
-  to the emulated i8042 controller in a way that does not set the
-  output-buffer-full bit KDB polls for, so every keystroke is silently
-  discarded.
+## Walkthrough (linear steps)
 
-The symptom is a guest that has stopped making progress with one vCPU spinning
-in `KdbpTryGetCharKeyboard()`, and no way to ask it anything.
+The walkthrough is the order to follow. The appendix contains the failure modes that make each step look like something else if skipped.
 
-The upstream boot entries (`LiveImg_Debug`, `Setup_Debug`) carry
-`/DEBUGPORT=COM1` but not `/KDSERIAL`, so a stock ISO cannot be driven this
-way. The fix belongs in the build, not in the lab: have the builder synthesise
-an **additional** `bootcd.ini` section — a new `[LiveImg_KdSerial]` or
-`[Setup_KdSerial]` entry whose options include `/KDSERIAL` — and select it with
-the default-OS setting. Adding a new section rather than editing the existing
-ones matters for two reasons: upstream's own entries stay untouched, so the
-change can never leak into a patch you intend to submit, and the plain entries
-remain available for comparison in the same ISO. The synthesised entries are
-only meaningful in a `KDBG=1` build, so make the build fail closed when they
-are requested without it rather than discover it an hour later.
+### 1. Getting ReactOS to talk (serial + /KDSERIAL)
 
-Getting the boot flags right is necessary but not sufficient: one build
-setting switches the whole serial channel off while leaving the guest
-apparently healthy. Before concluding that a silent COM1 means a dead guest,
-read *Build settings that break the lab's own channels* below.
+Serial is the primary debugging channel. A ReactOS boot entry with `/DEBUGPORT=COM1` routes the kernel debugger's *output* to COM1, which `console text` can read as exact characters. That is enough for boot messages, `DPRINT` output and assertion text, and it should be the default for every run: a graphical screenshot of a driver failure tells you far less than the serial log printed alongside it.
 
-## Check where the disks actually are before benchmarking
+Output alone is not enough once the kernel actually breaks into KDB. KDB reads its *input* from the PS/2 keyboard unless `/KDSERIAL` is also set — `ntoskrnl/kd/kdterminal.c` gates serial input on `KD_DEBUG_KDSERIAL`. Without that flag a break is close to invisible and completely undrivable:
 
-The rule is ISO on bulk storage, guest disk on fast storage. A live
-virtio-vs-IDE comparison broke it: **both** guests' disks were on the USB bulk
-directory store, which measures about 25 MB/s sequential write, so the run
-mostly measured the USB bus.
+- Under a graphics-mode framebuffer the prompt is never painted, because KDB writes to the legacy text buffer at `0xB8000`, which reads back as zeros.
+- Keys injected over VNC do not reach it either. RFB key events are delivered to the emulated i8042 controller in a way that does not set the output-buffer-full bit KDB polls for, so every keystroke is silently discarded.
 
-`storage status` now reports a `class` per storage, and a write that puts a
-guest disk on the bulk store warns unless `--slow-storage-accepted` is passed.
-Assert it before trusting any number:
+The symptom is a guest that has stopped making progress with one vCPU spinning in `KdbpTryGetCharKeyboard()`, and no way to ask it anything.
 
-```bash
-proxmox-lab storage status | grep -A2 '"class": "bulk"'
-proxmox-lab api --lease "$L" --method GET \
-  --path "/nodes/$NODE/qemu/$VMID/config" | grep -E 'scsi0|virtio0|ide0'
-```
+The upstream boot entries (`LiveImg_Debug`, `Setup_Debug`) carry `/DEBUGPORT=COM1` but not `/KDSERIAL`, so a stock ISO cannot be driven this way. The fix belongs in the build, not in the lab: have the builder synthesise an **additional** `bootcd.ini` section — a new `[LiveImg_KdSerial]` or `[Setup_KdSerial]` entry whose options include `/KDSERIAL` — and select it with the default-OS setting. Adding a new section rather than editing the existing ones matters for two reasons: upstream's own entries stay untouched, so the change can never leak into a patch you intend to submit, and the plain entries remain available for comparison in the same ISO. The synthesised entries are only meaningful in a `KDBG=1` build, so make the build fail closed when they are requested without it rather than discover it an hour later.
 
-If a disk resolves to the bulk store, move it before benchmarking — or state
-plainly that the figure is a floor, not a comparison.
+Getting the boot flags right is necessary but not sufficient: one build setting switches the whole serial channel off while leaving the guest apparently healthy. Before concluding that a silent COM1 means a dead guest, read *Build settings that break the lab's own channels* in the appendix.
 
-## The serial socket has no scrollback
+> **Requires:** every ReactOS VM has `serial0: socket` in its config (see [A. The serial socket has no scrollback](#a-the-serial-socket-has-no-scrollback)). Without it, `console text` has no stream to attach to, and an empty capture is expected.
 
-A QEMU guest needs `serial0: socket` in its config for `console text` to work
-at all. Given that, the socket delivers only what arrives while you are
-attached. Anything the guest printed before that is gone — there is no buffer
-to replay.
+### 2. VM shapes that work
 
-This is the single most expensive trap on this list. Several early runs
-attached a capture after the guest had already booted, saw an empty log, and
-concluded that COM1 was not wired up or that the ReactOS build had debugging
-compiled out. Both conclusions were wrong; the output had simply already
-happened. Attach before or at power-on — and note both flags, because
-Proxmox refuses to open a terminal for a stopped guest, so the naive ordering
-used to exit immediately with `VM not running`:
+These are measured on an amd64 build, not deductions from configuration.
 
-```bash
-proxmox-lab console text --vmid "$VMID" --follow --timeout 900 \
-  --wait-for-guest 300 > run.log 2>&1 &
-proxmox-lab api --lease "$L" --method POST \
-  --path "/nodes/$NODE/qemu/$VMID/status/start"
-```
+| Path | Firmware | Machine | Disk | Notes |
+|---|---|---|---|---|
+| UEFI + VirtIO | `bios=ovmf` with a fresh `efidisk0` (`efitype=4m`, no pre-enrolled keys) | `machine=pc` | `virtio0` | The target configuration for VirtIO work |
+| Legacy regression | `bios=seabios` | `machine=pc` | `ide0`, no `efidisk0` | Installs and boots to a desktop; use it to prove a patch has not broken the legacy path |
 
-`--wait-for-guest` retries the attach until the serial line exists; `--follow`
-is what streams for the whole window (a plain `--seconds 900` read returns as
-soon as the output pauses). This still leaves a one-poll-interval gap at the
-very start. When the first bytes matter absolutely, take the reset route
-instead — `console text --follow --from-reset --lease "$L"` attaches first and
-then restarts the guest inside the live session, which is the only way to be
-certain of t=0.
+`machine=pc` (i440fx) is deliberate in both cases. Under `q35` the guest stalls at `Loading boot drivers...` and never reaches Setup, so an otherwise healthy ISO looks broken. This is a compatibility workaround, not a statement about what ReactOS ought to support.
 
-**One `console text` session per VM.** A second concurrent session on the same
-guest does not error — it just receives nothing, while the first keeps all the
-bytes. Stop a running capture before starting another one or before using
-`--send`. If a capture comes back empty, the first hypothesis should always be
-that it never attached, not that the guest printed nothing; force some traffic
-and check again before writing anything down.
+The rest of the shape:
 
-The second hypothesis is that the build genuinely has no serial output —
-`DLL_EXPORT_VERSION=0x600` does exactly that to a Debug + `KDBG=1` build, with
-no other visible effect. See *Build settings that break the lab's own
-channels*.
+- `serial0=socket` always, on every ReactOS VM, whatever else you are testing.
+- `vga=virtio` when the virtio-GPU driver is under test, `vga=std` otherwise. Keyboard input over RFB needs a real display device, so never use `vga=serial0` on a guest you intend to drive.
+- `ostype=wxp`.
+- The NIC stays `link_down=1` unless the run genuinely needs egress. When it does, egress goes through the VPN gateway on `vmbr1` and never `vmbr0` — see [network.md](network.md).
+- Keep the ISO on bulk storage and the guest disk on fast storage, as in [storage.md](storage.md). See [B. Check where the disks actually are before benchmarking](#b-check-where-the-disks-actually-are-before-benchmarking).
+- Run `proxmox-lab iso diagnose --path <iso>` on any ISO that was assembled or repaired by hand before attaching it. A missing El Torito boot record looks exactly like a hang once the guest is running — see *Build settings that break the lab's own channels* in the appendix.
 
-## Driving KDB safely
+### 3. Build-loop discipline
 
-KDB has two prompt styles and they consume input differently.
+A full ReactOS build is **40 to 60 minutes**, which changes the economics of everything around it. Three habits follow from that:
 
-At the `(boipt)?` prompt — the one offered immediately after a break, where the
-letters in the parentheses are the choices — **KDB acts on single characters as
-they arrive.** Sending the word `bt` is therefore read as `b` (break
-repeatedly) followed by `t` (terminate thread), and the thread you were trying
-to inspect is gone. That is how one run lost the ReactOS Setup thread it was
-debugging.
+1. **Review the source change before building it.** A defect a code review would have caught costs an hour of build plus the lab run that was going to validate it. Reading the touched driver files in full is cheap by comparison.
+2. **Never idle while a build runs.** Advance the next piece of work and check the build log between tasks rather than polling it in a loop. Watch for `CMake Error` in the first couple of minutes — a configure failure surfaces immediately and saves the other fifty-eight.
+3. **Batch features into one build.** Several independent changes in a single ISO is almost always the right trade, even when it makes attribution slightly harder, because a second build costs another hour of lease time.
 
-Word commands such as `bt` are safe only at a bare `kdb:>` prompt. So the rule
-is: read the captured serial log to see which prompt you are actually at before
-sending anything, send exactly one character at a `(boipt)?` prompt, and keep
-word commands for `kdb:>`.
+One build-configuration fact is worth stating here because it will otherwise be rediscovered the slow way: **`KDBG=1` requires a Debug build.** `KDBG=1` with a Release build does not link, failing on undefined references to `ExpKdbgExtIrpFind` and `ExpKdbgExtHandle`, which exist only in Debug. Since `/KDSERIAL` needs `KDBG=1`, any run you intend to drive through KDB is a Debug build. Have the build script reject the combination up front.
 
-## Driving the guest UI
+Two further build settings are worth their own section, because neither of them surfaces as a build failure — both of them surface here, in the lab, as something else entirely. See [C. Build settings that break the lab's own channels](#c-build-settings-that-break-the-labs-own-channels).
 
-ReactOS has no agent, so the graphical console is the only way to reach Setup,
-the desktop and the control panel applets.
+### 4. Driving the guest UI
 
-The subcommand is **`console keys`**, plural. There is no `console key`. The
-singular form fails with an argparse error, and inside a compound command that
-error is easy to miss — the command appears to run and every keystroke is
-silently lost. This cost several boots before anyone noticed. Always confirm
-with `--screenshot-after`:
+ReactOS has no agent, so the graphical console is the only way to reach Setup, the desktop and the control panel applets.
+
+The subcommand is **`console keys`**, plural. There is no `console key`. The singular form fails with an argparse error, and inside a compound command that error is easy to miss — the command appears to run and every keystroke is silently lost. This cost several boots before anyone noticed. Always confirm with `--screenshot-after`:
 
 ```bash
 proxmox-lab console keys --lease "$L" --vmid "$VMID" --delay 0.6 up up enter \
   --screenshot-after 4
 ```
 
-Prefer the keyboard over clicking. `console click` requires a `--target` naming
-a visible control and passes the proposed coordinate to a vision model that
-must independently identify exactly one matching control; it refuses to click
-empty space and sometimes times out. That guard is correct, but it makes
-clicking a poor primitive for a desktop where much of what you want is not a
-labelled button. Two keyboard habits cover most of it:
+Prefer the keyboard over clicking. `console click` requires a `--target` naming a visible control and passes the proposed coordinate to a vision model that must independently identify exactly one matching control; it refuses to click empty space and sometimes times out. That guard is correct, but it makes clicking a poor primitive for a desktop where much of what you want is not a labelled button. Two keyboard habits cover most of it:
 
-- **Start → Run** is a reliable way into any control panel applet without a
-  desktop right-click: `ctrl-esc`, then `r`, then type the applet name
-  (`desk.cpl` for Display Properties).
-- **Arrow-key menu navigation counts disabled items.** A ReactOS context menu
-  steps through greyed-out entries such as *Paste* and *Paste shortcut* just
-  like enabled ones, so count them when working out how many presses a target
-  needs, and screenshot rather than assume.
+- **Start → Run** is a reliable way into any control panel applet without a desktop right-click: `ctrl-esc`, then `r`, then type the applet name (`desk.cpl` for Display Properties).
+- **Arrow-key menu navigation counts disabled items.** A ReactOS context menu steps through greyed-out entries such as *Paste* and *Paste shortcut* just like enabled ones, so count them when working out how many presses a target needs, and screenshot rather than assume.
 
-The FreeLoader boot menu is the tightest timing in the whole workflow: it shows
-for about **five seconds**, and any key stops the countdown. Reset the guest,
-wait roughly 1.6 seconds, then send keys. At three seconds you have usually
-already missed it.
+The FreeLoader boot menu is the tightest timing in the whole workflow: it shows for about **five seconds**, and any key stops the countdown. Reset the guest, wait roughly 1.6 seconds, then send keys. At three seconds you have usually already missed it.
 
 ```bash
 proxmox-lab api --lease "$L" --method POST \
@@ -180,50 +104,39 @@ proxmox-lab console keys --lease "$L" --vmid "$VMID" --delay 0.15 \
   up up up up up --screenshot-after 1
 ```
 
-Count entries from the highlighted default rather than from the top of the
-list, and take the screenshot before pressing Enter.
+Count entries from the highlighted default rather than from the top of the list, and take the screenshot before pressing Enter.
 
-## Telling a hung guest from a waiting one
+### 5. Driving KDB safely
 
-Never poll for a target value with an open-ended wait. Every early long wait in
-this workstream was written as "loop until the disk has been written N bytes",
-and every one of them sat there indefinitely the first time the guest froze —
-burning lease time and, worse, producing no information about *where* it froze.
+KDB has two prompt styles and they consume input differently.
 
-Watch for **change** instead, and report a stall. Sample the guest's counters
-periodically and compare against the previous sample:
+At the `(boipt)?` prompt — the one offered immediately after a break, where the letters in the parentheses are the choices — **KDB acts on single characters as they arrive.** Sending the word `bt` is therefore read as `b` (break repeatedly) followed by `t` (terminate thread), and the thread you were trying to inspect is gone. That is how one run lost the ReactOS Setup thread it was debugging.
+
+Word commands such as `bt` are safe only at a bare `kdb:>` prompt. So the rule is: read the captured serial log to see which prompt you are actually at before sending anything, send exactly one character at a `(boipt)?` prompt, and keep word commands for `kdb:>`.
+
+### 6. Telling a hung guest from a waiting one
+
+Never poll for a target value with an open-ended wait. Every early long wait in this workstream was written as "loop until the disk has been written N bytes", and every one of them sat there indefinitely the first time the guest froze — burning lease time and, worse, producing no information about *where* it froze.
+
+Watch for **change** instead, and report a stall. Sample the guest's counters periodically and compare against the previous sample:
 
 ```bash
 proxmox-lab api --method GET \
   --path "/nodes/$NODE/qemu/$VMID/status/current"
 ```
 
-The useful fields are `diskread`/`diskwrite` and `cpu`. If the disk counters do
-not move for some threshold — two minutes is a reasonable default for a
-ReactOS install — stop waiting and report a stall, distinguishing that outcome
-from "reached the target" and from "still progressing when the overall timeout
-expired". Those three outcomes want three different next actions.
+The useful fields are `diskread`/`diskwrite` and `cpu`. If the disk counters do not move for some threshold — two minutes is a reasonable default for a ReactOS install — stop waiting and report a stall, distinguishing that outcome from "reached the target" and from "still progressing when the overall timeout expired". Those three outcomes want three different next actions.
 
-### `diskwrite` can read 0 on a guest that is writing hard
+#### `diskwrite` can read 0 on a guest that is writing hard
 
-**Do not treat a still `diskwrite` as proof of a stall.** On a qcow2 image over
-directory-backed storage the counter has been observed sitting at **0 bytes for
-an entire session** while the guest was demonstrably writing. It is a cached,
-summed value that does not update in real time for every storage backend
-combination, so "the counter did not move" and "the guest did nothing" are two
-different statements and only one of them is measured.
+**Do not treat a still `diskwrite` as proof of a stall.** On a qcow2 image over directory-backed storage the counter has been observed sitting at **0 bytes for an entire session** while the guest was demonstrably writing. It is a cached, summed value that does not update in real time for every storage backend combination, so "the counter did not move" and "the guest did nothing" are two different statements and only one of them is measured.
 
 Two further traps in the same area:
 
-- qcow2 growth can be **metadata-only** — L1 and refcount tables allocated for
-  a large sparse image — so a file that grew by megabytes may carry no guest
-  data at all.
-- `ls -la` reports a sparse image's **apparent** size, which for an untouched
-  100 GB qcow2 is 100 GB of I/O that never happened. `du` reports the
-  **allocated** bytes, which is the number you want.
+- qcow2 growth can be **metadata-only** — L1 and refcount tables allocated for a large sparse image — so a file that grew by megabytes may carry no guest data at all.
+- `ls -la` reports a sparse image's **apparent** size, which for an untouched 100 GB qcow2 is 100 GB of I/O that never happened. `du` reports the **allocated** bytes, which is the number you want.
 
-Cross-check before concluding anything, with a command that samples twice and
-compares three independent signals:
+Cross-check before concluding anything, with a command that samples twice and compares three independent signals:
 
 ```bash
 proxmox-lab guest disk-activity --vmid "$VMID"                    # counter only
@@ -231,128 +144,91 @@ proxmox-lab guest disk-activity --lease "$L" --vmid "$VMID" \
   --ground-truth --interval 10
 ```
 
-`--ground-truth` adds QEMU's own block-layer counters (`info blockstats` over
-the Proxmox monitor endpoint — no SSH needed) and `du --block-size=1` on the
-backing image file (over the opt-in `[memflow]` host SSH channel), then reports
-a `disagreement` list naming any signal that saw nothing while another saw
-bytes. That list is the diagnostically useful part: it is what tells you the
-counter is lying rather than the guest being dead. Either extra signal may be
-unavailable — the monitor endpoint needs a privilege the `PVEVMAdmin` lab token
-does not have, and `du` needs the host SSH opt-in — and the command reports
-that and returns the rest rather than failing.
+`--ground-truth` adds QEMU's own block-layer counters (`info blockstats` over the Proxmox monitor endpoint — no SSH needed) and `du --block-size=1` on the backing image file (over the opt-in `[memflow]` host SSH channel), then reports a `disagreement` list naming any signal that saw nothing while another saw bytes. That list is the diagnostically useful part: it is what tells you the counter is lying rather than the guest being dead. Either extra signal may be unavailable — the monitor endpoint needs a privilege the `PVEVMAdmin` lab token does not have, and `du` needs the host SSH opt-in — and the command reports that and returns the rest rather than failing.
 
-Without `--ground-truth` the command deliberately reports `"writing": null`
-rather than `false` for a still counter, because that counter on its own cannot
-tell an idle guest from a stalled counter.
+Without `--ground-truth` the command deliberately reports `"writing": null` rather than `false` for a still counter, because that counter on its own cannot tell an idle guest from a stalled counter.
 
-A `cpu` reading near **0.5 on a 2-vCPU guest** means exactly one core is
-spinning: the guest is not idle and not making progress, which is the signature
-of a busy-wait such as the KDB keyboard poll described above. To see where it
-is spinning, use memflow, which needs no agent in the guest:
+A `cpu` reading near **0.5 on a 2-vCPU guest** means exactly one core is spinning: the guest is not idle and not making progress, which is the signature of a busy-wait such as the KDB keyboard poll described above. To see where it is spinning, use memflow, which needs no agent in the guest:
 
 ```bash
 proxmox-lab memflow registers --lease "$L" --vmid "$VMID"
 proxmox-lab memflow trace     --lease "$L" --vmid "$VMID" --steps 20
 ```
 
-The one thing a stall detector cannot tell you: **a guest sitting at an
-installer dialog waiting for input looks identical to a hang.** ReactOS Setup
-paused on a partition prompt writes no disk blocks, exactly like a frozen
-kernel. Always take a screenshot before concluding the guest is dead. This is
-the same failure mode documented for Windows Setup in [windows.md](windows.md),
-and it has the same answer: look at the screen.
+The one thing a stall detector cannot tell you: **a guest sitting at an installer dialog waiting for input looks identical to a hang.** ReactOS Setup paused on a partition prompt writes no disk blocks, exactly like a frozen kernel. Always take a screenshot before concluding the guest is dead. This is the same failure mode documented for Windows Setup in [windows.md](windows.md), and it has the same answer: look at the screen.
 
-## VM shapes that work
+### 7. Reading results
 
-These are measured on an amd64 build, not deductions from configuration.
+The most useful independent signal the lab gives you is a screenshot's **pixel dimensions**. `console screenshot` reports the size of the guest's real scanout, so a display mode change can be confirmed from outside the guest regardless of what the guest's own UI claims. That is how a virtio-GPU mode switch was shown to be genuinely reprogramming the hardware even though the resulting screen was black — which moved the investigation from "the mode change fails" to "nothing is being painted after it succeeds", a completely different bug.
 
-| Path | Firmware | Machine | Disk | Notes |
-|---|---|---|---|---|
-| UEFI + VirtIO | `bios=ovmf` with a fresh `efidisk0` (`efitype=4m`, no pre-enrolled keys) | `machine=pc` | `virtio0` | The target configuration for VirtIO work |
-| Legacy regression | `bios=seabios` | `machine=pc` | `ide0`, no `efidisk0` | Installs and boots to a desktop; use it to prove a patch has not broken the legacy path |
+Screenshots are read-only and take no lease:
 
-`machine=pc` (i440fx) is deliberate in both cases. Under `q35` the guest stalls
-at `Loading boot drivers...` and never reaches Setup, so an otherwise healthy
-ISO looks broken. This is a compatibility workaround, not a statement about
-what ReactOS ought to support.
+```bash
+proxmox-lab console screenshot --vmid "$VMID" --settle 3
+```
 
-The rest of the shape:
+For the serial log, a handful of greps are worth running over every capture before reading it in detail. Use `grep -a`, because a serial log routinely contains binary noise and GNU grep will otherwise decide it is not a text file:
 
-- `serial0=socket` always, on every ReactOS VM, whatever else you are testing.
-- `vga=virtio` when the virtio-GPU driver is under test, `vga=std` otherwise.
-  Keyboard input over RFB needs a real display device, so never use
-  `vga=serial0` on a guest you intend to drive.
-- `ostype=wxp`.
-- The NIC stays `link_down=1` unless the run genuinely needs egress. When it
-  does, egress goes through the VPN gateway on `vmbr1` and never `vmbr0` —
-  see [network.md](network.md).
-- Keep the ISO on bulk storage and the guest disk on fast storage, as in
-  [storage.md](storage.md).
-- Run `proxmox-lab iso diagnose --path <iso>` on any ISO that was assembled or
-  repaired by hand before attaching it. A missing El Torito boot record looks
-  exactly like a hang once the guest is running — see *Build settings that
-  break the lab's own channels*.
+```bash
+grep -acE "ASSERT_FAILURE|Assertion failed"   run.log   # any assertion at all
+grep -aiE "viostor|storport|virtio_gpu"       run.log   # driver-specific tags
+grep -acE "IOCTL_[A-Z_]+ failed"              run.log   # rejected IOCTLs
+```
 
-## Build-loop discipline
+Beyond that, grep for the exact `file.c(line)` or `file.c:line` string of any assertion you are tracking. Those strings are stable across builds and make a good regression check: a fix has worked when the string is gone from the log, not when the guest merely gets further.
 
-A full ReactOS build is **40 to 60 minutes**, which changes the economics of
-everything around it. Three habits follow from that:
+---
 
-1. **Review the source change before building it.** A defect a code review
-   would have caught costs an hour of build plus the lab run that was going to
-   validate it. Reading the touched driver files in full is cheap by
-   comparison.
-2. **Never idle while a build runs.** Advance the next piece of work and check
-   the build log between tasks rather than polling it in a loop. Watch for
-   `CMake Error` in the first couple of minutes — a configure failure surfaces
-   immediately and saves the other fifty-eight.
-3. **Batch features into one build.** Several independent changes in a single
-   ISO is almost always the right trade, even when it makes attribution
-   slightly harder, because a second build costs another hour of lease time.
+## Reference appendix
 
-One build-configuration fact is worth stating here because it will otherwise be
-rediscovered the slow way: **`KDBG=1` requires a Debug build.** `KDBG=1` with a
-Release build does not link, failing on undefined references to
-`ExpKdbgExtIrpFind` and `ExpKdbgExtHandle`, which exist only in Debug. Since
-`/KDSERIAL` needs `KDBG=1`, any run you intend to drive through KDB is a Debug
-build. Have the build script reject the combination up front.
+Supplementary traps and verification checks. Read once, then consult when a run looks like a hang or a crash but the guest may be healthy.
 
-Two further build settings are worth their own section, because neither of them
-surfaces as a build failure — both of them surface here, in the lab, as
-something else.
+### A. The serial socket has no scrollback
 
-## Build settings that break the lab's own channels
+A QEMU guest needs `serial0: socket` in its config for `console text` to work at all. Given that, the socket delivers only what arrives while you are attached. Anything the guest printed before that is gone — there is no buffer to replay.
 
-The ReactOS build system is not part of this repository, so nothing here can be
-enforced by `proxmox-lab`. It is documented here because each of these two
-settings produces a *lab-side* symptom that looks like something else entirely
-— a guest that crashed, and a guest that hung — and in both cases neither the
-build nor the lab prints a word about the real cause.
+This is the single most expensive trap on this list. Several early runs attached a capture after the guest had already booted, saw an empty log, and concluded that COM1 was not wired up or that the ReactOS build had debugging compiled out. Both conclusions were wrong; the output had simply already happened. Attach before or at power-on — and note both flags, because Proxmox refuses to open a terminal for a stopped guest, so the naive ordering used to exit immediately with `VM not running`:
 
-### `DLL_EXPORT_VERSION=0x600` silences KDBG serial
+```bash
+proxmox-lab console text --vmid "$VMID" --follow --timeout 900 \
+  --wait-for-guest 300 > run.log 2>&1 &
+proxmox-lab api --lease "$L" --method POST \
+  --path "/nodes/$NODE/qemu/$VMID/status/start"
+```
 
-The reason to set it is a real one. Building C++ targets against mingw's libgcc
-fails to link on undefined `__imp_InitializeConditionVariable`, and raising
-`DLL_EXPORT_VERSION` to `0x600` widens the exported surface enough to resolve
-it. The build then succeeds and the ISO boots normally, all the way to a
-desktop.
+`--wait-for-guest` retries the attach until the serial line exists; `--follow` is what streams for the whole window (a plain `--seconds 900` read returns as soon as the output pauses). This still leaves a one-poll-interval gap at the very start. When the first bytes matter absolutely, take the reset route instead — `console text --follow --from-reset --lease "$L"` attaches first and then restarts the guest inside the live session, which is the only way to be certain of t=0.
 
-What it costs is the entire serial channel. A `BUILD_TYPE=Debug KDBG=1` build
-booted with `/DEBUGPORT=COM1 /KDSERIAL` produces **zero bytes on COM1** — not
-fewer messages, none: no FreeLoader debug output, no kernel `DPRINT`, no KDB
-prompt, no break banner. Because the guest itself is healthy, the only thing
-the lab observes is an empty capture, which is indistinguishable from a guest
-that died before serial init.
+**One `console text` session per VM.** A second concurrent session on the same guest does not error — it just receives nothing, while the first keeps all the bytes. Stop a running capture before starting another one or before using `--send`. If a capture comes back empty, the first hypothesis should always be that it never attached, not that the guest printed nothing; force some traffic and check again before writing anything down.
 
-In this harness that means `console text` returns nothing, and so does
-`console text --follow --from-reset`. An operator who has read *The serial
-socket has no scrollback* above will correctly suspect a late attach, reattach
-earlier and earlier, keep getting nothing, and eventually report a hung guest.
-It is not hung. Two ways to tell the cases apart:
+The second hypothesis is that the build genuinely has no serial output — `DLL_EXPORT_VERSION=0x600` does exactly that to a Debug + `KDBG=1` build, with no other visible effect. See [C. Build settings that break the lab's own channels](#c-build-settings-that-break-the-labs-own-channels).
 
-- **Screenshot it first.** It costs no lease. A guest that has painted the
-  FreeLoader menu or a desktop while COM1 stays silent is a mute *build*; a
-  guest that genuinely died before serial init has not painted either.
+### B. Check where the disks actually are before benchmarking
+
+The rule is ISO on bulk storage, guest disk on fast storage. A live virtio-vs-IDE comparison broke it: **both** guests' disks were on the USB bulk directory store, which measures about 25 MB/s sequential write, so the run mostly measured the USB bus.
+
+`storage status` now reports a `class` per storage, and a write that puts a guest disk on the bulk store warns unless `--slow-storage-accepted` is passed. Assert it before trusting any number:
+
+```bash
+proxmox-lab storage status | grep -A2 '"class": "bulk"'
+proxmox-lab api --lease "$L" --method GET \
+  --path "/nodes/$NODE/qemu/$VMID/config" | grep -E 'scsi0|virtio0|ide0'
+```
+
+If a disk resolves to the bulk store, move it before benchmarking — or state plainly that the figure is a floor, not a comparison.
+
+### C. Build settings that break the lab's own channels
+
+The ReactOS build system is not part of this repository, so nothing here can be enforced by `proxmox-lab`. It is documented here because each of these two settings produces a *lab-side* symptom that looks like something else entirely — a guest that crashed, and a guest that hung — and in both cases neither the build nor the lab prints a word about the real cause.
+
+#### `DLL_EXPORT_VERSION=0x600` silences KDBG serial
+
+The reason to set it is a real one. Building C++ targets against mingw's libgcc fails to link on undefined `__imp_InitializeConditionVariable`, and raising `DLL_EXPORT_VERSION` to `0x600` widens the exported surface enough to resolve it. The build then succeeds and the ISO boots normally, all the way to a desktop.
+
+What it costs is the entire serial channel. A `BUILD_TYPE=Debug KDBG=1` build booted with `/DEBUGPORT=COM1 /KDSERIAL` produces **zero bytes on COM1** — not fewer messages, none: no FreeLoader debug output, no kernel `DPRINT`, no KDB prompt, no break banner. Because the guest itself is healthy, the only thing the lab observes is an empty capture, which is indistinguishable from a guest that died before serial init.
+
+In this harness that means `console text` returns nothing, and so does `console text --follow --from-reset`. An operator who has read [A. The serial socket has no scrollback](#a-the-serial-socket-has-no-scrollback) will correctly suspect a late attach, reattach earlier and earlier, keep getting nothing, and eventually report a hung guest. It is not hung. Two ways to tell the cases apart:
+
+- **Screenshot it first.** It costs no lease. A guest that has painted the FreeLoader menu or a desktop while COM1 stays silent is a mute *build*; a guest that genuinely died before serial init has not painted either.
 - **Compare two builds off the same ref**, which is the definitive test:
 
   ```bash
@@ -363,41 +239,19 @@ It is not hung. Two ways to tell the cases apart:
     REACTOS_REF="$REF" ARCH=amd64 BUILD_TYPE=Debug KDBG=1 ./scripts/build.sh
   ```
 
-  Boot both with the same VM shape and the same capture command. If A prints
-  and B does not, the build is mute. If *neither* prints, the fault is on this
-  side: a late attach, a VM without `serial0: socket`, or a second
-  `console text` session on the same guest holding all the bytes.
+  Boot both with the same VM shape and the same capture command. If A prints and B does not, the build is mute. If *neither* prints, the fault is on this side: a late attach, a VM without `serial0: socket`, or a second `console text` session on the same guest holding all the bytes.
 
-The rule: **do not combine `DLL_EXPORT_VERSION=0x600` with
-`BUILD_TYPE=Debug KDBG=1`** on any build you intend to debug over serial. Fix
-the C++ link error some other way, or accept a build you cannot serially debug
-and record that in the run notes so the next person does not spend a lease
-rediscovering it. There is a second reason to keep the two apart: the wider
-0x600 export surface also changes behaviour on the PnP and device-start paths,
-so a build made to get a link to succeed is not the build whose driver bring-up
-you were measuring.
+The rule: **do not combine `DLL_EXPORT_VERSION=0x600` with `BUILD_TYPE=Debug KDBG=1`** on any build you intend to debug over serial. Fix the C++ link error some other way, or accept a build you cannot serially debug and record that in the run notes so the next person does not spend a lease rediscovering it. There is a second reason to keep the two apart: the wider 0x600 export surface also changes behaviour on the PnP and device-start paths, so a build made to get a link to succeed is not the build whose driver bring-up you were measuring.
 
-### `ENABLE_ROSTESTS=0` breaks ISO assembly — and the obvious repair loses the boot record
+#### `ENABLE_ROSTESTS=0` breaks ISO assembly — and the obvious repair loses the boot record
 
-Turning the test suite off is a reasonable thing to want; it is a large part of
-the build. But the ISO manifests are generated without regard for it, so
-`bootcd.<config>.lst` and `reactos.dff` still name winetest binaries that were
-never built, and the final `ninja` step dies at the ISO-assembly phase:
+Turning the test suite off is a reasonable thing to want; it is a large part of the build. But the ISO manifests are generated without regard for it, so `bootcd.<config>.lst` and `reactos.dff` still name winetest binaries that were never built, and the final `ninja` step dies at the ISO-assembly phase:
 
 ```
 mkisofs: No such file or directory. Cannot open '.../ntdll_winetest.exe'.
 ```
 
-Everything before that point succeeded — kernel, drivers, the loader, the whole
-staging tree — so the natural repair is to strip the winetest lines out of the
-list and re-run mkisofs by hand over the staging directory. **That repair is
-where the lab time goes.** A plain `mkisofs -o out.iso <staging>` produces a
-completely valid ISO 9660 image containing the entire ReactOS tree and **no El
-Torito boot record**. mkisofs says nothing. The image mounts, the file tree is
-complete, attaching it to a guest works, and the guest starts — and then
-SeaBIOS finds nothing to boot and shows a black screen with no keyboard
-response, no display output and no error. From the lab there is nothing to
-distinguish it from a guest hung in early boot.
+Everything before that point succeeded — kernel, drivers, the loader, the whole staging tree — so the natural repair is to strip the winetest lines out of the list and re-run mkisofs by hand over the staging directory. **That repair is where the lab time goes.** A plain `mkisofs -o out.iso <staging>` produces a completely valid ISO 9660 image containing the entire ReactOS tree and **no El Torito boot record**. mkisofs says nothing. The image mounts, the file tree is complete, attaching it to a guest works, and the guest starts — and then SeaBIOS finds nothing to boot and shows a black screen with no keyboard response, no display output and no error. From the lab there is nothing to distinguish it from a guest hung in early boot.
 
 So the El Torito options are mandatory on any manual reassembly:
 
@@ -408,24 +262,15 @@ mkisofs -o reactos.iso \
   <staging-dir>
 ```
 
-Take the boot image path out of the `ninja` command line that failed rather
-than trusting the one above: `loader/isobtrt.bin` is what the amd64 bootcd
-staging tree uses, and it is build-specific. The rest is not negotiable.
-Without `-eltorito-boot` there is no boot record at all; without
-`-no-emul-boot` the firmware tries floppy emulation on a file that is not a
-floppy image; `-boot-load-size 4` states the sector count explicitly instead of
-leaving it to whichever default your mkisofs build happens to use.
+Take the boot image path out of the `ninja` command line that failed rather than trusting the one above: `loader/isobtrt.bin` is what the amd64 bootcd staging tree uses, and it is build-specific. The rest is not negotiable. Without `-eltorito-boot` there is no boot record at all; without `-no-emul-boot` the firmware tries floppy emulation on a file that is not a floppy image; `-boot-load-size 4` states the sector count explicitly instead of leaving it to whichever default your mkisofs build happens to use.
 
-**Then check it before it ever reaches a guest.** `iso diagnose` is local, takes
-no lease and no host, and reads the same structures the firmware reads:
+**Then check it before it ever reaches a guest.** `iso diagnose` is local, takes no lease and no host, and reads the same structures the firmware reads:
 
 ```bash
 proxmox-lab iso diagnose --path ./reactos.iso
 ```
 
-The field that proves the boot record survived is `el_torito_ok`, and the
-catalog it is derived from is printed alongside it (abridged and reordered here
-from the full sorted output):
+The field that proves the boot record survived is `el_torito_ok`, and the catalog it is derived from is printed alongside it (abridged and reordered here from the full sorted output):
 
 ```json
 "bootable_bios": true,
@@ -449,8 +294,7 @@ from the full sorted output):
 }
 ```
 
-An image assembled the wrong way reports `"el_torito_ok": false` and says so in
-`warnings`, naming the flags to rebuild with:
+An image assembled the wrong way reports `"el_torito_ok": false` and says so in `warnings`, naming the flags to rebuild with:
 
 ```
 no El Torito boot record at all, but the file tree is bootloader-shaped
@@ -461,81 +305,37 @@ with no keyboard and no error. Reassemble with the mandatory options:
 -boot-load-size 4 (the boot image path is build-specific)
 ```
 
-The same command also catches the ways a boot record can be present and still
-useless: a catalog that the boot record points at outside the image or at LBA
-0, a validation entry that fails its 16-bit checksum or is missing its
-`0x55 0xAA` key bytes (all of these give `catalog_usable: false`), an entry
-naming a boot image past the end of the file (`image_in_range: false`), and an
-entry with a boot-load-size of zero (`load_sectors: 0`), which loads nothing
-and jumps into it. Every one of those boots exactly as silently as no boot
-record at all, which is why the check is worth running every time rather than
-only when something already looks wrong.
+The same command also catches the ways a boot record can be present and still useless: a catalog that the boot record points at outside the image or at LBA 0, a validation entry that fails its 16-bit checksum or is missing its `0x55 0xAA` key bytes (all of these give `catalog_usable: false`), an entry naming a boot image past the end of the file (`image_in_range: false`), and an entry with a boot-load-size of zero (`load_sectors: 0`), which loads nothing and jumps into it. Every one of those boots exactly as silently as no boot record at all, which is why the check is worth running every time rather than only when something already looks wrong.
 
-The build-side fixes belong upstream — filter the winetest entries out of
-`bootcd.*.lst` and `reactos.dff` during configure when `ENABLE_ROSTESTS=0`, and
-fail with the name of the flag that controls the missing files instead of
-dying inside mkisofs. This lab cannot make those changes. What it can do is
-refuse to let a boot-record-less ISO reach a guest unnoticed.
+The build-side fixes belong upstream — filter the winetest entries out of `bootcd.*.lst` and `reactos.dff` during configure when `ENABLE_ROSTESTS=0`, and fail with the name of the flag that controls the missing files instead of dying inside mkisofs. This lab cannot make those changes. What it can do is refuse to let a boot-record-less ISO reach a guest unnoticed.
 
-## Reading results
+### D. Evidence discipline, and three diagnoses that were wrong
 
-The most useful independent signal the lab gives you is a screenshot's **pixel
-dimensions**. `console screenshot` reports the size of the guest's real
-scanout, so a display mode change can be confirmed from outside the guest
-regardless of what the guest's own UI claims. That is how a virtio-GPU mode
-switch was shown to be genuinely reprogramming the hardware even though the
-resulting screen was black — which moved the investigation from "the mode
-change fails" to "nothing is being painted after it succeeds", a completely
-different bug.
+Do not describe anything as verified without a captured log or screenshot behind it, and when a diagnosis turns out to be wrong, correct the earlier write-up in place rather than leaving a confident falsehood in the record for the next person to build on. Record the ISO and patch hashes alongside each run's evidence so a claim can be traced back to the exact artifact that produced it, and treat any artifact a run has cited as immutable from then on.
 
-Screenshots are read-only and take no lease:
+That discipline is not theoretical. Three diagnoses in this workstream were stated with confidence and were wrong:
 
-```bash
-proxmox-lab console screenshot --vmid "$VMID" --settle 3
-```
+1. **A fix was credited with resolving a downstream assertion it had nothing to do with.** An oversized allocation was found and fixed, and the assertion that was assumed to follow from it kept firing afterwards. Two real defects had been collapsed into one causal story on no evidence beyond plausibility.
+2. **An informational message was read as a failure.** A storage port driver logs "No driver object extension!" and then creates the extension on the next line. The message is normal; a run was spent chasing it.
+3. **An error was attributed to the driver under test when a different driver emitted it.** A `HwFindAdapter` failure blamed on a new virtio-GPU miniport was actually the legacy VGA driver failing, which is expected when the VM is configured with `vga=virtio`. The real fault was elsewhere entirely.
 
-For the serial log, a handful of greps are worth running over every capture
-before reading it in detail. Use `grep -a`, because a serial log routinely
-contains binary noise and GNU grep will otherwise decide it is not a text file:
+Two transferable lessons come out of all three. First, **identify which component emitted a message before attributing it** — on a serial log with several drivers logging into the same stream, the nearest plausible owner is frequently not the actual one. Second, **confirm that a fix changed the observed symptom before believing the causal chain**; a fix that is correct in isolation is not evidence that it was the fix for the thing you were chasing.
 
-```bash
-grep -acE "ASSERT_FAILURE|Assertion failed"   run.log   # any assertion at all
-grep -aiE "viostor|storport|virtio_gpu"       run.log   # driver-specific tags
-grep -acE "IOCTL_[A-Z_]+ failed"              run.log   # rejected IOCTLs
-```
+---
 
-Beyond that, grep for the exact `file.c(line)` or `file.c:line` string of any
-assertion you are tracking. Those strings are stable across builds and make a
-good regression check: a fix has worked when the string is gone from the log,
-not when the guest merely gets further.
+## Commands quick reference
 
-## Evidence discipline, and three diagnoses that were wrong
+Every `proxmox-lab` invocation below is verified against `src/proxmox_agent_lab/*/register()` signatures in this tree. No flag is invented — see source links inline.
 
-Do not describe anything as verified without a captured log or screenshot
-behind it, and when a diagnosis turns out to be wrong, correct the earlier
-write-up in place rather than leaving a confident falsehood in the record for
-the next person to build on. Record the ISO and patch hashes alongside each
-run's evidence so a claim can be traced back to the exact artifact that
-produced it, and treat any artifact a run has cited as immutable from then on.
-
-That discipline is not theoretical. Three diagnoses in this workstream were
-stated with confidence and were wrong:
-
-1. **A fix was credited with resolving a downstream assertion it had nothing to
-   do with.** An oversized allocation was found and fixed, and the assertion
-   that was assumed to follow from it kept firing afterwards. Two real defects
-   had been collapsed into one causal story on no evidence beyond plausibility.
-2. **An informational message was read as a failure.** A storage port driver
-   logs "No driver object extension!" and then creates the extension on the
-   next line. The message is normal; a run was spent chasing it.
-3. **An error was attributed to the driver under test when a different driver
-   emitted it.** A `HwFindAdapter` failure blamed on a new virtio-GPU miniport
-   was actually the legacy VGA driver failing, which is expected when the VM is
-   configured with `vga=virtio`. The real fault was elsewhere entirely.
-
-Two transferable lessons come out of all three. First, **identify which
-component emitted a message before attributing it** — on a serial log with
-several drivers logging into the same stream, the nearest plausible owner is
-frequently not the actual one. Second, **confirm that a fix changed the
-observed symptom before believing the causal chain**; a fix that is correct in
-isolation is not evidence that it was the fix for the thing you were chasing.
+| Purpose | Command | Key flags verified |
+|---|---|---|
+| Serial capture from boot | `proxmox-lab console text --vmid "$VMID" --follow --timeout 900 --wait-for-guest 300` | `console text`: `--vmid`, `--follow`, `--timeout`, `--wait-for-guest` (`src/proxmox_agent_lab/console.py`) |
+| Guaranteed t=0 capture | `proxmox-lab console text --follow --from-reset --lease "$L"` | `console text`: `--from-reset` requires `--lease` |
+| Drive boot menu | `proxmox-lab console keys --lease "$L" --vmid "$VMID" --delay 0.6 up up enter --screenshot-after 4` | `console keys`: `--lease`, `--vmid`, `--delay`, `--screenshot-after`, positional `keys` |
+| Reset guest | `proxmox-lab api --lease "$L" --method POST --path "/nodes/$NODE/qemu/$VMID/status/reset"` | `api`: `--lease`, `--method`, `--path` |
+| Measure disk writes | `proxmox-lab guest disk-activity --vmid "$VMID"` / `proxmox-lab guest disk-activity --lease "$L" --vmid "$VMID" --ground-truth --interval 10` | `guest disk-activity`: `--vmid`, `--lease`, `--ground-truth`, `--interval` |
+| Inspect spinning vCPU | `proxmox-lab memflow registers --lease "$L" --vmid "$VMID"`; `proxmox-lab memflow trace --lease "$L" --vmid "$VMID" --steps 20` | `memflow registers`: `--lease`, `--vmid`; `memflow trace`: `--steps` |
+| Check ISO boot record | `proxmox-lab iso diagnose --path ./reactos.iso` | `iso diagnose`: `--path` |
+| Screenshot scanout | `proxmox-lab console screenshot --vmid "$VMID" --settle 3` | `console screenshot`: `--vmid`, `--settle` |
+| Storage class check | `proxmox-lab storage status` | `storage status`: no extra flags; reports `"class": "bulk"` |
+| VM config check | `proxmox-lab api --lease "$L" --method GET --path "/nodes/$NODE/qemu/$VMID/config"` | `api`: `--lease`, `--method GET`, `--path` |

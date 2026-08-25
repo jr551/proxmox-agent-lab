@@ -32,6 +32,22 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/instal
   and the agent typed that text.</em>
 </p>
 
+## Contents
+
+- [Why an old computer?](#why-an-old-computer)
+- [On-demand environments for agents](#on-demand-environments-for-agents)
+- [What it can do](#what-it-can-do)
+- [What people use it for](#what-people-use-it-for)
+- [Bring the analysis environment you already trust](#bring-the-analysis-environment-you-already-trust)
+- [Responsible research](#responsible-research)
+- [Why it is safe to hand to an agent](#why-it-is-safe-to-hand-to-an-agent)
+- [Install](#install)
+- [Five-minute tour](#five-minute-tour)
+- [Reading a screen](#reading-a-screen)
+- [Point your agent at it](#point-your-agent-at-it)
+- [Docs](#docs)
+- [Status](#status)
+
 ---
 
 ## Why an old computer?
@@ -82,7 +98,7 @@ agent lab.
 | 🧪 | Experimental trusted OCI application LXC | `oci pull`, `oci create` |
 | 🔒 | Force all traffic through a VPN | `net gateway-create` |
 | 🕵️ | Prove there is no leak | `net leak-test` |
-| 📓 | Audit everything (SQLite or PocketBase) | `journal` |
+| 📓 | Audit everything to one shared ledger | `journal` |
 | 🔌 | Power on, power off, verified | `lease-begin` / `lease-end` |
 | 📌 | Keep machines alive (host stays on) | `lease-begin --long-term` |
 | 💾 | Weekly backups of what you keep | `backup` |
@@ -101,43 +117,34 @@ agent lab.
 
 ## What people use it for
 
-🧹 **A clean machine on demand.** Not a container — a real OS with a real
-kernel, booted from nothing, gone afterwards. "Works on my machine" stops being
-a question.
+Every row in the [capability table above](#what-it-can-do) maps to a concrete
+workflow — the table is the canonical list, the paragraph below is the short
+guide to it. Use a **clean machine on demand** — not a container, a real OS
+with a real kernel booted from nothing and gone afterwards so "works on my
+machine" stops being a question. **Test your own install docs** by pointing an
+agent at a fresh VM and your README — if step 4 is wrong, it finds out, not
+your users. **Let an agent break things** — kernel modules, firewall rules,
+partitioning, `rm -rf` — the blast radius is one lease. **Authorized reverse
+engineering** of an application, driver or firmware image from the screen down
+to live memory, USB and network behaviour. **Defensive analysis of untrusted
+software** by routing the guest through a VPN gateway with no path to your home
+network and proving it with `net leak-test` first. **Drive a GUI installer**
+such as Windows Setup which has no API — a multimodal model looks at the screen
+and clicks *Next*. **Reproduce a bug across distros** by booting Rocky, Ubuntu
+and Debian in turn, running the same script and comparing. **Kernel and OS
+development** — build a kernel or a whole OS, boot it on real virtual hardware,
+and when it panics on boot read the vCPU registers and RAM from *outside* the
+guest (`memflow boot-diagnose`), single-step it over the gdbstub
+(`memflow trace`), inspect its virtio devices and negotiated feature bits
+(`virtio inspect`), or repair its disk offline (`disk write`) — then roll back
+to the template and try the next build with no serial cable and no second
+machine. **Home-lab hosting on the same box** — keep a service alive with a
+long-term lease while the agent spins ephemeral job guests alongside it, so one
+retired PC is both your always-on home server and your agent's disposable lab
+and only draws power when something actually needs it. For why a spare desktop
+rather than a container suffices here, see [Why an old computer?](#why-an-old-computer).
 
-📖 **Testing your own install docs.** Point an agent at a fresh VM and your
-README. If step 4 is wrong, it finds out, not your users.
-
-💥 **Letting an agent break things.** Kernel modules, firewall rules,
-partitioning, `rm -rf`. The blast radius is one lease.
-
-🔬 **Authorized reverse engineering.** Study an application, driver or firmware
-image from the screen down to live memory, USB and network behaviour.
-
-🕵️ **Defensive analysis of untrusted software.** Route the guest through a VPN
-gateway with no path to your home network, and prove it with `net leak-test`
-first.
-
-🪟 **Driving a GUI installer.** Windows Setup has no API. A multimodal model
-looks at the screen and clicks *Next*.
-
-🐧 **Reproducing a bug across distros.** Boot Rocky, Ubuntu and Debian in turn,
-run the same script, compare.
-
-🐧 **Kernel and OS development.** Build a kernel or a whole OS, boot it on real
-virtual hardware, and when it panics on boot read the vCPU registers and RAM
-from *outside* the guest (`memflow boot-diagnose`), single-step it over the
-gdbstub (`memflow trace`), inspect its virtio devices and negotiated feature
-bits (`virtio inspect`), or repair its disk offline (`disk write`) — then roll
-back to the template and try the next build. No serial cable, no second
-machine.
-
-🏠 **Home-lab hosting on the same box.** Keep a service alive with a long-term
-lease while the agent spins ephemeral job guests alongside it. One retired PC
-is both your always-on home server and your agent's disposable lab, and it only
-draws power when something actually needs it.
-
-### Bring the analysis environment you already trust
+## Bring the analysis environment you already trust
 
 Old Computer → AI Lab is the orchestration and containment layer, not another
 tool-bundle distribution. Use clean OS templates or bring environments such as
@@ -173,11 +180,10 @@ the software remains MIT licensed.
 
 ## 📦 Install
 
-**One touch** — installs, configures, stores your token, health-checks:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
-```
+**One touch** — installs, configures, stores your token, health-checks: see the
+one-liner in the hero snippet above
+(`curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash`)
+— also documented in [docs/INSTALL.md](docs/INSTALL.md) step 4.
 
 **By hand:**
 
@@ -200,6 +206,8 @@ The cached bootstrap environment checks GitHub at most once per 24 hours and
 upgrades itself when a newer release exists. The CLI uses the same daily,
 non-blocking check; failed checks are cached so offline startup remains fast.
 
+### Host setup scripts
+
 **Blank Proxmox machine?** Run this on it, as root — it creates the API token,
 grants the right privileges, and arms Wake-on-LAN:
 
@@ -207,20 +215,19 @@ grants the right privileges, and arms Wake-on-LAN:
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/proxmox-host-setup.sh | bash
 ```
 
-**Optional PocketBase audit host?** Run this as root on Proxmox. It creates a
-persistent unprivileged LXC, asks for networking and port settings, and prints
-the API URL and initial administrator details:
+**The audit ledger.** One shared MariaDB, in a persistent container on the
+Proxmox host. Provision it once from any controller:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocketbase-host-setup.sh | bash
+proxmox-lab journal host-setup --host-change-authorized
 ```
 
-Keep the default HTTP service on a trusted LAN; place it behind TLS before
-access from an untrusted network.
-Store the printed superuser credentials in the controller's secret store and
-run `proxmox-lab journal --provision-pocketbase-agent`; it creates a restricted
-renewable audit account instead of leaving the controller on a superuser token.
+It prints one `export` line. Paste that on every other machine and it inherits
+every other secret automatically — that one credential is all a controller
+needs. The ledger goes down with the lab host between leases, so events spool
+locally and upload on the next `journal --flush-spool`.
 
+> **Trusted LAN only** — the ledger listens on the LAN with no TLS. See the canonical warning in [docs/storage.md](docs/storage.md#s3-scratch-bucket) (do not port-forward; TLS reverse proxy for untrusted networks).
 
 **No S3 bucket for guest file transfer?** Run this as root on Proxmox. It
 creates a persistent unprivileged LXC running a minimal MinIO server
@@ -229,8 +236,7 @@ creates a persistent unprivileged LXC running a minimal MinIO server
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-host-setup.sh | bash
 ```
-
-Same rule applies: trusted LAN only, TLS in front for anything else.
+> **Trusted LAN only** — this MinIO LXC also exposes plain HTTP on the LAN (S3 API only, no browser console). See the canonical warning in [docs/storage.md](docs/storage.md#s3-scratch-bucket). Do not port-forward; TLS reverse proxy for untrusted networks.
 
 **You need:** a spare PC running [Proxmox VE](https://www.proxmox.com) 8 or 9,
 and Python 3.11+ to drive it from. Wake-on-LAN is the default power-on and
@@ -261,15 +267,13 @@ proxmox-lab lease-end --lease "$L"          # destroy the clone, power off
 the clone is gone. That round trip — on, clone, work, destroy, off — is the
 whole point.
 
-### Reading a screen
+## Reading a screen
 
-A screen is read by a model, never by glyph matching. `console text` when the
-guest is a real terminal — it returns the guest's exact character stream.
-`console screenshot` when you can look at images yourself. When you cannot,
-`console inspect` sends one lease-owned screen to a configured vision provider,
-and `console screenshot --for-model` returns the screen inline as a bounded
-base64 PNG for your own vision to decode. There is no OCR: glyph matching only
-ever worked on a guest whose console font this controller already had.
+A screen is read by a model, never by glyph matching — use `console text` for a
+real terminal (exact character stream), `console screenshot` when you can view
+images, and `console inspect` or `console screenshot --for-model` (bounded
+base64 PNG) when you cannot. Full channel guide, image bounds and the no-OCR
+rationale are in [docs/console.md](docs/console.md).
 
 ## Point your agent at it
 

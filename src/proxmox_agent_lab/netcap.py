@@ -49,17 +49,18 @@ from . import memflow as _mf
 # Host channel (shared with memflow/usb: same host, same trust boundary).
 # --------------------------------------------------------------------------- #
 
+NOT_ENABLED = (
+    "Network capture runs on the Proxmox host over SSH -- the same host "
+    "connection memflow and usb use -- so it is off until you set "
+    "[memflow] enabled = true and ssh_host. See docs/netcap.md."
+)
+
+
 def _require_enabled(lab: Any) -> None:
-    if not _mf.ENABLED or not _mf.SSH_HOST:
-        raise lab.LabError(
-            "Network capture runs on the Proxmox host over SSH -- the same host "
-            "connection memflow and usb use -- so it is off until you set "
-            "[memflow] enabled = true and ssh_host. See docs/netcap.md."
-        )
+    _mf.require_host_ssh(lab, NOT_ENABLED)
 
 
-def _ssh(lab: Any, argv: list[str], *, timeout: int = 60):
-    return _mf._ssh(lab, argv, timeout=timeout)
+_ssh = _mf.host_run
 
 
 def _ssh_ok(lab: Any, argv: list[str], *, timeout: int = 60):
@@ -152,21 +153,13 @@ def cmd_capture(lab: Any, args: Any) -> None:
     )
     proc = _ssh(lab, ["bash", "-c", script], timeout=args.seconds + 60)
     if proc.returncode not in (0, None):
-        raise lab.LabError(
-            f"capture failed on the host: {(proc.stderr or '').strip()[:300]}"
-        )
-    pkts = 0
-    b64: list[str] = []
-    for line in proc.stdout.splitlines():
-        if line.startswith("PKTS="):
-            pkts = int(line.split("=", 1)[1] or 0)
-        else:
-            b64.append(line)
+        raise lab.LabError(f"capture failed on the host: {(proc.stderr or '').strip()[:300]}")
+    pkts, data = _mf.decode_capture_output(proc.stdout or "")
     out = os.path.expanduser(args.out)
     with open(out, "wb") as fh:
-        fh.write(base64.b64decode("".join(b64) or ""))
+        fh.write(data)
     lab.audit("netcap-capture", lease=args.lease, vmid=args.vmid, iface=iface,
-              seconds=args.seconds, packets=pkts, sync=False)
+              seconds=args.seconds, packets=pkts)
     print(json.dumps(
         {"vmid": args.vmid, "iface": iface, "packets": pkts, "out": out,
          "note": "open in Wireshark; TLS is ciphertext -- see 'netcap intercept'"},
@@ -208,7 +201,7 @@ def cmd_mitm_setup(lab: Any, args: Any) -> None:
     ip = _pct(lab, args.lxc,
               ["bash", "-c", "hostname -I 2>/dev/null | awk '{print $1}'"],
               timeout=30).stdout.strip()
-    lab.audit("netcap-mitm-setup", lease=args.lease, lxc=args.lxc, sync=False)
+    lab.audit("netcap-mitm-setup", lease=args.lease, lxc=args.lxc)
     print(json.dumps(
         {"lxc": args.lxc, "prepared": True, "proxy_ip": ip or None,
          "proxy_port": args.port,
@@ -285,7 +278,7 @@ def cmd_ca(lab: Any, args: Any) -> None:
         written["cer"] = out_cer
     helper = _CA_HELPERS[args.os].format(
         pem=written["pem"], cer=written.get("cer", written["pem"]))
-    lab.audit("netcap-ca", lease=args.lease, lxc=args.lxc, os=args.os, sync=False)
+    lab.audit("netcap-ca", lease=args.lease, lxc=args.lxc, os=args.os)
     print(json.dumps(
         {"lxc": args.lxc, "os": args.os, "written": written,
          "install_helper": helper},
@@ -373,7 +366,7 @@ def cmd_intercept(lab: Any, args: Any) -> None:
         saved["har"] = har
     lab.audit("netcap-intercept", lease=args.lease, lxc=args.lxc,
               seconds=args.seconds, flows=len(flows),
-              modified=bool(extra), sync=False)
+              modified=bool(extra))
     print(json.dumps(
         {"lxc": args.lxc, "port": args.port, "flow_count": len(flows),
          "modified": bool(extra), "probe_status": probe_status,
@@ -431,7 +424,7 @@ def cmd_doctor(lab: Any, args: Any) -> None:
     healthy = bool(checks["mitmdump"] and checks["ca_present"]
                    and checks["runner_present"])
     lab.audit("netcap-doctor", lease=args.lease, lxc=args.lxc,
-              healthy=healthy, sync=False)
+              healthy=healthy)
     print(json.dumps({"lxc": args.lxc, "healthy": healthy, "checks": checks},
                      indent=2, sort_keys=True))
     if not healthy:
@@ -528,8 +521,8 @@ echo "mitm-lxc-ready $LXC"
 # --------------------------------------------------------------------------- #
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     net = sub.add_parser(
         "netcap", help="network capture, SSL inspection and MITM relay")
@@ -546,7 +539,7 @@ def register(sub: Any, lab: Any) -> None:
                      help="stop after N packets (0 = until the duration)")
     cap.add_argument("--filter", help="BPF filter, e.g. 'tcp port 443'")
     cap.add_argument("--out", required=True, help="local pcap output file")
-    cap.set_defaults(func=bind(cmd_capture))
+    cap.set_defaults(func=_bind(lab, cmd_capture))
 
     setup = net_sub.add_parser(
         "mitm-setup", help="prepare a disposable LXC running mitmproxy")
@@ -558,7 +551,7 @@ def register(sub: Any, lab: Any) -> None:
     setup.add_argument("--port", type=int, default=8080,
                        help="proxy port the guest should use")
     setup.add_argument("--timeout", type=int, default=1800)
-    setup.set_defaults(func=bind(cmd_mitm_setup))
+    setup.set_defaults(func=_bind(lab, cmd_mitm_setup))
 
     ca = net_sub.add_parser(
         "ca", help="fetch the interception CA and print an OS install helper")
@@ -569,7 +562,7 @@ def register(sub: Any, lab: Any) -> None:
                     help="the guest OS to print an install helper for")
     ca.add_argument("--out", default="mitmproxy-ca.pem",
                     help="local path for the CA (a .cer is written alongside)")
-    ca.set_defaults(func=bind(cmd_ca))
+    ca.set_defaults(func=_bind(lab, cmd_ca))
 
     icept = net_sub.add_parser(
         "intercept", help="run the MITM proxy, decrypt flows, optionally rewrite")
@@ -592,10 +585,10 @@ def register(sub: Any, lab: Any) -> None:
     icept.add_argument("--har", help="save the HAR export locally")
     icept.add_argument("--max-flows", type=int, default=50,
                        help="how many flow summaries to print")
-    icept.set_defaults(func=bind(cmd_intercept))
+    icept.set_defaults(func=_bind(lab, cmd_intercept))
 
     doctor = net_sub.add_parser(
         "doctor", help="prove the MITM LXC is ready")
     doctor.add_argument("--lease", required=True)
     doctor.add_argument("--lxc", type=int, required=True)
-    doctor.set_defaults(func=bind(cmd_doctor))
+    doctor.set_defaults(func=_bind(lab, cmd_doctor))

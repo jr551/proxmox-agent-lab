@@ -89,28 +89,16 @@ def cmd_list_disks(lab: Any, args: Any) -> None:
     ))
 
 
-def cmd_add_disk(lab: Any, args: Any) -> None:
-    """Format one physical disk and register it as directory storage."""
-    if not args.host_change_authorized:
-        raise lab.LabError(
-            "Formatting a disk and adding node storage are host-level changes. "
-            "Re-run with --host-change-authorized only when the user has "
-            "explicitly asked for that exact change."
-        )
-    api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
-
+def _validate_wipe_target(lab: Any, api: Any, args: Any) -> dict[str, Any]:
+    """Lookup the device and enforce OS-disk / used / serial / size guards."""
     disks = _disks(lab, api)
-    match = next(
-        (d for d in disks if d.get("devpath") == args.device), None
-    )
+    match = next((d for d in disks if d.get("devpath") == args.device), None)
     if match is None:
         available = sorted(d.get("devpath", "?") for d in disks)
         raise lab.LabError(
             f"{args.device} is not a disk on {lab.NODE}. Present: {available}"
         )
     described = _describe(match)
-
     if described["os_disk"]:
         raise lab.LabError(
             f"refusing to format {args.device}: Proxmox reports it as the OS disk"
@@ -135,7 +123,30 @@ def cmd_add_disk(lab: Any, args: Any) -> None:
                 f"size mismatch for {args.device}: expected about "
                 f"{args.expect_size_gb} GB, found {actual} GB"
             )
+    return described
 
+
+def _set_content_with_fallback(lab: Any, api: Any, name: str,
+                               content: str) -> tuple[bool, str]:
+    """Try to set storage content types; returns (ok, note)."""
+    try:
+        api.call("PUT", f"/storage/{name}", {"content": content})
+        return True, ""
+    except lab.LabError as exc:
+        return False, str(exc)
+
+
+def cmd_add_disk(lab: Any, args: Any) -> None:
+    """Format one physical disk and register it as directory storage."""
+    if not args.host_change_authorized:
+        raise lab.LabError(
+            "Formatting a disk and adding node storage are host-level changes. "
+            "Re-run with --host-change-authorized only when the user has "
+            "explicitly asked for that exact change."
+        )
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
+    described = _validate_wipe_target(lab, api, args)
     lab.audit(
         "disk-format-requested",
         lease=args.lease,
@@ -146,7 +157,6 @@ def cmd_add_disk(lab: Any, args: Any) -> None:
         filesystem=args.filesystem,
         previously_used=described["used"],
     )
-
     upid = api.call(
         "POST",
         f"/nodes/{lab.NODE}/disks/directory",
@@ -158,14 +168,7 @@ def cmd_add_disk(lab: Any, args: Any) -> None:
         },
     )
     status = lab.wait_task(api, upid, timeout=args.timeout)
-
-    content_set = False
-    try:
-        api.call("PUT", f"/storage/{args.name}", {"content": args.content})
-        content_set = True
-    except lab.LabError as exc:
-        note = str(exc)
-
+    content_set, note = _set_content_with_fallback(lab, api, args.name, args.content)
     result: dict[str, Any] = {
         "device": args.device,
         "serial": described["serial"],
@@ -202,7 +205,6 @@ def cmd_add_disk(lab: Any, args: Any) -> None:
             f"{args.content} --host-change-authorized' (the disk is already "
             "formatted; re-running add-disk would erase it again)."
         )
-
 
 # --- unreferenced image garbage collection --------------------------------
 #
@@ -464,19 +466,19 @@ def cmd_status(lab: Any, args: Any) -> None:
 
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     storage = sub.add_parser("storage", help="physical disks and node storage")
     storage_sub = storage.add_subparsers(dest="storage_command", required=True)
 
     storage_sub.add_parser(
         "list-disks", help="show physical disks and which are unused"
-    ).set_defaults(func=bind(cmd_list_disks))
+    ).set_defaults(func=_bind(lab, cmd_list_disks))
 
     storage_sub.add_parser(
         "status", help="show configured storage and free space"
-    ).set_defaults(func=bind(cmd_status))
+    ).set_defaults(func=_bind(lab, cmd_status))
 
     add = storage_sub.add_parser(
         "add-disk", help="format a disk and add it as directory storage"
@@ -493,7 +495,7 @@ def register(sub: Any, lab: Any) -> None:
                      help="allow formatting a disk Proxmox reports as in use")
     add.add_argument("--host-change-authorized", action="store_true")
     add.add_argument("--timeout", type=int, default=1800)
-    add.set_defaults(func=bind(cmd_add_disk))
+    add.set_defaults(func=_bind(lab, cmd_add_disk))
 
     download = storage_sub.add_parser(
         "download-url", help="fetch an image into storage, checksum-verified"
@@ -513,7 +515,7 @@ def register(sub: Any, lab: Any) -> None:
     download.add_argument("--allow-unverified", action="store_true",
                           help="skip checksum verification (discouraged)")
     download.add_argument("--timeout", type=int, default=3600)
-    download.set_defaults(func=bind(cmd_download))
+    download.set_defaults(func=_bind(lab, cmd_download))
 
     gc = storage_sub.add_parser(
         "gc",
@@ -533,7 +535,7 @@ def register(sub: Any, lab: Any) -> None:
                     help="delete the volumes this run found unreferenced")
     gc.add_argument("--host-change-authorized", action="store_true")
     gc.add_argument("--lease", help="optional, recorded in the audit event")
-    gc.set_defaults(func=bind(cmd_gc))
+    gc.set_defaults(func=_bind(lab, cmd_gc))
 
     content = storage_sub.add_parser(
         "set-content", help="change what a storage may hold"
@@ -542,4 +544,4 @@ def register(sub: Any, lab: Any) -> None:
     content.add_argument("--name", required=True)
     content.add_argument("--content", default=DEFAULT_CONTENT)
     content.add_argument("--host-change-authorized", action="store_true")
-    content.set_defaults(func=bind(cmd_set_content))
+    content.set_defaults(func=_bind(lab, cmd_set_content))

@@ -552,6 +552,5 @@ def cmd_disk_activity(lab: Any, args: Any) -> None:
         blockstats_bytes=result["written_bytes"].get(SIGNAL_BLOCKSTATS),
         host_du_bytes=result["written_bytes"].get(SIGNAL_HOST_DU),
         disagreements=len(result["disagreement"]),
-        sync=False,
     )
     print(json.dumps(result, indent=2, sort_keys=True))

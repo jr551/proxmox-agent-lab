@@ -1,15 +1,42 @@
 # Storage: physical disks, node storage, and guest file transfer
 
-## Physical disks and node storage
+## Purpose
+
+Physical disks, node storage classes, reclaimed images, verified cloud-image fetches and S3 file transfer — one place for every host-side storage operation, with destructive actions gated and lease-audited.
+
+## Commands
+
+All flags verified against `src/proxmox_agent_lab/storage.py:register()` and `src/proxmox_agent_lab/console.py:register()` (S3/push/pull).
+
+| Command | Key flags (verified) | Notes |
+|---|---|---|
+| `storage status` | — | reports `class` (`fast`/`bulk`) and free space |
+| `storage list-disks` | — | physical disks, unused flag; needs `Sys.Audit`+`Sys.Modify` or returns 403 |
+| `storage add-disk --lease L --device /dev/sdb --name bulk --expect-serial S --expect-size-gb N --host-change-authorized [--wipe-confirmed] [--filesystem ext4|xfs] [--content ...]` | `--host-change-authorized`, `--wipe-confirmed`, `--expect-serial`, `--expect-size-gb` | formats the disk |
+| `storage set-content --lease L --name bulk --content ... --host-change-authorized` | `--host-change-authorized` | fix content types without re-formatting |
+| `storage gc [--storage ID] [--vmid N] [--dry-run] [--delete --host-change-authorized] [--lease L]` | `--delete`, `--host-change-authorized`, `--dry-run` | reports by default, deletes only with `--delete` |
+| `storage download-url --lease L --url URL --filename F --storage bulk --content import --checksum D --checksum-algorithm sha256|sha512 --allow-unverified` | `--allow-unverified` | node-side download, checksum required |
+| `s3 health \| s3 list --prefix ... \| s3 put --file --key \| s3 get --key --out \| s3 presign --key --method GET|PUT --expires 900 \| s3 delete --key ...` | `--prefix`, `--file`, `--key`, `--method`, `--expires` | scratch bucket ops |
+| `push --lease L --vmid N --file PATH --dest PATH [--url-only] [--windows] [--sha256]` / `pull --lease L --vmid N --remote PATH --out PATH [--keep] [--url-only]` | `--url-only`, `--keep`, `--windows` | presigned-URL transfer via guest agent |
+| `backup [--force] [--keep N] [--storage ID]` | `--force`, `--keep` | weekly long-term/retained backup |
+
+Quick examples:
+
+```bash
+proxmox-lab storage status
+proxmox-lab storage list-disks
+proxmox-lab storage gc                        # report only
+proxmox-lab s3 health; proxmox-lab s3 list --prefix screens/
+```
+
+### Physical disks and node storage
 
 ```bash
 proxmox-lab storage status                 # what exists, and free space
 proxmox-lab storage list-disks             # physical disks, and which are unused
 ```
 
-Adding a disk formats it, which destroys everything on it and cannot be
-undone. The command therefore refuses by default and needs the target named
-exactly:
+Adding a disk formats it, which destroys everything on it and cannot be undone. The command therefore refuses by default and needs the target named exactly:
 
 ```bash
 proxmox-lab storage add-disk --lease "$L" \
@@ -18,49 +45,15 @@ proxmox-lab storage add-disk --lease "$L" \
   --host-change-authorized
 ```
 
-Guards, all tested:
+On success the disk is formatted (`ext4` by default, `--filesystem xfs` available), mounted at `/mnt/pve/<name>`, registered as directory storage and set to hold `images,iso,vztmpl,import,backup,snippets`. Use `--content` to narrow that.
 
-- `--host-change-authorized` is mandatory, as for any host-level change.
-- The device is never auto-selected; `list-disks` shows candidates.
-- A disk Proxmox reports as the OS disk is refused outright.
-- A disk already carrying a filesystem, LVM member or partition table is
-  refused unless `--wipe-confirmed` is also passed.
-- `--expect-serial` and `--expect-size-gb` pin the physical device, so a
-  `/dev/sdX` name that moved across a reboot cannot redirect the wipe.
+A slow bulk disk such as a USB drive is a good home for install media, imported cloud images and backups. Keep running guest disks on `local-lvm`; a USB disk is fine for cold storage but will make a booted VM feel slow.
 
-On success the disk is formatted (`ext4` by default, `--filesystem xfs`
-available), mounted at `/mnt/pve/<name>`, registered as directory storage and
-set to hold `images,iso,vztmpl,import,backup,snippets`. Use `--content` to
-narrow that.
+### Fast or bulk: `storage status` says which
 
-All of that is the contract, so a partial result **exits non-zero**: if the
-storage is created but setting its content types fails, the JSON is still
-printed (with `content_configured: false` and the reason) and then the command
-fails, because a caller that read exit 0 would go on to upload content the
-storage will not accept. The disk is already formatted at that point, so
-finish it with `storage set-content` rather than rerunning `add-disk`, which
-would erase it again:
+`storage status` reports a `class` for every storage — `bulk` for the one named in `[storage] bulk_storage`, `fast` for everything else — so a caller can branch without hardcoding a site's storage id.
 
-```bash
-proxmox-lab storage set-content --lease "$L" --name bulk \
-  --content images,iso,vztmpl,import,backup,snippets \
-  --host-change-authorized
-```
-
-A slow bulk disk such as a USB drive is a good home for install media, imported
-cloud images and backups. Keep running guest disks on `local-lvm`; a USB disk
-is fine for cold storage but will make a booted VM feel slow.
-
-## Fast or bulk: `storage status` says which
-
-`storage status` reports a `class` for every storage — `bulk` for the one named
-in `[storage] bulk_storage`, `fast` for everything else — so a caller can
-branch without hardcoding a site's storage id.
-
-The distinction is not cosmetic. The lab's USB directory store measured about
-**25 MB/s** sequential write, so a guest whose disk lives there is I/O-bound on
-the cable. A live virtio-vs-IDE comparison was run with both guests' disks on
-exactly that store, and mostly measured the USB bus.
+The distinction is not cosmetic. The lab's USB directory store measured about **25 MB/s** sequential write, so a guest whose disk lives there is I/O-bound on the cable. A live virtio-vs-IDE comparison was run with both guests' disks on exactly that store, and mostly measured the USB bus.
 
 So a write that would put a *guest disk* on the bulk store prints a warning:
 
@@ -71,63 +64,34 @@ or benchmarked guest -- 'storage status' reports class fast|bulk. Pass
 --slow-storage-accepted to silence this.
 ```
 
-An ISO *mounted* from the bulk store (`media=cdrom`) is not warned about: that
-is the recommended arrangement. Pass `--slow-storage-accepted` when a slow
-guest disk is genuinely what you want.
+An ISO *mounted* from the bulk store (`media=cdrom`) is not warned about: that is the recommended arrangement. Pass `--slow-storage-accepted` (on the `api` path that creates the guest) when a slow guest disk is genuinely what you want.
 
-## Reclaiming unreferenced images: `storage gc`
+### Reclaiming unreferenced images: `storage gc`
 
-Failed creates, and guests destroyed outside a lease, leave disk images behind
-that no config points at. Finding them safely is the hard part, so `gc`
-**reports by default and deletes nothing**:
+Failed creates, and guests destroyed outside a lease, leave disk images behind that no config points at. Finding them safely is the hard part, so `gc` **reports by default and deletes nothing**:
 
 ```bash
 proxmox-lab storage gc                      # what is unreferenced?
 proxmox-lab storage gc --delete --host-change-authorized
 ```
 
-It lists every volume on the node's images-capable storage, then checks it
-against every guest config on the node. The check is deliberately blunt — every
-string value of every config key is searched, so a volume referenced as
-`usb-bulk:9002/vm-9002-disk-0.raw,iothread=1,size=100G` is recognised — because
-a false "orphan" here would authorise deleting a disk that is in use. Missing a
-real orphan only means it is reported next time.
+It lists every volume on the node's images-capable storage, then checks it against every guest config on the node. The check is deliberately blunt — every string value of every config key is searched, so a volume referenced as `usb-bulk:9002/vm-9002-disk-0.raw,iothread=1,size=100G` is recognised — because a false "orphan" here would authorise deleting a disk that is in use. Missing a real orphan only means it is reported next time.
 
 Three more guards worth knowing:
 
-- **Snapshots are read too, and that is not optional.** A snapshot's `vmstate`
-  volume (`vm-<id>-state-<name>`) is listed by the storage as ordinary `images`
-  content but appears *only* in the snapshot's own config, so a live-config-only
-  scan would have offered to delete the thing a rollback needs.
-- If any guest config or snapshot cannot be read, **nothing** is classified: a
-  volume it referenced would otherwise look unreferenced.
-- `--delete` only removes volumes that the *same run* found unreferenced;
-  nothing is carried over from an earlier report.
+- **Snapshots are read too, and that is not optional.** A snapshot's `vmstate` volume (`vm-<id>-state-<name>`) is listed by the storage as ordinary `images` content but appears *only* in the snapshot's own config, so a live-config-only scan would have offered to delete the thing a rollback needs.
+- If any guest config or snapshot cannot be read, **nothing** is classified: a volume it referenced would otherwise look unreferenced.
+- `--delete` only removes volumes that the *same run* found unreferenced; nothing is carried over from an earlier report.
 
 Every deletion is audited with its volid, provisioned size and on-disk size.
 
-**Read the right number before deleting anything.** The report distinguishes
-`orphaned_provisioned_gb` from `orphaned_on_disk_gb`, and only the second is
-returned by a deletion. On the lab node the first run found 4 unreferenced
-qcow2 images provisioned at 51.54 GB that held **9.33 MB** between them — three
-creates that failed almost immediately. Deleting them was the right tidy-up and
-reclaimed essentially no space; treating the provisioned figure as free space
-would have made an irreversible act look worthwhile when it was not.
+**Read the right number before deleting anything.** The report distinguishes `orphaned_provisioned_gb` from `orphaned_on_disk_gb`, and only the second is returned by a deletion. On the lab node the first run found 4 unreferenced qcow2 images provisioned at 51.54 GB that held **9.33 MB** between them — three creates that failed almost immediately. Deleting them was the right tidy-up and reclaimed essentially no space; treating the provisioned figure as free space would have made an irreversible act look worthwhile when it was not.
 
-The same gap bites when you go the other way and ask whether a *running* guest
-is writing. A sparse qcow2's apparent size (`ls -la`) is its provisioned size
-and says nothing about I/O; its allocated size (`du --block-size=1`) is what
-actually landed on the disk, and even that can be metadata-only growth — L1 and
-refcount tables — rather than guest data. Proxmox's own `diskwrite` counter is
-no substitute: it has been observed reading 0 for a whole session on a writing
-qcow2 guest over directory-backed storage. Measure the change over an interval
-and compare the signals against each other with `guest disk-activity
---ground-truth`; see [disk.md](disk.md).
+The same gap bites when you go the other way and ask whether a *running* guest is writing. A sparse qcow2's apparent size (`ls -la`) is its provisioned size and says nothing about I/O; its allocated size (`du --block-size=1`) is what actually landed on the disk, and even that can be metadata-only growth — L1 and refcount tables — rather than guest data. Proxmox's own `diskwrite` counter is no substitute: it has been observed reading 0 for a whole session on a writing qcow2 guest over directory-backed storage. Measure the change over an interval and compare the signals against each other with `guest disk-activity --ground-truth`; see [disk.md](disk.md).
 
-## Fetching cloud images
+### Fetching cloud images
 
-The node downloads directly, so a multi-gigabyte image never crosses the
-controller's link:
+The node downloads directly, so a multi-gigabyte image never crosses the controller's link:
 
 ```bash
 proxmox-lab storage download-url --lease "$L" \
@@ -137,27 +101,19 @@ proxmox-lab storage download-url --lease "$L" \
   --checksum <digest> --checksum-algorithm sha512
 ```
 
-A checksum is required. `--allow-unverified` exists but an unverified image is
-a supply-chain problem, not a convenience — use it only when the user accepts
-that. The published digest and URL are recorded in the audit event.
+A checksum is required. `--allow-unverified` exists but an unverified image is a supply-chain problem, not a convenience — use it only when the user accepts that. The published digest and URL are recorded in the audit event.
 
-### Required privileges
+#### Required privileges
 
-Disk operations need `Sys.Audit` and `Sys.Modify` on `/nodes/pve`, which the
-least-privilege lab token does not hold. Without them `list-disks` and
-`add-disk` return HTTP 403. Either grant those to the token, or perform the
-one-time disk setup as root and let the skill use the resulting storage
-normally.
+Disk operations need `Sys.Audit` and `Sys.Modify` on `/nodes/pve`, which the least-privilege lab token does not hold. Without them `list-disks` and `add-disk` return HTTP 403. Either grant those to the token, or perform the one-time disk setup as root and let the skill use the resulting storage normally.
 
-## S3 scratch bucket
+### S3 scratch bucket
 
-Don't have an S3-compatible bucket yet? `install.sh` can provision one for
-you: choose the `lxc` S3 backend and it prints a root-only
-`minio-host-setup.sh` command that creates a minimal, unprivileged MinIO LXC
-(S3 API only, no browser console) on the Proxmox host, along with the
-bucket and an access key. See [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox).
+Don't have an S3-compatible bucket yet? `install.sh` can provision one for you: choose the `lxc` S3 backend and it prints a root-only `minio-host-setup.sh` command that creates a minimal, unprivileged MinIO LXC (S3 API only, no browser console) on the Proxmox host, along with the bucket and an access key. See [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox).
 
-## Bucket
+> **Canonical warning — trusted LAN only.** The MariaDB audit ledger (`mariadb-host-setup.sh`) and the MinIO S3 LXC (`minio-host-setup.sh`) listen on the LAN with no TLS and — in the MinIO case — no browser console, only the S3 API. They are intended for a trusted LAN. **Do not port-forward them.** Put a TLS reverse proxy in front before exposing them to an untrusted network. This is the single canonical statement; [README.md](../README.md), [INSTALL.md](INSTALL.md#the-audit-ledger) and [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox) link here rather than repeating it. The host setup scripts print the same warning.
+
+### Bucket
 
 | Item | Value |
 |---|---|
@@ -167,19 +123,13 @@ bucket and an access key. See [INSTALL.md](INSTALL.md#optional-host-minio-on-pro
 | Addressing | path-style |
 | Credential source | macOS Keychain, service `proxmox-agent-lab`, accounts `s3-key-id` and `s3-secret-key` |
 
-Only the endpoint, bucket and region are recorded in this repository. The key
-ID and secret live in the Keychain, exactly like the Proxmox API token, and
-must never be written to a file, a manifest, a command line, or the journal.
+Only the endpoint, bucket and region are recorded in this repository. The key ID and secret live in the Keychain, exactly like the Proxmox API token, and must never be written to a file, a manifest, a command line, or the journal.
 
-Requests are signed with AWS SigV4 using the standard library. The endpoint
-sits behind Cloudflare, which rejects urllib's default user agent, so an
-explicit `User-Agent` is sent outside the signed header set.
+Requests are signed with AWS SigV4 using the standard library. The endpoint sits behind Cloudflare, which rejects urllib's default user agent, so an explicit `User-Agent` is sent outside the signed header set.
 
-## Getting files into and out of a guest
+### Getting files into and out of a guest
 
-Presigned URLs are the mechanism. The controller signs a short-lived URL
-locally; the guest fetches or uploads it with the `curl` or `Invoke-WebRequest`
-it already has. **No credential ever enters the guest.**
+Presigned URLs are the mechanism. The controller signs a short-lived URL locally; the guest fetches or uploads it with the `curl` or `Invoke-WebRequest` it already has. **No credential ever enters the guest.**
 
 ```bash
 # local file -> guest
@@ -191,12 +141,9 @@ proxmox-lab pull --lease "$L" --vmid 9001 \
   --remote /var/log/cloud-init.log --out ./cloud-init.log
 ```
 
-Both drive the transfer through qemu-guest-agent. Add `--windows` for a
-Windows guest, which swaps `curl` for `Invoke-WebRequest`.
+Both drive the transfer through qemu-guest-agent. Add `--windows` for a Windows guest, which swaps `curl` for `Invoke-WebRequest`.
 
-When there is no guest agent — an LXC container, or a guest mid-install — use
-`--url-only` to get a presigned URL and run the fetch yourself over
-`console text` or `console type`:
+When there is no guest agent — an LXC container, or a guest mid-install — use `--url-only` to get a presigned URL and run the fetch yourself over `console text` or `console type`:
 
 ```bash
 URL=$(proxmox-lab push --lease "$L" --vmid 9001 --file ./x --url-only \
@@ -204,7 +151,7 @@ URL=$(proxmox-lab push --lease "$L" --vmid 9001 --file ./x --url-only \
 proxmox-lab console text --vmid 9001 --send "curl -fsSL -o /tmp/x '$URL'"
 ```
 
-## Direct bucket operations
+### Direct bucket operations
 
 ```bash
 proxmox-lab s3 health
@@ -215,23 +162,16 @@ proxmox-lab s3 presign --key notes/notes.txt --method GET --expires 900
 proxmox-lab s3 delete --key notes/notes.txt
 ```
 
-## Rules
+### Rules
 
 - Default presigned lifetime is one hour; the maximum accepted is seven days.
-- Never paste a presigned URL into the journal, a commit, or a template. The
-  URL carries a valid signature. Audit events record the object key only.
-- The bucket is scratch space. Anything that must survive a lease belongs in
-  Proxmox storage or this repository, not here.
+- Never paste a presigned URL into the journal, a commit, or a template. The URL carries a valid signature. Audit events record the object key only.
+- The bucket is scratch space. Anything that must survive a lease belongs in Proxmox storage or this repository, not here.
 - `pull` deletes its scratch object after download unless `--keep` is given.
 
+### Long-term lease backups
 
-## Long-term lease backups
-
-Guests in a long-term lease are backed up weekly with `vzdump`, in snapshot
-mode so they keep running, to the storage named by `[lease]
-long_term_backup_storage` — or `[storage] bulk_storage` if that is blank. The
-slowest, largest disk is the right place: these are safety copies, not
-something you restore from often.
+Guests in a long-term lease are backed up weekly with `vzdump`, in snapshot mode so they keep running, to the storage named by `[lease] long_term_backup_storage` — or `[storage] bulk_storage` if that is blank. The slowest, largest disk is the right place: these are safety copies, not something you restore from often.
 
 ```bash
 proxmox-lab backup                # run any that are due (the watchdog does this)
@@ -239,5 +179,32 @@ proxmox-lab backup --force        # run now regardless
 proxmox-lab backup --keep 4       # keep more generations
 ```
 
-Only whole successful runs update the lease's `last_backup_at`, so a partial
-failure means the backup is retried rather than silently skipped for a week.
+Only whole successful runs update the lease's `last_backup_at`, so a partial failure means the backup is retried rather than silently skipped for a week.
+
+## Safety gate
+
+| Destructive op | Required flag | What it guards |
+|---|---|---|
+| Format a physical disk (`storage add-disk`) | `--host-change-authorized` + `--expect-serial` + `--expect-size-gb` | wiping the wrong `/dev/sdX` after a reboot re-ordering; `--wipe-confirmed` additionally required if the disk already carries a filesystem/LVM/partition table; OS disk is refused outright |
+| Change storage content types (`storage set-content`) | `--host-change-authorized` | host storage registry |
+| Delete unreferenced images (`storage gc --delete`) | `--host-change-authorized` + `--delete` | deleting a volume in use; see guards above (snapshots, unreadable configs, same-run only) |
+| Fetch without checksum (`storage download-url`) | `--allow-unverified` | supply-chain; discouraged |
+| S3 scratch credentials | never in file/argv/journal; Keychain only | presigned URLs audited by key only |
+
+All host-level storage changes share `--host-change-authorized`, like every host change in [safety-policy.md](safety-policy.md). Keep guest disks on `local-lvm`; a `bulk` directory store around 25 MB/s makes a booted guest I/O-bound.
+
+## Failure mode
+
+- `storage add-disk` is all-or-nothing in its exit code: if storage is created but setting content types fails, it prints JSON with `content_configured: false` and the reason, then exits non-zero — a caller checking exit 0 would otherwise upload to a store that rejects the content. Finish with `storage set-content` rather than re-running `add-disk`, which would erase the disk again.
+- `storage gc` reports `orphaned_provisioned_gb` vs `orphaned_on_disk_gb`; only the second is reclaimed (e.g. 51.54 GB provisioned → 9.33 MB on disk). Sparse `ls` vs `du` and Proxmox `diskwrite` can misreport on qcow2 over directories; use `guest disk-activity --ground-truth`.
+- `storage download-url` requires a checksum; without it the call is refused unless `--allow-unverified` is passed, which is audited as an explicit risk acceptance.
+- `list-disks`/`add-disk` without `Sys.Audit`+`Sys.Modify` on `/nodes/pve` return 403; perform the one-time disk setup as root instead.
+
+## See also
+
+- [CONFIGURATION.md](CONFIGURATION.md#storage) — `[storage]` keys `upload_storages`/`bulk_storage`
+- [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox) / [INSTALL.md](INSTALL.md#the-audit-ledger) — MinIO & MariaDB ledger setup (trusted LAN, see canonical warning above)
+- [disk.md](disk.md) — offline disk repair and ground-truth I/O measurement
+- [long-term-leases.md](long-term-leases.md) — weekly backup target selection
+- [safety-policy.md](safety-policy.md) — host-change authorization model
+

@@ -10,10 +10,10 @@ Start with the documentation:
 
 For setup and runtime failures, run `proxmox-lab doctor`, `guest probe`, and
 `journal --limit 20` before opening an issue. Include sanitized output and the
-package version, but remove credentials, addresses, VMIDs, captures, journals,
-and site topology.
+package version, following the redaction guidance in [SECURITY.md](SECURITY.md).
 
-Use GitHub issues for reproducible bugs and feature proposals. Use private
+Use GitHub issues for reproducible bugs and feature proposals — templates are in
+[.github/ISSUE_TEMPLATE](.github/ISSUE_TEMPLATE) — and use private
 vulnerability reporting for security issues, as described in
 [SECURITY.md](SECURITY.md).
 

@@ -238,8 +238,8 @@ def cmd_host_setup(lab: Any, args: Any) -> None:
 
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     disk = sub.add_parser(
         "disk",
@@ -254,14 +254,14 @@ def register(sub: Any, lab: Any) -> None:
     boot.add_argument("--image", help="local disk image to parse (no host)")
     boot.add_argument("--vmid", type=int, help="stopped guest to read instead")
     boot.add_argument("--lease")
-    boot.set_defaults(func=bind(cmd_boot_info))
+    boot.set_defaults(func=_bind(lab, cmd_boot_info))
 
     setup = disk_sub.add_parser(
         "host-setup", help="install libguestfs on the host (host change)")
     setup.add_argument("--host-change-authorized", action="store_true")
     setup.add_argument("--print", dest="print_only", action="store_true")
     setup.add_argument("--timeout", type=int, default=1200)
-    setup.set_defaults(func=bind(cmd_host_setup))
+    setup.set_defaults(func=_bind(lab, cmd_host_setup))
 
     ls = disk_sub.add_parser(
         "ls", help="list a directory in a stopped guest's filesystem")
@@ -270,7 +270,7 @@ def register(sub: Any, lab: Any) -> None:
     ls.add_argument("--mount", default="/dev/sda1",
                     help="guest device to mount (default: /dev/sda1)")
     ls.add_argument("--path", default="/")
-    ls.set_defaults(func=bind(cmd_ls))
+    ls.set_defaults(func=_bind(lab, cmd_ls))
 
     read = disk_sub.add_parser(
         "read", help="read a file from a stopped guest's filesystem")
@@ -279,7 +279,7 @@ def register(sub: Any, lab: Any) -> None:
     read.add_argument("--mount", default="/dev/sda1")
     read.add_argument("--path", required=True)
     read.add_argument("--out", help="write to this local file instead of stdout")
-    read.set_defaults(func=bind(cmd_read))
+    read.set_defaults(func=_bind(lab, cmd_read))
 
     write = disk_sub.add_parser(
         "write", help="write a local file into a stopped guest (dangerous)")
@@ -289,4 +289,4 @@ def register(sub: Any, lab: Any) -> None:
     write.add_argument("--src", required=True, help="local file to upload")
     write.add_argument("--dest", required=True, help="destination path in guest")
     write.add_argument("--i-understand", action="store_true")
-    write.set_defaults(func=bind(cmd_write))
+    write.set_defaults(func=_bind(lab, cmd_write))

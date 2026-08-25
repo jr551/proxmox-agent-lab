@@ -25,8 +25,8 @@ from __future__ import annotations
 import base64
 import json
 import secrets
-import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 from . import console
@@ -187,25 +187,38 @@ def provision_script() -> str:
     """The provisioning script with the lab address substituted in."""
     return PROVISION_SCRIPT.replace("__LAB_GATEWAY_IP__", LAB_GATEWAY_IP)
 
+_write_guest_file = console.write_guest_file
 
-def _write_guest_file(lab: Any, api: Any, vmid: int, path: str,
-                      content: str) -> None:
-    """Write a file into a guest without the content touching the ledger."""
-    api.call(
-        "POST",
-        f"/nodes/{lab.NODE}/qemu/{vmid}/agent/file-write",
-        {
-            "file": path,
-            "content": base64.b64encode(content.encode()).decode(),
-            "encode": 0,
-        },
-    )
+
 
 
 def _exec(lab: Any, api: Any, vmid: int, script: str, timeout: int = 900) -> dict:
-    return console.agent_exec(
-        lab, api, vmid, ["/bin/bash", "-c", script], timeout=timeout
-    )
+    return console.exec_guest_script(lab, api, vmid, script, timeout=timeout)
+
+
+def _provision_guest_files(lab: Any, api: Any, vmid: int, provision_timeout: int) -> None:
+    """Stage WireGuard, nftables, dnsmasq and the provision script, then run it."""
+    _exec(lab, api, vmid,
+          "mkdir -p /etc/wireguard && chmod 700 /etc/wireguard", timeout=60)
+    _write_guest_file(lab, api, vmid, "/etc/wireguard/wg0.conf",
+                      render_wg_config())
+    _exec(lab, api, vmid, "chmod 600 /etc/wireguard/wg0.conf", timeout=60)
+    _write_guest_file(lab, api, vmid, "/tmp/labgw-nftables.nft",
+                      render_nftables())
+    _write_guest_file(lab, api, vmid, "/tmp/labgw-dnsmasq.conf",
+                      render_dnsmasq())
+    _write_guest_file(lab, api, vmid, "/tmp/labgw-provision.sh",
+                      provision_script())
+    result = _exec(lab, api, vmid, "bash /tmp/labgw-provision.sh",
+                   timeout=provision_timeout)
+    if result["exitcode"] not in (0, None):
+        raise lab.LabError(
+            "gateway provisioning failed: "
+            + (result["stderr"] or result["stdout"])[-600:]
+        )
+
+
+
 
 
 def require_bridge(lab: Any, api: Any) -> None:
@@ -298,75 +311,21 @@ def cmd_gateway_create(lab: Any, args: Any) -> None:
     lab.wait_task(api, upid, timeout=args.clone_timeout)
     lab.register_resource(lease, "qemu", args.vmid, args.policy, name)
 
-    # A console password is set before first boot so the gateway can be
-    # bootstrapped over serial when the image has no guest agent. It is
-    # generated per build, held only in memory, and never audited.
-    password = secrets.token_urlsafe(18)
-    template_config = api.call(
-        "GET", f"/nodes/{lab.NODE}/qemu/{args.template}/config"
-    )
-    cloud_user = template_config.get("ciuser") or "debian"
-    api.call(
-        "PUT",
-        f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
+    console.prepare_cloudinit_worker(
+        lab, api, args.vmid, args.template,
         {
             "cores": args.cores,
             "memory": args.memory,
-            "ciuser": cloud_user,
-            "cipassword": password,
             "net0": "virtio,bridge=vmbr0,firewall=1",
             "net1": f"virtio,bridge={LAB_BRIDGE}",
             "ipconfig0": "ip=dhcp",
             "ipconfig1": f"ip={LAB_GATEWAY_IP}/{LAB_NETWORK.split('/')[1]}",
-            "agent": "enabled=1",
-            "onboot": 0,
             "tags": f"codex-lab;lease-{args.lease};labgw",
         },
+        agent_timeout=args.agent_timeout,
     )
-    start = api.call("POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/start")
-    lab.wait_task(api, start, timeout=180)
-
-    deadline = time.monotonic() + args.agent_timeout
-    while time.monotonic() < deadline:
-        if console.agent_ready(lab, api, args.vmid):
-            break
-        time.sleep(5)
-    else:
-        # Debian and Ubuntu generic cloud images ship without
-        # qemu-guest-agent, so install it over the serial console first.
-        console.bootstrap_guest_agent(lab, api, args.vmid, cloud_user, password)
-
-    # wireguard-tools is installed later by the provision script, so its
-    # config directory does not exist yet. Create it, locked down, before the
-    # private key lands in it.
-    _exec(lab, api, args.vmid,
-          "mkdir -p /etc/wireguard && chmod 700 /etc/wireguard", timeout=60)
-    _write_guest_file(lab, api, args.vmid, "/etc/wireguard/wg0.conf",
-                      render_wg_config())
-    _exec(lab, api, args.vmid, "chmod 600 /etc/wireguard/wg0.conf", timeout=60)
-    _write_guest_file(lab, api, args.vmid, "/tmp/labgw-nftables.nft",
-                      render_nftables())
-    _write_guest_file(lab, api, args.vmid, "/tmp/labgw-dnsmasq.conf",
-                      render_dnsmasq())
-    _write_guest_file(lab, api, args.vmid, "/tmp/labgw-provision.sh",
-                      provision_script())
-    result = _exec(lab, api, args.vmid, "bash /tmp/labgw-provision.sh",
-                   timeout=args.provision_timeout)
-    if result["exitcode"] not in (0, None):
-        raise lab.LabError(
-            "gateway provisioning failed: "
-            + (result["stderr"] or result["stdout"])[-600:]
-        )
-
-    # The console password existed only to bootstrap the agent. Proxmox keeps
-    # cipassword in the VM config, so leaving it behind would park a live
-    # credential in cleartext for the life of the guest.
-    try:
-        api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
-                 {"delete": "cipassword"})
-        cipassword_cleared = True
-    except lab.LabError:
-        cipassword_cleared = False
+    _provision_guest_files(lab, api, args.vmid, args.provision_timeout)
+    cipassword_cleared = _clear_bootstrap_password(lab, api, args.vmid)
 
     lab.audit("vpn-gateway-created", lease=args.lease, vmid=args.vmid,
               bridge=LAB_BRIDGE, endpoint=WG_ENDPOINT)
@@ -752,21 +711,13 @@ def _sibling_ip(gateway: str, last_octet: int) -> str:
 
 def _ensure_agent(lab: Any, api: Any, vmid: int, cloud_user: str,
                   password: str, timeout: int) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if console.agent_ready(lab, api, vmid):
-            return
-        time.sleep(5)
-    console.bootstrap_guest_agent(lab, api, vmid, cloud_user, password)
+    console.ensure_agent(lab, api, vmid, cloud_user, password, timeout)
 
 
 def _clear_bootstrap_password(lab: Any, api: Any, vmid: int) -> bool:
-    try:
-        api.call("PUT", f"/nodes/{lab.NODE}/qemu/{vmid}/config",
-                 {"delete": "cipassword"})
-        return True
-    except lab.LabError:
-        return False
+    # Delegates to console.clear_bootstrap_password which does {"delete": "cipassword"}
+    return console.clear_bootstrap_password(lab, api, vmid)
+
 
 
 def _spawn_dnsmasq_server(lab: Any, api: Any, args: Any, *, role: str,
@@ -785,40 +736,20 @@ def _spawn_dnsmasq_server(lab: Any, api: Any, args: Any, *, role: str,
     lab.wait_task(api, upid, timeout=args.clone_timeout)
     lab.register_resource(lease, "qemu", args.vmid, args.policy, name)
 
-    # A console password is set before first boot so the serial bootstrap can
-    # install qemu-guest-agent when the image lacks one; it is cleared after.
-    password = secrets.token_urlsafe(18)
-    template_config = api.call(
-        "GET", f"/nodes/{lab.NODE}/qemu/{args.template}/config"
-    )
-    cloud_user = template_config.get("ciuser") or "debian"
     prefix = LAB_NETWORK.split("/")[1]
-    api.call(
-        "PUT",
-        f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
+    cloud_user, password = console.prepare_cloudinit_worker(
+        lab, api, args.vmid, args.template,
         {
             "cores": args.cores,
             "memory": args.memory,
-            "ciuser": cloud_user,
-            "cipassword": password,
-            # net0 on the home bridge gives the server egress for its own
-            # provisioning (apt); net1 on the lab bridge is where it serves.
-            # dnsmasq binds only the lab-side interface, so it never answers
-            # on the egress NIC.
             "net0": "virtio,bridge=vmbr0,firewall=1",
             "net1": f"virtio,bridge={LAB_BRIDGE}",
             "ipconfig0": "ip=dhcp",
             "ipconfig1": f"ip={server_ip}/{prefix},gw={LAB_GATEWAY_IP}",
-            "agent": "enabled=1",
-            "onboot": 0,
             "tags": f"codex-lab;lease-{args.lease};{role}",
         },
+        agent_timeout=args.agent_timeout,
     )
-    start = api.call(
-        "POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/start"
-    )
-    lab.wait_task(api, start, timeout=180)
-    _ensure_agent(lab, api, args.vmid, cloud_user, password, args.agent_timeout)
 
     _write_guest_file(lab, api, args.vmid, "/tmp/lab-server.conf", conf)
     provision = SERVER_PROVISION.replace(
@@ -839,7 +770,6 @@ def _spawn_dnsmasq_server(lab: Any, api: Any, args: Any, *, role: str,
 
 def cmd_dhcp_create(lab: Any, args: Any) -> None:
     """Spawn a lease-owned DHCP server (optional, dnsmasq)."""
-    import json
 
     api = lab.ProxmoxAPI()
     server_ip = args.server_ip or _sibling_ip(LAB_GATEWAY_IP, 2)
@@ -889,7 +819,6 @@ def cmd_dhcp_create(lab: Any, args: Any) -> None:
 
 def cmd_dhcp_leases(lab: Any, args: Any) -> None:
     """Show the DHCP server's current lease table."""
-    import json
 
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
@@ -910,7 +839,6 @@ def cmd_dhcp_leases(lab: Any, args: Any) -> None:
 
 def cmd_tftp_create(lab: Any, args: Any) -> None:
     """Spawn a lease-owned TFTP server (optional, dnsmasq)."""
-    import json
 
     api = lab.ProxmoxAPI()
     server_ip = args.server_ip or _sibling_ip(LAB_GATEWAY_IP, 3)
@@ -946,9 +874,6 @@ def cmd_tftp_create(lab: Any, args: Any) -> None:
 
 def cmd_tftp_push(lab: Any, args: Any) -> None:
     """Stage a file into the TFTP root of a lease-owned TFTP server."""
-    import json
-    from pathlib import Path
-
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     source = Path(args.file).expanduser().resolve()
@@ -1014,8 +939,8 @@ def cmd_status(lab: Any, args: Any) -> None:
 
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     net = sub.add_parser("net", help="forced-VPN egress for lab guests")
     net_sub = net.add_subparsers(dest="net_command", required=True)
@@ -1024,7 +949,7 @@ def register(sub: Any, lab: Any) -> None:
         "host-bridge", help=f"create {LAB_BRIDGE} (host networking change)"
     )
     bridge.add_argument("--host-change-authorized", action="store_true")
-    bridge.set_defaults(func=bind(cmd_host_bridge))
+    bridge.set_defaults(func=_bind(lab, cmd_host_bridge))
 
     create = net_sub.add_parser("gateway-create", help="build the VPN gateway VM")
     create.add_argument("--lease", required=True)
@@ -1040,7 +965,7 @@ def register(sub: Any, lab: Any) -> None:
     # Debian and Ubuntu images always need.
     create.add_argument("--agent-timeout", type=int, default=120)
     create.add_argument("--provision-timeout", type=int, default=1200)
-    create.set_defaults(func=bind(cmd_gateway_create))
+    create.set_defaults(func=_bind(lab, cmd_gateway_create))
 
     verify = net_sub.add_parser("verify", help="prove egress uses the tunnel")
     verify.add_argument("--lease", required=True,
@@ -1048,7 +973,7 @@ def register(sub: Any, lab: Any) -> None:
     verify.add_argument("--vmid", type=int, required=True)
     verify.add_argument("--max-handshake-age", type=int, default=300,
                         help="seconds; older than this means a dead tunnel")
-    verify.set_defaults(func=bind(cmd_verify))
+    verify.set_defaults(func=_bind(lab, cmd_verify))
 
     leak = net_sub.add_parser(
         "leak-test", help="prove a guest cannot reach the internet un-tunnelled"
@@ -1065,17 +990,17 @@ def register(sub: Any, lab: Any) -> None:
                       help="do not install curl in the guest to confirm the exit IP")
     leak.add_argument("--gateway-vmid", type=int,
                       help="also test the kill switch by cycling wg0 there")
-    leak.set_defaults(func=bind(cmd_leak_test))
+    leak.set_defaults(func=_bind(lab, cmd_leak_test))
 
     attach = net_sub.add_parser("attach", help="move a guest behind the gateway")
     attach.add_argument("--lease", required=True)
     attach.add_argument("--vmid", type=int, required=True)
     attach.add_argument("--nic", default="net0")
     attach.add_argument("--gateway-vmid", type=int)
-    attach.set_defaults(func=bind(cmd_attach))
+    attach.set_defaults(func=_bind(lab, cmd_attach))
 
     status = net_sub.add_parser("status", help="show the lab network")
-    status.set_defaults(func=bind(cmd_status))
+    status.set_defaults(func=_bind(lab, cmd_status))
 
     dhcp = net_sub.add_parser(
         "dhcp-create",
@@ -1100,14 +1025,14 @@ def register(sub: Any, lab: Any) -> None:
     dhcp.add_argument("--clone-timeout", type=int, default=1800)
     dhcp.add_argument("--agent-timeout", type=int, default=120)
     dhcp.add_argument("--provision-timeout", type=int, default=1200)
-    dhcp.set_defaults(func=bind(cmd_dhcp_create))
+    dhcp.set_defaults(func=_bind(lab, cmd_dhcp_create))
 
     dhcp_leases = net_sub.add_parser(
         "dhcp-leases", help="show the DHCP server's lease table"
     )
     dhcp_leases.add_argument("--lease", required=True)
     dhcp_leases.add_argument("--vmid", type=int, required=True)
-    dhcp_leases.set_defaults(func=bind(cmd_dhcp_leases))
+    dhcp_leases.set_defaults(func=_bind(lab, cmd_dhcp_leases))
 
     tftp = net_sub.add_parser(
         "tftp-create",
@@ -1125,7 +1050,7 @@ def register(sub: Any, lab: Any) -> None:
     tftp.add_argument("--clone-timeout", type=int, default=1800)
     tftp.add_argument("--agent-timeout", type=int, default=120)
     tftp.add_argument("--provision-timeout", type=int, default=1200)
-    tftp.set_defaults(func=bind(cmd_tftp_create))
+    tftp.set_defaults(func=_bind(lab, cmd_tftp_create))
 
     tftp_push = net_sub.add_parser(
         "tftp-push", help="stage a file into a TFTP server's root"
@@ -1135,4 +1060,4 @@ def register(sub: Any, lab: Any) -> None:
     tftp_push.add_argument("--file", required=True)
     tftp_push.add_argument("--name", help="name in the TFTP root (default: file name)")
     tftp_push.add_argument("--root", help=f"TFTP root, default {TFTP_ROOT}")
-    tftp_push.set_defaults(func=bind(cmd_tftp_push))
+    tftp_push.set_defaults(func=_bind(lab, cmd_tftp_push))

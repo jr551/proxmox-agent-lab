@@ -1,5 +1,8 @@
 # Repository Guidelines
 
+> **Audience:** Contributors and maintainers editing `src/proxmox_agent_lab/`, `tests/`, and automation in `.github/`/`scripts/`.
+> **Scope:** Project overview, architecture, key directories, dev commands, and code conventions. For lab operation, see `SKILL.md` (lease quick-ref) and `docs/AGENTS.md` (deep operational guidance).
+
 ## Project Overview
 
 `proxmox-agent-lab` is a standard-library Python package and agent skill for operating a disposable Proxmox research lab. The `proxmox-lab` CLI powers on a spare host, creates or operates leased VMs/LXCs, exposes guest consoles and file/network tooling, records an audit trail, destroys lease-owned resources, and verifies host power-off.
@@ -23,6 +26,7 @@ Use it only for systems the operator owns or is authorized to test. The safety m
    - Mutating API calls require a lease and are restricted to safe guest paths unless an explicit host-change authorization flag is supplied. Resources are registered with the lease; destructive operations require ownership.
    - Lease end cleans up owned resources in dependency-safe order, records failures, and powers off the host only when the shutdown and no-other-lease conditions are satisfied. Shutdown is verified by repeated API failure, not assumed from a request.
    - Ordinary leases expire; long-term leases deliberately pin the host on and use separate protection, release, destroy, and backup semantics.
+   - Operational lease shape (trap, `lease-begin`/`lease-end`, `lease-heartbeat`) is canonical in `SKILL.md` § Every task follows this shape — see there for the copy-paste block. Host-setup one-liners live in `docs/INSTALL.md`.
 
 4. **Guest and protocol channels**
    - `guest.py` probes the guest and prefers qemu-guest-agent for real exit codes, then serial when available; console/VNC is used when the screen is the source of truth.

@@ -21,12 +21,12 @@ callers -- and agents -- can say "run this in the guest" and get a result.
 
 from __future__ import annotations
 
+import json
 import shlex
 
 from dataclasses import dataclass, field
 from pathlib import Path
 import secrets
-import shlex
 import time
 from typing import Any
 
@@ -282,7 +282,6 @@ def _lease_owns(lab: Any, lease_id: str, kind: str, vmid: int) -> bool:
 
 def cmd_template(lab: Any, args: Any) -> None:
     """Convert a stopped, lease-owned guest into a cloneable template."""
-    import json
 
     api = lab.ProxmoxAPI()
     if not _lease_owns(lab, args.lease, args.kind, args.vmid):
@@ -312,7 +311,6 @@ def cmd_template(lab: Any, args: Any) -> None:
 
 def cmd_clone(lab: Any, args: Any) -> None:
     """Clone a lease-owned template into a new guest, registering it."""
-    import json
 
     api = lab.ProxmoxAPI()
     if not _lease_owns(lab, args.lease, args.kind, args.template):
@@ -348,85 +346,85 @@ def cmd_clone(lab: Any, args: Any) -> None:
     ))
 
 
+def _await_snapshot_task(lab: Any, api: Any, upid: Any, args: Any) -> None:
+    if isinstance(upid, str) and upid.startswith("UPID:"):
+        lab.wait_task(api, upid, timeout=args.task_timeout)
+
+
+def _snapshot_list(lab: Any, api: Any, args: Any, base: str) -> None:
+    result = api.call("GET", base) or []
+    snapshots = [
+        {
+            "name": s.get("snapname"),
+            "type": s.get("snaptype"),
+            "created": s.get("snaptime"),
+            "description": s.get("description"),
+        }
+        for s in result if isinstance(s, dict)
+    ]
+    print(json.dumps({"vmid": args.vmid, "snapshots": snapshots},
+                     indent=2, sort_keys=True))
+
+
+def _snapshot_create(lab: Any, api: Any, args: Any, base: str) -> None:
+    if not args.name:
+        raise lab.LabError("snapshot create requires --name")
+    upid = api.call("POST", base, {"snapname": args.name, "description": args.description or ""})
+    _await_snapshot_task(lab, api, upid, args)
+    lab.audit("guest-snapshot", lease=args.lease, kind=args.kind,
+              vmid=args.vmid, name=args.name, sync=False)
+    print(json.dumps({"vmid": args.vmid, "snapshot": args.name, "created": True},
+                     indent=2, sort_keys=True))
+
+
+def _snapshot_delete(lab: Any, api: Any, args: Any, base: str) -> None:
+    if not args.name:
+        raise lab.LabError("snapshot delete requires --name")
+    upid = api.call("DELETE", f"{base}/{args.name}")
+    _await_snapshot_task(lab, api, upid, args)
+    lab.audit("guest-snapshot-delete", lease=args.lease, kind=args.kind,
+              vmid=args.vmid, name=args.name, sync=False)
+    print(json.dumps({"vmid": args.vmid, "snapshot": args.name, "deleted": True},
+                     indent=2, sort_keys=True))
+
+
+def _snapshot_rollback(lab: Any, api: Any, args: Any, base: str) -> None:
+    if not args.name:
+        raise lab.LabError("snapshot rollback requires --name")
+    status = api.call("GET", f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/status/current")
+    if status.get("status") != "stopped":
+        raise lab.LabError(
+            f"VMID {args.vmid} must be stopped before rollback "
+            f"(status={status.get('status')}); stop it first"
+        )
+    upid = api.call("POST", f"{base}/{args.name}/rollback")
+    _await_snapshot_task(lab, api, upid, args)
+    lab.audit("guest-snapshot-rollback", lease=args.lease, kind=args.kind,
+              vmid=args.vmid, name=args.name, sync=False)
+    print(json.dumps({"vmid": args.vmid, "snapshot": args.name, "rolled_back": True},
+                     indent=2, sort_keys=True))
+
+
 def cmd_snapshot(lab: Any, args: Any) -> None:
     """Create, list, roll back or delete Proxmox snapshots of a lease guest."""
-    import json
-
     api = lab.ProxmoxAPI()
     if not _lease_owns(lab, args.lease, args.kind, args.vmid):
-        raise lab.LabError(
-            f"VMID {args.vmid} is not a {args.kind} guest registered to this lease"
-        )
+        raise lab.LabError(f"VMID {args.vmid} is not a {args.kind} guest registered to this lease")
     base = f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/snapshot"
     if args.mode == "list":
-        result = api.call("GET", base) or []
-        snapshots = [
-            {
-                "name": s.get("snapname"),
-                "type": s.get("snaptype"),
-                "created": s.get("snaptime"),
-                "description": s.get("description"),
-            }
-            for s in result
-            if isinstance(s, dict)
-        ]
-        print(json.dumps(
-            {"vmid": args.vmid, "snapshots": snapshots},
-            indent=2, sort_keys=True,
-        ))
+        _snapshot_list(lab, api, args, base)
         return
     if args.mode == "create":
-        if not args.name:
-            raise lab.LabError("snapshot create requires --name")
-        upid = api.call(
-            "POST", base, {"snapname": args.name, "description": args.description or ""}
-        )
-        if isinstance(upid, str) and upid.startswith("UPID:"):
-            lab.wait_task(api, upid, timeout=args.task_timeout)
-        lab.audit("guest-snapshot", lease=args.lease, kind=args.kind,
-                  vmid=args.vmid, name=args.name, sync=False)
-        print(json.dumps(
-            {"vmid": args.vmid, "snapshot": args.name, "created": True},
-            indent=2, sort_keys=True,
-        ))
+        _snapshot_create(lab, api, args, base)
         return
     if args.mode == "delete":
-        if not args.name:
-            raise lab.LabError("snapshot delete requires --name")
-        upid = api.call("DELETE", f"{base}/{args.name}")
-        if isinstance(upid, str) and upid.startswith("UPID:"):
-            lab.wait_task(api, upid, timeout=args.task_timeout)
-        lab.audit("guest-snapshot-delete", lease=args.lease, kind=args.kind,
-                  vmid=args.vmid, name=args.name, sync=False)
-        print(json.dumps(
-            {"vmid": args.vmid, "snapshot": args.name, "deleted": True},
-            indent=2, sort_keys=True,
-        ))
+        _snapshot_delete(lab, api, args, base)
         return
     if args.mode == "rollback":
-        if not args.name:
-            raise lab.LabError("snapshot rollback requires --name")
-        status = api.call(
-            "GET", f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/status/current"
-        )
-        if status.get("status") != "stopped":
-            raise lab.LabError(
-                f"VMID {args.vmid} must be stopped before rollback "
-                f"(status={status.get('status')}); stop it first"
-            )
-        upid = api.call("POST", f"{base}/{args.name}/rollback")
-        if isinstance(upid, str) and upid.startswith("UPID:"):
-            lab.wait_task(api, upid, timeout=args.task_timeout)
-        lab.audit("guest-snapshot-rollback", lease=args.lease, kind=args.kind,
-                  vmid=args.vmid, name=args.name, sync=False)
-        print(json.dumps(
-            {"vmid": args.vmid, "snapshot": args.name, "rolled_back": True},
-            indent=2, sort_keys=True,
-        ))
-
+        _snapshot_rollback(lab, api, args, base)
+        return
 
 def cmd_probe(lab: Any, args: Any) -> None:
-    import json
 
     api = lab.ProxmoxAPI()
     caps = probe(lab, api, args.vmid)
@@ -460,7 +458,6 @@ def _runs_dir(lab: Any) -> Path:
 
 def _record_run(lab: Any, vmid: int, pid: str, log: str,
                 command: str) -> Path:
-    import json
 
     path = _runs_dir(lab) / f"vm{vmid}-{pid}.json"
     path.write_text(json.dumps({
@@ -471,8 +468,6 @@ def _record_run(lab: Any, vmid: int, pid: str, log: str,
 
 
 def _find_run(lab: Any, vmid: int, pid: str) -> dict[str, Any]:
-    import json
-
     path = _runs_dir(lab) / f"vm{vmid}-{pid}.json"
     if not path.is_file():
         raise GuestError(
@@ -495,10 +490,8 @@ def _pid_alive(lab: Any, api: Any, vmid: int, pid: str) -> bool:
 
 def cmd_log(lab: Any, args: Any) -> None:
     """Print or follow the log of a detached guest run."""
-    import json
 
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
     record = _find_run(lab, args.vmid, args.pid)
     log = record["log"]
     cursor = 0
@@ -552,7 +545,6 @@ def cmd_log(lab: Any, args: Any) -> None:
 
 def cmd_wait(lab: Any, args: Any) -> None:
     """Wait for a detached guest run to exit, then report its tail."""
-    import json
 
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
@@ -588,7 +580,6 @@ def cmd_wait(lab: Any, args: Any) -> None:
 
 
 def cmd_run(lab: Any, args: Any) -> None:
-    import json
     import sys
 
     api = lab.ProxmoxAPI()
@@ -655,7 +646,6 @@ def cmd_inventory(lab: Any, args: Any) -> None:
     retained registry vouches for a guest this tool created -- nothing will
     ever clean it up, and while it runs it blocks host power-off.
     """
-    import json
 
     api = lab.ProxmoxAPI()
     described = lab.describe_guests(api)
@@ -691,7 +681,6 @@ def cmd_retain(lab: Any, args: Any) -> None:
     "this one is deliberate". It changes controller state only -- the guest
     itself is never touched, and no lease is required.
     """
-    import json
 
     from . import inventory as inventory_module
 
@@ -724,8 +713,8 @@ def cmd_retain(lab: Any, args: Any) -> None:
 
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     guest = sub.add_parser("guest", help="talk to a guest over any channel")
     guest_sub = guest.add_subparsers(dest="guest_command", required=True)
@@ -742,7 +731,7 @@ def register(sub: Any, lab: Any) -> None:
         "--retained-only", action="store_true",
         help="only guests in the retained registry",
     )
-    inventory_cmd.set_defaults(func=bind(cmd_inventory))
+    inventory_cmd.set_defaults(func=_bind(lab, cmd_inventory))
 
     retain_cmd = guest_sub.add_parser(
         "retain",
@@ -759,13 +748,13 @@ def register(sub: Any, lab: Any) -> None:
     retain_cmd.add_argument("--lease", help="the lease that created it, if known")
     retain_cmd.add_argument("--forget", action="store_true",
                             help="remove the guest from the registry instead")
-    retain_cmd.set_defaults(func=bind(cmd_retain))
+    retain_cmd.set_defaults(func=_bind(lab, cmd_retain))
 
     probe_cmd = guest_sub.add_parser(
         "probe", help="how can this guest be reached? (read-only)"
     )
     probe_cmd.add_argument("--vmid", type=int, required=True)
-    probe_cmd.set_defaults(func=bind(cmd_probe))
+    probe_cmd.set_defaults(func=_bind(lab, cmd_probe))
 
     activity_cmd = guest_sub.add_parser(
         "disk-activity",
@@ -798,7 +787,7 @@ def register(sub: Any, lab: Any) -> None:
         default=diskactivity.DEFAULT_DEADLINE_SECONDS,
         help="overall deadline for the measurement (default: %(default)s)",
     )
-    activity_cmd.set_defaults(func=bind(diskactivity.cmd_disk_activity))
+    activity_cmd.set_defaults(func=_bind(lab, diskactivity.cmd_disk_activity))
 
     run_cmd = guest_sub.add_parser(
         "run", help="run a command, picking the channel automatically"
@@ -817,7 +806,7 @@ def register(sub: Any, lab: Any) -> None:
                          help="start in the background and return immediately "
                               "(agent channel; Linux guests)")
     run_cmd.add_argument("command", nargs="+")
-    run_cmd.set_defaults(func=bind(cmd_run))
+    run_cmd.set_defaults(func=_bind(lab, cmd_run))
 
     log_cmd = guest_sub.add_parser(
         "log", help="print or stream the log of a detached guest run"
@@ -831,7 +820,7 @@ def register(sub: Any, lab: Any) -> None:
                          help="stream new output until the run exits or timeout")
     log_cmd.add_argument("--timeout", type=int, default=60,
                          help="seconds to follow (default 60)")
-    log_cmd.set_defaults(func=bind(cmd_log))
+    log_cmd.set_defaults(func=_bind(lab, cmd_log))
 
     wait_cmd = guest_sub.add_parser(
         "wait", help="wait for a detached guest run to exit and report its tail"
@@ -840,7 +829,7 @@ def register(sub: Any, lab: Any) -> None:
     wait_cmd.add_argument("--vmid", type=int, required=True)
     wait_cmd.add_argument("--pid", required=True)
     wait_cmd.add_argument("--timeout", type=int, default=3600)
-    wait_cmd.set_defaults(func=bind(cmd_wait))
+    wait_cmd.set_defaults(func=_bind(lab, cmd_wait))
 
     template_cmd = guest_sub.add_parser(
         "template",
@@ -850,7 +839,7 @@ def register(sub: Any, lab: Any) -> None:
     template_cmd.add_argument("--vmid", type=int, required=True)
     template_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
     template_cmd.add_argument("--task-timeout", type=int, default=300)
-    template_cmd.set_defaults(func=bind(cmd_template))
+    template_cmd.set_defaults(func=_bind(lab, cmd_template))
 
     clone_cmd = guest_sub.add_parser(
         "clone", help="clone a lease-owned template into a new guest"
@@ -861,7 +850,7 @@ def register(sub: Any, lab: Any) -> None:
     clone_cmd.add_argument("--name")
     clone_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
     clone_cmd.add_argument("--task-timeout", type=int, default=600)
-    clone_cmd.set_defaults(func=bind(cmd_clone))
+    clone_cmd.set_defaults(func=_bind(lab, cmd_clone))
 
     snap = guest_sub.add_parser(
         "snapshot",
@@ -875,4 +864,4 @@ def register(sub: Any, lab: Any) -> None:
     snap.add_argument("--name", help="snapshot name (create/rollback/delete)")
     snap.add_argument("--description")
     snap.add_argument("--task-timeout", type=int, default=600)
-    snap.set_defaults(func=bind(cmd_snapshot))
+    snap.set_defaults(func=_bind(lab, cmd_snapshot))

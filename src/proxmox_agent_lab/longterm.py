@@ -341,11 +341,11 @@ def cmd_list(lab: Any, args: Any) -> None:
 
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     listing = sub.add_parser("lease-list", help="show active leases")
-    listing.set_defaults(func=bind(cmd_list))
+    listing.set_defaults(func=_bind(lab, cmd_list))
 
     destroy = sub.add_parser(
         "lease-destroy",
@@ -354,7 +354,7 @@ def register(sub: Any, lab: Any) -> None:
     destroy.add_argument("--lease", required=True)
     destroy.add_argument("--confirm", action="store_true",
                          help="required: this deletes protected machines")
-    destroy.set_defaults(func=bind(cmd_destroy))
+    destroy.set_defaults(func=_bind(lab, cmd_destroy))
 
     release = sub.add_parser(
         "lease-release",
@@ -365,7 +365,7 @@ def register(sub: Any, lab: Any) -> None:
         "--confirm", action="store_true",
         help="required: retained machines become independent of the lease",
     )
-    release.set_defaults(func=bind(cmd_release))
+    release.set_defaults(func=_bind(lab, cmd_release))
 
     backup = sub.add_parser(
         "backup", help="run weekly backups for long-term leases that are due"
@@ -383,4 +383,4 @@ def register(sub: Any, lab: Any) -> None:
     backup.add_argument("--force", action="store_true",
                         help="back up now even if not due")
     backup.add_argument("--timeout", type=int, default=7200)
-    backup.set_defaults(func=bind(cmd_backup))
+    backup.set_defaults(func=_bind(lab, cmd_backup))

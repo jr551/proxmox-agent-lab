@@ -165,14 +165,11 @@ def launch_script(name: str, spec: dict[str, Any], adb_port: int) -> str:
 
 def _exec(lab: Any, api: Any, vmid: int, script: str,
           timeout: int = 1800) -> dict[str, Any]:
-    import base64
-    api.call("POST", f"/nodes/{lab.NODE}/qemu/{vmid}/agent/file-write",
-             {"file": "/tmp/pxl-android-step.sh",
-              "content": base64.b64encode(script.encode()).decode(),
-              "encode": 0})
-    return console.agent_exec(lab, api, vmid,
-                              ["/bin/bash", "/tmp/pxl-android-step.sh"],
+    console.write_guest_file(lab, api, vmid, "/tmp/pxl-android-step.sh", script)
+    return console.exec_guest(lab, api, vmid,
+                              ["/bin/sh", "/tmp/pxl-android-step.sh"],
                               timeout=timeout)
+
 
 
 def cmd_profiles(lab: Any, args: Any) -> None:
@@ -189,58 +186,34 @@ def cmd_profiles(lab: Any, args: Any) -> None:
     }, indent=2, sort_keys=True))
 
 
-def cmd_create(lab: Any, args: Any) -> None:
-    """Build an Android device: a VM, the SDK, and an AVD on its console."""
-    api = lab.ProxmoxAPI()
-    lease = lab.load_lease(args.lease)
-    spec = profile(args.profile)
-    api_level = args.api or spec["api"]
-    abi = args.abi
-
-    if args.vmid in lease["initial_vmids"]:
-        raise AndroidError(f"VMID {args.vmid} existed before this lease")
-    template = args.template or int(
-        _CONFIG.network.get("gateway_template_vmid") or 0)
-    if not template:
-        raise AndroidError("pass --template <vmid> of a cloud-init image")
-
-    # The emulator needs KVM inside the guest, which needs the host to pass
-    # virtualisation through. Without it this still runs, just slowly.
-    host_cpu = "host"
+def _create_device_vm(lab: Any, api: Any, lease: dict[str, Any], args: Any,
+                      spec: dict[str, Any], template: int) -> tuple[str, int, str]:
+    """Clone, register and cloud-init the Android VM. Returns (name, memory, api_level)."""
     name = args.name or f"android-{args.profile}-{args.vmid}"
     upid = api.call("POST", f"/nodes/{lab.NODE}/qemu/{template}/clone",
                     {"newid": args.vmid, "name": name, "full": 1,
                      "target": lab.NODE})
     lab.wait_task(api, upid, timeout=args.clone_timeout)
     lab.register_resource(lease, "qemu", args.vmid, args.policy, name)
+    memory = args.memory or (spec["ram_mb"] + int(spec.get("vm_overhead_mb", 3072)))
+    console.prepare_cloudinit_worker(
+        lab, api, args.vmid, template,
+        {
+            "cores": args.cores,
+            "memory": memory,
+            "cpu": "host",
+            "vga": "std",
+            "ipconfig0": "ip=dhcp",
+            "tags": f"codex-lab;lease-{args.lease};android",
+        },
+        agent_timeout=120,
+    )
+    return name, memory, spec["api"]
 
-    import secrets as _secrets
-    password = _secrets.token_urlsafe(18)
-    template_config = api.call("GET", f"/nodes/{lab.NODE}/qemu/{template}/config")
-    cloud_user = template_config.get("ciuser") or "debian"
-    # Give the VM more RAM than the phone: emulator plus X plus the OS.
-    memory = args.memory or (spec["ram_mb"]
-                             + int(spec.get("vm_overhead_mb", 3072)))
-    api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config", {
-        "cores": args.cores, "memory": memory, "cpu": host_cpu,
-        "ciuser": cloud_user, "cipassword": password,
-        "ipconfig0": "ip=dhcp", "agent": "enabled=1", "onboot": 0,
-        # A real graphical console: the emulator draws here, and that is what
-        # console screenshot and share links then show.
-        "vga": "std",
-        "tags": f"codex-lab;lease-{args.lease};android",
-    })
-    lab.wait_task(api, api.call(
-        "POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/start"), timeout=180)
 
-    deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
-        if console.agent_ready(lab, api, args.vmid):
-            break
-        time.sleep(5)
-    else:
-        console.bootstrap_guest_agent(lab, api, args.vmid, cloud_user, password)
-
+def _run_android_steps(lab: Any, api: Any, args: Any, spec: dict[str, Any],
+                       api_level: int, abi: str) -> None:
+    """Run the SDK/AVD/launch steps; raises AndroidError on failure."""
     steps = (
         ("sdk", setup_script(api_level, abi,
                              spec.get("image_type", "google_apis")),
@@ -255,17 +228,26 @@ def cmd_create(lab: Any, args: Any) -> None:
                 f"{label} step failed: "
                 + (result["stderr"] or result["stdout"])[-600:])
 
-    try:
-        api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
-                 {"delete": "cipassword"})
-    except lab.LabError:
-        pass
 
+def cmd_create(lab: Any, args: Any) -> None:
+    """Build an Android device: a VM, the SDK, and an AVD on its console."""
+    api = lab.ProxmoxAPI()
+    lease = lab.load_lease(args.lease)
+    spec = profile(args.profile)
+    api_level = args.api or spec["api"]
+    abi = args.abi
+    if args.vmid in lease["initial_vmids"]:
+        raise AndroidError(f"VMID {args.vmid} existed before this lease")
+    template = args.template or int(_CONFIG.network.get("gateway_template_vmid") or 0)
+    if not template:
+        raise AndroidError("pass --template <vmid> of a cloud-init image")
+    name, _, _ = _create_device_vm(lab, api, lease, args, spec, template)
+    _run_android_steps(lab, api, args, spec, api_level, abi)
+    console.clear_bootstrap_password(lab, api, args.vmid)
     templated = False
     if args.as_template:
         _make_template(lab, api, lease, args.vmid)
         templated = True
-
     lab.audit("android-created", lease=args.lease, vmid=args.vmid,
               profile=args.profile, api_level=api_level, abi=abi,
               template=templated)
@@ -293,7 +275,6 @@ def cmd_create(lab: Any, args: Any) -> None:
             f"--wait-task",
         ],
     }, indent=2, sort_keys=True))
-
 
 def _make_template(lab: Any, api: Any, lease: dict, vmid: int) -> None:
     """Shut a built device down cleanly and convert it to a template."""
@@ -388,15 +369,15 @@ def cmd_adb(lab: Any, args: Any) -> None:
 
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     android = sub.add_parser(
         "android", help="Android devices as lab guests (emulated phones)")
     android_sub = android.add_subparsers(dest="android_command", required=True)
 
     android_sub.add_parser("profiles", help="known device profiles"
-                           ).set_defaults(func=bind(cmd_profiles))
+                           ).set_defaults(func=_bind(lab, cmd_profiles))
 
     create = android_sub.add_parser("create", help="build an Android device")
     create.add_argument("--lease", required=True)
@@ -421,21 +402,21 @@ def register(sub: Any, lab: Any) -> None:
                              "future devices clone in seconds")
     create.add_argument("--clone-timeout", type=int, default=1800)
     create.add_argument("--setup-timeout", type=int, default=2400)
-    create.set_defaults(func=bind(cmd_create))
+    create.set_defaults(func=_bind(lab, cmd_create))
 
     status = android_sub.add_parser("status", help="is the device up?")
     status.add_argument("--vmid", type=int, required=True)
-    status.set_defaults(func=bind(cmd_status))
+    status.set_defaults(func=_bind(lab, cmd_status))
 
     template = android_sub.add_parser(
         "template", help="convert an already-built device to a template")
     template.add_argument("--lease", required=True)
     template.add_argument("--vmid", type=int, required=True)
-    template.set_defaults(func=bind(cmd_template))
+    template.set_defaults(func=_bind(lab, cmd_template))
 
     adb = android_sub.add_parser("adb", help="run an adb command")
     adb.add_argument("--lease", required=True)
     adb.add_argument("--vmid", type=int, required=True)
     adb.add_argument("--timeout", type=int, default=300)
     adb.add_argument("command", nargs="+")
-    adb.set_defaults(func=bind(cmd_adb))
+    adb.set_defaults(func=_bind(lab, cmd_adb))

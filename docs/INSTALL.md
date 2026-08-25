@@ -1,9 +1,19 @@
 # Installation
 
-From a spare PC to a working lab. Budget about an hour, most of it waiting for
-the Proxmox installer.
+> **Two paths**
+>
+> - **Fastest:** `proxmox-host-setup.sh` on the Proxmox host (as root) → `install.sh` on your laptop → `proxmox-lab doctor`.
+> - **Full manual:** BIOS/WoL (step 2) → manual API token (step 3 · by hand) → same `install.sh` → `doctor`.
+>
+> Budget about an hour, most of it waiting for the Proxmox installer.
 
-If you already run Proxmox, skip to [step 3](#3-install-the-controller).
+**Hard prerequisites** — fail fast if any is missing:
+
+- **Controller:** Python 3.11+ (`install.sh:70` probes `python3.13` → `python3.12` → `python3.11` → `python3`), `pipx` if available otherwise `pip --user` fallback (`install.sh:96-104`).
+- **Network:** wired NIC with Wake-on-LAN and a static IP (or DHCP reservation) for the Proxmox host.
+- **Proxmox:** VE 8 or 9 on the spare PC.
+
+If you already run Proxmox, skip to [step 3](#3-create-an-api-token).
 
 ---
 
@@ -80,7 +90,9 @@ VPN gateway — that grants the token permission to change host configuration,
 so it is opt-in.
 
 It is safe to re-run and touches nothing that already exists. Then skip to
-[step 4](#4-install-the-controller).
+[step 4](#4-one-time-controller-setup).
+
+> Same one-liner is in [README.md](../README.md#-install) — detail stays here so this guide is self-contained.
 
 ### 🔧 Or by hand
 
@@ -116,19 +128,51 @@ guided installer:
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
 ```
 
-It installs the isolated CLI where `pipx` is available, asks for the Proxmox
-address, node, API-token identity, power details, audit backend, and S3
-scratch bucket, stores secrets in the OS keyring, writes a mode-600 config,
-and runs `doctor`.
-Re-run it with `--configure` to safely replace configuration answers:
+It installs the CLI isolated via `pipx` when available, otherwise `pip --user`
+(`install.sh:96-104`), asks for the Proxmox address, node, API-token identity,
+power details, audit backend, and S3 scratch bucket, stores secrets in the OS
+keyring, writes a mode-600 config, and runs `doctor`. If you want an agent to
+drive the install, copy the template in [Agent first message](#agent-first-message).
+
+Re-run it with `--configure` to safely replace configuration answers
+(`install.sh:33-36` defines `--configure`/`--yes`; `install.sh:44-49` reads
+`PXL_*` before prompting; without `--configure` it asks via `PXL_RECONFIGURE`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash -s -- --configure
 ```
 
 The script never writes the Proxmox or PocketBase token to TOML. Enter each
-secret only at its local hidden prompt. For unattended provisioning, use the
-documented `PXL_*` variables only in a protected CI secret environment.
+secret only at its local hidden prompt. For unattended provisioning, add `--yes`
+(`install.sh:31,35` — skips prompts) and supply `PXL_*` variables only in a
+protected CI secret environment.
+
+#### Non-interactive `PXL_*` variables (see [`install.sh:10-19`](../install.sh#L10-L19))
+
+| Variable | Purpose |
+|---|---|
+| `PXL_HOST` | Proxmox IP/hostname |
+| `PXL_NODE` | Node name (hostname, e.g. `pve`) |
+| `PXL_TOKEN_USER` | API token user (`agent@pve`) |
+| `PXL_TOKEN_NAME` | API token name (`lab`) |
+| `PXL_TOKEN_SECRET` | API token secret (keyring, not TOML) |
+| `PXL_MAC` | Wired NIC MAC for Wake-on-LAN |
+| `PXL_AUDIT_BACKEND` | `sqlite` / `jsonl` / `pocketbase` |
+| `PXL_PB_URL` | PocketBase URL (when `pocketbase`) |
+| `PXL_PB_COLLECTION` | PocketBase collection (`proxmox_lab_events`) |
+| `PXL_PB_TOKEN_SECRET` | PocketBase token (keyring) |
+| `PXL_S3_BACKEND` | `none` / `existing` / `lxc` |
+| `PXL_S3_ENDPOINT` | S3 endpoint (when `existing`) |
+| `PXL_S3_BUCKET` | Bucket name |
+| `PXL_S3_REGION` | Region (`us-east-1`) |
+| `PXL_S3_KEY_ID_SECRET` | S3 access-key ID (keyring) |
+| `PXL_S3_SECRET_KEY_SECRET` | S3 secret access key (keyring) |
+| `PXL_ALLOW_HOST_ADMIN` | `proxmox-host-setup.sh` only — `1` grants host-admin (node/storage) |
+| `PXL_RECONFIGURE` | `y` forces reconfigure without `--configure` prompt |
+
+All `PXL_*` names match `ask VAR` in `install.sh` via `PXL_${VAR}` (`install.sh:43-44`). Secrets (`*_SECRET`) are piped to `proxmox-lab secrets set --stdin` and never written to config. For the host-setup flags see [`proxmox-host-setup.sh:27-29`](../proxmox-host-setup.sh#L27-L29) (`PXL_USER`/`PXL_TOKEN`/`PXL_ROLE`) and `PXL_ALLOW_HOST_ADMIN`.
+
+> **No install at all?** `bootstrap.sh` (same one-liner in [README.md](../README.md#-install)) builds a throwaway venv under `$TMPDIR/proxmox-agent-lab-env` and prints its `proxmox-lab` path — handy for an agent with no checkout: `PXL=$(curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/bootstrap.sh | sh) && "$PXL" doctor` (`bootstrap.sh:25-52`). This guide uses `install.sh`; bootstrap is the escape hatch.
 
 ### Optional: host PocketBase on Proxmox
 
@@ -139,6 +183,8 @@ to run **as root on the Proxmox host**:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocketbase-host-setup.sh | bash
 ```
+
+> Same one-liner appears in [README.md](../README.md#-install) — detail stays here so this guide is self-contained.
 
 The host script asks for an LXC ID, storage, bridge, IP configuration, HTTP
 port, and first superuser. It creates a persistent unprivileged Debian LXC
@@ -154,8 +200,7 @@ startup: `ensure_on` tolerates the audit write failing for up to 30 seconds
 after the Proxmox API answers before it gives up and just warns, rather than
 failing the power-on itself.
 
-The default service is HTTP for a trusted LAN; do not port-forward it. Put a
-TLS reverse proxy in front of it before access from an untrusted network.
+> **Trusted LAN only** — see the canonical warning in [storage.md](storage.md#s3-scratch-bucket) (plain HTTP on the LAN, do not port-forward; TLS reverse proxy for untrusted networks). The host setup script prints the same warning.
 After the controller has its API URL, store the first PocketBase superuser
 email and password locally, then run:
 
@@ -183,6 +228,8 @@ the Proxmox host**:
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-host-setup.sh | bash
 ```
 
+> Same one-liner appears in [README.md](../README.md#-install) — detail stays here so this guide is self-contained.
+
 The host script asks for an LXC ID, storage, bridge, IP configuration, disk
 size, bucket name, and access key. It creates a persistent unprivileged
 Debian LXC set to start automatically whenever the Proxmox host does — this
@@ -190,14 +237,12 @@ lab powers its host off between leases, so nothing else would start the
 container back up — installs a single-binary MinIO server as a restricted
 systemd service (S3 API only — the browser console is disabled), creates
 the bucket, and prints the endpoint, bucket, region, and credentials.
-
-The service is HTTP for a trusted LAN; do not port-forward it. Put a TLS
-reverse proxy in front of it before access from an untrusted network. Re-run
-controller setup, select `existing`, enter the printed endpoint, bucket and
+> **Trusted LAN only** — see the canonical warning in [storage.md](storage.md#s3-scratch-bucket). The host setup script prints the same warning.
+Re-run controller setup, select `existing`, enter the printed endpoint, bucket and
 region, and enter the printed access key and secret key at their hidden
 local prompts.
 
-### Copy this as the first message to your installation agent
+### Agent first message
 
 ```text
 Install proxmox-agent-lab as a first-stage task. First ask me only for the
@@ -269,11 +314,17 @@ this tool: when the work is done, the machine is off.
 If the controller crashes or you close the laptop mid-run, nothing would clean
 up. The watchdog sweeps expired leases and shuts an idle host down.
 
-**macOS:**
+**macOS (from a checkout):**
 
 ```sh
 ./scripts/install-watchdog
 ```
+
+> Verified: `scripts/install-watchdog` exists in the checkout. It writes
+> `~/Library/LaunchAgents/lol.rowe.proxmox-agent-lab-watchdog.plist` with
+> `Label` `lol.rowe.proxmox-agent-lab-watchdog` (personal/hardcoded — see
+> `scripts/install-watchdog:5,17`) and `StartInterval` 300 s / `RunAtLoad`,
+> running `scripts/proxmox-lab cleanup-expired`.
 
 **Linux (systemd user units):**
 

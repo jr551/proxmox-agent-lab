@@ -292,8 +292,8 @@ def cmd_monitor(lab: Any, args: Any) -> None:
 
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     virtio = sub.add_parser(
         "virtio",
@@ -310,7 +310,7 @@ def register(sub: Any, lab: Any) -> None:
     decode.add_argument("--device",
                         choices=sorted(_DEVICE_BITS),
                         help="device type for device-specific bit names")
-    decode.set_defaults(func=bind(cmd_decode))
+    decode.set_defaults(func=_bind(lab, cmd_decode))
 
     inspect = virtio_sub.add_parser(
         "inspect",
@@ -319,7 +319,7 @@ def register(sub: Any, lab: Any) -> None:
     inspect.add_argument("--vmid", type=int, required=True)
     inspect.add_argument("--lease",
                          help="optional: audit the read against a lease")
-    inspect.set_defaults(func=bind(cmd_inspect))
+    inspect.set_defaults(func=_bind(lab, cmd_inspect))
 
     monitor = virtio_sub.add_parser(
         "monitor",
@@ -331,4 +331,4 @@ def register(sub: Any, lab: Any) -> None:
         help="the 'info' subcommand to run (read-only)",
     )
     monitor.add_argument("--lease")
-    monitor.set_defaults(func=bind(cmd_monitor))
+    monitor.set_defaults(func=_bind(lab, cmd_monitor))

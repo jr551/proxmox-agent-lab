@@ -14,18 +14,31 @@ trap 'proxmox-lab lease-end --lease "$L"' EXIT
 # while :; do sleep 1200; proxmox-lab lease-heartbeat --lease "$L" || break; done &
 ```
 
+## Shared preamble: clone and start a fresh guest
+
+Recipes 1 and 3 start the same way: clone a template, register it to the lease,
+and start it. The three lines below are the preamble; the recipes refer back
+to it as "clone → register → start".
+
+```bash
+# clone a template into a fresh lease-owned guest (replace <template-vmid>, <new-vmid>, <name>)
+proxmox-lab api --lease "$L" --method POST \
+  --path /nodes/$NODE/qemu/<template-vmid>/clone \
+  --data newid=<new-vmid> --data name=<name> --wait-task
+proxmox-lab lease-register --lease "$L" --kind qemu --vmid <new-vmid>
+proxmox-lab api --lease "$L" --method POST --path /nodes/$NODE/qemu/<new-vmid>/status/start --wait-task
+```
+
+`--wait-task` is required to block until the Proxmox task finishes
+(`cli.py:2951-2978`); templates vary — pick the one from `site-notes.md`.
+
 ## 1. Browse the web in a throwaway browser (GUI sites, logins, JS)
 
 For pages that need a real browser profile or resist plain HTTP fetches.
 
-```bash
-# clone a desktop template with Firefox/Chromium preinstalled (fast path)
-proxmox-lab api --lease "$L" --method POST \
-  --path /nodes/$NODE/qemu/<template-vmid>/clone \
-  --data newid=9001 --data name=browse --wait-task
-proxmox-lab lease-register --lease "$L" --kind qemu --vmid 9001
-proxmox-lab api --lease "$L" --method POST --path /nodes/$NODE/qemu/9001/status/start --wait-task
+Use the shared preamble above (e.g. `<template-vmid>` → `9001` `browse`), then:
 
+```bash
 proxmox-lab guest probe --vmid 9001            # which channels answer?
 
 # look → act loop:
@@ -38,9 +51,7 @@ proxmox-lab console type  --lease "$L" --vmid 9001 --text-stdin --enter <<< "htt
 - Type URLs into the address bar (`ctrl-l`) instead of clicking it — deterministic.
 - Secrets (passwords) go through `--text-stdin`; they never appear in argv,
   shell history, or the audit journal.
-- **Trap:** a VM whose display is serial (`vga: serial0`, most cloud images)
-  takes screenshots but silently drops VNC keystrokes. `guest probe` reports
-  `keyboard_input: false` — drive those over `console text` instead.
+- Display trap: see [console.md §4 — Keyboard input needs a VGA display](console.md#keyboard-input-needs-a-vga-display). A `vga: serial0` guest takes screenshots but `guest probe` reports `keyboard_input: false`; drive those over `console text` instead.
 - Untrusted site? Attach a VPN gateway first (recipe 5) and prove isolation
   with `net leak-test`.
 
@@ -62,23 +73,15 @@ proxmox-lab pull --lease "$L" --vmid 9002 --remote /tmp/p.html --out ./p.html
 
 - `console text` takes an optional `--lease`; `pull` requires `--remote`
   (guest path) and writes locally via `--out`.
-- `console screenshot --ocr` exists only for VGA text-mode screens reachable
-  only over VNC (BIOS, boot menus); it refuses on graphical screens and needs
-  an imported font table (`console import-font`). Prefer your own vision on
-  the PNG.
+- `console screenshot --ocr` and `console import-font` were removed in 0.11.0 — glyph matching could not read a guest's own font (see [console.md appendix](console.md#appendix-why-there-is-no-ocr)). Use `console text` for a real terminal or `console screenshot --for-model` / `console inspect` for a model-read screen.
 
 ## 3. Develop and test an app in a disposable environment
 
 The core loop: clone → push code → build/test → pull artifacts → destroy.
 
-```bash
-# fresh Ubuntu cloud VM in seconds instead of installing
-proxmox-lab api --lease "$L" --method POST \
-  --path /nodes/$NODE/qemu/<ubuntu-template>/clone \
-  --data newid=9002 --data name=devbox --wait-task
-proxmox-lab lease-register --lease "$L" --kind qemu --vmid 9002
-proxmox-lab api --lease "$L" --method POST --path /nodes/$NODE/qemu/9002/status/start --wait-task
+Use the shared preamble above (e.g. `<ubuntu-template>` → `9002` `devbox`), then:
 
+```bash
 proxmox-lab push --lease "$L" --vmid 9002 --file ./myapp.tar.gz --dest /root/
 proxmox-lab guest run --lease "$L" --vmid 9002 -- bash -c "cd /root && tar xzf myapp.tar.gz && make test"
 proxmox-lab pull --lease "$L" --vmid 9002 --remote /root/artifacts.tar --out ./artifacts.tar
@@ -174,12 +177,11 @@ Expiring public noVNC link; the URL *is* the credential.
 
 ## Choosing a channel (cheat sheet)
 
-| Situation | Use |
-|---|---|
-| Guest agent installed | `guest run` |
-| Serial console, no agent | `console text` / serial login |
-| Graphical only | `console screenshot` + `click`/`type`/`keys` |
-| Text-mode VGA screen over VNC | `console screenshot --ocr` (narrow case) |
+See [console.md §1 — Choosing a channel](console.md#1-choosing-a-channel) for
+the canonical channel table. Do not duplicate it here. Note: `console screenshot
+--ocr` / `console import-font` were removed in 0.11.0 — use `console text`
+or `console screenshot --for-model` / `console inspect` (see
+[console.md appendix](console.md#appendix-why-there-is-no-ocr)).
 
 ## Failure drill
 

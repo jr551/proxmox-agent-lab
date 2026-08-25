@@ -2,7 +2,7 @@
 
 Thanks for helping turn spare hardware into safer research infrastructure.
 
-## Before opening a change
+## Ground rules
 
 - Keep the runtime package standard-library only and compatible with Python
   3.11+.
@@ -12,8 +12,6 @@ Thanks for helping turn spare hardware into safer research infrastructure.
   serials, private endpoints, captures, or runtime journals.
 - Do not weaken lease ownership, auditing, expiry, cleanup, or verified
   shutdown invariants.
-- For a destructive or protocol-level change, test the guard that should stop
-  unsafe behaviour—not only the successful path.
 
 Repository-specific engineering rules are in [AGENTS.md](AGENTS.md). Security
 boundaries are documented in [docs/safety-policy.md](docs/safety-policy.md).
@@ -23,13 +21,19 @@ boundaries are documented in [docs/safety-policy.md](docs/safety-policy.md).
 ```bash
 python3.11 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m unittest discover -s tests -v
+PYTHONWARNINGS=error .venv/bin/python -m unittest discover -s tests -v
 ```
 
 The runtime has no third-party dependencies. `pytest` is optional development
-tooling; the canonical suite also runs directly through `unittest`.
+tooling; the canonical suite also runs directly through `unittest` with
+warnings as errors (`PYTHONWARNINGS=error`).
 
-## Required checks
+## Testing expectations
+
+For a destructive or protocol-level change, test the guard that should stop
+unsafe behaviour—not only the successful path.
+
+Run the required checks before opening a pull request:
 
 ```bash
 PYTHONWARNINGS=error python3 -m unittest discover -s tests -q
@@ -55,8 +59,10 @@ into an issue or pull request.
 Maintainers release from a clean, green `main` branch:
 
 1. Update the version in `pyproject.toml` and
-   `src/proxmox_agent_lab/__init__.py`.
-2. Move the relevant changelog entries under a dated version heading.
+   `src/proxmox_agent_lab/__init__.py` (both must match; current version is
+   `0.11.0`).
+2. Move the relevant changelog entries under a dated version heading in
+   [CHANGELOG.md](CHANGELOG.md).
 3. Run `python scripts/check-release.py --tag vX.Y.Z` with the intended tag.
 4. Create and push the annotated `vX.Y.Z` tag.
 

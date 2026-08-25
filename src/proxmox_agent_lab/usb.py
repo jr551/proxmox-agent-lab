@@ -32,17 +32,9 @@ from . import memflow as _mf
 # Host channel (shared with memflow: same host, same trust boundary).
 # --------------------------------------------------------------------------- #
 
-def _require_enabled(lab: Any) -> None:
-    if not _mf.ENABLED or not _mf.SSH_HOST:
-        raise lab.LabError(
-            "USB sniffing runs on the Proxmox host over SSH -- the same host "
-            "connection memflow uses -- so it is off until you set [memflow] "
-            "enabled = true and ssh_host. See docs/usb.md."
-        )
+_require_enabled = _mf.require_host_ssh
+_ssh = _mf.host_run
 
-
-def _ssh(lab: Any, argv: list[str], *, timeout: int = 60):
-    return _mf._ssh(lab, argv, timeout=timeout)
 
 
 def _lsusb(lab: Any) -> list[dict[str, Any]]:
@@ -213,20 +205,11 @@ def cmd_sniff(lab: Any, args: Any) -> None:
     )
     proc = _ssh(lab, ["bash", "-c", script], timeout=args.seconds + 60)
     if proc.returncode not in (0, None):
-        raise lab.LabError(
-            f"usb capture failed on the host: {(proc.stderr or '').strip()[:300]}"
-        )
-    lines = proc.stdout.splitlines()
-    pkts = 0
-    b64 = []
-    for line in lines:
-        if line.startswith("PKTS="):
-            pkts = int(line.split("=", 1)[1] or 0)
-        else:
-            b64.append(line)
+        raise lab.LabError(f"capture failed on the host: {(proc.stderr or '').strip()[:300]}")
+    pkts, data = _mf.decode_capture_output(proc.stdout or "")
     out = os.path.expanduser(args.out)
     with open(out, "wb") as fh:
-        fh.write(base64.b64decode("".join(b64) or ""))
+        fh.write(data)
     lab.audit("usb-sniff", lease=args.lease, device=device["id"], bus=bus,
               seconds=args.seconds, packets=pkts, sync=False)
     print(json.dumps(
@@ -243,14 +226,14 @@ def cmd_sniff(lab: Any, args: Any) -> None:
 # --------------------------------------------------------------------------- #
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     usb = sub.add_parser("usb", help="USB passthrough and traffic sniffing")
     usb_sub = usb.add_subparsers(dest="usb_command", required=True)
 
     listp = usb_sub.add_parser("list", help="list host USB devices and passthroughs")
-    listp.set_defaults(func=bind(cmd_list))
+    listp.set_defaults(func=_bind(lab, cmd_list))
 
     attach = usb_sub.add_parser(
         "attach", help="pass a host USB device to a guest (passthrough change)"
@@ -260,14 +243,14 @@ def register(sub: Any, lab: Any) -> None:
     attach.add_argument("--device", required=True,
                         help="vendor:product (04e8:61b6) or bus-dev (1-2)")
     attach.add_argument("--host-change-authorized", action="store_true")
-    attach.set_defaults(func=bind(cmd_attach))
+    attach.set_defaults(func=_bind(lab, cmd_attach))
 
     detach = usb_sub.add_parser("detach", help="remove a USB passthrough slot")
     detach.add_argument("--lease", required=True)
     detach.add_argument("--vmid", type=int, required=True)
     detach.add_argument("--slot", required=True, help="usb0..usb4")
     detach.add_argument("--host-change-authorized", action="store_true")
-    detach.set_defaults(func=bind(cmd_detach))
+    detach.set_defaults(func=_bind(lab, cmd_detach))
 
     sniff = usb_sub.add_parser(
         "sniff", help="capture a device's USB traffic to a local pcap"
@@ -280,4 +263,4 @@ def register(sub: Any, lab: Any) -> None:
     sniff.add_argument("--count", type=int, default=0,
                        help="stop after N packets (0 = until the duration)")
     sniff.add_argument("--out", required=True, help="local pcap output file")
-    sniff.set_defaults(func=bind(cmd_sniff))
+    sniff.set_defaults(func=_bind(lab, cmd_sniff))

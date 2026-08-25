@@ -82,6 +82,21 @@ def _require_enabled(lab: Any) -> None:
         )
 
 
+def _check_len(lab: Any, n: int, max_bytes: int = 16 * 1024 * 1024) -> None:
+    if n <= 0 or n > max_bytes:
+        raise lab.LabError(f"--len must be between 1 and {max_bytes} bytes")
+
+
+def _parse_hex(lab: Any, value: str) -> str:
+    hexbytes = value.strip().lower()
+    if not hexbytes or len(hexbytes) % 2 or any(
+        c not in "0123456789abcdef" for c in hexbytes
+    ):
+        raise lab.LabError("--hex must be an even-length string of hex digits")
+    return hexbytes
+
+
+
 def _ssh_argv(remote: str) -> list[str]:
     argv = [
         "ssh",
@@ -221,12 +236,43 @@ def host_remove_file(lab: Any, path: str, *, timeout: int = 30) -> bool:
     try:
         proc = _ssh(lab, ["rm", "-f", "--", path], timeout=timeout)
     except (OSError, lab.LabError):
-        # Cleanup runs in a finally path: it reports failure to the caller,
-        # which records it, rather than masking the original error.
         return False
     return proc.returncode == 0
 
+def run_remote_capture(lab: Any, script: str, *, timeout: int = 60
+                       ) -> tuple[int, bytes]:
+    """Run a host-side tcpdump script and return (packet_count, pcap_bytes).
 
+    The script must print ``PKTS=N`` on its own line and base64-encode the
+    pcap on the remaining lines, as netcap/usb do. Failures raise LabError
+    with the host's stderr (if any).
+    """
+    import base64
+
+    proc = host_run(lab, ["bash", "-c", script], timeout=timeout)
+    if proc.returncode not in (0, None):
+        raise lab.LabError(
+            f"capture failed on the host: {(proc.stderr or '').strip()[:300]}"
+        )
+    return decode_capture_output(proc.stdout or "")
+
+
+def decode_capture_output(stdout: str) -> tuple[int, bytes]:
+    """Parse PKTS= and base64 pcap from a capture script's stdout."""
+    import base64
+
+    pkts = 0
+    b64: list[str] = []
+    for line in stdout.splitlines():
+        if line.startswith("PKTS="):
+            try:
+                pkts = int(line.split("=", 1)[1] or 0)
+            except ValueError:
+                pkts = 0
+        else:
+            b64.append(line)
+    data = base64.b64decode("".join(b64) or "")
+    return pkts, data
 def _helper(lab: Any, sub_argv: list[str], *, timeout: int = 90,
             ) -> subprocess.CompletedProcess:
     proc = _ssh(lab, [HELPER, *sub_argv], timeout=timeout)
@@ -360,22 +406,42 @@ def cmd_processes(lab: Any, args: Any) -> None:
     ))
 
 
-def cmd_read(lab: Any, args: Any) -> None:
-    """Read raw bytes from the guest's kernel virtual address space."""
+def _gated_read_cmd(lab: Any, args: Any, *, helper_cmd: str, audit_event: str) -> None:
+    """Shared read path: _require_enabled→len-cap→lease→running→helper→audit→print."""
     _require_enabled(lab)
-    if args.len <= 0 or args.len > 16 * 1024 * 1024:
-        # Same cap as `dump`: the host-side helper allocates the full buffer
-        # as root, so an oversized request could OOM it (audit 2026-08-24).
-        raise lab.LabError("--len must be between 1 and 16777216 bytes")
+    _check_len(lab, args.len)
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     _require_running_qemu(lab, api, args.vmid)
     result = _helper_json(
-        lab, ["read", str(args.vmid), args.addr, str(args.len)], timeout=90
+        lab, [helper_cmd, str(args.vmid), args.addr, str(args.len)], timeout=90
     )
-    lab.audit("memflow-read", lease=args.lease, vmid=args.vmid,
+    lab.audit(audit_event, lease=args.lease, vmid=args.vmid,
               addr=args.addr, length=args.len, sync=False)
     print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
+
+
+def _gated_write_cmd(lab: Any, args: Any, *, helper_cmd: str, audit_event: str,
+                     understand_message: str) -> None:
+    """Shared write path: gated behind --i-understand, hex-parsed, then helper."""
+    _require_enabled(lab)
+    if not getattr(args, "i_understand", False):
+        raise lab.LabError(understand_message)
+    hexbytes = _parse_hex(lab, args.hex)
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
+    _require_running_qemu(lab, api, args.vmid)
+    result = _helper_json(
+        lab, [helper_cmd, str(args.vmid), args.addr, hexbytes], timeout=90
+    )
+    lab.audit(audit_event, lease=args.lease, vmid=args.vmid,
+              addr=args.addr, length=len(hexbytes) // 2, sync=False)
+    print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
+
+
+def cmd_read(lab: Any, args: Any) -> None:
+    """Read raw bytes from the guest's kernel virtual address space."""
+    _gated_read_cmd(lab, args, helper_cmd="read", audit_event="memflow-read")
 
 
 def cmd_registers(lab: Any, args: Any) -> None:
@@ -397,26 +463,14 @@ def cmd_write(lab: Any, args: Any) -> None:
     compromises the guest. It is therefore hard-gated behind --i-understand on
     top of the lease, and the bytes themselves are never audited.
     """
-    _require_enabled(lab)
-    if not getattr(args, "i_understand", False):
-        raise lab.LabError(
+    _gated_write_cmd(
+        lab, args, helper_cmd="write", audit_event="memflow-write",
+        understand_message=(
             "memflow write mutates the live memory of a running guest kernel; a "
             "wrong byte will crash or compromise it. Re-run with --i-understand "
             "only when the user has explicitly asked to patch guest memory."
-        )
-    hexbytes = args.hex.strip().lower()
-    if not hexbytes or len(hexbytes) % 2 or any(c not in "0123456789abcdef" for c in hexbytes):
-        raise lab.LabError("--hex must be an even-length string of hex digits")
-    api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
-    _require_running_qemu(lab, api, args.vmid)
-    result = _helper_json(
-        lab, ["write", str(args.vmid), args.addr, hexbytes], timeout=90
+        ),
     )
-    # Record that a write happened and where/how big, never the bytes written.
-    lab.audit("memflow-write", lease=args.lease, vmid=args.vmid,
-              addr=args.addr, length=len(hexbytes) // 2, sync=False)
-    print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
 
 
 def cmd_phys_read(lab: Any, args: Any) -> None:
@@ -426,20 +480,7 @@ def cmd_phys_read(lab: Any, args: Any) -> None:
     goes straight through the QEMU connector to guest-physical memory, so it
     works on Linux guests too. Useful once `scan` has located an address.
     """
-    _require_enabled(lab)
-    if args.len <= 0 or args.len > 16 * 1024 * 1024:
-        # Same cap as `dump`: the host-side helper allocates the full buffer
-        # as root, so an oversized request could OOM it (audit 2026-08-24).
-        raise lab.LabError("--len must be between 1 and 16777216 bytes")
-    api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
-    _require_running_qemu(lab, api, args.vmid)
-    result = _helper_json(
-        lab, ["phys-read", str(args.vmid), args.addr, str(args.len)], timeout=90
-    )
-    lab.audit("memflow-phys-read", lease=args.lease, vmid=args.vmid,
-              addr=args.addr, length=args.len, sync=False)
-    print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
+    _gated_read_cmd(lab, args, helper_cmd="phys-read", audit_event="memflow-phys-read")
 
 
 def cmd_phys_write(lab: Any, args: Any) -> None:
@@ -449,26 +490,15 @@ def cmd_phys_write(lab: Any, args: Any) -> None:
     address (any guest OS). A wrong address corrupts the guest, so it is
     hard-gated behind --i-understand, and the bytes are never audited.
     """
-    _require_enabled(lab)
-    if not getattr(args, "i_understand", False):
-        raise lab.LabError(
+    _gated_write_cmd(
+        lab, args, helper_cmd="phys-write", audit_event="memflow-phys-write",
+        understand_message=(
             "memflow phys-write injects bytes into a running guest's live RAM; "
             "a wrong address will corrupt or crash it. Re-run with "
             "--i-understand only when the user has explicitly asked to patch "
             "guest memory."
-        )
-    hexbytes = args.hex.strip().lower()
-    if not hexbytes or len(hexbytes) % 2 or any(c not in "0123456789abcdef" for c in hexbytes):
-        raise lab.LabError("--hex must be an even-length string of hex digits")
-    api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
-    _require_running_qemu(lab, api, args.vmid)
-    result = _helper_json(
-        lab, ["phys-write", str(args.vmid), args.addr, hexbytes], timeout=90
+        ),
     )
-    lab.audit("memflow-phys-write", lease=args.lease, vmid=args.vmid,
-              addr=args.addr, length=len(hexbytes) // 2, sync=False)
-    print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
 
 
 def cmd_scan(lab: Any, args: Any) -> None:
@@ -483,9 +513,7 @@ def cmd_scan(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     _require_running_qemu(lab, api, args.vmid)
-    hexneedle = args.hex.strip().lower()
-    if not hexneedle or len(hexneedle) % 2 or any(c not in "0123456789abcdef" for c in hexneedle):
-        raise lab.LabError("--hex must be an even-length string of hex digits")
+    hexneedle = _parse_hex(lab, args.hex)
     result = _helper_json(
         lab, ["scan", str(args.vmid), hexneedle, str(args.max_hits)],
         timeout=args.timeout,
@@ -499,10 +527,7 @@ def cmd_scan(lab: Any, args: Any) -> None:
 def cmd_dump(lab: Any, args: Any) -> None:
     """Extract a region of guest memory to a local file for offline analysis."""
     _require_enabled(lab)
-    if args.len <= 0 or args.len > 16 * 1024 * 1024:
-        raise lab.LabError("--len must be between 1 and 16777216 bytes")
-    api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    _check_len(lab, args.len)
     _require_running_qemu(lab, api, args.vmid)
     result = _helper_json(
         lab, ["read", str(args.vmid), args.addr, str(args.len)],
@@ -553,8 +578,7 @@ def cmd_ghidra_setup(lab: Any, args: Any) -> None:
 def cmd_analyze(lab: Any, args: Any) -> None:
     """Dump a region of guest memory and analyse it with Ghidra in the LXC."""
     _require_enabled(lab)
-    if args.len <= 0 or args.len > 4 * 1024 * 1024:
-        raise lab.LabError("--len must be between 1 and 4194304 bytes")
+    _check_len(lab, args.len, max_bytes=4 * 1024 * 1024)
     api = lab.ProxmoxAPI()
     lab.load_lease(args.lease)
     _require_running_qemu(lab, api, args.vmid)
@@ -1288,8 +1312,8 @@ echo "ghidra-lxc-ready $LXC"
 # --------------------------------------------------------------------------- #
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     mf = sub.add_parser(
         "memflow", help="agentless guest introspection with memflow (advanced)"
@@ -1301,7 +1325,7 @@ def register(sub: Any, lab: Any) -> None:
     )
     doctor.add_argument("--vmid", type=int,
                         help="also check this specific guest is introspectable")
-    doctor.set_defaults(func=bind(cmd_doctor))
+    doctor.set_defaults(func=_bind(lab, cmd_doctor))
 
     setup = mf_sub.add_parser(
         "host-setup", help="install the memflow stack on the host (host change)"
@@ -1310,7 +1334,7 @@ def register(sub: Any, lab: Any) -> None:
     setup.add_argument("--print", dest="print_only", action="store_true",
                        help="print the host script instead of running it")
     setup.add_argument("--timeout", type=int, default=1800)
-    setup.set_defaults(func=bind(cmd_host_setup))
+    setup.set_defaults(func=_bind(lab, cmd_host_setup))
 
     procs = mf_sub.add_parser(
         "processes", help="list a running guest's processes from outside it"
@@ -1318,7 +1342,7 @@ def register(sub: Any, lab: Any) -> None:
     procs.add_argument("--lease", required=True,
                        help="required: this reads a running guest")
     procs.add_argument("--vmid", type=int, required=True)
-    procs.set_defaults(func=bind(cmd_processes))
+    procs.set_defaults(func=_bind(lab, cmd_processes))
 
     read = mf_sub.add_parser(
         "read", help="read raw bytes from guest kernel memory"
@@ -1328,14 +1352,14 @@ def register(sub: Any, lab: Any) -> None:
     read.add_argument("--addr", required=True,
                       help="kernel virtual address, e.g. 0xfffff80000000000")
     read.add_argument("--len", type=int, default=64, help="number of bytes")
-    read.set_defaults(func=bind(cmd_read))
+    read.set_defaults(func=_bind(lab, cmd_read))
 
     regs = mf_sub.add_parser(
         "registers", help="report the guest's vCPU registers (via QEMU monitor)"
     )
     regs.add_argument("--lease", required=True)
     regs.add_argument("--vmid", type=int, required=True)
-    regs.set_defaults(func=bind(cmd_registers))
+    regs.set_defaults(func=_bind(lab, cmd_registers))
 
     write = mf_sub.add_parser(
         "write", help="write raw bytes into live guest memory (dangerous)"
@@ -1349,7 +1373,7 @@ def register(sub: Any, lab: Any) -> None:
                        action="store_true",
                        help="required: confirm you intend to mutate live "
                             "guest memory")
-    write.set_defaults(func=bind(cmd_write))
+    write.set_defaults(func=_bind(lab, cmd_write))
 
     pread = mf_sub.add_parser(
         "phys-read", help="read raw bytes from guest physical RAM (any OS)"
@@ -1358,7 +1382,7 @@ def register(sub: Any, lab: Any) -> None:
     pread.add_argument("--vmid", type=int, required=True)
     pread.add_argument("--addr", required=True, help="physical address, e.g. 0x1a2b3c")
     pread.add_argument("--len", type=int, default=64, help="number of bytes")
-    pread.set_defaults(func=bind(cmd_phys_read))
+    pread.set_defaults(func=_bind(lab, cmd_phys_read))
 
     pwrite = mf_sub.add_parser(
         "phys-write", help="inject raw bytes into guest physical RAM (dangerous)"
@@ -1370,7 +1394,7 @@ def register(sub: Any, lab: Any) -> None:
     pwrite.add_argument("--i-understand", dest="i_understand",
                         action="store_true",
                         help="required: confirm you intend to inject into live RAM")
-    pwrite.set_defaults(func=bind(cmd_phys_write))
+    pwrite.set_defaults(func=_bind(lab, cmd_phys_write))
 
     scan = mf_sub.add_parser(
         "scan", help="search guest physical RAM for a byte signature"
@@ -1383,7 +1407,7 @@ def register(sub: Any, lab: Any) -> None:
                       help="stop after this many matches")
     scan.add_argument("--timeout", type=int, default=180,
                       help="seconds; a full RAM sweep can take a while")
-    scan.set_defaults(func=bind(cmd_scan))
+    scan.set_defaults(func=_bind(lab, cmd_scan))
 
     dump = mf_sub.add_parser(
         "dump", help="extract a region of guest memory to a local file"
@@ -1393,7 +1417,7 @@ def register(sub: Any, lab: Any) -> None:
     dump.add_argument("--addr", required=True, help="kernel virtual address")
     dump.add_argument("--len", type=int, default=4096, help="bytes to extract")
     dump.add_argument("--out", required=True, help="local output file")
-    dump.set_defaults(func=bind(cmd_dump))
+    dump.set_defaults(func=_bind(lab, cmd_dump))
 
     trace = mf_sub.add_parser(
         "trace", help="single-step the guest and disassemble each instruction"
@@ -1403,7 +1427,7 @@ def register(sub: Any, lab: Any) -> None:
     trace.add_argument("--steps", type=int, default=10)
     trace.add_argument("--over", action="store_true",
                        help="step over calls instead of into them")
-    trace.set_defaults(func=bind(cmd_trace))
+    trace.set_defaults(func=_bind(lab, cmd_trace))
 
     brk = mf_sub.add_parser(
         "break", help="set a breakpoint, continue, and report where it stops"
@@ -1413,7 +1437,7 @@ def register(sub: Any, lab: Any) -> None:
     brk.add_argument("--addr", required=True, help="breakpoint address")
     brk.add_argument("--timeout", type=int, default=15,
                      help="seconds to wait for the breakpoint before giving up")
-    brk.set_defaults(func=bind(cmd_break))
+    brk.set_defaults(func=_bind(lab, cmd_break))
 
     bootdiag = mf_sub.add_parser(
         "boot-diagnose",
@@ -1428,7 +1452,7 @@ def register(sub: Any, lab: Any) -> None:
                           help="max physical addresses to report per signature")
     bootdiag.add_argument("--timeout", type=int, default=180,
                           help="per-signature RAM scan timeout in seconds")
-    bootdiag.set_defaults(func=bind(cmd_boot_diagnose))
+    bootdiag.set_defaults(func=_bind(lab, cmd_boot_diagnose))
 
     gsetup = mf_sub.add_parser(
         "ghidra-setup", help="prepare a disposable LXC with Ghidra headless"
@@ -1437,7 +1461,7 @@ def register(sub: Any, lab: Any) -> None:
     gsetup.add_argument("--lxc", type=int, required=True,
                         help="VMID for the analysis container")
     gsetup.add_argument("--timeout", type=int, default=1800)
-    gsetup.set_defaults(func=bind(cmd_ghidra_setup))
+    gsetup.set_defaults(func=_bind(lab, cmd_ghidra_setup))
 
     analyze = mf_sub.add_parser(
         "analyze", help="dump guest code and analyse it with Ghidra in the LXC"
@@ -1452,4 +1476,4 @@ def register(sub: Any, lab: Any) -> None:
     analyze.add_argument("--base",
                          help="load base for the blob (defaults to --addr)")
     analyze.add_argument("--timeout", type=int, default=600)
-    analyze.set_defaults(func=bind(cmd_analyze))
+    analyze.set_defaults(func=_bind(lab, cmd_analyze))

@@ -194,6 +194,12 @@ def redact(value: Any, key: str = "") -> Any:
     return value
 
 
+def _bind(lab: Any, fn: Any) -> Any:
+    """Bind a ``lab`` instance to a command handler for argparse."""
+    return lambda args: fn(lab, args)
+
+
+
 @contextlib.contextmanager
 def controller_lock() -> Any:
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -3071,11 +3077,22 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _module() -> Any:
-    """This module as an object, for helper modules that call back into it."""
+    """This module as an object, for helper modules that call back into it.
+
+    When imported normally ``__name__`` is ``proxmox_agent_lab.cli`` and the
+    module is already in ``sys.modules``. The fallback handles path-loaded
+    execution (e.g. ``importlib.util.spec_from_file_location``) where the
+    loader does not register the module: it builds a minimal
+    ``proxmox_lab`` compatibility shim — historic top-level name for the same
+    code now shipped as ``proxmox_agent_lab`` (see 03db912) — and registers
+    it in ``sys.modules`` so ``import proxmox_lab`` resolves.
+    """
     module = sys.modules.get(__name__)
     if module is None:  # loaded by path without sys.modules registration
         module = types.ModuleType("proxmox_lab")
         module.__dict__.update(globals())
+        sys.modules["proxmox_lab"] = module
+        sys.modules[__name__] = module
     return module
 
 

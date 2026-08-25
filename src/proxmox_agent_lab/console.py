@@ -37,6 +37,29 @@ WS_PATH_TEMPLATE = "/api2/json/nodes/{node}/{kind}/{vmid}/vncwebsocket"
 DEFAULT_SCREENSHOT_DIR = Path.home() / ".local" / "state" / "proxmox-agent-lab" / "screens"
 SAFE_KEY = re.compile(r"^[a-z0-9-]{1,40}$")
 
+# Vision prompt for click-target verification: filled at call time with the
+# concrete target label and cursor coordinate. Hoisted so the 50-line f-string
+# does not dominate cmd_click.
+VISION_CLICK_PROMPT = """Verify one cursor checkpoint. Return only JSON:
+{{
+  "screen": "short checkpoint name",
+  "summary": "what is visibly happening",
+  "controls": [{{"label": {target_json}, "bbox": [x0, y0, x1, y1], "confidence": 0.0}}],
+  "recommended_action": {{"kind": "click", "value": "{x},{y}", "reason": "cursor visibly overlaps the named control"}},
+  "expected_change": "the named control opens",
+  "warnings": []
+}}
+The harness has already moved the visible cursor to ({x},{y}) and will
+click exactly there. Locate the one control named {target_repr} in the image and
+report its bounding box as "bbox": [x0, y0, x1, y1] in framebuffer pixels
+(origin top-left, x increases right, y increases down, x0 < x1 and y0 < y1);
+the bbox must cover the visible control body, not a single guessed point. Then
+decide only whether the cursor visibly overlaps that control's body: if it
+does, recommended_action is kind=click with value "{x},{y}"; if it
+does not overlap, is ambiguous, or the named control is absent, return
+controls=[] and recommended_action kind=stop. Never infer overlap from the
+supplied coordinates alone; judge from the image."""
+
 # Chunked transfers: files above SINGLE_OBJECT_MAX_MB are moved in parts so a
 # retry resumes instead of restarting, and the assembled file is verified
 # against a SHA-256 on both ends. Linux guests only (curl + split); Windows
@@ -554,6 +577,104 @@ def agent_ready(lab: Any, api: Any, vmid: int) -> bool:
         return False
 
 
+def wait_agent_ready(lab: Any, api: Any, vmid: int, timeout: int,
+                     interval: float = 5) -> bool:
+    """Poll until the guest agent responds, or the timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if agent_ready(lab, api, vmid):
+            return True
+        time.sleep(interval)
+    return False
+
+
+def write_guest_file(lab: Any, api: Any, vmid: int, path: str,
+                     content: str) -> None:
+    """Write a file into a guest without the content touching the ledger."""
+    api.call(
+        "POST",
+        f"/nodes/{lab.NODE}/qemu/{vmid}/agent/file-write",
+        {
+            "file": path,
+            "content": base64.b64encode(content.encode()).decode(),
+            "encode": 0,
+        },
+    )
+
+
+def exec_guest(lab: Any, api: Any, vmid: int, argv: list[str],
+               timeout: int = 300) -> dict[str, Any]:
+    """Run a command through the guest agent (argv form)."""
+    return agent_exec(lab, api, vmid, argv, timeout=timeout)
+
+
+def exec_guest_script(lab: Any, api: Any, vmid: int, script: str,
+                      timeout: int = 300) -> dict[str, Any]:
+    """Run a shell script through the guest agent via /bin/sh."""
+    return exec_guest(lab, api, vmid, ["/bin/sh", "-c", script], timeout=timeout)
+
+
+
+
+def ensure_agent(lab: Any, api: Any, vmid: int, cloud_user: str,
+                 password: str, timeout: int) -> None:
+    """Wait for the agent; bootstrap over serial when it never appears."""
+    if wait_agent_ready(lab, api, vmid, timeout):
+        return
+    bootstrap_guest_agent(lab, api, vmid, cloud_user, password)
+
+
+def clear_bootstrap_password(lab: Any, api: Any, vmid: int) -> bool:
+    """Delete the one-time cipassword from the VM config. Returns cleared."""
+    try:
+        api.call(
+            "PUT",
+            f"/nodes/{lab.NODE}/qemu/{vmid}/config",
+            {"delete": "cipassword"},
+        )
+        return True
+    except lab.LabError:
+        return False
+
+
+def prepare_cloudinit_worker(
+    lab: Any,
+    api: Any,
+    vmid: int,
+    template_vmid: int,
+    config_updates: dict[str, Any],
+    *,
+    agent_timeout: int = 120,
+    start_timeout: int = 180,
+) -> tuple[str, str]:
+    """Shared cloud-init bootstrap: password, config, start, agent wait.
+
+    Generates a one-time password, resolves the template's cloud user,
+    applies ``config_updates`` plus the cloud-init identity, starts the guest,
+    and waits for the agent (bootstrapping over serial when needed). The
+    caller must call ``clear_bootstrap_password`` when the post-boot
+    provisioning has finished. Returns ``(cloud_user, password)``.
+    """
+    password = secrets.token_urlsafe(18)
+    template_config = api.call(
+        "GET", f"/nodes/{lab.NODE}/qemu/{template_vmid}/config"
+    )
+    cloud_user = template_config.get("ciuser") or "debian"
+    payload: dict[str, Any] = {
+        "ciuser": cloud_user,
+        "cipassword": password,
+        "agent": "enabled=1",
+        "onboot": 0,
+        **config_updates,
+    }
+    api.call("PUT", f"/nodes/{lab.NODE}/qemu/{vmid}/config", payload)
+    start = api.call("POST", f"/nodes/{lab.NODE}/qemu/{vmid}/status/start")
+    lab.wait_task(api, start, timeout=start_timeout)
+    ensure_agent(lab, api, vmid, cloud_user, password, agent_timeout)
+    return cloud_user, password
+
+
+
 # --- command handlers ----------------------------------------------------
 
 
@@ -995,6 +1116,8 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
 
 def _require_owned_qemu(lab: Any, lease_id: str, vmid: int) -> None:
     lab.require_lease_resource(lab.load_lease(lease_id), "qemu", vmid)
+
+
 def cmd_screenshot_burst(lab: Any, args: Any) -> None:
     """Capture several screenshots over time as one stitched image.
 
@@ -1191,6 +1314,83 @@ def cmd_type(lab: Any, args: Any) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def _cursor_checkpoint(lab: Any, session: VncSession, args: Any,
+                       target: str) -> tuple[dict[str, Any], dict[str, Any], bool, str, dict[str, Any]]:
+    """Move the cursor, capture, run vision, and verify the target.
+
+    Returns (checkpoint, temporal, verified, reason, analysis). Raises the
+    caller's LabError on vision failure so the click is blocked.
+    """
+    width, height = session.client.width, session.client.height
+    target_json = json.dumps(target, ensure_ascii=False)
+    session.client.pointer(args.x, args.y, 0)
+    rgb = session.client.capture(timeout=25.0, settle=args.calibration_settle)
+    checkpoint = _save_screenshot(
+        args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
+        state_root=lab.STATE_ROOT,
+    )
+    guided, temporal = _model_frame(lab, args.lease, args.vmid, rgb, width, height)
+    gridded = png_module.overlay_coordinate_grid(width, height, guided, step=100)
+    grid_png = png_module.encode_png(width, height, gridded)
+    prompt = VISION_CLICK_PROMPT.format(
+        target_json=target_json, x=args.x, y=args.y, target_repr=repr(target),
+    )
+    try:
+        analysis = vision.analyze_png(
+            lab.CONFIG, grid_png, width=width, height=height, prompt=prompt,
+            timeout=args.vision_timeout, provider=args.provider,
+        )
+    except (vision.VisionError, secrets_store.SecretError) as exc:
+        raise _api_error(lab, f"click blocked: vision checkpoint failed: {exc}") from None
+    verified, reason = vision.verifies_target(analysis, target, args.x, args.y)
+    lab.audit(
+        "console-click-calibration", lease=args.lease, vmid=args.vmid,
+        width=width, height=height, target=target, verified=verified,
+        provider=analysis.get("provider"), sync=False,
+    )
+    return checkpoint, temporal, verified, reason, analysis
+
+
+def _emit_click_result(
+    lab: Any, args: Any, screenshot: dict[str, Any] | None, *,
+    empty_space: bool, target: str = "",
+    checkpoint: dict[str, Any] | None = None,
+    temporal: dict[str, Any] | None = None,
+    reason: str = "", analysis: dict[str, Any] | None = None,
+) -> None:
+    """Audit and print the final click result for both empty-space and verified paths."""
+    if empty_space:
+        lab.audit(
+            "console-click-unverified", lease=args.lease, vmid=args.vmid,
+            x=args.x, y=args.y, button=args.button, sync=False,
+        )
+        result: dict[str, Any] = {
+            "vmid": args.vmid, "clicked": [args.x, args.y], "empty_space": True,
+            "verification": {
+                "accepted": True,
+                "reason": "explicit empty-space opt-out; coordinate unverified",
+            },
+        }
+        if screenshot is not None:
+            result["screenshot_after"] = screenshot
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    lab.audit("console-click", lease=args.lease, vmid=args.vmid,
+              x=args.x, y=args.y, button=args.button, sync=False)
+    result = {
+        "vmid": args.vmid, "clicked": [args.x, args.y], "target": target,
+        "verification": {"accepted": True, "reason": reason},
+        "temporal": temporal,
+    }
+    if analysis is not None:
+        control = vision.matched_control(analysis, target)
+        if control is not None and isinstance(control.get("bbox"), list):
+            result["control_bbox"] = control["bbox"]
+    if screenshot is not None:
+        result["screenshot_after"] = screenshot
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def cmd_click(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     _require_owned_qemu(lab, args.lease, args.vmid)
@@ -1219,57 +1419,10 @@ def cmd_click(lab: Any, args: Any) -> None:
         if empty_space:
             session.client.click(args.x, args.y, button=args.button, double=args.double)
             screenshot = _capture_after_action(lab, api, args, session)
+            checkpoint = temporal = verified = reason = analysis = None  # type: ignore[assignment]
         else:
-            width, height = session.client.width, session.client.height
-            target_json = json.dumps(target, ensure_ascii=False)
-            session.client.pointer(args.x, args.y, 0)
-            rgb = session.client.capture(timeout=25.0, settle=args.calibration_settle)
-            checkpoint = _save_screenshot(
-                args.vmid, rgb, width, height, getattr(args, "screenshot_out", None),
-                state_root=lab.STATE_ROOT,
-            )
-            guided, temporal = _model_frame(
-                lab, args.lease, args.vmid, rgb, width, height
-            )
-            gridded = png_module.overlay_coordinate_grid(
-                width, height, guided, step=100
-            )
-            grid_png = png_module.encode_png(width, height, gridded)
-            prompt = f"""Verify one cursor checkpoint. Return only JSON:
-{{
-  "screen": "short checkpoint name",
-  "summary": "what is visibly happening",
-  "controls": [{{"label": {target_json}, "bbox": [x0, y0, x1, y1], "confidence": 0.0}}],
-  "recommended_action": {{"kind": "click", "value": "{args.x},{args.y}", "reason": "cursor visibly overlaps the named control"}},
-  "expected_change": "the named control opens",
-  "warnings": []
-}}
-The harness has already moved the visible cursor to ({args.x},{args.y}) and will
-click exactly there. Locate the one control named {target!r} in the image and
-report its bounding box as "bbox": [x0, y0, x1, y1] in framebuffer pixels
-(origin top-left, x increases right, y increases down, x0 < x1 and y0 < y1);
-the bbox must cover the visible control body, not a single guessed point. Then
-decide only whether the cursor visibly overlaps that control's body: if it
-does, recommended_action is kind=click with value "{args.x},{args.y}"; if it
-does not overlap, is ambiguous, or the named control is absent, return
-controls=[] and recommended_action kind=stop. Never infer overlap from the
-supplied coordinates alone; judge from the image."""
-            try:
-                analysis = vision.analyze_png(
-                    lab.CONFIG, grid_png, width=width, height=height, prompt=prompt,
-                    timeout=args.vision_timeout, provider=args.provider,
-                )
-            except (vision.VisionError, secrets_store.SecretError) as exc:
-                raise _api_error(
-                    lab, f"click blocked: vision checkpoint failed: {exc}"
-                ) from None
-            verified, reason = vision.verifies_target(
-                analysis, target, args.x, args.y
-            )
-            lab.audit(
-                "console-click-calibration", lease=args.lease, vmid=args.vmid,
-                width=width, height=height, target=target, verified=verified,
-                provider=analysis.get("provider"), sync=False,
+            checkpoint, temporal, verified, reason, analysis = _cursor_checkpoint(
+                lab, session, args, target
             )
             if not verified:
                 print(json.dumps({
@@ -1283,34 +1436,12 @@ supplied coordinates alone; judge from the image."""
             session.client.click(args.x, args.y, button=args.button, double=args.double)
             screenshot = _capture_after_action(lab, api, args, session)
     if empty_space:
-        lab.audit(
-            "console-click-unverified", lease=args.lease, vmid=args.vmid,
-            x=args.x, y=args.y, button=args.button, sync=False,
-        )
-        result = {
-            "vmid": args.vmid, "clicked": [args.x, args.y], "empty_space": True,
-            "verification": {
-                "accepted": True,
-                "reason": "explicit empty-space opt-out; coordinate unverified",
-            },
-        }
-        if screenshot is not None:
-            result["screenshot_after"] = screenshot
-        print(json.dumps(result, indent=2, sort_keys=True))
+        _emit_click_result(lab, args, screenshot, empty_space=True)
         return
-    lab.audit("console-click", lease=args.lease, vmid=args.vmid,
-              x=args.x, y=args.y, button=args.button, sync=False)
-    result = {
-        "vmid": args.vmid, "clicked": [args.x, args.y], "target": target,
-        "verification": {"accepted": True, "reason": reason},
-        "temporal": temporal,
-    }
-    control = vision.matched_control(analysis, target)
-    if control is not None and isinstance(control.get("bbox"), list):
-        result["control_bbox"] = control["bbox"]
-    if screenshot is not None:
-        result["screenshot_after"] = screenshot
-    print(json.dumps(result, indent=2, sort_keys=True))
+    _emit_click_result(
+        lab, args, screenshot, empty_space=False, target=target,
+        checkpoint=checkpoint, temporal=temporal, reason=reason, analysis=analysis,
+    )
 
 
 def cmd_has_gui_locked_up(lab: Any, args: Any) -> None:
@@ -1594,9 +1725,8 @@ def cmd_text(lab: Any, args: Any) -> None:
     if args.follow:
         # Continuous capture (kernel boot logs, panic traces): read until the
         # timeout or Ctrl+C, printing each chunk as it arrives.
-        import time as _time
 
-        deadline = _time.monotonic() + (args.timeout if args.timeout else 3600)
+        deadline = time.monotonic() + (args.timeout if args.timeout else 3600)
         with _attach_term(lab, api, kind, args.vmid, wait=wait) as session:
             if args.from_reset:
                 api.call(
@@ -1604,7 +1734,7 @@ def cmd_text(lab: Any, args: Any) -> None:
                 )
                 lab.audit("console-text-from-reset", lease=args.lease,
                           vmid=args.vmid, sync=False)
-            while _time.monotonic() < deadline:
+            while time.monotonic() < deadline:
                 chunk = session.read_bytes(1.0)
                 if chunk:
                     print(chunk.decode("utf-8", "replace"), end="", flush=True)
@@ -2005,26 +2135,8 @@ def cmd_preflight(lab: Any, args: Any) -> None:
     ))
 
 
-def register(sub: Any, lab: Any) -> None:
-    """Attach the console, transfer and S3 subcommands to the main parser."""
-
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
-
-    def add_after_screenshot(parser: Any) -> None:
-        parser.add_argument(
-            "--screenshot-after", type=float, metavar="SECONDS",
-            help="after input, wait this long and include a PNG in the "
-                 "result; 'keys' and 'type' also report screen_changed from "
-                 "it, the only evidence the input reached the guest",
-        )
-        parser.add_argument(
-            "--screenshot-out", "--out", dest="screenshot_out",
-            help="path for --screenshot-after (default: state screens directory)",
-        )
-
-    console = sub.add_parser("console", help="VNC, terminal and guest access")
-    console_sub = console.add_subparsers(dest="console_command", required=True)
+def _register_console(console_sub: Any, lab: Any, add_after_screenshot: Any) -> None:
+    from .cli import _bind
 
     shot = console_sub.add_parser("screenshot", help="capture the screen as PNG")
     shot.add_argument("--vmid", type=int, required=True)
@@ -2040,8 +2152,6 @@ def register(sub: Any, lab: Any) -> None:
         help="also return the screen as a bounded, downscaled base64 PNG in "
              "the JSON, for a caller that reads images with its own vision",
     )
-    # Removal signpost, not a working flag. Listed rather than hidden so
-    # --help itself points at the replacement. Delete in 0.11.0.
     shot.add_argument(
         "--ocr", action="store_true",
         help="removed: glyph-matching OCR could not read a guest's own font; "
@@ -2055,7 +2165,7 @@ def register(sub: Any, lab: Any) -> None:
              "opt-in [memflow] host SSH channel to fetch and delete it",
     )
     shot.add_argument("--lease", help="required with --via monitor")
-    shot.set_defaults(func=bind(cmd_screenshot))
+    shot.set_defaults(func=_bind(lab, cmd_screenshot))
 
     burst = console_sub.add_parser(
         "screenshot-burst",
@@ -2071,7 +2181,7 @@ def register(sub: Any, lab: Any) -> None:
     burst.add_argument("--upload", action="store_true",
                        help="also store the PNG in the S3 scratch bucket")
     burst.add_argument("--url-expiry", type=int, default=3600)
-    burst.set_defaults(func=bind(cmd_screenshot_burst))
+    burst.set_defaults(func=_bind(lab, cmd_screenshot_burst))
 
     inspect = console_sub.add_parser(
         "inspect", help="inspect one lease-owned screenshot with cloud vision"
@@ -2095,7 +2205,7 @@ def register(sub: Any, lab: Any) -> None:
         help="do not return the screen as base64 when every vision provider "
              "fails; error with no image instead",
     )
-    inspect.set_defaults(func=bind(cmd_inspect))
+    inspect.set_defaults(func=_bind(lab, cmd_inspect))
 
     keys = console_sub.add_parser("keys", help="send key combinations")
     keys.add_argument("--lease", required=True)
@@ -2104,7 +2214,7 @@ def register(sub: Any, lab: Any) -> None:
     keys.add_argument("--via", choices=("vnc", "api"), default="vnc")
     keys.add_argument("--delay", type=float, default=0.08)
     add_after_screenshot(keys)
-    keys.set_defaults(func=bind(cmd_keys))
+    keys.set_defaults(func=_bind(lab, cmd_keys))
 
     typing = console_sub.add_parser("type", help="type text at the console")
     typing.add_argument("--lease", required=True)
@@ -2115,7 +2225,7 @@ def register(sub: Any, lab: Any) -> None:
     typing.add_argument("--enter", action="store_true")
     typing.add_argument("--delay", type=float, default=0.012)
     add_after_screenshot(typing)
-    typing.set_defaults(func=bind(cmd_type))
+    typing.set_defaults(func=_bind(lab, cmd_type))
 
     click = console_sub.add_parser("click", help="click at a pixel position")
     click.add_argument("--lease", required=True)
@@ -2141,7 +2251,7 @@ def register(sub: Any, lab: Any) -> None:
         default="auto",
     )
     add_after_screenshot(click)
-    click.set_defaults(func=bind(cmd_click))
+    click.set_defaults(func=_bind(lab, cmd_click))
 
     gui_lockup = console_sub.add_parser(
         "has-gui-locked-up",
@@ -2154,7 +2264,7 @@ def register(sub: Any, lab: Any) -> None:
     gui_lockup.add_argument("--timeout", type=float, default=25.0)
     gui_lockup.add_argument("--threshold", type=int, default=24,
                             help="per-channel change to count a pixel as different")
-    gui_lockup.set_defaults(func=bind(cmd_has_gui_locked_up))
+    gui_lockup.set_defaults(func=_bind(lab, cmd_has_gui_locked_up))
 
     terminal_lockup = console_sub.add_parser(
         "has-terminal-locked-up",
@@ -2168,7 +2278,7 @@ def register(sub: Any, lab: Any) -> None:
     terminal_lockup.add_argument("--timeout", type=float, default=25.0)
     terminal_lockup.add_argument("--threshold", type=int, default=24,
                                  help="per-channel change to count a pixel as different")
-    terminal_lockup.set_defaults(func=bind(cmd_has_terminal_locked_up))
+    terminal_lockup.set_defaults(func=_bind(lab, cmd_has_terminal_locked_up))
 
     text = console_sub.add_parser(
         "text", help="read the real terminal stream (exact characters)"
@@ -2197,7 +2307,7 @@ def register(sub: Any, lab: Any) -> None:
              "so a capture can be started before the guest is powered on",
     )
     text.add_argument("--lease")
-    text.set_defaults(func=bind(cmd_text))
+    text.set_defaults(func=_bind(lab, cmd_text))
 
     bridge = console_sub.add_parser(
         "bridge",
@@ -2217,7 +2327,7 @@ def register(sub: Any, lab: Any) -> None:
     bridge.add_argument("--host", default="127.0.0.1")
     bridge.add_argument("--port", type=int, default=0,
                         help="local TCP port (0 = pick a free one)")
-    bridge.set_defaults(func=bind(cmd_bridge))
+    bridge.set_defaults(func=_bind(lab, cmd_bridge))
 
     execute = console_sub.add_parser("exec", help="run a command via guest agent")
     execute.add_argument("--lease", required=True)
@@ -2226,24 +2336,24 @@ def register(sub: Any, lab: Any) -> None:
     execute.add_argument("--windows", action="store_true")
     execute.add_argument("--timeout", type=int, default=300)
     execute.add_argument("command", nargs="+")
-    execute.set_defaults(func=bind(cmd_exec))
+    execute.set_defaults(func=_bind(lab, cmd_exec))
 
     preflight = console_sub.add_parser(
         "preflight", help="check console privileges and scratch storage"
     )
-    preflight.set_defaults(func=bind(cmd_preflight))
+    preflight.set_defaults(func=_bind(lab, cmd_preflight))
 
-    # Removal signpost, not a working command. Its old arguments are still
-    # accepted and entirely ignored, so the explanation below is what an
-    # upgraded caller sees instead of "unrecognized arguments". Delete in
-    # 0.11.0.
     import_font = console_sub.add_parser(
         "import-font",
         help="removed: a screen is read by a vision model, not a font table",
     )
     for ignored in ("--file", "--from-vmid", "--guest-path", "--lease"):
         import_font.add_argument(ignored, help=argparse.SUPPRESS)
-    import_font.set_defaults(func=bind(cmd_import_font))
+    import_font.set_defaults(func=_bind(lab, cmd_import_font))
+
+
+def _register_transfer(sub: Any, lab: Any) -> None:
+    from .cli import _bind
 
     push = sub.add_parser("push", help="copy a local file into a guest")
     push.add_argument("--lease", required=True)
@@ -2260,7 +2370,7 @@ def register(sub: Any, lab: Any) -> None:
                       help="part size for large-file transfers (default 64)")
     push.add_argument("--sha256",
                       help="expected SHA-256 of the file; verified on the guest")
-    push.set_defaults(func=bind(cmd_push))
+    push.set_defaults(func=_bind(lab, cmd_push))
 
     pull = sub.add_parser("pull", help="copy a file out of a guest")
     pull.add_argument("--lease", required=True)
@@ -2278,34 +2388,59 @@ def register(sub: Any, lab: Any) -> None:
     pull.add_argument("--sha256",
                       help="expected SHA-256; skips the transfer when the "
                            "local file already matches")
-    pull.set_defaults(func=bind(cmd_pull))
+    pull.set_defaults(func=_bind(lab, cmd_pull))
+
+
+def _register_s3(sub: Any, lab: Any) -> None:
+    from .cli import _bind
 
     store = sub.add_parser("s3", help="scratch bucket operations")
     store_sub = store.add_subparsers(dest="s3_command", required=True)
-    store_sub.add_parser("health").set_defaults(func=bind(cmd_s3))
+    store_sub.add_parser("health").set_defaults(func=_bind(lab, cmd_s3))
     listing = store_sub.add_parser("list")
     listing.add_argument("--prefix", default="")
-    listing.set_defaults(func=bind(cmd_s3))
+    listing.set_defaults(func=_bind(lab, cmd_s3))
     putter = store_sub.add_parser("put")
     putter.add_argument("--file", required=True)
     putter.add_argument("--key")
-    putter.set_defaults(func=bind(cmd_s3))
+    putter.set_defaults(func=_bind(lab, cmd_s3))
     getter = store_sub.add_parser("get")
     getter.add_argument("--key", required=True)
     getter.add_argument("--out")
-    getter.set_defaults(func=bind(cmd_s3))
+    getter.set_defaults(func=_bind(lab, cmd_s3))
     signer = store_sub.add_parser("presign")
     signer.add_argument("--key", required=True)
     signer.add_argument("--method", default="GET", choices=("GET", "PUT"))
     signer.add_argument("--expires", type=int, default=3600)
-    signer.set_defaults(func=bind(cmd_s3))
+    signer.set_defaults(func=_bind(lab, cmd_s3))
     remover = store_sub.add_parser("delete")
     remover.add_argument("--key", required=True)
-    remover.set_defaults(func=bind(cmd_s3))
+    remover.set_defaults(func=_bind(lab, cmd_s3))
+
+
+def register(sub: Any, lab: Any) -> None:
+    """Attach the console, transfer and S3 subcommands to the main parser."""
+    def add_after_screenshot(parser: Any) -> None:
+        parser.add_argument(
+            "--screenshot-after", type=float, metavar="SECONDS",
+            help="after input, wait this long and include a PNG in the "
+                 "result; 'keys' and 'type' also report screen_changed from "
+                 "it, the only evidence the input reached the guest",
+        )
+        parser.add_argument(
+            "--screenshot-out", "--out", dest="screenshot_out",
+            help="path for --screenshot-after (default: state screens directory)",
+        )
+
+    console = sub.add_parser("console", help="VNC, terminal and guest access")
+    console_sub = console.add_subparsers(dest="console_command", required=True)
+    _register_console(console_sub, lab, add_after_screenshot)
+    _register_transfer(sub, lab)
+    _register_s3(sub, lab)
 
 
 def bootstrap_guest_agent(lab: Any, api: Any, vmid: int, user: str,
-                                 password: str) -> None:
+                          password: str) -> None:
     """Install qemu-guest-agent through the serial.
 
     Generic cloud images have no guest agent, so there is no way in until one
@@ -2324,117 +2459,12 @@ def bootstrap_guest_agent(lab: Any, api: Any, vmid: int, user: str,
             timeout=600,
         )
         term.run("sudo systemctl enable --now qemu-guest-agent", timeout=120)
-    deadline = time.monotonic() + 180
-    while time.monotonic() < deadline:
-        if agent_ready(lab, api, vmid):
-            lab.audit("guest-agent-bootstrapped", vmid=vmid, via="serial",
-                      sync=False)
-            return
-        time.sleep(5)
+    if wait_agent_ready(lab, api, vmid, 180):
+        lab.audit("guest-agent-bootstrapped", vmid=vmid, via="serial",
+                  sync=False)
+        return
     raise lab.LabError(
         "installed qemu-guest-agent over serial but the agent still does not "
         "answer; check 'console text --vmid %s'" % vmid
     )
 
-
-# --- change detection -----------------------------------------------------
-#
-# Cheap enough to run on every poll: a 16x16 grid of average brightness,
-# compared cell by cell. Two hash designs were tried first and both missed
-# real events -- a difference hash scored a dialog on a plain background at 7
-# against a threshold of 12, and an average hash scored a dialog over a lit
-# terminal at 0. Keeping the raw cell values costs the same and catches both.
-#
-# Measured on a 320x200 screen: nothing 0, blinking cursor 2, a new line of
-# text 22, a dialog appearing 56.
-
-CHANGE_THRESHOLD = 4
-CELL_TOLERANCE = 8
-# A console stays legible at half size, and a smaller PNG is cheaper for
-# whoever has to look at it.
-MAX_DIMENSION = 0   # 0 = full size
-
-
-def frame_signature(rgb: bytes, width: int, height: int, size: int = 16,
-                    subsamples: int = 3) -> bytes:
-    """A coarse thumbnail of the screen: one average brightness per cell.
-
-    Two hashes were tried first and both missed real events:
-
-    * a *difference* hash encodes horizontal gradients, so a dialog appearing
-      on a plain background only altered bits at its edges;
-    * an *average* hash records each cell as above or below the frame mean, so
-      brightening an already-bright region -- a dialog over a lit terminal --
-      changed no bits at all.
-
-    Keeping the actual cell values instead, and comparing them numerically,
-    catches both. It is no more expensive: 256 cells, a fraction of a
-    millisecond, and it compresses a megapixel screen to 256 bytes.
-    """
-    if width < 2 or height < 2:
-        return b""
-    cells = bytearray(size * size)
-    for row in range(size):
-        for column in range(size):
-            total = 0
-            for sy in range(subsamples):
-                y = (row * subsamples + sy) * height // (size * subsamples)
-                for sx in range(subsamples):
-                    x = (column * subsamples + sx) * width // (size * subsamples)
-                    offset = (y * width + x) * 3
-                    # Rec. 601 luma, integer-only.
-                    total += (
-                        rgb[offset] * 299
-                        + rgb[offset + 1] * 587
-                        + rgb[offset + 2] * 114
-                    ) // 1000
-            cells[row * size + column] = min(
-                255, total // (subsamples * subsamples)
-            )
-    return bytes(cells)
-
-
-def signature_distance(first: bytes, second: bytes,
-                       cell_tolerance: int = CELL_TOLERANCE) -> int:
-    """How many cells changed by more than `cell_tolerance`.
-
-    Counting cells rather than summing differences means a slow global drift
-    (a fading backlight, a dithered gradient) does not accumulate into a false
-    positive, while a localised change of any size is counted once per cell.
-    """
-    if not first or not second or len(first) != len(second):
-        return len(second or first)
-    return sum(
-        1 for a, b in zip(first, second) if abs(a - b) > cell_tolerance
-    )
-
-
-def frames_differ(first: bytes, second: bytes,
-                  threshold: int = CHANGE_THRESHOLD) -> bool:
-    return signature_distance(first, second) >= threshold
-
-
-# --- layer 2: the local model --------------------------------------------
-
-
-def downscale(rgb: bytes, width: int, height: int,
-              limit: int = MAX_DIMENSION) -> tuple[bytes, int, int]:
-    """Shrink a frame for the model. Nearest-neighbour is fine here.
-
-    The encoder's cost grows with pixel count, and a 1280x800 console carries
-    far more detail than a four-way state classification needs.
-    """
-    if limit <= 0 or (width <= limit and height <= limit):
-        return rgb, width, height
-    scale = max(width, height) / limit
-    new_width = max(1, int(width / scale))
-    new_height = max(1, int(height / scale))
-    out = bytearray(new_width * new_height * 3)
-    for y in range(new_height):
-        source_row = (y * height // new_height) * width
-        target_row = y * new_width * 3
-        for x in range(new_width):
-            offset = (source_row + x * width // new_width) * 3
-            target = target_row + x * 3
-            out[target:target + 3] = rgb[offset:offset + 3]
-    return bytes(out), new_width, new_height

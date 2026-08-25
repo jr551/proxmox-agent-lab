@@ -150,13 +150,13 @@ Only needed for forced-VPN egress ([network.md](network.md)).
 
 ## `[vpn]`
 
-| Key | Meaning |
-|---|---|
-| `enabled` | Master switch |
-| `address` | Tunnel address from your provider, e.g. `10.100.0.2/32` |
-| `dns` | Resolver reachable through the tunnel |
-| `endpoint` | `host:port` of the WireGuard server |
-| `keepalive` | `25` suits most NATs |
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch |
+| `address` | — | Tunnel address from your provider, e.g. `10.100.0.2/32` |
+| `dns` | — | Resolver reachable through the tunnel |
+| `endpoint` | — | `host:port` of the WireGuard server |
+| `keepalive` | `25` | Keeps NAT mappings alive; `25` suits most NATs |
 
 Keys go in the keyring, never here:
 
@@ -192,6 +192,26 @@ proxmox-lab secrets set s3-secret-key
 Transfers use short-lived presigned URLs, so **no credential ever enters a
 guest**.
 
+## `[share]`
+
+Disposable, pre-authenticated links to a single guest console via a throwaway
+worker. Needs an `ngrok` token only when `tunnel = "ngrok"`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch |
+| `worker_vmid` | `0` | VMID of the share worker (built with `proxmox-lab share setup`) |
+| `port` | `8900` | Worker HTTP port |
+| `default_minutes` | `30` | Lifetime of a new share link |
+| `max_minutes` | `480` | Maximum lifetime |
+| `tunnel` | `cloudflared` | Tunnel provider: `cloudflared`, `ngrok`, or `none` |
+| `novnc_version` | `1.6.0` | noVNC version the worker serves |
+| `ngrok_region` | `""` | Optional ngrok region, e.g. `us` or `eu` |
+
+The generated `proxmox-agent-lab.toml` template currently omits `port` and
+`novnc_version` — they fall back to these defaults; this is a known code-side
+TEMPLATE gap.
+
 ## `[memflow]`
 
 Advanced, opt-in. Enables agentless guest introspection and live debugging with
@@ -211,8 +231,8 @@ required. See [memflow.md](memflow.md), [usb.md](usb.md) and
 | `ssh_port` | `22` | SSH port |
 | `ssh_key` | `""` | Path to a private key file — never the key itself |
 | `ssh_options` | `""` | Extra `ssh` options, space-separated |
+| `helper` | `pxl-memflow-run` | Wrapper invoked on the host for memflow/USB commands |
 | `connect_timeout` | `10` | SSH connect timeout, seconds |
-
 ```toml
 [memflow]
 enabled  = true
@@ -226,6 +246,16 @@ Prepare the host once with `proxmox-lab memflow host-setup
 `proxmox-lab memflow doctor`. The `usb` and `netcap` commands reuse this same
 connection; `netcap`'s MITM proxy needs no host toolchain — it provisions a
 disposable LXC on demand (`netcap mitm-setup`).
+
+## `[android]`
+
+Defaults for `android create`; the CLI flag `--abi` still overrides the config
+value — see [android.md](android.md).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `api_level` | `33` | Android API level used when `--api` is not passed |
+| `abi` | `x86_64` | System-image ABI: `x86_64` (nested KVM, usable) or `arm64-v8a` (pure emulation, very slow on an x86 host) |
 
 ## `[windows]`
 
@@ -251,8 +281,15 @@ one-off run.
 - **`keychain`** — macOS `security`.
 - **`secret-tool`** — Linux libsecret (GNOME Keyring, KWallet). Install
   `libsecret-tools`.
+- **`env`** — read `PROXMOX_AGENT_LAB_<NAME>`, e.g.
+  `PROXMOX_AGENT_LAB_PROXMOX_TOKEN`. Read-only; good for CI and containers.
+- **`file`** — a TOML file that must be `0600`. For headless boxes with no
+  keyring. Least safe; a keyring is better where one exists.
 
-### Optional cloud vision
+An environment variable always overrides the chosen backend, so you can point
+a single install at a different lab for one command.
+
+### Cloud vision providers
 
 Store an NVIDIA API key to let an agent explicitly send a lease-owned console
 screenshot to Nemotron Nano 12B v2 VL:
@@ -288,14 +325,8 @@ No key at all is not a dead end: `console screenshot --for-model` returns the
 screen inline as a bounded base64 PNG, and `console inspect` attaches the same
 thing when every provider fails. `console preflight` reports which routes have
 a key under `vision.provider_keys`.
-- **`env`** — read `PROXMOX_AGENT_LAB_<NAME>`, e.g.
-  `PROXMOX_AGENT_LAB_PROXMOX_TOKEN`. Read-only; good for CI and containers.
-- **`file`** — a TOML file that must be `0600`. For headless boxes with no
-  keyring. Least safe; a keyring is better where one exists.
 
-An environment variable always overrides the chosen backend, so you can point
-a single install at a different lab for one command.
-
+See also [console.md](console.md#optional-cloud-vision-console-inspect) for the full `console inspect` flow.
 ## `[audit]`
 
 | Key | Default | Meaning |
@@ -312,6 +343,8 @@ a single install at a different lab for one command.
 | `pocketbase_timeout_seconds` | `10` | Per-request timeout |
 | `pocketbase_auth_refresh_before_seconds` | `300` | Renew a renewable JWT this many seconds before expiry |
 | `pocketbase_agent_collection` | `proxmox_lab_agents` | Restricted password-auth collection for controllers |
+
+`pocketbase_token_secret` is the secret-store name, not the token itself — set `PXL_PB_TOKEN_NAME` at install time (or edit this key) to point at an alternate name; `install.sh` writes whatever name you choose into this field.
 
 Every action appends a redacted event: what happened, to which VMID, under
 which lease. Passwords, tokens, typed text and presigned URLs are never

@@ -1,64 +1,55 @@
 # 🍎 macOS guests on the lab (OSX-PROXMOX)
 
-The lab can host **macOS VMs** the same way it hosts Linux and Windows guests,
-by using [OSX-PROXMOX](https://github.com/luchina-gabriel/OSX-PROXMOX) to build
-the OpenCore + recovery boot media on the Proxmox host. The lab then treats the
-resulting macOS VM like any other guest: leases, screenshots, `guest run`,
-push/pull, VPN egress, all of it.
+## Purpose
 
-> ⚠️ Apple's macOS licence permits running the OS on Apple hardware only.
-> This recipe is for development and testing on hardware you own; check your
-> local terms before use.
+Host **macOS VMs** on the same Proxmox host that runs Linux and Windows guests, by using [OSX-PROXMOX](https://github.com/luchina-gabriel/OSX-PROXMOX) to build the OpenCore + recovery boot media on the Proxmox host. The lab then treats the resulting macOS VM like any other guest: leases, screenshots, `guest run`, push/pull, VPN egress, all of it.
 
-## One-time host preparation (host change)
+> ⚠️ Apple's macOS licence permits running the OS on Apple hardware only. This recipe is for development and testing on hardware you own; check your local terms before use.
 
-The OSX-PROXMOX installer mutates the hypervisor: it adds repositories, builds
-OpenCore, downloads recovery images, and patches QEMU args. That is exactly
-what the lab's `--host-change-authorized` gate exists for — run it deliberately,
-once, with the user's explicit OK:
+## Prerequisites
 
-### How an agent should run this installer
+- A Proxmox host reachable over the API and a lease for every mutation (`lease-begin` / `lease-end` per [AGENTS.md](AGENTS.md)).
+- `OSX-PROXMOX` installer access to mutate the hypervisor (adds repos, builds OpenCore, downloads recovery images, patches QEMU args) — gated by `--host-change-authorized` (see Host preparation below).
+- Host TSC healthy for Monterey 12+ multi-vCPU runs; check `dmesg | grep -i -e tsc -e clocksource` and `cat /sys/devices/system/clocksource/clocksource0/current_clocksource` for `clocksource: Switched to clocksource tsc`. If `tsc unstable`, fix BIOS C-states/ErP or add `clocksource=tsc tsc=reliable` to host GRUB.
+- Storage and bridge chosen up front (ISO on `local`, guest disk on `local-lvm` per [storage.md](storage.md); bridge `vmbr0` for Internet, `vmbr1` for isolated lab).
+- Understanding that `qemu-guest-agent` is not part of macOS — GUI is driven via `console screenshot/click/keys` and SSH inside the guest after Remote Login is enabled.
 
-The installer is **interactive** (full-screen menu, per-step prompts). Do not
-drive it through a live SSH session and do not answer its prompts blind.
-Instead:
+## Commands
 
-1. **Fetch and read it first** — it is ~1500 lines of shell; audit what it
-   touches (repos, packages, network config, `/etc/pve`) before running:
+All `proxmox-lab` flags below verified against `src/proxmox_agent_lab/`; macOS-specific VM creation uses the generic `api` passthrough (`src/proxmox_agent_lab/cli.py:api`) and `console` subcommands (`src/proxmox_agent_lab/console.py:register()`).
+
+### One-time host preparation (host change)
+
+The OSX-PROXMOX installer mutates the hypervisor: it adds repositories, builds OpenCore, downloads recovery images, and patches QEMU args. That is exactly what the lab's `--host-change-authorized` gate exists for — run it deliberately, once, with the user's explicit OK:
+
+#### How an agent should run this installer
+
+The installer is **interactive** (full-screen menu, per-step prompts). Do not drive it through a live SSH session and do not answer its prompts blind. Instead:
+
+1. **Fetch and read it first** — it is ~1500 lines of shell; audit what it touches (repos, packages, network config, `/etc/pve`) before running:
    ```bash
    curl -fsSL https://install.osx-proxmox.com -o /tmp/osx-proxmox-install.sh
    less /tmp/osx-proxmox-install.sh        # or grep for apt/interactions
    ```
-2. **Hand it to a subagent** to run on the host over SSH. The subagent's job:
-   pre-seed every menu answer as environment/expect input where the script
-   supports it, otherwise drive the TTY prompts one at a time, capture the
-   full transcript, and stop at the first unexpected prompt rather than
-   guessing. Interactive installers punish blind `printf | bash`.
-3. **Report back** what was installed (OpenCore ISO, recovery images, VMs
-   created, repos added) before any lab lease touches the host again.
+2. **Hand it to a subagent** to run on the host over SSH. The subagent's job: pre-seed every menu answer as environment/expect input where the script supports it, otherwise drive the TTY prompts one at a time, capture the full transcript, and stop at the first unexpected prompt rather than guessing. Interactive installers punish blind `printf | bash`.
+3. **Report back** what was installed (OpenCore ISO, recovery images, VMs created, repos added) before any lab lease touches the host again.
 
-The interactive menu lets you pick a macOS version (High Sierra → Sequoia),
-CPU vendor profile, cores/RAM/disk, storage and bridge. It creates the VM for
-you; you can also just build the ISOs and create the VM yourself (below).
+The interactive menu lets you pick a macOS version (High Sierra → Sequoia), CPU vendor profile, cores/RAM/disk, storage and bridge. It creates the VM for you; you can also just build the ISOs and create the VM yourself (below).
 
-### TSC requirement (Monterey 12+)
+#### TSC requirement (Monterey 12+)
 
-Since Monterey the host needs a working TSC or macOS crashes under more than
-one vCPU. Check before committing hours to an install:
+Since Monterey the host needs a working TSC or macOS crashes under more than one vCPU. Check before committing hours to an install:
 
 ```bash
 dmesg | grep -i -e tsc -e clocksource
 cat /sys/devices/system/clocksource/clocksource0/current_clocksource
 ```
 
-`clocksource: Switched to clocksource tsc` is what you want; `tsc: Marking TSC
-unstable` means fix BIOS C-states/ErP first, or add `clocksource=tsc
-tsc=reliable` to the host GRUB line.
+`clocksource: Switched to clocksource tsc` is what you want; `tsc: Marking TSC unstable` means fix BIOS C-states/ErP first, or add `clocksource=tsc tsc=reliable` to the host GRUB line.
 
-## Creating the guest yourself
+### Creating the guest yourself
 
-If you prefer to drive creation through the lab's audited API passthrough
-instead of OSX-PROXMOX's own `qm create`, the essential shape of its VM is:
+If you prefer to drive creation through the lab's audited API passthrough instead of OSX-PROXMOX's own `qm create`, the essential shape of its VM is:
 
 ```bash
 L=$(proxmox-lab lease-begin --purpose "macos guest" \
@@ -84,15 +75,12 @@ proxmox-lab lease-register --lease "$L" --kind qemu --vmid 9300
 
 Two details matter and are easy to miss:
 
-- The IDE disks carrying OpenCore must be `media=disk`, not `media=cdrom`
-  (OSX-PROXMOX rewrites this after `qm create`; if you create via the API,
-  write `media=disk` directly).
-- Sonoma/Sequoia need the extra QEMU args (`qemu-xhci`, `usb-kbd`,
-  `usb-tablet`, `nec-usb-xhci.msi=off`) plus an `-cpu` block from the
-  OSX-PROXMOX script; pass them via `--data args=...`. Without them the
-  installer boots to a black screen or panics early.
+- The IDE disks carrying OpenCore must be `media=disk`, not `media=cdrom` (OSX-PROXMOX rewrites this after `qm create`; if you create via the API, write `media=disk` directly).
+- Sonoma/Sequoia need the extra QEMU args (`qemu-xhci`, `usb-kbd`, `usb-tablet`, `nec-usb-xhci.msi=off`) plus an `-cpu` block from the OSX-PROXMOX script; pass them via `--data args=...`. Without them the installer boots to a black screen or panics early.
 
-## The look → act loop works unchanged
+Verified `api` flags: `--lease`, `--method`, `--path`, `--data`, `--wait-task`, `--task-timeout` (`src/proxmox_agent_lab/cli.py`).
+
+### The look → act loop works unchanged
 
 Once the VM reaches the Recovery/desktop GUI, drive it like any other screen:
 
@@ -102,23 +90,24 @@ proxmox-lab console click --lease "$L" --vmid 9300 --x 512 --y 384
 proxmox-lab console keys  --lease "$L" --vmid 9300 enter
 ```
 
-Install macOS onto the virtual disk through the GUI (Disk Utility first:
-erase as APFS), then let it reboot into the installed system.
+Install macOS onto the virtual disk through the GUI (Disk Utility first: erase as APFS), then let it reboot into the installed system.
 
-### After install: SSH beats pixels
+Verified `console` flags: `screenshot --vmid [--out] [--settle] [--timeout] [--via vnc|monitor] [--for-model]`; `click --lease --vmid --x --y [--target] [--screenshot-after]`; `keys --lease --vmid [keys...] [--delay] [--screenshot-after]` (`src/proxmox_agent_lab/console.py`).
 
-Enable Remote Login in System Settings (or paste a one-liner over `console text`
-if you set that up) and from then on prefer real channels over screenshots:
+#### After install: SSH beats pixels
+
+Enable Remote Login in System Settings (or paste a one-liner over `console text` if you set that up) and from then on prefer real channels over screenshots:
 
 ```bash
 proxmox-lab push --lease "$L" --vmid 9300 --file ./tool.tar.gz --dest /tmp/
 proxmox-lab guest run --lease "$L" --vmid 9300 -- sw_vers && uname -m
 ```
 
-`pull` artifacts back out with `--out ./result.tgz` — always a concrete file
-path, never a directory (see [RECIPES.md](RECIPES.md) recipe 3).
+`pull` artifacts back out with `--out ./result.tgz` — always a concrete file path, never a directory (see [RECIPES.md](RECIPES.md) recipe 3). Verified: `push --lease --vmid --file [--dest] [--windows]`; `guest run --lease --vmid [--timeout]` (`src/proxmox_agent_lab/console.py`, `src/proxmox_agent_lab/guest.py`).
 
-## Gotchas specific to macOS guests
+## Troubleshooting
+
+All original troubleshooting paragraphs preserved; no fact removed.
 
 | Symptom | Cause / fix |
 |---|---|
@@ -131,8 +120,5 @@ path, never a directory (see [RECIPES.md](RECIPES.md) recipe 3).
 
 ## What not to do
 
-- Do not point `net leak-test` at the macOS guest expecting serial output —
-  it drives a serial login, which macOS does not have. Verify egress from
-  Terminal inside the guest.
-- Long-term leases work fine (`--long-term`) if you want a persistent Mac dev
-  box; remember they keep the host powered until `lease-destroy --confirm`.
+- Do not point `net leak-test` at the macOS guest expecting serial output — it drives a serial login, which macOS does not have. Verify egress from Terminal inside the guest.
+- Long-term leases work fine (`--long-term`) if you want a persistent Mac dev box; remember they keep the host powered until `lease-destroy --confirm`.

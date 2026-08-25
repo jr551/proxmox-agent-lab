@@ -349,6 +349,49 @@ def _dismiss_setup_ui(lab: Any, api: Any, vmid: int,
     return sent
 
 
+def _prepare_unattended(lab: Any, api: Any, args: Any, name: str,
+                        driver_branch: str, supplied_password: str | None) -> tuple[str | None, str | None]:
+    """Build the answer file ISO and attach it. Returns (password, volume)."""
+    if not args.unattended:
+        return None, None
+    password = supplied_password or generate_password()
+    xml = render_unattend(
+        locale=args.locale,
+        timezone=args.timezone,
+        hostname=args.hostname or name[:15],
+        owner=args.owner,
+        image_index=args.image_index,
+        driver_branch=driver_branch,
+        admin_password=password,
+    )
+    with tempfile.TemporaryDirectory() as staging:
+        iso_path = Path(staging) / f"autounattend-{args.vmid}.iso"
+        build_answer_iso(xml, iso_path)
+        if not iso_path.exists():
+            alternative = iso_path.with_suffix(".iso.cdr")
+            if alternative.exists():
+                alternative.rename(iso_path)
+        volume = _upload_iso(lab, api, args.lease, iso_path)
+    api.call(
+        "PUT",
+        f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
+        {"ide3": f"{volume},media=cdrom"},
+    )
+    return password, volume
+
+
+def _boot_with_taps(lab: Any, api: Any, args: Any) -> dict[str, Any]:
+    """Start the guest and tap past the boot prompt + Setup language page."""
+    result: dict[str, Any] = {}
+    start_upid = api.call("POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/start")
+    lab.wait_task(api, start_upid, timeout=120)
+    result["started"] = True
+    if args.unattended and args.boot_key:
+        result["boot_key_taps"] = _tap_boot_prompt(lab, api, args.vmid)
+        result["setup_ui_taps"] = _dismiss_setup_ui(lab, api, args.vmid)
+    return result
+
+
 def cmd_install(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     lease = lab.load_lease(args.lease)
@@ -357,12 +400,6 @@ def cmd_install(lab: Any, args: Any) -> None:
         raise lab.LabError(f"VMID {args.vmid} existed before this lease")
     name = args.name or f"win{args.version}-lab-{args.vmid}"
     driver_branch = _driver_branch(args.version, args.driver_branch)
-    # Read and check the Administrator password before anything is cloned.
-    # Unlike a console login this *creates* the credential, so an empty one
-    # would build a blank-password account into the answer file; it is refused
-    # rather than quietly replaced, and omitting the flag is how you ask for a
-    # generated password. Checked here so the guard cannot fire after a clone
-    # has already left a half-built guest behind.
     supplied_password: str | None = None
     if args.unattended and args.password_stdin:
         supplied_password = sys.stdin.readline().strip()
@@ -371,12 +408,10 @@ def cmd_install(lab: Any, args: Any) -> None:
                 "--password-stdin received an empty Administrator password; "
                 "omit the flag to have a strong one generated"
             )
-
     upid = _clone(lab, api, template_vmid, args.vmid, name,
                   args.full_clone, args.storage)
     lab.wait_task(api, upid, timeout=args.clone_timeout)
     lab.register_resource(lease, "qemu", args.vmid, args.policy, name)
-
     config: dict[str, Any] = {
         "cores": args.cores,
         "memory": args.memory,
@@ -384,7 +419,6 @@ def cmd_install(lab: Any, args: Any) -> None:
         "onboot": 0,
     }
     api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config", config)
-
     result: dict[str, Any] = {
         "vmid": args.vmid,
         "name": name,
@@ -392,63 +426,20 @@ def cmd_install(lab: Any, args: Any) -> None:
         "cloned_from": template_vmid,
         "answer_file_offered": bool(args.unattended),
     }
-
-    password: str | None = None
-    if args.unattended:
-        password = supplied_password or generate_password()
-        xml = render_unattend(
-            locale=args.locale,
-            timezone=args.timezone,
-            hostname=args.hostname or name[:15],
-            owner=args.owner,
-            image_index=args.image_index,
-            driver_branch=driver_branch,
-            admin_password=password,
-        )
-        with tempfile.TemporaryDirectory() as staging:
-            iso_path = Path(staging) / f"autounattend-{args.vmid}.iso"
-            build_answer_iso(xml, iso_path)
-            # hdiutil appends .cdr unless the name already ends in .iso
-            if not iso_path.exists():
-                alternative = iso_path.with_suffix(".iso.cdr")
-                if alternative.exists():
-                    alternative.rename(iso_path)
-            volume = _upload_iso(lab, api, args.lease, iso_path)
-        api.call(
-            "PUT",
-            f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
-            {"ide3": f"{volume},media=cdrom"},
-        )
+    password, volume = _prepare_unattended(
+        lab, api, args, name, driver_branch, supplied_password
+    )
+    if password is not None:
         result["answer_iso"] = volume
         result["administrator_password"] = password
-        result["password_note"] = (
-            "shown once here and never written to the audit ledger"
-        )
-        # Measured on Server 2022 eval media: everything in the answer file
-        # applies, but Setup still shows its language page first and waits
-        # there. It is dismissed below; see _dismiss_setup_ui.
+        result["password_note"] = "shown once here and never written to the audit ledger"
         result["answer_file_note"] = (
             "the language page is not covered by the answer file and is "
             "dismissed with Enter after Setup's UI loads; everything after it "
             "runs unattended"
         )
-
     if args.start:
-        start_upid = api.call("POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/start")
-        lab.wait_task(api, start_upid, timeout=120)
-        result["started"] = True
-        # The Windows ISO boots via UEFI, which shows "Press any key to boot
-        # from CD or DVD..." for a few seconds; miss it and the firmware falls
-        # through to the empty disk and Setup never starts. For an unattended
-        # install there is no human to catch it, so tap Enter across that
-        # window automatically. Best-effort: a failure here must not fail the
-        # install, and the presses are bounded to the boot window.
-        if args.unattended and args.boot_key:
-            result["boot_key_taps"] = _tap_boot_prompt(lab, api, args.vmid)
-            # Then get past Setup's language page, which the answer file does
-            # not cover. Without this the install waits there indefinitely.
-            result["setup_ui_taps"] = _dismiss_setup_ui(lab, api, args.vmid)
-
+        result.update(_boot_with_taps(lab, api, args))
     lab.audit(
         "windows-install-started",
         lease=args.lease,
@@ -641,8 +632,8 @@ def _shred_answer_iso(lab: Any, api: Any, vmid: int) -> str | None:
 
 
 def register(sub: Any, lab: Any) -> None:
-    def bind(handler: Any) -> Any:
-        return lambda args: handler(lab, args)
+    from .cli import _bind
+
 
     windows = sub.add_parser("windows", help="install and set up Windows guests")
     windows_sub = windows.add_subparsers(dest="windows_command", required=True)
@@ -684,7 +675,7 @@ def register(sub: Any, lab: Any) -> None:
     install.add_argument("--timezone", default="GMT Standard Time")
     install.add_argument("--hostname")
     install.add_argument("--owner", default="proxmox-agent-lab")
-    install.set_defaults(func=bind(cmd_install))
+    install.set_defaults(func=_bind(lab, cmd_install))
 
     wait = windows_sub.add_parser("wait-agent", help="wait for qemu-guest-agent")
     wait.add_argument("--lease")
@@ -695,11 +686,11 @@ def register(sub: Any, lab: Any) -> None:
                       help="give up early if the guest has written almost "
                            "nothing to disk by now, which means Setup is "
                            "waiting for input; 0 disables the check")
-    wait.set_defaults(func=bind(cmd_wait_agent))
+    wait.set_defaults(func=_bind(lab, cmd_wait_agent))
 
     finish = windows_sub.add_parser("finish", help="enable RDP/SSH and report IPs")
     finish.add_argument("--lease", required=True)
     finish.add_argument("--vmid", type=int, required=True)
     finish.add_argument("--no-openssh", dest="openssh", action="store_false")
     finish.add_argument("--timeout", type=int, default=900)
-    finish.set_defaults(func=bind(cmd_finish))
+    finish.set_defaults(func=_bind(lab, cmd_finish))

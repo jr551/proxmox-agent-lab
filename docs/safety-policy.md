@@ -44,7 +44,7 @@ proxmox-lab lease-destroy --lease <id> --confirm
 5. Lease expiry is two hours by default and is extended by heartbeats.
 6. Ending or expiring the last lease powers off `pve`.
 7. Completion requires the Proxmox API to remain unreachable for two consecutive checks.
-8. Every operation writes a redacted audit event and attempts a normal fast-forward/rebase Forgejo sync. PocketBase authorization failures identify the audit-token secret to refresh. An `api` write may already have reached Proxmox before its audit event fails; it reports that write as succeeded but unrecorded rather than claiming an unrelated Proxmox permission failure.
+8. Every operation writes a redacted audit event to the shared MariaDB ledger. The lab host is powered off between leases, so an unreachable ledger spools the event locally rather than failing the action; `journal --flush-spool` uploads the backlog. An `api` write may already have reached Proxmox before its audit event fails; it reports that write as succeeded but unrecorded rather than claiming an unrelated Proxmox permission failure.
 9. Every MCP tool call records only its tool name and refreshes the idle clock.
 10. A reachable host with no active leases is shut down after eight hours without an MCP tool call.
 11. Console input (keys, typing, clicks), guest execution and file transfer require an active lease. Screenshots and terminal reads do not.

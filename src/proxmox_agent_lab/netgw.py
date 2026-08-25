@@ -409,7 +409,7 @@ def cmd_verify(lab: Any, args: Any) -> None:
         and checks["every_accept_rule_uses_the_tunnel"]
     )
     lab.audit("vpn-gateway-verified", vmid=args.vmid, healthy=healthy,
-              egress_ip=tunnel_ip, sync=False)
+              egress_ip=tunnel_ip)
     print(json.dumps({"vmid": args.vmid, "healthy": healthy, "checks": checks},
                      indent=2, sort_keys=True))
     if not healthy:
@@ -649,7 +649,7 @@ def cmd_attach(lab: Any, args: Any) -> None:
     api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
              {args.nic: updated, f"ipconfig{m.group(1)}": "ip=dhcp"})
     lab.audit("vpn-guest-attached", lease=args.lease, vmid=args.vmid,
-              nic=args.nic, bridge=LAB_BRIDGE, sync=False)
+              nic=args.nic, bridge=LAB_BRIDGE)
     print(json.dumps(
         {
             "vmid": args.vmid,
@@ -804,7 +804,7 @@ def cmd_dhcp_create(lab: Any, args: Any) -> None:
     )
     lab.audit("dhcp-server-created", lease=args.lease, vmid=args.vmid,
               server_ip=server_ip, range=rng,
-              bootfile=args.bootfile or None, sync=False)
+              bootfile=args.bootfile or None)
     print(json.dumps({
         "vmid": args.vmid, "name": name, "server_ip": server_ip,
         "range": rng, "dns": dns, "gateway": args.gateway or LAB_GATEWAY_IP,
@@ -863,7 +863,7 @@ def cmd_tftp_create(lab: Any, args: Any) -> None:
         pre_start=f"mkdir -p {root}",
     )
     lab.audit("tftp-server-created", lease=args.lease, vmid=args.vmid,
-              server_ip=server_ip, root=root, sync=False)
+              server_ip=server_ip, root=root)
     print(json.dumps({
         "vmid": args.vmid, "name": name, "server_ip": server_ip,
         "root": root, "provisioned": True,
@@ -906,7 +906,7 @@ def cmd_tftp_push(lab: Any, args: Any) -> None:
             f"{source.stat().st_size}"
         )
     lab.audit("tftp-file-pushed", lease=args.lease, vmid=args.vmid,
-              path=dest, bytes=size, sync=False)
+              path=dest, bytes=size)
     print(json.dumps({
         "vmid": args.vmid, "path": dest, "bytes": size, "name": name,
     }, indent=2, sort_keys=True))

@@ -123,7 +123,7 @@ class ReadPathGuardTests(unittest.TestCase):
     def test_successful_read_audits_a_count_not_the_contents(self) -> None:
         audited: dict = {}
 
-        def fake_audit(event, *, sync=True, **fields):
+        def fake_audit(event, **fields):
             audited["event"] = event
             audited["fields"] = fields
 
@@ -176,7 +176,7 @@ class WriteGateTests(unittest.TestCase):
     def test_write_audits_length_not_the_bytes(self) -> None:
         audited: dict = {}
 
-        def fake_audit(event, *, sync=True, **fields):
+        def fake_audit(event, **fields):
             audited.update({"event": event, "fields": fields})
 
         with mock.patch.object(memflow, "ENABLED", True), \
@@ -227,7 +227,7 @@ class PhysMemoryGuardTests(unittest.TestCase):
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit",
-                               lambda e, *, sync=True, **f: audited.update(
+                               lambda e, **f: audited.update(
                                    {"event": e, "fields": f})), \
              mock.patch.object(memflow, "_helper_json",
                                return_value={"written": 1}), \
@@ -254,7 +254,7 @@ class PhysMemoryGuardTests(unittest.TestCase):
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit",
-                               lambda e, *, sync=True, **f: audited.update(
+                               lambda e, **f: audited.update(
                                    {"event": e, "fields": f})), \
              mock.patch.object(memflow, "_helper_json",
                                return_value={"hits": ["0x1", "0x2"]}), \
@@ -289,7 +289,7 @@ class DebugGuardTests(unittest.TestCase):
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit",
-                               lambda e, *, sync=True, **f: audited.update(
+                               lambda e, **f: audited.update(
                                    {"event": e, "fields": f})), \
              mock.patch.object(memflow, "_helper_json",
                                return_value={"steps": []}) as helper, \

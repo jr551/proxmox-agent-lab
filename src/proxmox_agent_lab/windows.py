@@ -458,7 +458,6 @@ def cmd_install(lab: Any, args: Any) -> None:
         version=args.version,
         template=template_vmid,
         unattended=bool(args.unattended),
-        sync=False,
     )
     result["next"] = (
         [
@@ -602,7 +601,7 @@ def cmd_finish(lab: Any, args: Any) -> None:
         pass
     shredded = _shred_answer_iso(lab, api, args.vmid)
     lab.audit("windows-finished", lease=args.lease, vmid=args.vmid,
-              addresses=addresses, answer_iso_removed=shredded, sync=False)
+              addresses=addresses, answer_iso_removed=shredded)
     print(json.dumps(
         {"vmid": args.vmid, "addresses": addresses, "steps": steps,
          "answer_iso_removed": shredded},

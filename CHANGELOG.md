@@ -4,6 +4,75 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.12.0 - 2026-08-25
+
+One shared audit ledger, and one secret per machine.
+
+The journal was a SQLite file per controller, optionally mirrored to PocketBase
+and to a git repo. Two machines driving the same lab kept two partial histories
+that never met, and adding a machine meant repeating the whole secret setup.
+This replaces all of that with one MariaDB on the Proxmox host.
+
+### Changed — the audit ledger
+
+- **MariaDB is now the only backend, and it is required.** `sqlite`, `jsonl`,
+  PocketBase and the git mirror are gone, along with `pocketbase.py`,
+  `pocketbase-host-setup.sh` and every `[audit] pocketbase_*`/`git_*` key.
+- **Provisioned in one command**: `proxmox-lab journal host-setup
+  --host-change-authorized` creates a persistent unprivileged container on the
+  Proxmox host, publishes it on the hypervisor's own address, and creates the
+  database. It is deliberately not lease-owned, so lease-end cannot destroy the
+  history it just wrote. `mariadb-host-setup.sh` is the same script for a host
+  you would rather set up directly.
+- **The lab host is off between leases, so the ledger is too.** No action ever
+  fails for it: events spool locally and upload on the next
+  `journal --flush-spool`. `doctor` reports a backlog, and its reachability
+  probe uses a short timeout so it stays fast while the host sleeps.
+- **New query surface**: `journal --controller`, `--migrations`, `--migrate`.
+
+### Changed — secrets
+
+- **Secrets live in the environment**, not an OS keyring. `env` is the default
+  backend; `keychain` and `secret-tool` remain available but are legacy.
+- **One credential per machine.** `mariadb-password` is the only secret a
+  controller needs; every other secret is stored in the ledger and handed out
+  from there, so adding a machine is a single `export`. Provisioning copies
+  this controller's existing secrets — including any still in its OS keyring —
+  into the shared store. An environment variable still overrides any single
+  secret locally.
+- That bootstrap password is now the key to all the others. The ledger listens
+  on the lab LAN only; treat it as the master secret.
+- The OS keyring is no longer an *implicit* fallback inside `get`. Reaching
+  past the configured backend into whatever the desktop keyring held made a
+  "missing" secret unpredictable — in tests it returned the developer's real
+  secrets. Migration reads it explicitly instead.
+
+### Added — upgrading, including from a second machine
+
+- **Upgrades port themselves.** The first command after an upgrade carries this
+  controller's old local ledger into the shared one. Safe to re-run.
+- **A second machine knows what to do.** Event ids are derived from content and
+  inserts are `INSERT IGNORE`, so a second controller adds only the events the
+  first did not already have, and reports what it found rather than presenting
+  a no-op as a failure. Concurrent migrations serialise on a MariaDB advisory
+  lock, and a `migrations` table records who has migrated.
+- Verified against the real 5,138-event ledger from this project's own lab:
+  full history migrated, a second controller added only its own 3 events, and
+  re-running uploaded 0.
+
+### Changed — dependencies
+
+- **The zero-dependency policy is retired.** MariaDB needs a client protocol
+  the standard library does not have. The controller now depends on PyMySQL
+  (pure Python, so still no compiler) and cryptography. CI installs the package
+  before running the suite.
+
+### Fixed
+
+- `net attach` raised `NameError: name 're' is not defined`; `netgw.py` never
+  imported `re`.
+- `install.sh` no longer asks about audit backends at all.
+
 ## 0.11.0 - 2026-08-24
 
 A security-audit release: every shipped-code finding from the 2026-08-24 audit

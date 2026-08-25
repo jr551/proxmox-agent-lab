@@ -302,7 +302,7 @@ def cmd_template(lab: Any, args: Any) -> None:
     if isinstance(result, str) and result.startswith("UPID:"):
         lab.wait_task(api, result, timeout=args.task_timeout)
     lab.audit("guest-template", lease=args.lease, kind=args.kind,
-              vmid=args.vmid, sync=False)
+              vmid=args.vmid)
     print(json.dumps(
         {"vmid": args.vmid, "kind": args.kind, "result": result},
         indent=2, sort_keys=True,
@@ -338,7 +338,7 @@ def cmd_clone(lab: Any, args: Any) -> None:
             args.name or f"clone-{args.newid}",
         )
     lab.audit("guest-clone", lease=args.lease, kind=args.kind,
-              template=args.template, vmid=args.newid, sync=False)
+              template=args.template, vmid=args.newid)
     print(json.dumps(
         {"vmid": args.newid, "kind": args.kind, "template": args.template,
          "result": result},
@@ -372,7 +372,7 @@ def _snapshot_create(lab: Any, api: Any, args: Any, base: str) -> None:
     upid = api.call("POST", base, {"snapname": args.name, "description": args.description or ""})
     _await_snapshot_task(lab, api, upid, args)
     lab.audit("guest-snapshot", lease=args.lease, kind=args.kind,
-              vmid=args.vmid, name=args.name, sync=False)
+              vmid=args.vmid, name=args.name)
     print(json.dumps({"vmid": args.vmid, "snapshot": args.name, "created": True},
                      indent=2, sort_keys=True))
 
@@ -383,7 +383,7 @@ def _snapshot_delete(lab: Any, api: Any, args: Any, base: str) -> None:
     upid = api.call("DELETE", f"{base}/{args.name}")
     _await_snapshot_task(lab, api, upid, args)
     lab.audit("guest-snapshot-delete", lease=args.lease, kind=args.kind,
-              vmid=args.vmid, name=args.name, sync=False)
+              vmid=args.vmid, name=args.name)
     print(json.dumps({"vmid": args.vmid, "snapshot": args.name, "deleted": True},
                      indent=2, sort_keys=True))
 
@@ -400,7 +400,7 @@ def _snapshot_rollback(lab: Any, api: Any, args: Any, base: str) -> None:
     upid = api.call("POST", f"{base}/{args.name}/rollback")
     _await_snapshot_task(lab, api, upid, args)
     lab.audit("guest-snapshot-rollback", lease=args.lease, kind=args.kind,
-              vmid=args.vmid, name=args.name, sync=False)
+              vmid=args.vmid, name=args.name)
     print(json.dumps({"vmid": args.vmid, "snapshot": args.name, "rolled_back": True},
                      indent=2, sort_keys=True))
 
@@ -615,7 +615,7 @@ def cmd_run(lab: Any, args: Any) -> None:
             raise lab.LabError(f"detached run did not report a pid: {pid!r}")
         _record_run(lab, args.vmid, pid, log, command)
         lab.audit("guest-run-detached", lease=args.lease, vmid=args.vmid,
-                  pid=pid, sync=False)
+                  pid=pid)
         print(json.dumps({
             "vmid": args.vmid, "pid": pid, "log": log, "command": command,
             "next": f"proxmox-lab guest log --lease {args.lease} "
@@ -631,7 +631,7 @@ def cmd_run(lab: Any, args: Any) -> None:
     except GuestError as exc:
         raise lab.LabError(str(exc)) from None
     lab.audit("guest-run", lease=args.lease, vmid=args.vmid,
-              channel=result.channel, exit_code=result.exit_code, sync=False)
+              channel=result.channel, exit_code=result.exit_code)
     print(json.dumps(payload, indent=2, sort_keys=True))
     if not result.ok:
         raise lab.LabError(f"command exited {result.exit_code}")
@@ -689,7 +689,7 @@ def cmd_retain(lab: Any, args: Any) -> None:
     if args.forget:
         removed = inventory_module.forget(lab.STATE_ROOT, kind, args.vmid)
         lab.audit("retained-forgotten", kind=kind, vmid=args.vmid,
-                  found=removed, sync=False)
+                  found=removed)
         print(json.dumps(
             {"vmid": args.vmid, "kind": kind, "retained": False,
              "was_registered": removed},

@@ -10,8 +10,6 @@
 # Non-interactive:
 #   PXL_HOST=192.168.1.50 PXL_NODE=pve PXL_TOKEN_USER=agent@pve \
 #   PXL_TOKEN_NAME=lab PXL_TOKEN_SECRET=... PXL_MAC=aa:bb:.. ./install.sh --yes
-#   PXL_AUDIT_BACKEND=pocketbase PXL_PB_URL=https://pb.example \
-#   PXL_PB_TOKEN_SECRET=... ./install.sh --yes
 #   PXL_S3_BACKEND=existing PXL_S3_ENDPOINT=https://s3.example \
 #   PXL_S3_BUCKET=lab-scratch PXL_S3_KEY_ID_SECRET=... \
 #   PXL_S3_SECRET_KEY_SECRET=... ./install.sh --yes
@@ -135,31 +133,15 @@ if [ "$CONFIGURE" -eq 1 ]; then
     ask TOKEN_USER "API token user" "agent@pve"
     ask TOKEN_NAME "API token name" "lab"
     ask MAC        "Wired NIC MAC, for Wake-on-LAN" ""
-    ask_choice AUDIT_BACKEND \
-        "Audit backend (sqlite, jsonl, or pocketbase)" "sqlite" \
-        sqlite jsonl pocketbase
-    PB_URL=""
-    PB_COLLECTION="proxmox_lab_events"
-    PB_TOKEN_NAME="audit-token"
-    if [ "$AUDIT_BACKEND" = "pocketbase" ]; then
-        ask_choice PB_LOCATION \
-            "PocketBase location (existing or proxmox)" "existing" \
-            existing proxmox
-        if [ "$PB_LOCATION" = "proxmox" ]; then
-            say ""
-            say "  Run this once as root on the Proxmox host. It creates an"
-            say "  unprivileged PocketBase LXC, service account, port, and"
-            say "  first superuser; it prints the API URL when finished:"
-            say ""
-            say "  curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocketbase-host-setup.sh | bash"
-            say ""
-            die "re-run this controller setup with the printed PocketBase API URL"
-        fi
-        ask PB_URL "PocketBase URL (HTTPS, or trusted-LAN HTTP)" ""
-        [ -n "$PB_URL" ] || die "PocketBase URL is required when audit backend is pocketbase"
-        ask PB_COLLECTION "PocketBase audit collection" "proxmox_lab_events"
-        ask PB_TOKEN_NAME "Secret-store name for the PocketBase token" "audit-token"
-    fi
+    say ""
+    say "  The audit ledger is MariaDB on the Proxmox host. If you have not"
+    say "  provisioned it yet, finish this setup and then run:"
+    say ""
+    say "    proxmox-lab journal host-setup --host-change-authorized"
+    say ""
+    say "  It prints one export line. Paste that on every other controller and"
+    say "  they inherit every other secret automatically."
+    say ""
     ask_choice S3_BACKEND \
         "S3 scratch bucket for guest file transfer (none, existing, or lxc)" "none" \
         none existing lxc
@@ -193,11 +175,10 @@ if [ "$CONFIGURE" -eq 1 ]; then
     mkdir -p "$(dirname "$CONFIG")"
     [ -f "$CONFIG" ] || "$BIN" init --path "$CONFIG" >/dev/null
     "$PYTHON" - "$CONFIG" "$HOST" "$NODE" "$TOKEN_USER" "$TOKEN_NAME" "$MAC" \
-        "$BROADCAST" "$AUDIT_BACKEND" "$PB_URL" "$PB_COLLECTION" "$PB_TOKEN_NAME" \
-        "$S3_ENDPOINT" "$S3_BUCKET" "$S3_REGION" <<'PY'
+        "$BROADCAST" "$S3_ENDPOINT" "$S3_BUCKET" "$S3_REGION" <<'PY'
 import json, pathlib, re, sys
-(path, host, node, tuser, tname, mac, bcast, backend, pb_url, pb_collection,
- pb_secret, s3_endpoint, s3_bucket, s3_region) = sys.argv[1:15]
+(path, host, node, tuser, tname, mac, bcast,
+ s3_endpoint, s3_bucket, s3_region) = sys.argv[1:11]
 text = pathlib.Path(path).read_text()
 
 def setkey(text, section, key, value, required=False):
@@ -223,11 +204,6 @@ for key, value in (("host", host), ("node", node), ("token_user", tuser),
     text = setkey(text, "proxmox", key, value)
 for key, value in (("mac", mac), ("broadcast", bcast)):
     text = setkey(text, "power", key, value)
-text = setkey(text, "audit", "backend", backend, required=True)
-if backend == "pocketbase":
-    text = setkey(text, "audit", "pocketbase_url", pb_url, required=True)
-    text = setkey(text, "audit", "pocketbase_collection", pb_collection, required=True)
-    text = setkey(text, "audit", "pocketbase_token_secret", pb_secret, required=True)
 if s3_endpoint:
     text = setkey(text, "s3", "enabled", True, required=True)
     text = setkey(text, "s3", "endpoint", s3_endpoint, required=True)
@@ -270,31 +246,6 @@ elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
     fi
 else
     warn "no token provided -- run 'proxmox-lab secrets set proxmox-token'"
-fi
-
-# ---------------------------------------------------------- audit backend ---
-if [ "${AUDIT_BACKEND:-}" = "pocketbase" ]; then
-    step "PocketBase audit token"
-    PB_TOKEN_VALUE="${PXL_PB_TOKEN_SECRET:-}"
-    if "$BIN" secrets list 2>/dev/null | grep -q "\"$PB_TOKEN_NAME\": true"; then
-        say "  ${DIM}already stored in your keyring${RESET}"
-    elif [ -n "$PB_TOKEN_VALUE" ]; then
-        if printf '%s\n' "$PB_TOKEN_VALUE" \
-             | "$BIN" secrets set "$PB_TOKEN_NAME" --stdin >/dev/null 2>&1; then
-            say "  ${GREEN}stored${RESET}"
-        else
-            keyring_unavailable "$PB_TOKEN_NAME"
-        fi
-    elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
-        say "  ${DIM}Use a renewable PocketBase superuser token to bootstrap; it stays only in your OS keyring.${RESET}"
-        if "$BIN" secrets set "$PB_TOKEN_NAME"; then
-            say "  ${GREEN}stored${RESET}"
-        else
-            keyring_unavailable "$PB_TOKEN_NAME"
-        fi
-    else
-        warn "no PocketBase token provided -- run 'proxmox-lab secrets set $PB_TOKEN_NAME'"
-    fi
 fi
 
 # ---------------------------------------------------------------- s3 bucket ---
@@ -350,12 +301,8 @@ if "$BIN" doctor; then
     say "    proxmox-lab status"
     say "    proxmox-lab lease-begin --purpose \"first run\""
     say ""
-    if [ "${AUDIT_BACKEND:-}" = "pocketbase" ]; then
-        say "    # Prefer a restricted renewable audit agent after bootstrap:"
-        say "    proxmox-lab secrets set pocketbase-superuser-email"
-        say "    proxmox-lab secrets set pocketbase-superuser-password"
-        say "    proxmox-lab journal --provision-pocketbase-agent"
-    fi
+    say "    # If the audit ledger is not up yet, provision it once:"
+    say "    proxmox-lab journal host-setup --host-change-authorized"
     say "Docs: https://github.com/jr551/proxmox-agent-lab/blob/main/docs/INSTALL.md"
 else
     printf '\n%sAlmost there.%s Fix what doctor listed above, then re-run:\n\n' "$YELLOW$BOLD" "$RESET"

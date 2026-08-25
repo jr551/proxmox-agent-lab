@@ -111,7 +111,7 @@ Disk operations need `Sys.Audit` and `Sys.Modify` on `/nodes/pve`, which the lea
 
 Don't have an S3-compatible bucket yet? `install.sh` can provision one for you: choose the `lxc` S3 backend and it prints a root-only `minio-host-setup.sh` command that creates a minimal, unprivileged MinIO LXC (S3 API only, no browser console) on the Proxmox host, along with the bucket and an access key. See [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox).
 
-> **Canonical warning — trusted LAN only.** The optional PocketBase audit LXC (`pocketbase-host-setup.sh`) and the MinIO S3 LXC (`minio-host-setup.sh`) expose plain HTTP on the LAN with no TLS and — in the MinIO case — no browser console, only the S3 API. They are intended for a trusted LAN. **Do not port-forward them.** Put a TLS reverse proxy in front before exposing them to an untrusted network. This is the single canonical statement; [README.md](../README.md#optional-pocketbase-audit-host), [INSTALL.md](INSTALL.md#optional-host-pocketbase-on-proxmox) and [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox) link here rather than repeating it. The host setup scripts print the same warning.
+> **Canonical warning — trusted LAN only.** The MariaDB audit ledger (`mariadb-host-setup.sh`) and the MinIO S3 LXC (`minio-host-setup.sh`) listen on the LAN with no TLS and — in the MinIO case — no browser console, only the S3 API. They are intended for a trusted LAN. **Do not port-forward them.** Put a TLS reverse proxy in front before exposing them to an untrusted network. This is the single canonical statement; [README.md](../README.md), [INSTALL.md](INSTALL.md#the-audit-ledger) and [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox) link here rather than repeating it. The host setup scripts print the same warning.
 
 ### Bucket
 
@@ -203,7 +203,7 @@ All host-level storage changes share `--host-change-authorized`, like every host
 ## See also
 
 - [CONFIGURATION.md](CONFIGURATION.md#storage) — `[storage]` keys `upload_storages`/`bulk_storage`
-- [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox) / [INSTALL.md](INSTALL.md#optional-host-pocketbase-on-proxmox) — MinIO & PocketBase LXC setup (trusted LAN, see canonical warning above)
+- [INSTALL.md](INSTALL.md#optional-host-minio-on-proxmox) / [INSTALL.md](INSTALL.md#the-audit-ledger) — MinIO & MariaDB ledger setup (trusted LAN, see canonical warning above)
 - [disk.md](disk.md) — offline disk repair and ground-truth I/O measurement
 - [long-term-leases.md](long-term-leases.md) — weekly backup target selection
 - [safety-policy.md](safety-policy.md) — host-change authorization model

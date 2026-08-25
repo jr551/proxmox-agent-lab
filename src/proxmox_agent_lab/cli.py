@@ -35,7 +35,7 @@ from . import config as config_module
 from . import inventory as inventory_module
 from . import power as power_module
 from . import journal as journal_module
-from . import pocketbase as pocketbase_module
+from . import mariadb as mariadb_module
 from . import secrets_store
 from .config import ConfigError
 
@@ -69,7 +69,6 @@ LOCK_PATH = STATE_ROOT / "controller.lock"
 # installed package -- site-packages is not writable, and an operator's audit
 # trail is not part of the software.
 JOURNAL_ROOT = Path(CONFIG.audit.get("journal_dir") or (STATE_ROOT / "journal"))
-AUDIT_BACKEND = CONFIG.audit.get("backend", "sqlite")
 SENSITIVE_KEY = re.compile(
     r"(pass(word)?|token|secret|authorization|private.?key|cipassword|ssh.?keys?)",
     re.IGNORECASE,
@@ -226,319 +225,97 @@ def sweep_lock(name: str) -> Any:
         yield True
 
 
-def sync_repo(record: dict[str, Any], suffix: str) -> None:
-    """Optionally copy one audit record to a private git log repository.
+def _controller_id() -> str:
+    """This machine's name in the shared ledger."""
+    return str(CONFIG.audit.get("controller_id") or socket.gethostname())
 
-    Off by default: most people do not want their lab's audit trail pushed
-    anywhere. Enable with [audit] git_sync = true and git_repo = "<path>".
+
+_LEDGER_CACHE: Any = False
+
+
+def ledger() -> Any:
+    """Settings for the shared MariaDB ledger, or None if not configured yet.
+
+    Cached for the life of the process: this is consulted on every audited
+    action, and rebuilding it each time would re-read the bootstrap secret.
     """
-    if not CONFIG.audit.get("git_sync"):
+    global _LEDGER_CACHE
+    if _LEDGER_CACHE is False:
+        try:
+            secret = secrets_store.get(
+                CONFIG, secrets_store.BOOTSTRAP_SECRET, required=False
+            )
+        except secrets_store.SecretError:
+            secret = ""
+        _LEDGER_CACHE = journal_module.settings_from_config(CONFIG, secret)
+    return _LEDGER_CACHE
+
+
+_AUTO_MIGRATED = False
+
+
+def _auto_migrate_once() -> None:
+    """Carry a controller upgraded from an older release into the shared ledger.
+
+    Runs at most once per process, and at most once per machine (a marker file
+    records it). Silent and non-fatal: an upgrade must not turn the first
+    command after it into a failure.
+    """
+    global _AUTO_MIGRATED
+    if _AUTO_MIGRATED:
         return
-    configured = CONFIG.audit.get("git_repo")
-    if not configured:
+    _AUTO_MIGRATED = True
+    settings = ledger()
+    if settings is None or journal_module.migration_done(JOURNAL_ROOT):
+        return
+    detail = journal_module.auto_migrate(
+        settings, JOURNAL_ROOT, controller=_controller_id()
+    )
+    if detail and detail.get("uploaded"):
         print(
-            "warning: [audit] git_sync is on but git_repo is empty; "
-            "journal not pushed",
+            f"notice: carried {detail['uploaded']} event(s) from this "
+            "controller's previous local ledger into the shared MariaDB "
+            "ledger. The old files were left in place.",
             file=sys.stderr,
         )
-        return
-    try:
-        journal_module.sync_git(
-            Path(configured),
-            record,
-            suffix,
-            str(CONFIG.audit.get("git_branch") or "logs"),
-        )
-    except (OSError, RuntimeError, ValueError) as exc:
-        print(f"warning: journal sync failed: {str(exc)[:300]}", file=sys.stderr)
 
 
-_SUPERUSER_CREDENTIAL_KEYS = (
-    "pocketbase-superuser-email", "pocketbase-superuser-password",
-)
-_AGENT_CREDENTIAL_KEYS = (
-    "pocketbase-agent-email", "pocketbase-agent-password",
-)
+def audit(event: str, **fields: Any) -> None:
+    """Append one redacted event to the shared ledger.
 
-
-def _pocketbase_token_secret_name() -> str:
-    return str(CONFIG.audit.get("pocketbase_token_secret") or "audit-token").strip()
-
-
-def _pocketbase_settings() -> tuple[str, str, str, float, float]:
-    url = str(CONFIG.audit.get("pocketbase_url") or "").strip()
-    collection = str(
-        CONFIG.audit.get("pocketbase_collection") or "proxmox_lab_events"
-    ).strip()
-    secret_name = _pocketbase_token_secret_name()
-    try:
-        timeout = float(CONFIG.audit.get("pocketbase_timeout_seconds", 10))
-        refresh_before = float(
-            CONFIG.audit.get("pocketbase_auth_refresh_before_seconds", 300)
-        )
-    except (TypeError, ValueError):
-        raise LabError(
-            "[audit] PocketBase timeout and refresh window must be numbers"
-        ) from None
-    if not url:
-        raise LabError("[audit] pocketbase_url is not set")
-    if timeout <= 0:
-        raise LabError("[audit] pocketbase_timeout_seconds must be positive")
-    if refresh_before < 0:
-        raise LabError(
-            "[audit] pocketbase_auth_refresh_before_seconds cannot be negative"
-        )
-    return url, collection, secret_name, timeout, refresh_before
-
-
-def _pocketbase_password_auth(
-    url: str, auth_collection: str, timeout: float,
-) -> str | None:
-    if auth_collection == "_superusers":
-        identity_key, password_key = _SUPERUSER_CREDENTIAL_KEYS
-    else:
-        identity_key, password_key = _AGENT_CREDENTIAL_KEYS
-    try:
-        identity = secrets_store.get(CONFIG, identity_key, required=False)
-        password = secrets_store.get(CONFIG, password_key, required=False)
-    except secrets_store.SecretError as exc:
-        raise LabError(str(exc)) from None
-    if not identity or not password:
-        return None
-    try:
-        return pocketbase_module.Client.authenticate_password(
-            url, auth_collection, identity, password, timeout=timeout
-        )
-    except (ValueError, pocketbase_module.PocketBaseError) as exc:
-        raise LabError(str(exc)) from None
-
-
-# A nonrenewable token cannot be refreshed, so once it lapses every journal
-# read and audit write fails hard. Warn well before that happens.
-_NONRENEWABLE_TOKEN_WARNING_SECONDS = 48 * 3600
-
-
-def _warn_if_token_nonrenewable(token: str) -> None:
-    claims = pocketbase_module.token_claims(token)
-    if claims.get("refreshable") is not False:
-        return
-    expiry = claims.get("exp")
-    if isinstance(expiry, bool) or not isinstance(expiry, (int, float)):
-        return
-    remaining = expiry - time.time()
-    if remaining > _NONRENEWABLE_TOKEN_WARNING_SECONDS:
-        return
-    hours = max(0.0, remaining) / 3600
-    print(
-        "notice: the PocketBase audit token is nonrenewable and expires in "
-        f"{hours:.1f}h; run 'proxmox-lab journal --provision-pocketbase-agent' "
-        "to switch to a renewable agent, or store the pocketbase-agent-email "
-        "and pocketbase-agent-password secrets so expiry can re-authenticate",
-        file=sys.stderr,
-    )
-
-
-def _provision_pocketbase_agent(
-    superuser: pocketbase_module.Client,
-) -> dict[str, Any]:
-    """Create (or rotate) the permanent restricted audit agent.
-
-    Stores the agent's password credentials and its fresh token in the
-    configured secret store, so expiry can always re-authenticate.
+    Never fails the action being audited. The lab host is powered off between
+    leases by design, so an unreachable ledger spools locally and is uploaded
+    later by 'proxmox-lab journal --flush-spool'.
     """
-    agent_collection = str(
-        CONFIG.audit.get("pocketbase_agent_collection")
-        or "proxmox_lab_agents"
-    ).strip()
-    try:
-        identity = secrets_store.get(
-            CONFIG, "pocketbase-agent-email", required=False
-        )
-        password = secrets_store.get(
-            CONFIG, "pocketbase-agent-password", required=False
-        )
-    except secrets_store.SecretError as exc:
-        raise LabError(str(exc)) from None
-    if bool(identity) != bool(password):
-        raise LabError(
-            "PocketBase agent credentials are incomplete; store both "
-            "'pocketbase-agent-email' and 'pocketbase-agent-password', "
-            "or remove both before provisioning."
-        )
-    rotate_existing = not identity
-    if not identity:
-        identity, password = pocketbase_module.Client.new_agent_credentials()
-        try:
-            secrets_store.store(CONFIG, "pocketbase-agent-email", identity)
-            secrets_store.store(
-                CONFIG, "pocketbase-agent-password", password
-            )
-        except secrets_store.SecretError as exc:
-            raise LabError(str(exc)) from None
-    result = superuser.provision_agent(
-        agent_collection,
-        identity,
-        password,
-        rotate_existing=rotate_existing,
-    )
-    try:
-        _url, _collection, token_secret, _timeout, _refresh = (
-            _pocketbase_settings()
-        )
-        secrets_store.store(CONFIG, token_secret, result["token"])
-    except secrets_store.SecretError as exc:
-        raise LabError(
-            "PocketBase agent was provisioned but its token could not be "
-            "stored: " + str(exc)
-        ) from None
-    return result
-
-
-def pocketbase_client() -> pocketbase_module.Client:
-    url, collection, secret_name, timeout, refresh_before = _pocketbase_settings()
-    try:
-        token = secrets_store.get(CONFIG, secret_name)
-        client = pocketbase_module.Client(url, token, collection, timeout=timeout)
-    except (ValueError, secrets_store.SecretError) as exc:
-        raise LabError(str(exc)) from None
-    auth_collection = pocketbase_module.token_auth_collection(token)
-    if auth_collection == "_superusers":
-        # A superuser token pasted into the audit slot is over-privileged
-        # and, in practice, short-lived. Convert it once into a permanent
-        # least-privileged agent with password re-authentication, store the
-        # agent token in its place, and use that from here on.
-        try:
-            result = _provision_pocketbase_agent(client)
-        except pocketbase_module.PocketBaseError as exc:
-            raise LabError(
-                "the stored audit token is a PocketBase superuser token, and "
-                "converting it into a permanent restricted agent failed: "
-                + str(exc)
-            ) from None
-        try:
-            client = pocketbase_module.Client(
-                url, result["token"], collection, timeout=timeout
-            )
-        except ValueError as exc:
-            raise LabError(str(exc)) from None
-        print(
-            "notice: the stored audit token was a PocketBase superuser "
-            "token; a permanent least-privileged agent was provisioned in "
-            f"collection {result['agent_collection']!r} and its renewable "
-            "token now replaces the superuser token in the secret store",
-            file=sys.stderr,
-        )
-        return client
-    if (
-        auth_collection is not None
-        and pocketbase_module.token_expires_within(
-            token, refresh_before, now=time.time()
-        )
-    ):
-        try:
-            refreshed = client.refresh_auth_token(auth_collection)
-        except pocketbase_module.PocketBaseError as exc:
-            if exc.status not in {401, 403}:
-                raise LabError(str(exc)) from None
-            refreshed = _pocketbase_password_auth(
-                url, auth_collection, timeout
-            )
-            if refreshed is None:
-                raise LabError(
-                    "PocketBase token is expired or nonrenewable and no "
-                    f"password credentials are stored for {auth_collection!r}"
-                ) from None
-        try:
-            secrets_store.store(CONFIG, secret_name, refreshed)
-        except secrets_store.SecretError as exc:
-            raise LabError(
-                "PocketBase token refreshed but could not be persisted: "
-                + str(exc)
-            ) from None
-        try:
-            client = pocketbase_module.Client(
-                url, refreshed, collection, timeout=timeout
-            )
-        except ValueError as exc:
-            raise LabError(str(exc)) from None
-    _warn_if_token_nonrenewable(client.token)
-    return client
-
-
-def pocketbase_superuser_client() -> pocketbase_module.Client:
-    """Authenticate the provisioner without reusing the audit agent token."""
-    url, collection, _secret_name, timeout, _refresh_before = _pocketbase_settings()
-    token = _pocketbase_password_auth(url, "_superusers", timeout)
-    if token is None:
-        raise LabError(
-            "PocketBase superuser credentials are not stored. Run "
-            "'proxmox-lab secrets set pocketbase-superuser-email' and "
-            "'proxmox-lab secrets set pocketbase-superuser-password'."
-        )
-    try:
-        return pocketbase_module.Client(url, token, collection, timeout=timeout)
-    except ValueError as exc:
-        raise LabError(str(exc)) from None
-
-
-def _audit_spool_path() -> Path:
-    return JOURNAL_ROOT / "spool.jsonl"
-
-
-def _spool_audit_event(record: dict[str, Any], reason: str) -> None:
-    """Keep an already-redacted event locally when the backend rejects it.
-
-    Losing audit credentials mid-session must not force abandoning the tool:
-    the event is preserved append-only and uploaded later with
-    'journal --flush-spool'.
-    """
-    path = _audit_spool_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as handle:
-        handle.write(json.dumps(record, sort_keys=True) + "\n")
-    print(
-        f"notice: audit backend unavailable ({reason}); event "
-        f"{record.get('event')!r} spooled to {path}. Fix the credentials "
-        "(e.g. 'proxmox-lab secrets set "
-        f"{_pocketbase_token_secret_name()}'), then upload the backlog with "
-        "'proxmox-lab journal --flush-spool'",
-        file=sys.stderr,
-    )
-
-
-def audit(event: str, *, sync: bool = True, **fields: Any) -> None:
     now = utc_now()
     record = {
         "timestamp": now.isoformat().replace("+00:00", "Z"),
         "event": event,
+        "event_id": uuid.uuid4().hex,
+        "controller": _controller_id(),
         **redact(fields),
     }
-    client: pocketbase_module.Client | None = None
-    spooled = False
-    if AUDIT_BACKEND == "pocketbase":
-        record["event_id"] = uuid.uuid4().hex
-        record["controller"] = str(
-            CONFIG.audit.get("controller_id") or socket.gethostname()
-        )
-        # An expired or nonrenewable token must not abort the action being
-        # audited; the git-synced JSONL mirror below still records it and the
-        # event is spooled for a later '--flush-spool'.
-        try:
-            client = pocketbase_client()
-        except LabError as exc:
-            _spool_audit_event(record, str(exc))
-            spooled = True
-    if not spooled:
-        try:
-            journal_module.append(
-                JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
-            )
-        except pocketbase_module.PocketBaseError as exc:
-            if exc.status not in (401, 403):
-                raise
-            _spool_audit_event(record, f"PocketBase HTTP {exc.status}")
-    if sync:
-        sync_repo(record, event)
+    _auto_migrate_once()
+    outcome = journal_module.record(
+        ledger(), JOURNAL_ROOT, record, controller=_controller_id()
+    )
+    if outcome == "spooled" and not _SPOOL_NOTICE_SHOWN:
+        _note_spooling()
+
+
+_SPOOL_NOTICE_SHOWN = False
+
+
+def _note_spooling() -> None:
+    """Say once per run that the ledger is unreachable and events are queued."""
+    global _SPOOL_NOTICE_SHOWN
+    _SPOOL_NOTICE_SHOWN = True
+    print(
+        "notice: the audit ledger is unreachable; events are being spooled to "
+        f"{journal_module.spool_path(JOURNAL_ROOT)}. Upload them with "
+        "'proxmox-lab journal --flush-spool' once the lab host is up.",
+        file=sys.stderr,
+    )
 
 
 _TOKEN_CACHE: str | None = None
@@ -629,36 +406,14 @@ class ProxmoxAPI:
             return False
 
 
-_AUDIT_THROUGH_BOOT_RETRY_SECONDS = 30
-
-
 def _audit_through_boot(event: str, **fields: Any) -> None:
-    """audit(), tolerant of a just-woken host's own audit backend still
-    starting up.
+    """audit(), for the moment right after the lab host wakes.
 
-    The audit backend can itself be hosted on this same lab host (see
-    pocketbase-host-setup.sh) -- an onboot LXC that starts alongside Proxmox
-    but is not necessarily answering the instant the API is. A short bounded
-    retry covers that normal startup race; if the backend is still
-    unreachable after it, the event is dropped with a loud warning rather
-    than failing the power-on itself, since losing one audit line is
-    recoverable and failing to confirm the host is up is not.
+    The ledger runs on that same host, so it is routinely not answering yet
+    when the Proxmox API already is. `audit` never raises -- it spools -- so
+    this is simply audit() with a name that says why the call site cares.
     """
-    deadline = time.monotonic() + _AUDIT_THROUGH_BOOT_RETRY_SECONDS
-    while True:
-        try:
-            audit(event, **fields)
-            return
-        except pocketbase_module.PocketBaseError as exc:
-            if time.monotonic() >= deadline:
-                print(
-                    f"warning: '{event}' was not recorded to the audit "
-                    f"backend (still unreachable {_AUDIT_THROUGH_BOOT_RETRY_SECONDS}s "
-                    f"after power-on): {exc}",
-                    file=sys.stderr,
-                )
-                return
-            time.sleep(3)
+    audit(event, **fields)
 
 
 def ensure_on(api: ProxmoxAPI, timeout: int | None = None) -> bool:
@@ -803,7 +558,6 @@ def stop_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
             vmid=vmid,
             kind=kind,
             task_id=upid,
-            sync=False,
         )
         hard_upid = api.call("POST", f"/nodes/{NODE}/{kind}/{vmid}/status/stop")
         wait_task(api, hard_upid, timeout=60)
@@ -1024,14 +778,13 @@ def shutdown_host(api: ProxmoxAPI) -> bool:
     running = running_guest_vmids(api)
     if running:
         audit("lab-power-off-blocked-by-running-guest", host=HOST, node=NODE,
-              vmids=running, sync=False)
+              vmids=running)
         return False
     try:
         task = api.call("POST", f"/nodes/{NODE}/status", {"command": "shutdown"})
-        audit("lab-graceful-shutdown-requested", node=NODE, task_id=task,
-              sync=False)
+        audit("lab-graceful-shutdown-requested", node=NODE, task_id=task)
     except LabError as exc:
-        audit("lab-graceful-shutdown-request-failed", error=str(exc), sync=False)
+        audit("lab-graceful-shutdown-request-failed", error=str(exc))
     deadline = time.monotonic() + 240
     down_count = 0
     while time.monotonic() < deadline:
@@ -1054,7 +807,7 @@ def shutdown_host(api: ProxmoxAPI) -> bool:
         return False
     try:
         detail = power_module.force_off(CONFIG)
-        audit("lab-emergency-force-off-requested", sync=False, **detail)
+        audit("lab-emergency-force-off-requested", **detail)
     except (power_module.PowerError, ConfigError) as exc:
         audit("lab-power-off-unverified", host=HOST, node=NODE, error=str(exc))
         return False
@@ -1637,7 +1390,6 @@ def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
                 kind=kind,
                 vmid=vmid,
                 owner=owner,
-                sync=False,
             )
             continue
         try:
@@ -1659,7 +1411,6 @@ def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
                 kind=kind,
                 vmid=vmid,
                 policy=resource.get("policy", "delete"),
-                sync=False,
             )
         except LabError as exc:
             failures.append(f"{kind}/{vmid}: {exc}")
@@ -1669,7 +1420,6 @@ def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
                 kind=kind,
                 vmid=vmid,
                 error=str(exc),
-                sync=False,
             )
     lease["state"] = "closed" if not failures else "cleanup_failed"
     lease["closed_at"] = iso_now()
@@ -1916,12 +1666,7 @@ def cmd_lease_abandon(args: argparse.Namespace) -> None:
                 missing=missing,
                 reason=lease["abandoned_reason"],
             )
-        except (
-            LabError,
-            OSError,
-            ValueError,
-            pocketbase_module.PocketBaseError,
-        ) as exc:
+        except (LabError, OSError, ValueError) as exc:
             audit_error = str(exc)
             print(
                 "warning: lease was closed but its audit event could not be "
@@ -2101,7 +1846,6 @@ def reclaim_orphans(
                 vmid=vmid,
                 lease_tag=guest.get("lease_tag"),
                 signal=activity.get("signal"),
-                sync=False,
             )
             continue
         try:
@@ -2119,7 +1863,7 @@ def reclaim_orphans(
             result["failed"][str(vmid)] = str(exc)[:300]
             audit(
                 "orphan-guest-stop-failed", kind=kind, vmid=vmid,
-                error=str(exc)[:300], sync=False,
+                error=str(exc)[:300],
             )
     return result
 
@@ -2261,7 +2005,6 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
                 "mcp-idle-shutdown-triggered",
                 idle_seconds=idle_seconds,
                 threshold_seconds=MCP_IDLE_SHUTDOWN_SECONDS,
-                sync=False,
             )
             host_powered_off = shutdown_host(api)
         # The watchdog runs every five minutes. Recording a no-op sweep would
@@ -2483,46 +2226,15 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         "state_dir": str(STATE_ROOT),
         "journal_dir": str(JOURNAL_ROOT),
         "audit": {
-            "local_backend": AUDIT_BACKEND,
-            # Git sync is an independent, redacted JSONL export. It remains
-            # valid when the richer local ledger is SQLite.
-            "git_sync": bool(CONFIG.audit.get("git_sync")),
-            "git_repo": (
-                str(CONFIG.audit.get("git_repo") or "")
-                if CONFIG.audit.get("git_sync") else None
-            ),
-            "git_branch": (
-                str(CONFIG.audit.get("git_branch") or "logs")
-                if CONFIG.audit.get("git_sync") else None
-            ),
+            "ledger": ledger().describe() if ledger() else None,
         },
     }
-    if AUDIT_BACKEND not in {"sqlite", "jsonl", "pocketbase"}:
-        problems.append(f"[audit] unsupported backend: {AUDIT_BACKEND}")
-    if CONFIG.audit.get("git_sync"):
-        configured = str(CONFIG.audit.get("git_repo") or "")
-        if not configured:
-            report["audit"]["git_status"] = {
-                "ok": False, "problem": "git_repo is empty",
-            }
-            problems.append(
-                "[audit] git_sync is on but git_repo is empty; no audit "
-                "record is being exported"
-            )
-        else:
-            git_status = journal_module.git_sync_status(
-                Path(configured),
-                str(CONFIG.audit.get("git_branch") or "logs"),
-            )
-            report["audit"]["git_status"] = git_status
-            if not git_status["ok"]:
-                problems.append(
-                    "[audit] git_sync is enabled but the mirror is unusable "
-                    f"({git_status['problem']}): {git_status['repo']}. Each "
-                    "mutating command only prints a warning, so the private "
-                    "export has been failing silently"
-                )
-    spool = _audit_spool_path()
+    if ledger() is None:
+        problems.append(
+            "[audit] no ledger configured. Run 'proxmox-lab journal "
+            "host-setup' to provision MariaDB on the Proxmox host."
+        )
+    spool = journal_module.spool_path(JOURNAL_ROOT)
     try:
         spooled: int | None = sum(
             1 for line in spool.read_text().splitlines() if line.strip()
@@ -2534,21 +2246,9 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     if spooled:
         problems.append(
             f"{spooled} audit record(s) are still spooled locally at {spool}: "
-            "the configured backend refused them. Upload the backlog with "
+            "the ledger was unreachable. Upload the backlog with "
             "'proxmox-lab journal --flush-spool'"
         )
-    if AUDIT_BACKEND == "pocketbase":
-        report["audit"]["pocketbase"] = {
-            "url": str(CONFIG.audit.get("pocketbase_url") or ""),
-            "collection": str(
-                CONFIG.audit.get("pocketbase_collection")
-                or "proxmox_lab_events"
-            ),
-            "token_secret": str(
-                CONFIG.audit.get("pocketbase_token_secret")
-                or "audit-token"
-            ),
-        }
     if CONFIG.unknown_sections:
         report["unknown_sections"] = CONFIG.unknown_sections
         problems.append(
@@ -2580,46 +2280,22 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         problems.append("Proxmox API token not stored; run "
                         "'proxmox-lab secrets set proxmox-token'")
 
-    if AUDIT_BACKEND == "pocketbase":
-        try:
-            secrets_store.get(
-                CONFIG,
-                str(
-                    CONFIG.audit.get("pocketbase_token_secret")
-                    or "audit-token"
-                ),
+    settings = ledger()
+    if settings is not None:
+        report["ledger_reachable"] = mariadb_module.ping(settings)
+        if not report["ledger_reachable"]:
+            # Not a problem: the lab host is off between leases by design, and
+            # events spool until it is back.
+            report["ledger_note"] = (
+                "ledger unreachable -- expected when the lab host is powered "
+                "off; events spool locally until it returns"
             )
-            report["pocketbase_token_stored"] = True
-        except secrets_store.SecretError:
-            report["pocketbase_token_stored"] = False
-            problems.append(
-                "PocketBase token not stored; run "
-                "'proxmox-lab secrets set audit-token'"
-            )
-        if not CONFIG.audit.get("pocketbase_url"):
-            problems.append("[audit] pocketbase_url is not set")
-        elif report.get("pocketbase_token_stored"):
-            try:
-                client = pocketbase_client()
-                try:
-                    client.get_collection()
-                except pocketbase_module.PocketBaseError as exc:
-                    # The collections API is superuser-only. A restricted
-                    # audit agent (the recommended credential) gets a 403
-                    # there even though it can read and write the ledger,
-                    # so prove reachability through the records API it is
-                    # actually entitled to.
-                    if exc.status != 403 or (
-                        pocketbase_module.token_auth_collection(client.token)
-                        == "_superusers"
-                    ):
-                        raise
-                    client.query(limit=1)
-                report["pocketbase_collection_reachable"] = True
-            except (LabError, pocketbase_module.PocketBaseError) as exc:
-                report["pocketbase_collection_reachable"] = False
+        else:
+            pending = len(journal_module.read_spool(JOURNAL_ROOT))
+            if pending:
                 problems.append(
-                    f"PocketBase audit collection check failed: {exc}"
+                    f"{pending} audit event(s) are spooled locally; upload "
+                    "them with 'proxmox-lab journal --flush-spool'"
                 )
     mode = CONFIG.power.get("mode")
     report["power"] = {
@@ -2731,111 +2407,174 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         raise LabError(f"{len(problems)} problem(s) found")
 
 
-def cmd_journal(args: argparse.Namespace) -> None:
-    """Read, migrate, or provision the audit ledger."""
-    if args.provision_pocketbase_agent:
-        result = _provision_pocketbase_agent(pocketbase_superuser_client())
-        audit = result["audit_collection"]
-        print(json.dumps({
-            "agent_collection": result["agent_collection"],
-            "agent_created": result["agent_created"],
-            "audit_collection_created": audit["created"],
-            "credential_mode": "password-reauthentication",
-        }, indent=2, sort_keys=True))
-        return
-    needs_pocketbase = (
-        AUDIT_BACKEND == "pocketbase"
-        or args.provision_pocketbase
-        or args.migrate_sqlite_to_pocketbase
-        or args.flush_spool
+def _guard_install_block(hostguard_module: Any) -> str:
+    """Shell that writes the lease guard onto the host and starts its timer."""
+    script = hostguard_module.GUARD_SCRIPT.replace("\\", "\\\\")
+    return (
+        "cat > /usr/local/lib/pxl-hostguard.py <<'PXLGUARD'\n"
+        + hostguard_module.GUARD_SCRIPT
+        + "\nPXLGUARD\nchmod 755 /usr/local/lib/pxl-hostguard.py\n"
+        + hostguard_module.GUARD_UNITS
     )
-    client = pocketbase_client() if needs_pocketbase else None
-    if args.provision_pocketbase:
-        if client is None:
-            raise LabError("PocketBase client is not configured")
-        result = client.provision()
+
+
+def _provision_ledger(args: argparse.Namespace) -> dict[str, Any]:
+    """Provision MariaDB on the Proxmox host and seed the shared secrets.
+
+    A persistent, unprivileged container marked onboot, published on the
+    hypervisor's own address. Deliberately not lease-owned: the ledger has to
+    outlive the leases it records, so lease-end must never destroy it.
+    """
+    if not args.host_change_authorized:
+        raise LabError(
+            "provisioning the audit ledger creates a container and a NAT rule "
+            "on the Proxmox host. Re-run with --host-change-authorized only "
+            "when the user asked for it."
+        )
+    from . import hostguard as hostguard_module
+    from . import memflow as memflow_module
+
+    ctid = args.ctid or 9310
+    storage = args.storage or str(CONFIG.storage.get("bulk_storage") or "local-lvm")
+    existing = secrets_store.get(
+        CONFIG, secrets_store.BOOTSTRAP_SECRET, required=False
+    )
+    password = existing or secrets.token_urlsafe(24)
+    script = (
+        mariadb_module.HOST_SETUP_SCRIPT
+        .replace("__CTID__", str(ctid))
+        .replace("__STORAGE__", storage)
+        .replace("__BRIDGE__", str(args.bridge))
+        .replace("__DBNAME__", str(CONFIG.audit.get("database") or "proxmox_lab"))
+        .replace("__DBUSER__", str(CONFIG.audit.get("user") or "proxmox_lab"))
+        .replace("__DBPASS__", password)
+        .replace("__GUARD_INSTALL__", _guard_install_block(hostguard_module))
+    )
+    memflow_module._require_enabled(_module())
+    proc = memflow_module._ssh(
+        _module(), ["bash", "-s"], timeout=args.timeout, stdin=script
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode not in (0, None) or "ledger-ready" not in output:
+        raise LabError(
+            "audit ledger provisioning failed: " + output.strip()[-800:]
+        )
+
+    settings = journal_module.settings_from_config(CONFIG, password)
+    if settings is None:
+        raise LabError("ledger provisioned but [audit] host is not resolvable")
+    mariadb_module.ensure_schema(settings)
+
+    # Seed the shared store so a second controller needs only this password.
+    seeded = _seed_shared_secrets(settings)
+    env_var = secrets_store._env_name(secrets_store.BOOTSTRAP_SECRET)
+    global _LEDGER_CACHE
+    _LEDGER_CACHE = settings
+    return {
+        "ctid": ctid,
+        "ledger": settings.describe(),
+        "reachable": mariadb_module.ping(settings),
+        "shared_secrets_seeded": seeded,
+        "bootstrap_env_var": env_var,
+        # Printed once, here, because there is nowhere else to get it: MariaDB
+        # keeps only a hash, and this is the credential every other controller
+        # needs. Re-running host-setup with it already in the environment keeps
+        # the same one rather than rotating it.
+        "bootstrap_export": f"export {env_var}='{password}'",
+        "bootstrap_password_was_generated": not existing,
+        "next": [
+            f"Put this in the environment of every controller:  export {env_var}=...",
+            "proxmox-lab journal --migrate    # carry this machine's history over",
+        ],
+        "host_output": output.strip()[-400:],
+    }
+
+
+def _seed_shared_secrets(settings: Any) -> list[str]:
+    """Copy this controller's secrets into the shared store, once.
+
+    This is what makes adding a machine a one-liner. Only secrets this
+    controller can actually read are copied, and an existing shared value is
+    never overwritten -- the first controller to set one wins.
+    """
+    now = utc_now().isoformat().replace("+00:00", "Z")
+    existing = {row["name"] for row in mariadb_module.list_secrets(settings)}
+    seeded: list[str] = []
+    for name in secrets_store.KNOWN_SECRETS:
+        if name == secrets_store.BOOTSTRAP_SECRET or name in existing:
+            continue
+        try:
+            value = secrets_store.get(CONFIG, name, required=False)
+        except secrets_store.SecretError:
+            value = ""
+        if not value:
+            # An upgraded controller may still hold this only in the OS
+            # keystore it used before secrets moved to the environment.
+            legacy = secrets_store.legacy_keystore()
+            value = (legacy and secrets_store.read_legacy(legacy, name)) or ""
+        if not value:
+            continue
+        mariadb_module.put_secret(
+            settings, name, value,
+            updated_by=_controller_id(), updated_at=now,
+        )
+        seeded.append(name)
+    return seeded
+
+
+def cmd_journal(args: argparse.Namespace) -> None:
+    """Read the shared audit ledger, or carry an old local one into it."""
+    if args.host_setup:
+        result = _provision_ledger(args)
         print(json.dumps(result, indent=2, sort_keys=True))
         return
-    if args.migrate_sqlite_to_pocketbase:
-        if client is None:
-            raise LabError("PocketBase client is not configured")
-        with controller_lock():
-            provision = client.provision()
-            source_dir = (
-                Path(args.sqlite_journal_dir).expanduser()
-                if args.sqlite_journal_dir
-                else JOURNAL_ROOT
-            )
-            result = journal_module.migrate_sqlite_to_pocketbase(
-                source_dir,
-                client,
-                controller=str(
-                    CONFIG.audit.get("controller_id") or socket.gethostname()
-                ),
-            )
-        result["collection"] = client.collection_name
-        result["collection_created"] = provision["created"]
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return
+
+    settings = ledger()
+    if settings is None:
+        raise LabError(
+            "no audit ledger configured. Run 'proxmox-lab journal host-setup' "
+            "to provision MariaDB on the Proxmox host."
+        )
+
     if args.flush_spool:
-        path = _audit_spool_path()
-        lines = path.read_text().splitlines() if path.exists() else []
-        uploaded, duplicates, remaining = 0, 0, []
-        failure: str | None = None
-        for index, line in enumerate(lines):
-            if failure is not None:
-                remaining.append(line)
-                continue
-            record = json.loads(line)
-            try:
-                journal_module.append(
-                    JOURNAL_ROOT, AUDIT_BACKEND, record, pocketbase=client
-                )
-                uploaded += 1
-            except pocketbase_module.PocketBaseError as exc:
-                if exc.status == 400:
-                    # The collection's unique event_id index rejects a
-                    # re-upload of an event a previous flush already sent.
-                    duplicates += 1
-                else:
-                    failure = str(exc)
-                    remaining.append(line)
-        if remaining:
-            path.write_text("\n".join(remaining) + "\n")
-        elif path.exists():
-            path.unlink()
-        result = {
-            "uploaded": uploaded,
-            "duplicates_skipped": duplicates,
-            "remaining": len(remaining),
-        }
-        if failure is not None:
-            result["stopped_on_error"] = failure
-        print(json.dumps(result, indent=2, sort_keys=True))
-        if failure is not None:
-            raise LabError(
-                f"spool flush stopped after {uploaded} upload(s): {failure}"
+        with controller_lock():
+            result = journal_module.flush_spool(
+                settings, JOURNAL_ROOT, controller=_controller_id()
             )
+        print(json.dumps(result, indent=2, sort_keys=True))
         return
-    if args.summary:
+
+    if args.migrate:
+        with controller_lock():
+            result = journal_module.migrate_legacy(
+                settings, JOURNAL_ROOT, controller=_controller_id()
+            )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+
+    if args.migrations:
         print(json.dumps(
-            journal_module.summary(
-                JOURNAL_ROOT, backend=AUDIT_BACKEND, pocketbase=client
-            ),
-            indent=2,
-            sort_keys=True,
+            {"migrations": mariadb_module.migrations(settings)},
+            indent=2, sort_keys=True, default=str,
         ))
         return
-    if args.import_jsonl:
-        count = journal_module.import_jsonl(JOURNAL_ROOT)
-        print(json.dumps({"imported": count}, indent=2))
+
+    if args.summary:
+        print(json.dumps(
+            journal_module.summary(settings),
+            indent=2, sort_keys=True, default=str,
+        ))
         return
+
     events = journal_module.query(
-        JOURNAL_ROOT, limit=args.limit, lease=args.lease,
-        event=args.event, since=args.since,
-        backend=AUDIT_BACKEND, pocketbase=client,
+        settings,
+        limit=args.limit,
+        lease=args.lease,
+        event=args.event,
+        since=args.since,
+        controller=args.controller,
     )
-    print(json.dumps(events, indent=2, sort_keys=True))
+    print(json.dumps(events, indent=2, sort_keys=True, default=str))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2882,32 +2621,33 @@ def parser() -> argparse.ArgumentParser:
     ledger.add_argument("--event", help="exact name, or a * wildcard")
     ledger.add_argument("--since", help="ISO timestamp lower bound")
     ledger.add_argument("--summary", action="store_true")
-    ledger.add_argument(
-        "--provision-pocketbase",
-        action="store_true",
-        help="create or validate the configured PocketBase audit collection",
-    )
-    ledger.add_argument(
-        "--provision-pocketbase-agent",
-        action="store_true",
-        help="create a renewable restricted audit agent using stored superuser credentials",
-    )
+    ledger.add_argument("--controller", help="only this controller's events")
     ledger.add_argument(
         "--flush-spool",
         action="store_true",
-        help="upload audit events spooled locally while the backend was down",
+        help="upload audit events spooled locally while the ledger was down",
     )
-    ledger.add_argument("--import-jsonl", action="store_true",
-                        help="load legacy per-day JSONL files into the database")
     ledger.add_argument(
-        "--migrate-sqlite-to-pocketbase",
+        "--migrate",
         action="store_true",
-        help="copy the SQLite audit ledger to the configured PocketBase collection",
+        help="carry this controller's pre-MariaDB ledger into the shared one "
+             "(runs automatically on upgrade; safe to re-run)",
     )
     ledger.add_argument(
-        "--sqlite-journal-dir",
-        help="source journal directory (default: configured journal_dir)",
+        "--migrations",
+        action="store_true",
+        help="which controllers have already migrated their old ledger",
     )
+    ledger.add_argument(
+        "--host-setup",
+        action="store_true",
+        help="provision MariaDB on the Proxmox host (host change)",
+    )
+    ledger.add_argument("--host-change-authorized", action="store_true")
+    ledger.add_argument("--ctid", type=int, help="container ID for the ledger")
+    ledger.add_argument("--storage", help="storage for the ledger container")
+    ledger.add_argument("--bridge", default="vmbr0")
+    ledger.add_argument("--timeout", type=int, default=1800)
     ledger.set_defaults(func=cmd_journal)
 
     power = sub.add_parser(
@@ -3102,7 +2842,7 @@ def _expected_errors() -> tuple[type[BaseException], ...]:
     """
     errors: list[type[BaseException]] = [
         LabError, ConfigError, secrets_store.SecretError,
-        pocketbase_module.PocketBaseError, power_module.PowerError, ValueError,
+        mariadb_module.MariaDBError, power_module.PowerError, ValueError,
         json.JSONDecodeError,
     ]
     for name in (

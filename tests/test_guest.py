@@ -74,8 +74,7 @@ class GuestTemplateTests(unittest.TestCase):
                 "POST", "/nodes/aipve/qemu/7/template"
             )
             lab.audit.assert_called_once_with(
-                "guest-template", lease="L1", kind="qemu", vmid=7, sync=False
-            )
+                "guest-template", lease="L1", kind="qemu", vmid=7)
 
     def test_clone_registers_new_guest_under_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,7 +97,6 @@ class GuestTemplateTests(unittest.TestCase):
             self.assertEqual((kind, vmid), ("qemu", 8))
             lab.audit.assert_called_once_with(
                 "guest-clone", lease="L1", kind="qemu", template=7, vmid=8,
-                sync=False,
             )
 
 
@@ -179,7 +177,6 @@ class DetachedRunTests(unittest.TestCase):
             self.assertTrue(record.is_file())
             lab.audit.assert_called_once_with(
                 "guest-run-detached", lease="L1", vmid=7, pid="4242",
-                sync=False,
             )
 
     def test_log_reads_tail_and_stops_on_exit(self) -> None:
@@ -298,7 +295,7 @@ class DetachedRunTests(unittest.TestCase):
             )
             lab.audit.assert_any_call(
                 "guest-snapshot-rollback", lease="L1", kind="qemu", vmid=7,
-                name="before-kernel", sync=False,
+                name="before-kernel",
             )
 
 

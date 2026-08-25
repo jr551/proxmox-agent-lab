@@ -1046,7 +1046,7 @@ def _screenshot_via_monitor(lab: Any, api: Any, args: Any) -> dict[str, Any]:
     # The fact of the capture, never its contents: a screen can show anything.
     lab.audit("console-screenshot", lease=args.lease, vmid=args.vmid,
               source="monitor", width=width, height=height,
-              bytes=len(data), host_file_removed=removed, sync=False)
+              bytes=len(data), host_file_removed=removed)
     result: dict[str, Any] = {
         "vmid": args.vmid,
         "source": "monitor",
@@ -1072,7 +1072,7 @@ def _screenshot_via_monitor(lab: Any, api: Any, args: Any) -> dict[str, Any]:
         )
         lab.audit("console-screenshot-for-model", lease=args.lease,
                   vmid=args.vmid, source="monitor",
-                  bytes=result["image"].get("bytes", 0), sync=False)
+                  bytes=result["image"].get("bytes", 0))
     if getattr(args, "upload", False):
         key = f"screens/vm{args.vmid}-{int(time.time())}.png"
         s3.put_bytes(key, data, "image/png")
@@ -1113,7 +1113,7 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
         )
         # The fact and the size, never the pixels: a screen can show anything.
         lab.audit("console-screenshot-for-model", vmid=args.vmid, source="vnc",
-                  bytes=result["image"].get("bytes", 0), sync=False)
+                  bytes=result["image"].get("bytes", 0))
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -1234,7 +1234,7 @@ def cmd_inspect(lab: Any, args: Any) -> None:
             error=reason[:200], provider=args.provider or "auto",
             # The fact and the size of the handback, never its pixels.
             image_returned=handback is not None,
-            image_bytes=(handback or {}).get("bytes", 0), sync=False,
+            image_bytes=(handback or {}).get("bytes", 0),
         )
         failure: dict[str, Any] = {
             "vmid": args.vmid,
@@ -1248,7 +1248,7 @@ def cmd_inspect(lab: Any, args: Any) -> None:
         raise _api_error(lab, reason) from None
     lab.audit(
         "console-vision-inspect", lease=args.lease, vmid=args.vmid,
-        provider=analysis["provider"], model=analysis["model"], sync=False,
+        provider=analysis["provider"], model=analysis["model"],
     )
     destination = {
         "nvidia": "integrate.api.nvidia.com",
@@ -1283,7 +1283,7 @@ def cmd_keys(lab: Any, args: Any) -> None:
                 time.sleep(args.delay)
             screenshot = _capture_after_action(lab, api, args, session)
     lab.audit("console-keys", lease=args.lease, vmid=args.vmid,
-              count=len(combos), via=args.via, sync=False)
+              count=len(combos), via=args.via)
     result: dict[str, Any] = {
         "vmid": args.vmid, "keys_sent": len(combos), "via": args.via,
     }
@@ -1309,7 +1309,7 @@ def cmd_type(lab: Any, args: Any) -> None:
         screenshot = _capture_after_action(lab, api, args, session)
     # The text itself is never audited: it may contain a password.
     lab.audit("console-type", lease=args.lease, vmid=args.vmid,
-              characters=sent, sync=False)
+              characters=sent)
     result: dict[str, Any] = {"vmid": args.vmid, "characters_sent": sent}
     if screenshot is not None:
         result["screenshot_after"] = screenshot
@@ -1349,7 +1349,7 @@ def _cursor_checkpoint(lab: Any, session: VncSession, args: Any,
     lab.audit(
         "console-click-calibration", lease=args.lease, vmid=args.vmid,
         width=width, height=height, target=target, verified=verified,
-        provider=analysis.get("provider"), sync=False,
+        provider=analysis.get("provider"),
     )
     return checkpoint, temporal, verified, reason, analysis
 
@@ -1364,7 +1364,7 @@ def _emit_click_result(
     if empty_space:
         lab.audit(
             "console-click-unverified", lease=args.lease, vmid=args.vmid,
-            x=args.x, y=args.y, button=args.button, sync=False,
+            x=args.x, y=args.y, button=args.button,
         )
         result: dict[str, Any] = {
             "vmid": args.vmid, "clicked": [args.x, args.y], "empty_space": True,
@@ -1378,7 +1378,7 @@ def _emit_click_result(
         print(json.dumps(result, indent=2, sort_keys=True))
         return
     lab.audit("console-click", lease=args.lease, vmid=args.vmid,
-              x=args.x, y=args.y, button=args.button, sync=False)
+              x=args.x, y=args.y, button=args.button)
     result = {
         "vmid": args.vmid, "clicked": [args.x, args.y], "target": target,
         "verification": {"accepted": True, "reason": reason},
@@ -1482,7 +1482,7 @@ def cmd_has_gui_locked_up(lab: Any, args: Any) -> None:
             previous = current
     locked_up = all(delta == 0 for delta in deltas)
     lab.audit("console-has-gui-locked-up", lease=args.lease, vmid=args.vmid,
-              locked_up=locked_up, sync=False)
+              locked_up=locked_up)
     result: dict[str, Any] = {
         "vmid": args.vmid,
         "locked_up": locked_up,
@@ -1615,7 +1615,7 @@ def cmd_bridge(lab: Any, args: Any) -> None:
     listener.listen(1)
     port = listener.getsockname()[1]
     lab.audit("console-bridge", lease=args.lease, vmid=args.vmid,
-              kind=args.kind, port=port, sync=False)
+              kind=args.kind, port=port)
     print(
         f"bridge ready: {args.host}:{port} -> {args.kind}/{args.vmid} serial. "
         f"Connect with e.g. 'nc {args.host} {port}' (or a kernel debugger such "
@@ -1735,7 +1735,7 @@ def cmd_text(lab: Any, args: Any) -> None:
                     "POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/reset"
                 )
                 lab.audit("console-text-from-reset", lease=args.lease,
-                          vmid=args.vmid, sync=False)
+                          vmid=args.vmid)
             while time.monotonic() < deadline:
                 chunk = session.read_bytes(1.0)
                 if chunk:
@@ -1777,7 +1777,7 @@ def cmd_exec(lab: Any, args: Any) -> None:
         ]
     result = agent_exec(lab, api, args.vmid, command, timeout=args.timeout)
     lab.audit("guest-exec", lease=args.lease, vmid=args.vmid,
-              argv0=command[0], exitcode=result["exitcode"], sync=False)
+              argv0=command[0], exitcode=result["exitcode"])
     print(json.dumps(result, indent=2))
 
 
@@ -1965,7 +1965,7 @@ def cmd_push(lab: Any, args: Any) -> None:
         result = _push_chunked(lab, api, args, source, payload, source.name)
         lab.audit("guest-push", lease=args.lease, vmid=args.vmid,
                   s3_key=result["s3_key"], bytes=len(payload),
-                  parts=result["parts"], chunked=True, sync=False)
+                  parts=result["parts"], chunked=True)
         print(json.dumps(result, indent=2, sort_keys=True))
         return
     key = args.key or f"push/{secrets.token_hex(6)}/{source.name}"
@@ -1992,7 +1992,7 @@ def cmd_push(lab: Any, args: Any) -> None:
         if run["exitcode"] not in (0, None):
             raise _api_error(lab, f"guest fetch failed: {run['stderr'][:400]}")
     lab.audit("guest-push", lease=args.lease, vmid=args.vmid, s3_key=key,
-              bytes=len(payload), dest=dest, sync=False)
+              bytes=len(payload), dest=dest)
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -2010,7 +2010,7 @@ def cmd_pull(lab: Any, args: Any) -> None:
         if hashlib.sha256(out.read_bytes()).hexdigest() == args.sha256:
             lab.audit("guest-pull", lease=args.lease, vmid=args.vmid,
                       bytes=out.stat().st_size, sha256=args.sha256,
-                      already_verified=True, sync=False)
+                      already_verified=True)
             print(json.dumps({
                 "vmid": args.vmid, "path": str(out),
                 "bytes": out.stat().st_size, "sha256": args.sha256,
@@ -2031,7 +2031,7 @@ def cmd_pull(lab: Any, args: Any) -> None:
             result = _pull_chunked(lab, api, args, name)
             lab.audit("guest-pull", lease=args.lease, vmid=args.vmid,
                       s3_key=result.get("s3_key", ""), bytes=result["bytes"],
-                      parts=result.get("parts"), chunked=True, sync=False)
+                      parts=result.get("parts"), chunked=True)
             print(json.dumps(result, indent=2, sort_keys=True))
             return
     key = args.key or f"pull/{secrets.token_hex(6)}/{Path(args.remote).name}"
@@ -2049,7 +2049,7 @@ def cmd_pull(lab: Any, args: Any) -> None:
     if not args.keep:
         s3.delete_object(key)
     lab.audit("guest-pull", lease=args.lease, vmid=args.vmid, s3_key=key,
-              bytes=len(payload), sync=False)
+              bytes=len(payload))
     print(json.dumps(
         {"vmid": args.vmid, "path": str(target), "bytes": len(payload)}, indent=2
     ))
@@ -2462,8 +2462,7 @@ def bootstrap_guest_agent(lab: Any, api: Any, vmid: int, user: str,
         )
         term.run("sudo systemctl enable --now qemu-guest-agent", timeout=120)
     if wait_agent_ready(lab, api, vmid, 180):
-        lab.audit("guest-agent-bootstrapped", vmid=vmid, via="serial",
-                  sync=False)
+        lab.audit("guest-agent-bootstrapped", vmid=vmid, via="serial")
         return
     raise lab.LabError(
         "installed qemu-guest-agent over serial but the agent still does not "

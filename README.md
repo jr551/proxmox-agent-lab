@@ -98,7 +98,7 @@ agent lab.
 | 🧪 | Experimental trusted OCI application LXC | `oci pull`, `oci create` |
 | 🔒 | Force all traffic through a VPN | `net gateway-create` |
 | 🕵️ | Prove there is no leak | `net leak-test` |
-| 📓 | Audit everything (SQLite or PocketBase) | `journal` |
+| 📓 | Audit everything to one shared ledger | `journal` |
 | 🔌 | Power on, power off, verified | `lease-begin` / `lease-end` |
 | 📌 | Keep machines alive (host stays on) | `lease-begin --long-term` |
 | 💾 | Weekly backups of what you keep | `backup` |
@@ -215,17 +215,19 @@ grants the right privileges, and arms Wake-on-LAN:
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/proxmox-host-setup.sh | bash
 ```
 
-**Optional PocketBase audit host?** Run this as root on Proxmox. It creates a
-persistent unprivileged LXC, asks for networking and port settings, and prints
-the API URL and initial administrator details:
+**The audit ledger.** One shared MariaDB, in a persistent container on the
+Proxmox host. Provision it once from any controller:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocketbase-host-setup.sh | bash
+proxmox-lab journal host-setup --host-change-authorized
 ```
-> **Trusted LAN only** — this PocketBase LXC exposes plain HTTP on the LAN. See the canonical warning in [docs/storage.md](docs/storage.md#s3-scratch-bucket) (trusted LAN, do not port-forward; TLS reverse proxy for untrusted networks). The host setup script prints the same warning.
-Store the printed superuser credentials in the controller's secret store and
-run `proxmox-lab journal --provision-pocketbase-agent`; it creates a restricted
-renewable audit account instead of leaving the controller on a superuser token.
+
+It prints one `export` line. Paste that on every other machine and it inherits
+every other secret automatically — that one credential is all a controller
+needs. The ledger goes down with the lab host between leases, so events spool
+locally and upload on the next `journal --flush-spool`.
+
+> **Trusted LAN only** — the ledger listens on the LAN with no TLS. See the canonical warning in [docs/storage.md](docs/storage.md#s3-scratch-bucket) (do not port-forward; TLS reverse proxy for untrusted networks).
 
 **No S3 bucket for guest file transfer?** Run this as root on Proxmox. It
 creates a persistent unprivileged LXC running a minimal MinIO server

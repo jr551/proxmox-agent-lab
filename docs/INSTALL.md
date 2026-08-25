@@ -142,7 +142,7 @@ Re-run it with `--configure` to safely replace configuration answers
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash -s -- --configure
 ```
 
-The script never writes the Proxmox or PocketBase token to TOML. Enter each
+The script never writes the Proxmox token to TOML. Enter each
 secret only at its local hidden prompt. For unattended provisioning, add `--yes`
 (`install.sh:31,35` — skips prompts) and supply `PXL_*` variables only in a
 protected CI secret environment.
@@ -157,10 +157,6 @@ protected CI secret environment.
 | `PXL_TOKEN_NAME` | API token name (`lab`) |
 | `PXL_TOKEN_SECRET` | API token secret (keyring, not TOML) |
 | `PXL_MAC` | Wired NIC MAC for Wake-on-LAN |
-| `PXL_AUDIT_BACKEND` | `sqlite` / `jsonl` / `pocketbase` |
-| `PXL_PB_URL` | PocketBase URL (when `pocketbase`) |
-| `PXL_PB_COLLECTION` | PocketBase collection (`proxmox_lab_events`) |
-| `PXL_PB_TOKEN_SECRET` | PocketBase token (keyring) |
 | `PXL_S3_BACKEND` | `none` / `existing` / `lxc` |
 | `PXL_S3_ENDPOINT` | S3 endpoint (when `existing`) |
 | `PXL_S3_BUCKET` | Bucket name |
@@ -174,47 +170,40 @@ All `PXL_*` names match `ask VAR` in `install.sh` via `PXL_${VAR}` (`install.sh:
 
 > **No install at all?** `bootstrap.sh` (same one-liner in [README.md](../README.md#-install)) builds a throwaway venv under `$TMPDIR/proxmox-agent-lab-env` and prints its `proxmox-lab` path — handy for an agent with no checkout: `PXL=$(curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/bootstrap.sh | sh) && "$PXL" doctor` (`bootstrap.sh:25-52`). This guide uses `install.sh`; bootstrap is the escape hatch.
 
-### Optional: host PocketBase on Proxmox
+### The audit ledger
 
-When the installer asks for an audit backend, choose `pocketbase`, then
-`proxmox` if you want the lab host to run the service. It prints this command
-to run **as root on the Proxmox host**:
+The ledger is MariaDB in a persistent container on the Proxmox host, and it is
+required — there is no local-only mode. Provision it once, from any
+controller, after `install.sh` has finished:
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/pocketbase-host-setup.sh | bash
+```bash
+proxmox-lab journal host-setup --host-change-authorized
 ```
 
-> Same one-liner appears in [README.md](../README.md#-install) — detail stays here so this guide is self-contained.
+That creates the container (unprivileged, `onboot`, not lease-owned so
+lease-end never destroys it), publishes it on the hypervisor's own address,
+creates the database, and copies this controller's existing secrets into the
+shared store. It prints one line:
 
-The host script asks for an LXC ID, storage, bridge, IP configuration, HTTP
-port, and first superuser. It creates a persistent unprivileged Debian LXC
-set to start automatically whenever the Proxmox host does — this lab powers
-its host off between leases, so nothing else would start the container back
-up — installs PocketBase as a restricted systemd service, and prints the
-dashboard and API URLs. It does not modify existing guests or the host
-firewall.
-
-Hosting the audit backend on the same machine the lab powers on and off
-means a `power-on`/`lease-begin` can briefly race the container's own
-startup: `ensure_on` tolerates the audit write failing for up to 30 seconds
-after the Proxmox API answers before it gives up and just warns, rather than
-failing the power-on itself.
-
-> **Trusted LAN only** — see the canonical warning in [storage.md](storage.md#s3-scratch-bucket) (plain HTTP on the LAN, do not port-forward; TLS reverse proxy for untrusted networks). The host setup script prints the same warning.
-After the controller has its API URL, store the first PocketBase superuser
-email and password locally, then run:
-
-```sh
-proxmox-lab secrets set pocketbase-superuser-email
-proxmox-lab secrets set pocketbase-superuser-password
-proxmox-lab journal --provision-pocketbase-agent
+```bash
+export PROXMOX_AGENT_LAB_MARIADB_PASSWORD='...'
 ```
 
-This creates a controller-only PocketBase auth record and replaces
-`audit-token` with its renewable token. The controller refreshes that token
-before expiry and reauthenticates as the restricted account if needed; the
-superuser remains only for explicit reprovisioning. Do not use a nonrenewable
-impersonation token for a controller that must run indefinitely.
+Paste that into the environment of every other controller. It is the only
+credential they need; everything else is read from the shared store. Treat it
+as the master secret.
+
+To set the host up directly instead, `mariadb-host-setup.sh` is the same
+script:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/mariadb-host-setup.sh \
+  | CTID=9310 STORAGE=local-lvm DBPASS="$(openssl rand -base64 24)" bash
+```
+
+Upgrading a controller from an older release needs nothing: the first command
+after the upgrade carries its old local ledger into the shared one, and doing
+that on a second machine adds only the events the first did not already have.
 
 ### Optional: host MinIO on Proxmox
 
@@ -247,24 +236,18 @@ local prompts.
 ```text
 Install proxmox-agent-lab as a first-stage task. First ask me only for the
 non-secret setup choices: Proxmox address, node, API-token user and name,
-power method, whether audit storage should be SQLite, JSONL, an existing
-PocketBase service, or a new PocketBase LXC on the Proxmox host, and whether
-the S3 scratch bucket should be skipped, an existing bucket, or a new MinIO
-LXC on the Proxmox host. Never ask me to paste a token or password into chat,
-config, command arguments, or an environment variable. Run the project’s
-guided install.sh locally so its hidden prompts store secrets only in the OS
-keyring, then run `proxmox-lab doctor` and report every remaining issue
+power method, and whether the S3 scratch bucket should be skipped, an existing
+bucket, or a new MinIO LXC on the Proxmox host. Never ask me to paste a token
+or password into chat, config, command arguments, or an environment variable.
+Run the project's guided install.sh locally so its hidden prompts store
+secrets safely, then run `proxmox-lab doctor` and report every remaining issue
 exactly.
 
-If I choose a new PocketBase LXC, show me the root-only
-`pocketbase-host-setup.sh` command and wait for me to run it on the Proxmox
-host. Do not expose the HTTP port to the Internet or change host firewall
-rules. After I provide the resulting trusted-LAN API URL, finish the
-controller setup. Store the first superuser email and password only through
-hidden local prompts, then run `proxmox-lab journal
---provision-pocketbase-agent` to create the restricted renewable controller
-account. Report the API URL and collection name another controller needs; do
-not distribute superuser or impersonation tokens.
+The audit ledger is MariaDB on the Proxmox host and is required. After
+install.sh, run `proxmox-lab journal host-setup --host-change-authorized` and
+report the single `export PROXMOX_AGENT_LAB_MARIADB_PASSWORD=...` line it
+prints, which is what every other controller needs. Do not expose port 3306 to
+the Internet or change host firewall rules.
 
 If I choose a new MinIO LXC, show me the root-only `minio-host-setup.sh`
 command and wait for me to run it on the Proxmox host. Do not expose the S3

@@ -990,7 +990,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         self.assertIn("X increases right", analyze.call_args.kwargs["prompt"])
         lab.audit.assert_called_once_with(
             "console-vision-inspect", lease=args.lease, vmid=7,
-            provider="nvidia", model=lab_console.vision.MODEL, sync=False,
+            provider="nvidia", model=lab_console.vision.MODEL,
         )
 
     def test_cmd_screenshot_writes_a_file(self) -> None:
@@ -1304,7 +1304,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         analyze.assert_not_called()
         lab.audit.assert_called_once_with(
             "console-click-unverified", lease="lease-12345678", vmid=1,
-            x=1, y=1, button=3, sync=False,
+            x=1, y=1, button=3,
         )
         payload = json.loads(printed.call_args.args[0])
         self.assertEqual(payload["clicked"], [1, 1])
@@ -1335,7 +1335,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         self.assertIn("caveat", payload)
         lab.audit.assert_called_once_with(
             "console-has-gui-locked-up", lease="lease-1", vmid=1,
-            locked_up=True, sync=False,
+            locked_up=True,
         )
 
     def test_has_gui_locked_up_false_when_a_probe_sees_change(self) -> None:
@@ -1456,7 +1456,7 @@ class ScreenshotCommandTests(unittest.TestCase):
         lab.audit.assert_called_once_with(
             "console-vision-inspect-failed", lease=args.lease, vmid=7,
             error=message[:200], provider="nvidia", image_returned=True,
-            image_bytes=payload["image"]["bytes"], sync=False,
+            image_bytes=payload["image"]["bytes"],
         )
         self.assertNotIn("base64", lab.audit.call_args.kwargs)
 

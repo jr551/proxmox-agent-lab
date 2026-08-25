@@ -134,7 +134,7 @@ def cmd_boot_info(lab: Any, args: Any) -> None:
         _require_stopped(lab, api, args.vmid)
         b64 = _run_host(lab, ["boot-sectors", str(args.vmid), "34"]).strip()
         data = base64.b64decode(b64) if b64 else b""
-        lab.audit("disk-boot-info", lease=args.lease, vmid=args.vmid, sync=False)
+        lab.audit("disk-boot-info", lease=args.lease, vmid=args.vmid)
         source = {"vmid": args.vmid}
     parsed = bootstruct.parse_boot_sectors(data)
     print(json.dumps({**source, **parsed}, indent=2, sort_keys=True))
@@ -147,7 +147,7 @@ def cmd_ls(lab: Any, args: Any) -> None:
     _require_stopped(lab, api, args.vmid)
     out = _run_host(lab, ["ls", str(args.vmid), args.mount, args.path])
     lab.audit("disk-ls", lease=args.lease, vmid=args.vmid,
-              mount=args.mount, sync=False)
+              mount=args.mount)
     print(json.dumps(
         {"vmid": args.vmid, "mount": args.mount, "path": args.path,
          "entries": out.splitlines()},
@@ -164,7 +164,7 @@ def cmd_read(lab: Any, args: Any) -> None:
         lab, ["cat", str(args.vmid), args.mount, args.path], timeout=180).strip()
     blob = base64.b64decode(b64) if b64 else b""
     lab.audit("disk-read", lease=args.lease, vmid=args.vmid,
-              mount=args.mount, length=len(blob), sync=False)
+              mount=args.mount, length=len(blob))
     if args.out:
         out = os.path.expanduser(args.out)
         with open(out, "wb") as fh:
@@ -209,7 +209,7 @@ def cmd_write(lab: Any, args: Any) -> None:
             "disk: host write failed: "
             f"{(proc.stderr or '').strip()[:300] or 'unknown error'}")
     lab.audit("disk-write", lease=args.lease, vmid=args.vmid,
-              mount=args.mount, dest=args.dest, sync=False)
+              mount=args.mount, dest=args.dest)
     print(json.dumps(
         {"vmid": args.vmid, "dest": args.dest, "wrote": src},
         indent=2, sort_keys=True))

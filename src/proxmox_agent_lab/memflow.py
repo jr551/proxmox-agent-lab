@@ -351,7 +351,7 @@ def cmd_doctor(lab: Any, args: Any) -> None:
         for value in checks.values()
         if isinstance(value, bool)
     ) and bool(checks.get("tool_installed", True))
-    lab.audit("memflow-doctor", host=SSH_HOST, healthy=healthy, sync=False)
+    lab.audit("memflow-doctor", host=SSH_HOST, healthy=healthy)
     print(json.dumps({"healthy": healthy, "checks": checks},
                      indent=2, sort_keys=True))
     if not healthy:
@@ -382,7 +382,7 @@ def cmd_host_setup(lab: Any, args: Any) -> None:
         )
     proc = _ssh(lab, ["bash", "-s"], timeout=args.timeout, stdin=script)
     lab.audit("memflow-host-setup", host=SSH_HOST,
-              exit_code=proc.returncode, sync=False)
+              exit_code=proc.returncode)
     if proc.stdout:
         print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
     if proc.stderr and proc.stderr.strip():
@@ -407,7 +407,7 @@ def cmd_processes(lab: Any, args: Any) -> None:
     _require_running_qemu(lab, api, args.vmid)
     rows = _helper_json(lab, ["process-list", str(args.vmid)], timeout=120)
     lab.audit("memflow-processes", lease=args.lease, vmid=args.vmid,
-              count=len(rows) if isinstance(rows, list) else None, sync=False)
+              count=len(rows) if isinstance(rows, list) else None)
     print(json.dumps(
         {"vmid": args.vmid, "process_count": len(rows) if isinstance(rows, list) else 0,
          "processes": rows},
@@ -426,7 +426,7 @@ def _gated_read_cmd(lab: Any, args: Any, *, helper_cmd: str, audit_event: str) -
         lab, [helper_cmd, str(args.vmid), args.addr, str(args.len)], timeout=90
     )
     lab.audit(audit_event, lease=args.lease, vmid=args.vmid,
-              addr=args.addr, length=args.len, sync=False)
+              addr=args.addr, length=args.len)
     print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
 
 
@@ -444,7 +444,7 @@ def _gated_write_cmd(lab: Any, args: Any, *, helper_cmd: str, audit_event: str,
         lab, [helper_cmd, str(args.vmid), args.addr, hexbytes], timeout=90
     )
     lab.audit(audit_event, lease=args.lease, vmid=args.vmid,
-              addr=args.addr, length=len(hexbytes) // 2, sync=False)
+              addr=args.addr, length=len(hexbytes) // 2)
     print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
 
 
@@ -460,7 +460,7 @@ def cmd_registers(lab: Any, args: Any) -> None:
     lab.load_lease(args.lease)
     _require_running_qemu(lab, api, args.vmid)
     regs = _helper_json(lab, ["registers", str(args.vmid)], timeout=60)
-    lab.audit("memflow-registers", lease=args.lease, vmid=args.vmid, sync=False)
+    lab.audit("memflow-registers", lease=args.lease, vmid=args.vmid)
     print(json.dumps({"vmid": args.vmid, "registers": regs},
                      indent=2, sort_keys=True))
 
@@ -529,7 +529,7 @@ def cmd_scan(lab: Any, args: Any) -> None:
     )
     lab.audit("memflow-scan", lease=args.lease, vmid=args.vmid,
               needle_len=len(hexneedle) // 2,
-              hits=len(result.get("hits", [])), sync=False)
+              hits=len(result.get("hits", [])))
     print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
 
 
@@ -549,7 +549,7 @@ def cmd_dump(lab: Any, args: Any) -> None:
     with open(out, "wb") as fh:
         fh.write(blob)
     lab.audit("memflow-dump", lease=args.lease, vmid=args.vmid,
-              addr=args.addr, length=len(blob), sync=False)
+              addr=args.addr, length=len(blob))
     print(json.dumps(
         {"vmid": args.vmid, "addr": result.get("addr", args.addr),
          "bytes": len(blob), "out": out},
@@ -582,7 +582,7 @@ def cmd_ghidra_setup(lab: Any, args: Any) -> None:
                               "delete", "ghidra-lab")
     except Exception:  # pragma: no cover - best-effort registration
         pass
-    lab.audit("memflow-ghidra-setup", lease=args.lease, lxc=args.lxc, sync=False)
+    lab.audit("memflow-ghidra-setup", lease=args.lease, lxc=args.lxc)
     print(json.dumps({"lxc": args.lxc, "prepared": True}, indent=2, sort_keys=True))
 
 
@@ -605,7 +605,7 @@ def cmd_analyze(lab: Any, args: Any) -> None:
             + str(result.get("log_tail", result["error"]))[:400]
         )
     lab.audit("memflow-analyze", lease=args.lease, vmid=args.vmid,
-              lxc=args.lxc, addr=args.addr, length=args.len, sync=False)
+              lxc=args.lxc, addr=args.addr, length=args.len)
     print(json.dumps({"vmid": args.vmid, "base": base, **result},
                      indent=2, sort_keys=True))
 
@@ -627,7 +627,7 @@ def cmd_trace(lab: Any, args: Any) -> None:
         sub.append("over")
     result = _helper_json(lab, sub, timeout=max(60, args.steps * 3))
     lab.audit("memflow-trace", lease=args.lease, vmid=args.vmid,
-              steps=args.steps, over=bool(args.over), sync=False)
+              steps=args.steps, over=bool(args.over))
     print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
 
 
@@ -646,7 +646,7 @@ def cmd_break(lab: Any, args: Any) -> None:
         timeout=args.timeout + 30,
     )
     lab.audit("memflow-break", lease=args.lease, vmid=args.vmid,
-              addr=args.addr, hit=bool(result.get("hit")), sync=False)
+              addr=args.addr, hit=bool(result.get("hit")))
     print(json.dumps({"vmid": args.vmid, **result}, indent=2, sort_keys=True))
 
 
@@ -768,7 +768,7 @@ def cmd_boot_diagnose(lab: Any, args: Any) -> None:
 
     lab.audit("memflow-boot-diagnose", lease=args.lease, vmid=args.vmid,
               cpu_state=cpu_state, categories=categories,
-              signature_count=len(findings), sync=False)
+              signature_count=len(findings))
     print(json.dumps({
         "vmid": args.vmid,
         "cpu_state": cpu_state,

@@ -361,7 +361,7 @@ def cmd_adb(lab: Any, args: Any) -> None:
         ["/bin/bash", "-c", f"{SDK_ROOT}/platform-tools/adb {command}"],
         timeout=args.timeout)
     lab.audit("android-adb", lease=args.lease, vmid=args.vmid,
-              argv0=args.command[0], exitcode=result["exitcode"], sync=False)
+              argv0=args.command[0], exitcode=result["exitcode"])
     print(json.dumps({"exit_code": result["exitcode"],
                       "stdout": result["stdout"][-4000:],
                       "stderr": result["stderr"][-1000:]},

@@ -121,7 +121,7 @@ def cmd_list(lab: Any, args: Any) -> None:
         if len(parts) >= 3:
             passthrough.append({"vmid": int(parts[0]), "index": parts[1],
                                 "spec": " ".join(parts[2:])})
-    lab.audit("usb-list", host=_mf.SSH_HOST, count=len(devices), sync=False)
+    lab.audit("usb-list", host=_mf.SSH_HOST, count=len(devices))
     print(json.dumps({"devices": devices, "passthrough": passthrough},
                      indent=2, sort_keys=True))
 
@@ -153,7 +153,7 @@ def cmd_attach(lab: Any, args: Any) -> None:
     api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
              {slot: f"host={device['id']}"})
     lab.audit("usb-attach", lease=args.lease, vmid=args.vmid, slot=slot,
-              device=device["id"], sync=False)
+              device=device["id"])
     print(json.dumps(
         {"vmid": args.vmid, "slot": slot, "device": device["id"],
          "name": device["name"],
@@ -182,8 +182,7 @@ def cmd_detach(lab: Any, args: Any) -> None:
         raise lab.LabError(f"{args.slot} is not configured on VMID {args.vmid}")
     api.call("PUT", f"/nodes/{lab.NODE}/qemu/{args.vmid}/config",
              {"delete": args.slot})
-    lab.audit("usb-detach", lease=args.lease, vmid=args.vmid, slot=args.slot,
-              sync=False)
+    lab.audit("usb-detach", lease=args.lease, vmid=args.vmid, slot=args.slot)
     print(json.dumps({"vmid": args.vmid, "slot": args.slot, "detached": True},
                      indent=2, sort_keys=True))
 
@@ -219,7 +218,7 @@ def cmd_sniff(lab: Any, args: Any) -> None:
     with open(out, "wb") as fh:
         fh.write(data)
     lab.audit("usb-sniff", lease=args.lease, device=device["id"], bus=bus,
-              seconds=args.seconds, packets=pkts, sync=False)
+              seconds=args.seconds, packets=pkts)
     print(json.dumps(
         {"device": device["id"], "name": device["name"],
          "bus": bus, "device_address": device["dev"],

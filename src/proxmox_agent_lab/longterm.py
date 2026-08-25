@@ -240,7 +240,7 @@ def cmd_destroy(lab: Any, args: Any) -> None:
                            False)
         except lab.LabError as exc:
             lab.audit("long-term-unprotect-failed", lease=lease["id"],
-                      vmid=resource["vmid"], error=str(exc), sync=False)
+                      vmid=resource["vmid"], error=str(exc))
     for resource in lease.get("resources", []):
         resource["policy"] = "delete"
 
@@ -295,7 +295,7 @@ def cmd_release(lab: Any, args: Any) -> None:
         except lab.LabError as exc:
             lab.audit(
                 "long-term-unprotect-failed", lease=lease["id"],
-                vmid=resource["vmid"], error=str(exc), sync=False,
+                vmid=resource["vmid"], error=str(exc),
             )
     lease["kind"] = "session"
     lab.save_lease(lease)

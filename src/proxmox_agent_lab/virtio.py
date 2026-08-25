@@ -259,8 +259,7 @@ def cmd_inspect(lab: Any, args: Any) -> None:
         })
 
     lab.audit("virtio-inspect", lease=args.lease, vmid=args.vmid,
-              configured=len(configured), live_devices=len(devices),
-              sync=False)
+              configured=len(configured), live_devices=len(devices))
     print(json.dumps({
         "vmid": args.vmid,
         "configured_devices": configured,
@@ -284,7 +283,7 @@ def cmd_monitor(lab: Any, args: Any) -> None:
     command = "info " + args.query
     output = _monitor(lab, api, args.vmid, command)
     lab.audit("virtio-monitor", lease=args.lease, vmid=args.vmid,
-              query=args.query, sync=False)
+              query=args.query)
     print(json.dumps(
         {"vmid": args.vmid, "command": command, "output": output},
         indent=2, sort_keys=True,

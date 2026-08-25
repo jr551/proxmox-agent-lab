@@ -159,7 +159,7 @@ def cmd_capture(lab: Any, args: Any) -> None:
     with open(out, "wb") as fh:
         fh.write(data)
     lab.audit("netcap-capture", lease=args.lease, vmid=args.vmid, iface=iface,
-              seconds=args.seconds, packets=pkts, sync=False)
+              seconds=args.seconds, packets=pkts)
     print(json.dumps(
         {"vmid": args.vmid, "iface": iface, "packets": pkts, "out": out,
          "note": "open in Wireshark; TLS is ciphertext -- see 'netcap intercept'"},
@@ -201,7 +201,7 @@ def cmd_mitm_setup(lab: Any, args: Any) -> None:
     ip = _pct(lab, args.lxc,
               ["bash", "-c", "hostname -I 2>/dev/null | awk '{print $1}'"],
               timeout=30).stdout.strip()
-    lab.audit("netcap-mitm-setup", lease=args.lease, lxc=args.lxc, sync=False)
+    lab.audit("netcap-mitm-setup", lease=args.lease, lxc=args.lxc)
     print(json.dumps(
         {"lxc": args.lxc, "prepared": True, "proxy_ip": ip or None,
          "proxy_port": args.port,
@@ -278,7 +278,7 @@ def cmd_ca(lab: Any, args: Any) -> None:
         written["cer"] = out_cer
     helper = _CA_HELPERS[args.os].format(
         pem=written["pem"], cer=written.get("cer", written["pem"]))
-    lab.audit("netcap-ca", lease=args.lease, lxc=args.lxc, os=args.os, sync=False)
+    lab.audit("netcap-ca", lease=args.lease, lxc=args.lxc, os=args.os)
     print(json.dumps(
         {"lxc": args.lxc, "os": args.os, "written": written,
          "install_helper": helper},
@@ -366,7 +366,7 @@ def cmd_intercept(lab: Any, args: Any) -> None:
         saved["har"] = har
     lab.audit("netcap-intercept", lease=args.lease, lxc=args.lxc,
               seconds=args.seconds, flows=len(flows),
-              modified=bool(extra), sync=False)
+              modified=bool(extra))
     print(json.dumps(
         {"lxc": args.lxc, "port": args.port, "flow_count": len(flows),
          "modified": bool(extra), "probe_status": probe_status,
@@ -424,7 +424,7 @@ def cmd_doctor(lab: Any, args: Any) -> None:
     healthy = bool(checks["mitmdump"] and checks["ca_present"]
                    and checks["runner_present"])
     lab.audit("netcap-doctor", lease=args.lease, lxc=args.lxc,
-              healthy=healthy, sync=False)
+              healthy=healthy)
     print(json.dumps({"lxc": args.lxc, "healthy": healthy, "checks": checks},
                      indent=2, sort_keys=True))
     if not healthy:

@@ -329,107 +329,84 @@ a key under `vision.provider_keys`.
 See also [console.md](console.md#optional-cloud-vision-console-inspect) for the full `console inspect` flow.
 ## `[audit]`
 
+The audit ledger is one shared MariaDB, running in a persistent container on
+the Proxmox host and published on the hypervisor's own address. Every
+controller writes to the same history, so two machines driving one lab no
+longer keep two partial ones.
+
+Provision it once, from any controller:
+
+```bash
+proxmox-lab journal host-setup --host-change-authorized
+```
+
 | Key | Default | Meaning |
 |---|---|---|
-| `backend` | `sqlite` | Audit backend: `sqlite`, `jsonl`, or `pocketbase` |
-| `journal_dir` | `<state>/journal` | Local audit ledger directory |
-| `git_sync` | `false` | Copy each redacted event to a private git log |
-| `git_repo` | — | Dedicated private logging checkout |
-| `git_branch` | `logs` | Remote branch receiving logging commits |
-| `controller_id` | hostname | Stable identifier written by the PocketBase backend |
-| `pocketbase_url` | — | Absolute HTTP(S) URL of the PocketBase service |
-| `pocketbase_collection` | `proxmox_lab_events` | Private collection for audit records |
-| `pocketbase_token_secret` | `audit-token` | Secret-store name containing the active API token |
-| `pocketbase_timeout_seconds` | `10` | Per-request timeout |
-| `pocketbase_auth_refresh_before_seconds` | `300` | Renew a renewable JWT this many seconds before expiry |
-| `pocketbase_agent_collection` | `proxmox_lab_agents` | Restricted password-auth collection for controllers |
+| `host` | the `[proxmox]` host | Where the ledger runs |
+| `port` | `3306` | MariaDB port on that host |
+| `database` | `proxmox_lab` | Database name |
+| `user` | `proxmox_lab` | Database user |
+| `password_secret` | `mariadb-password` | Secret name holding the password |
+| `timeout_seconds` | `10` | Per-statement timeout |
+| `journal_dir` | `<state>/journal` | Local spool, and any pre-MariaDB ledger |
+| `controller_id` | hostname | This machine's name in the shared ledger |
 
-`pocketbase_token_secret` is the secret-store name, not the token itself — set `PXL_PB_TOKEN_NAME` at install time (or edit this key) to point at an alternate name; `install.sh` writes whatever name you choose into this field.
+### The ledger is not always up, and that is fine
+
+The lab host powers itself off between leases, so the ledger goes with it.
+Nothing fails: an event that cannot be written is appended to a local spool
+and uploaded later.
+
+```bash
+proxmox-lab journal --flush-spool
+```
+
+`doctor` reports a backlog. The probe it uses has a short timeout, so `doctor`
+stays fast while the host is asleep.
+
+### One secret per machine
+
+`mariadb-password` is the only credential a controller needs. Every other
+secret — WireGuard keys, tunnel tokens, vision API keys — is stored in the
+ledger and handed out from there, so adding a machine is one line:
+
+```bash
+export PROXMOX_AGENT_LAB_MARIADB_PASSWORD='...'
+```
+
+Treat it accordingly: it is the key to all the others. An environment variable
+still overrides any individual secret locally.
+
+### Upgrading from a pre-MariaDB controller
+
+The first command after an upgrade carries this machine's old local ledger
+into the shared one automatically. It is safe to re-run, and safe on a second
+machine: event ids are derived from content, so shared history is recognised
+and only genuinely new events are added.
+
+```bash
+proxmox-lab journal --migrate      # force it now
+proxmox-lab journal --migrations   # who has already migrated
+```
+
+The old files are read, never deleted.
 
 Every action appends a redacted event: what happened, to which VMID, under
 which lease. Passwords, tokens, typed text and presigned URLs are never
 recorded — only counts, exit codes and object keys.
 
-The `pocketbase` backend sends the same redacted event to a private
-PocketBase collection and does not silently fall back to a local ledger. Keep
-the token in the configured secret store:
+`doctor` reports `audit.spooled_records`: a non-zero backlog means events are
+sitting only on local disk, and it names `journal --flush-spool` as the fix.
 
-```toml
-[audit]
-backend = "pocketbase"
-pocketbase_url = "https://pocketbase.example"
-pocketbase_collection = "proxmox_lab_events"
-pocketbase_token_secret = "audit-token"
-```
+Reading it back:
 
 ```bash
-# One-time bootstrap; these credentials are used only by the explicit
-# provisioning command and are kept in the configured secret store.
-proxmox-lab secrets set pocketbase-superuser-email
-proxmox-lab secrets set pocketbase-superuser-password
-proxmox-lab journal --provision-pocketbase-agent
-proxmox-lab doctor
+proxmox-lab journal --limit 20
+proxmox-lab journal --lease 20260825125630-8edf9a82
+proxmox-lab journal --event 'guest-*'
+proxmox-lab journal --controller other-pc
+proxmox-lab journal --summary
 ```
-
-A shortcut: storing a **superuser token** directly as the audit token
-(`proxmox-lab secrets set audit-token`) is detected on first use and converted
-automatically — the controller provisions the permanent least-privileged agent
-with that token, stores the agent's password credentials, and replaces the
-superuser token in the secret store with the agent's renewable one. Pasting a
-superuser token is therefore a one-time bootstrap, never a standing
-credential.
-
-PocketBase JWTs are inherently finite; there is no unlimited token. The
-controller refreshes a renewable `_superusers` or agent token before its
-configured expiry window and atomically replaces the keyring value. The
-provisioning command instead creates a password-authenticated
-`pocketbase_agent_collection` record, stores its generated credentials and
-active token in the secret store, and grants that collection only list, view,
-and create access to the configured audit collection. If a stored agent token
-has already expired, the controller obtains a replacement through that stored
-account password. Update and delete remain superuser-only.
-
-`journal --provision-pocketbase-agent` may change the configured audit
-collection rules to that restricted agent collection. Use it only for the
-controller collection named in the current configuration. The original
-`journal --provision-pocketbase` creates or validates a superuser-only audit
-collection without changing its rules.
-
-### SQLite migration and rollback
-
-The backend switch is a clean cutover, not a live dual-write migration:
-
-1. Stop all controllers that can write the audit ledger and copy the SQLite
-   database from `journal_dir` to an offline backup.
-2. Add the PocketBase settings and token, leaving `backend = "sqlite"`.
-3. Run `proxmox-lab journal --migrate-sqlite-to-pocketbase`. It validates or
-   creates the collection, preserves each redacted JSON record, and prints the
-   source count, time range, and deterministic SHA-256 digest.
-4. Restarts are safe: deterministic event IDs skip already imported records;
-   the SQLite database is read-only throughout.
-5. Set `backend = "pocketbase"` and run `proxmox-lab doctor` before resuming
-   leases.
-
-Rollback is fail-safe: stop writers, restore `backend = "sqlite"`, and retain
-the untouched SQLite backup. PocketBase records are not deleted on rollback.
-
-`git_sync` is off by default. Most people do not want their lab's audit trail
-pushed anywhere. If you enable it, point `git_repo` at the root of a clean,
-**private, logging-only checkout**: the journal records host addresses and
-VMIDs. The local backend can remain `sqlite`; the logging checkout receives
-one JSONL file per day. Sync fails closed if that checkout contains any other
-uncommitted file, and only `journal/YYYY-MM-DD.jsonl` is ever staged.
-`doctor` reports these independently as `audit.local_backend` and
-`audit.git_sync`; SQLite plus Git sync is an intentional supported setup.
-
-When `git_sync` is on, `doctor` also checks that the mirror could actually
-receive a record and reports `audit.git_status` — the repository exists, is a
-repository root, is clean and is writable. A failure there is a `doctor`
-problem, because each mutating command only prints a warning when a push
-fails, which is easy to miss for weeks. `doctor` reports
-`audit.spooled_records` for the same reason: a non-zero backlog means the
-configured backend refused events that are now only on local disk, and it
-names `journal --flush-spool` as the fix.
 
 ---
 

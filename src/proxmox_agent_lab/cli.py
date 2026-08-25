@@ -767,7 +767,20 @@ def running_guest_vmids(api: ProxmoxAPI) -> list[int]:
     return sorted(
         int(item["vmid"]) for item in resources
         if isinstance(item, dict) and item.get("status") == "running"
+        and not _is_lab_infrastructure(item)
     )
+
+
+# Infrastructure this tool runs on the host itself -- currently the audit
+# ledger. It is onboot and outlives every lease on purpose, so counting it as
+# an untracked guest would mean the host could never power itself off again,
+# which is the whole point of the machine.
+INFRA_TAG = "codex-lab-infra"
+
+
+def _is_lab_infrastructure(resource: dict[str, Any]) -> bool:
+    tags = str(resource.get("tags") or "").replace(",", ";")
+    return INFRA_TAG in [tag.strip() for tag in tags.split(";")]
 
 
 def shutdown_host(api: ProxmoxAPI) -> bool:
@@ -2408,8 +2421,11 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 
 def _guard_install_block(hostguard_module: Any) -> str:
-    """Shell that writes the lease guard onto the host and starts its timer."""
-    script = hostguard_module.GUARD_SCRIPT.replace("\\", "\\\\")
+    """Shell that writes the lease guard onto the host and starts its timer.
+
+    The heredoc delimiter is quoted, so the shell expands nothing inside it and
+    the script travels verbatim.
+    """
     return (
         "cat > /usr/local/lib/pxl-hostguard.py <<'PXLGUARD'\n"
         + hostguard_module.GUARD_SCRIPT

@@ -2281,3 +2281,45 @@ class StateIsolationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InfrastructureGuestTests(unittest.TestCase):
+    """The audit ledger runs on the host and outlives every lease.
+
+    Found live: the first lease-end after provisioning it refused to power the
+    host off, naming the ledger container as an untracked running guest. Left
+    alone that means the machine can never power itself off again, which is
+    the entire point of it.
+    """
+
+    def _resources(self) -> list[dict]:
+        return [
+            {"vmid": 9310, "status": "running", "tags": "codex-lab-infra"},
+            {"vmid": 9001, "status": "running", "tags": "codex-lab;lease-x"},
+            {"vmid": 9002, "status": "stopped", "tags": ""},
+        ]
+
+    def test_the_ledger_container_is_not_an_untracked_guest(self) -> None:
+        api = mock.Mock()
+        api.call.return_value = self._resources()
+        self.assertEqual(LAB.running_guest_vmids(api), [9001])
+
+    def test_an_ordinary_running_guest_still_blocks_power_off(self) -> None:
+        api = mock.Mock()
+        api.call.return_value = [
+            {"vmid": 9001, "status": "running", "tags": "codex-lab;lease-x"},
+        ]
+        self.assertEqual(LAB.running_guest_vmids(api), [9001])
+
+    def test_comma_separated_tags_are_understood(self) -> None:
+        """Proxmox has used both separators; the guard must not depend on it."""
+        api = mock.Mock()
+        api.call.return_value = [
+            {"vmid": 9310, "status": "running", "tags": "codex-lab-infra,other"},
+        ]
+        self.assertEqual(LAB.running_guest_vmids(api), [])
+
+    def test_a_guest_with_no_tags_is_still_counted(self) -> None:
+        api = mock.Mock()
+        api.call.return_value = [{"vmid": 9005, "status": "running"}]
+        self.assertEqual(LAB.running_guest_vmids(api), [9005])

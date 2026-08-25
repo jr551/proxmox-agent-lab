@@ -490,8 +490,8 @@ def _pid_alive(lab: Any, api: Any, vmid: int, pid: str) -> bool:
 
 def cmd_log(lab: Any, args: Any) -> None:
     """Print or follow the log of a detached guest run."""
-
     api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
     record = _find_run(lab, args.vmid, args.pid)
     log = record["log"]
     cursor = 0

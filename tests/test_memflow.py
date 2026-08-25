@@ -420,3 +420,40 @@ class BootDiagnoseTests(unittest.TestCase):
                     LAB, Args(lease="L", vmid=9050, settle=0.0,
                               max_hits=4, timeout=30))
         helper.assert_not_called()
+
+
+class DumpRegressionTests(unittest.TestCase):
+    """`memflow dump` must open the API and check the lease before reading.
+
+    Regression: a refactor once dropped both `api = lab.ProxmoxAPI()` and
+    `lab.load_lease(...)` from cmd_dump, leaving an undefined `api` (the
+    command raised NameError) and no lease gate. compileall cannot see it.
+    """
+
+    def _args(self, out: str) -> mock.Mock:
+        return mock.Mock(len=64, addr="0x1000", vmid=101, lease="L1", out=out)
+
+    def test_dump_checks_the_lease_and_writes_bytes(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "dump.bin")
+            with mock.patch.object(memflow, "_require_enabled"), \
+                 mock.patch.object(memflow, "_require_running_qemu"), \
+                 mock.patch.object(memflow, "_helper_json",
+                                   return_value={"hex": "41424344"}):
+                memflow.cmd_dump(lab, self._args(out))
+            self.assertEqual(Path(out).read_bytes(), b"ABCD")
+        lab.load_lease.assert_called_once_with("L1")
+        lab.ProxmoxAPI.assert_called_once_with()
+
+    def test_dump_refuses_an_invalid_lease(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.load_lease.side_effect = RuntimeError("no such lease")
+        with mock.patch.object(memflow, "_require_enabled"), \
+             mock.patch.object(memflow, "_require_running_qemu"), \
+             mock.patch.object(memflow, "_helper_json") as helper:
+            with self.assertRaises(RuntimeError):
+                memflow.cmd_dump(lab, self._args("/dev/null"))
+        helper.assert_not_called()

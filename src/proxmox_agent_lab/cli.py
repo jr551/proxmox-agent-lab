@@ -199,7 +199,6 @@ def _bind(lab: Any, fn: Any) -> Any:
     return lambda args: fn(lab, args)
 
 
-
 @contextlib.contextmanager
 def controller_lock() -> Any:
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -252,8 +251,6 @@ def sync_repo(record: dict[str, Any], suffix: str) -> None:
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"warning: journal sync failed: {str(exc)[:300]}", file=sys.stderr)
-
-
 
 
 _SUPERUSER_CREDENTIAL_KEYS = (

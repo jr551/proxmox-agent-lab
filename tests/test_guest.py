@@ -394,3 +394,43 @@ class EmptyConsolePasswordTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeaseGateRegressionTests(unittest.TestCase):
+    """`guest log` requires --lease, so it must actually validate it.
+
+    Regression: a refactor dropped `lab.load_lease(args.lease)` from cmd_log
+    while argparse still marked --lease required, so any string was accepted
+    and the authorisation check silently did nothing.
+    """
+
+    def test_log_validates_the_lease_before_reading_a_run(self) -> None:
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.load_lease.side_effect = RuntimeError("no such lease")
+        args = mock.Mock(lease="BOGUS", vmid=101, pid="1",
+                         tail=None, follow=False, timeout=1)
+        with mock.patch.object(lab_guest, "_find_run") as find_run:
+            with self.assertRaises(RuntimeError):
+                lab_guest.cmd_log(lab, args)
+        lab.load_lease.assert_called_once_with("BOGUS")
+        find_run.assert_not_called()
+
+
+class GuestShellRegressionTests(unittest.TestCase):
+    """Provisioning scripts are bash, so the guest-side helper must use bash.
+
+    Regression: a dedup pass silently pointed the shared helper at /bin/sh.
+    These scripts declare `#!/bin/bash` and open with `set -euo pipefail`.
+    dash only gained `pipefail` in 0.5.12 (Debian 13, Ubuntu 24.04), so on
+    older guests -- Debian 11/12, Ubuntu 22.04 -- /bin/sh aborts on line 2.
+    Run them under the interpreter they declare.
+    """
+
+    def test_exec_guest_script_runs_under_bash(self) -> None:
+        lab = mock.Mock()
+        lab.NODE = "aipve"
+        with mock.patch.object(lab_console, "agent_exec") as agent_exec:
+            lab_console.exec_guest_script(lab, mock.Mock(), 101, "set -euo pipefail")
+        argv = agent_exec.call_args.args[3]
+        self.assertEqual(argv[0], "/bin/bash", f"dash cannot run these: {argv}")

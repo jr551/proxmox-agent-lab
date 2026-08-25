@@ -49,9 +49,18 @@ from . import memflow as _mf
 # Host channel (shared with memflow/usb: same host, same trust boundary).
 # --------------------------------------------------------------------------- #
 
-_require_enabled = _mf.require_host_ssh
-_ssh = _mf.host_run
+NOT_ENABLED = (
+    "Network capture runs on the Proxmox host over SSH -- the same host "
+    "connection memflow and usb use -- so it is off until you set "
+    "[memflow] enabled = true and ssh_host. See docs/netcap.md."
+)
 
+
+def _require_enabled(lab: Any) -> None:
+    _mf.require_host_ssh(lab, NOT_ENABLED)
+
+
+_ssh = _mf.host_run
 
 
 def _ssh_ok(lab: Any, argv: list[str], *, timeout: int = 60):

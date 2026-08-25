@@ -19,7 +19,6 @@ file you name, and the audit ledger records only that a capture happened.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -32,9 +31,18 @@ from . import memflow as _mf
 # Host channel (shared with memflow: same host, same trust boundary).
 # --------------------------------------------------------------------------- #
 
-_require_enabled = _mf.require_host_ssh
-_ssh = _mf.host_run
+NOT_ENABLED = (
+    "USB sniffing runs on the Proxmox host over SSH -- the same host "
+    "connection memflow uses -- so it is off until you set [memflow] "
+    "enabled = true and ssh_host. See docs/usb.md."
+)
 
+
+def _require_enabled(lab: Any) -> None:
+    _mf.require_host_ssh(lab, NOT_ENABLED)
+
+
+_ssh = _mf.host_run
 
 
 def _lsusb(lab: Any) -> list[dict[str, Any]]:

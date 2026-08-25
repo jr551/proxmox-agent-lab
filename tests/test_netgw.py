@@ -192,3 +192,26 @@ def _args(lab: mock.Mock, *argv: str):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProvisionShellRegressionTests(unittest.TestCase):
+    """Gateway and server provisioning scripts must reach a bash interpreter.
+
+    They declare `#!/bin/bash` and rely on `set -euo pipefail`, which dash
+    supports only from 0.5.12 (Debian 13+). Older guests would abort on line 2.
+    """
+
+    def test_provision_scripts_need_bash(self) -> None:
+        for name, script in (
+            ("provision_script", lab_netgw.provision_script()),
+            ("SERVER_PROVISION", lab_netgw.SERVER_PROVISION),
+        ):
+            self.assertIn("pipefail", script,
+                          f"{name} no longer needs bash; relax this test")
+
+    def test_exec_sends_the_script_to_bash(self) -> None:
+        lab = mock.Mock()
+        with mock.patch.object(lab_netgw.console, "agent_exec") as agent_exec:
+            lab_netgw._exec(lab, mock.Mock(), 101, "set -euo pipefail")
+        argv = agent_exec.call_args.args[3]
+        self.assertEqual(argv[0], "/bin/bash", f"dash cannot run these: {argv}")

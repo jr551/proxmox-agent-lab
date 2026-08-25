@@ -367,6 +367,7 @@ def _prepare_unattended(lab: Any, api: Any, args: Any, name: str,
     with tempfile.TemporaryDirectory() as staging:
         iso_path = Path(staging) / f"autounattend-{args.vmid}.iso"
         build_answer_iso(xml, iso_path)
+        # hdiutil appends .cdr unless the name already ends in .iso
         if not iso_path.exists():
             alternative = iso_path.with_suffix(".iso.cdr")
             if alternative.exists():
@@ -381,7 +382,17 @@ def _prepare_unattended(lab: Any, api: Any, args: Any, name: str,
 
 
 def _boot_with_taps(lab: Any, api: Any, args: Any) -> dict[str, Any]:
-    """Start the guest and tap past the boot prompt + Setup language page."""
+    """Start the guest and tap past the boot prompt + Setup language page.
+
+    The Windows ISO boots via UEFI, which shows "Press any key to boot from CD
+    or DVD..." for a few seconds; miss it and the firmware falls through to the
+    empty disk and Setup never starts. For an unattended install there is no
+    human to catch it, so tap Enter across that window automatically.
+    Best-effort: a failure here must not fail the install, and the presses are
+    bounded to the boot window. Measured on Server 2022 eval media: everything
+    in the answer file applies, but Setup still shows its language page first
+    and waits there -- see _dismiss_setup_ui.
+    """
     result: dict[str, Any] = {}
     start_upid = api.call("POST", f"/nodes/{lab.NODE}/qemu/{args.vmid}/status/start")
     lab.wait_task(api, start_upid, timeout=120)

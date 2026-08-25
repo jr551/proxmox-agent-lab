@@ -610,10 +610,14 @@ def exec_guest(lab: Any, api: Any, vmid: int, argv: list[str],
 
 def exec_guest_script(lab: Any, api: Any, vmid: int, script: str,
                       timeout: int = 300) -> dict[str, Any]:
-    """Run a shell script through the guest agent via /bin/sh."""
-    return exec_guest(lab, api, vmid, ["/bin/sh", "-c", script], timeout=timeout)
+    """Run a shell script through the guest agent via bash.
 
-
+    bash, not /bin/sh: the scripts this runs declare ``#!/bin/bash`` and open
+    with ``set -euo pipefail``. dash only gained ``pipefail`` in 0.5.12
+    (Debian 13, Ubuntu 24.04), so on an older guest image /bin/sh aborts on
+    the second line. Run them under the interpreter they declare.
+    """
+    return exec_guest(lab, api, vmid, ["/bin/bash", "-c", script], timeout=timeout)
 
 
 def ensure_agent(lab: Any, api: Any, vmid: int, cloud_user: str,
@@ -672,7 +676,6 @@ def prepare_cloudinit_worker(
     lab.wait_task(api, start, timeout=start_timeout)
     ensure_agent(lab, api, vmid, cloud_user, password, agent_timeout)
     return cloud_user, password
-
 
 
 # --- command handlers ----------------------------------------------------
@@ -1354,7 +1357,6 @@ def _cursor_checkpoint(lab: Any, session: VncSession, args: Any,
 def _emit_click_result(
     lab: Any, args: Any, screenshot: dict[str, Any] | None, *,
     empty_space: bool, target: str = "",
-    checkpoint: dict[str, Any] | None = None,
     temporal: dict[str, Any] | None = None,
     reason: str = "", analysis: dict[str, Any] | None = None,
 ) -> None:
@@ -1440,7 +1442,7 @@ def cmd_click(lab: Any, args: Any) -> None:
         return
     _emit_click_result(
         lab, args, screenshot, empty_space=False, target=target,
-        checkpoint=checkpoint, temporal=temporal, reason=reason, analysis=analysis,
+        temporal=temporal, reason=reason, analysis=analysis,
     )
 
 

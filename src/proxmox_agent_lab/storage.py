@@ -194,6 +194,10 @@ def cmd_add_disk(lab: Any, args: Any) -> None:
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     if not content_set:
+        # The command's contract is a registered storage set to hold the
+        # requested content types. Half of that is not success: a caller that
+        # sees exit 0 goes on to upload an ISO the storage will not accept.
+        # The result above is printed first so the recovery details survive.
         raise lab.LabError(
             f"storage {args.name} was created from {args.device} but its "
             f"content types were not set: {note[:300]}. Finish with "

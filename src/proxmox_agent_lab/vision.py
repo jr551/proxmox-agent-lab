@@ -369,7 +369,6 @@ def _chat_request(endpoint: str, api_key: str, payload: dict[str, Any],
     return _http_json(req, timeout, label)
 
 
-
 def _openrouter(config: Any, image: bytes, task: str, *, model: str,
                 width: int, height: int, timeout: int,
                 max_tokens: int) -> dict[str, Any]:
@@ -392,8 +391,6 @@ def _openrouter(config: Any, image: bytes, task: str, *, model: str,
         value, provider="openrouter", requested_model=model,
         width=width, height=height,
     )
-
-
 
 
 def _kilo(config: Any, image: bytes, task: str, *, width: int, height: int,
@@ -562,8 +559,6 @@ def _raise_no_valid_provider(attempts: list[dict[str, Any]]) -> None:
     raise VisionError(f"no vision provider returned a valid analysis: {summary}")
 
 
-
-
 def analyze_png(config: Any, image: bytes, *, width: int, height: int,
                 prompt: str | None = None, timeout: int = 120,
                 max_tokens: int = 1024, provider: str = "auto") -> dict[str, Any]:
@@ -652,6 +647,7 @@ def _race_providers(providers: dict[str, Any], timeout: int) -> dict[str, Any]:
             name, result, exc, elapsed = finished.get(timeout=wait)
         except queue.Empty:
             break
+        remaining -= 1
         elapsed_ms = round(elapsed * 1000)
         if exc is not None:
             _record_attempt(

@@ -806,8 +806,29 @@ class VpnGatewayTests(unittest.TestCase):
             self.assertNotIn('"eth1"', rendered)
 
     def test_bootstrap_password_is_cleared_after_use(self) -> None:
-        source = (SCRIPTS / "netgw.py").read_text()
-        self.assertIn('{"delete": "cipassword"}', source)
+        """The one-time cipassword must not survive provisioning.
+
+        Asserts the behaviour, not the source text: the implementation is
+        shared in console.clear_bootstrap_password, so grepping netgw.py for
+        the payload would pass on a comment and fail on a working refactor.
+        """
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        api = mock.Mock()
+        self.assertTrue(lab_netgw._clear_bootstrap_password(lab, api, 101))
+        api.call.assert_called_once_with(
+            "PUT", "/nodes/aipve/qemu/101/config", {"delete": "cipassword"}
+        )
+
+    def test_bootstrap_password_clear_failure_is_reported(self) -> None:
+        """A failed clear must return False, never silently claim success."""
+        lab = mock.Mock()
+        lab.LabError = RuntimeError
+        lab.NODE = "aipve"
+        api = mock.Mock()
+        api.call.side_effect = RuntimeError("boom")
+        self.assertFalse(lab_netgw._clear_bootstrap_password(lab, api, 101))
 
     def test_verify_requires_a_lease_and_checks_handshake_age(self) -> None:
         source = (SCRIPTS / "netgw.py").read_text()

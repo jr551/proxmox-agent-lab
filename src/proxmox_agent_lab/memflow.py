@@ -83,6 +83,8 @@ def _require_enabled(lab: Any) -> None:
 
 
 def _check_len(lab: Any, n: int, max_bytes: int = 16 * 1024 * 1024) -> None:
+    # The host-side helper allocates the full buffer as root, so an oversized
+    # request could OOM it (audit 2026-08-24).
     if n <= 0 or n > max_bytes:
         raise lab.LabError(f"--len must be between 1 and {max_bytes} bytes")
 
@@ -94,7 +96,6 @@ def _parse_hex(lab: Any, value: str) -> str:
     ):
         raise lab.LabError("--hex must be an even-length string of hex digits")
     return hexbytes
-
 
 
 def _ssh_argv(remote: str) -> list[str]:
@@ -157,9 +158,17 @@ def host_ssh_enabled() -> bool:
     return bool(ENABLED and SSH_HOST)
 
 
-def require_host_ssh(lab: Any) -> None:
-    """Raise unless the host SSH channel is enabled and configured."""
-    _require_enabled(lab)
+def require_host_ssh(lab: Any, message: str | None = None) -> None:
+    """Raise unless the host SSH channel is enabled and configured.
+
+    ``message`` lets a subsystem that shares this channel (netcap, usb) raise
+    its own guidance pointing at its own doc, rather than memflow's.
+    """
+    if message is None:
+        _require_enabled(lab)
+        return
+    if not ENABLED or not SSH_HOST:
+        raise lab.LabError(message)
 
 
 def host_run(lab: Any, argv: list[str], *, timeout: int = 60
@@ -236,6 +245,8 @@ def host_remove_file(lab: Any, path: str, *, timeout: int = 30) -> bool:
     try:
         proc = _ssh(lab, ["rm", "-f", "--", path], timeout=timeout)
     except (OSError, lab.LabError):
+        # Cleanup runs in a finally path: it reports failure to the caller,
+        # which records it, rather than masking the original error.
         return False
     return proc.returncode == 0
 
@@ -247,8 +258,6 @@ def run_remote_capture(lab: Any, script: str, *, timeout: int = 60
     pcap on the remaining lines, as netcap/usb do. Failures raise LabError
     with the host's stderr (if any).
     """
-    import base64
-
     proc = host_run(lab, ["bash", "-c", script], timeout=timeout)
     if proc.returncode not in (0, None):
         raise lab.LabError(
@@ -528,6 +537,8 @@ def cmd_dump(lab: Any, args: Any) -> None:
     """Extract a region of guest memory to a local file for offline analysis."""
     _require_enabled(lab)
     _check_len(lab, args.len)
+    api = lab.ProxmoxAPI()
+    lab.load_lease(args.lease)
     _require_running_qemu(lab, api, args.vmid)
     result = _helper_json(
         lab, ["read", str(args.vmid), args.addr, str(args.len)],

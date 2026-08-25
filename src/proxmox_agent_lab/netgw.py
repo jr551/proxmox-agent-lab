@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import base64
 import json
-import secrets
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -190,14 +190,15 @@ def provision_script() -> str:
 _write_guest_file = console.write_guest_file
 
 
-
-
 def _exec(lab: Any, api: Any, vmid: int, script: str, timeout: int = 900) -> dict:
     return console.exec_guest_script(lab, api, vmid, script, timeout=timeout)
 
 
 def _provision_guest_files(lab: Any, api: Any, vmid: int, provision_timeout: int) -> None:
     """Stage WireGuard, nftables, dnsmasq and the provision script, then run it."""
+    # wireguard-tools is installed later by the provision script, so its
+    # config directory does not exist yet. Create it, locked down, before the
+    # private key lands in it.
     _exec(lab, api, vmid,
           "mkdir -p /etc/wireguard && chmod 700 /etc/wireguard", timeout=60)
     _write_guest_file(lab, api, vmid, "/etc/wireguard/wg0.conf",
@@ -216,9 +217,6 @@ def _provision_guest_files(lab: Any, api: Any, vmid: int, provision_timeout: int
             "gateway provisioning failed: "
             + (result["stderr"] or result["stdout"])[-600:]
         )
-
-
-
 
 
 def require_bridge(lab: Any, api: Any) -> None:
@@ -715,9 +713,10 @@ def _ensure_agent(lab: Any, api: Any, vmid: int, cloud_user: str,
 
 
 def _clear_bootstrap_password(lab: Any, api: Any, vmid: int) -> bool:
-    # Delegates to console.clear_bootstrap_password which does {"delete": "cipassword"}
+    # The console password existed only to bootstrap the agent. Proxmox keeps
+    # cipassword in the VM config, so leaving it behind would park a live
+    # credential in cleartext for the life of the guest.
     return console.clear_bootstrap_password(lab, api, vmid)
-
 
 
 def _spawn_dnsmasq_server(lab: Any, api: Any, args: Any, *, role: str,
@@ -742,6 +741,10 @@ def _spawn_dnsmasq_server(lab: Any, api: Any, args: Any, *, role: str,
         {
             "cores": args.cores,
             "memory": args.memory,
+            # net0 on the home bridge gives the server egress for its own
+            # provisioning (apt); net1 on the lab bridge is where it serves.
+            # dnsmasq binds only the lab-side interface, so it never answers
+            # on the egress NIC.
             "net0": "virtio,bridge=vmbr0,firewall=1",
             "net1": f"virtio,bridge={LAB_BRIDGE}",
             "ipconfig0": "ip=dhcp",

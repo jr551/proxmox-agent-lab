@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
-import time
 from typing import Any
 
 from . import config as _config
@@ -166,10 +165,11 @@ def launch_script(name: str, spec: dict[str, Any], adb_port: int) -> str:
 def _exec(lab: Any, api: Any, vmid: int, script: str,
           timeout: int = 1800) -> dict[str, Any]:
     console.write_guest_file(lab, api, vmid, "/tmp/pxl-android-step.sh", script)
+    # bash, not sh: these steps open with `set -euo pipefail`, which dash
+    # (Debian's /bin/sh) rejects outright.
     return console.exec_guest(lab, api, vmid,
-                              ["/bin/sh", "/tmp/pxl-android-step.sh"],
+                              ["/bin/bash", "/tmp/pxl-android-step.sh"],
                               timeout=timeout)
-
 
 
 def cmd_profiles(lab: Any, args: Any) -> None:

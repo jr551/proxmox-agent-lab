@@ -21,6 +21,7 @@ os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
 import re  # noqa: E402
 import sys  # noqa: E402
 import unittest  # noqa: E402
+from unittest import mock  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -199,3 +200,23 @@ class HonestyTests(unittest.TestCase):
         """Measured: ro.product.model stays the stock image's."""
         doc = (Path(__file__).parents[1] / "docs" / "android.md").read_text()
         self.assertIn("sdk_gphone_x86_64", doc)
+
+
+class StepShellRegressionTests(unittest.TestCase):
+    """Android step scripts declare #!/bin/bash and use `set -euo pipefail`."""
+
+    def test_step_scripts_are_bash(self) -> None:
+        scripts = sorted(android.SCRIPTS.glob("*.sh"))
+        self.assertTrue(scripts, "no android scripts found")
+        for path in scripts:
+            body = path.read_text()
+            self.assertTrue(body.startswith("#!/bin/bash"), f"{path.name} shebang")
+            self.assertIn("pipefail", body, f"{path.name} relies on bash")
+
+    def test_exec_runs_the_step_under_bash(self) -> None:
+        lab = mock.Mock()
+        with mock.patch.object(android.console, "write_guest_file"), \
+             mock.patch.object(android.console, "agent_exec") as agent_exec:
+            android._exec(lab, mock.Mock(), 101, "set -euo pipefail")
+        argv = agent_exec.call_args.args[3]
+        self.assertEqual(argv[0], "/bin/bash", f"dash cannot run these: {argv}")

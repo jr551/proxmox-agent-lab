@@ -4,6 +4,14 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.12.1 - 2026-08-25
+
+### Fixed
+
+- `doctor` listed a spooled audit backlog twice. The ledger check counted the
+  spool as well as the block that already reported it, so a controller with
+  events waiting saw the same problem printed two ways.
+
 ## 0.12.0 - 2026-08-25
 
 One shared audit ledger, and one secret per machine.

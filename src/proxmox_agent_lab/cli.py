@@ -2303,13 +2303,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                 "ledger unreachable -- expected when the lab host is powered "
                 "off; events spool locally until it returns"
             )
-        else:
-            pending = len(journal_module.read_spool(JOURNAL_ROOT))
-            if pending:
-                problems.append(
-                    f"{pending} audit event(s) are spooled locally; upload "
-                    "them with 'proxmox-lab journal --flush-spool'"
-                )
+        # The spool backlog is reported once, below, where it is counted.
     mode = CONFIG.power.get("mode")
     report["power"] = {
         "mode": mode,

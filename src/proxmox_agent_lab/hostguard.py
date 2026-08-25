@@ -16,6 +16,14 @@ disk inspected; a guest it deleted is gone, and the guard is the component
 running unattended with the least context about what the work was worth.
 Destroying stays with the controller, which knows the lease's policy.
 
+It then powers the host off, because a lab that cleans up but stays awake has
+only solved half the problem -- the eight-day lease also meant eight days of
+electricity. The condition for that is deliberately blunt: **no guest running
+at all**, infrastructure aside. Not "no lease the ledger knows about" -- a
+controller that has not been upgraded yet writes nowhere this guard can read,
+and its work would look like an idle host. If something is running, somebody
+may be using it.
+
 Installed by `proxmox-lab journal host-setup` alongside the ledger container.
 """
 
@@ -38,6 +46,11 @@ CONFIG_PATH = "/etc/pxl-hostguard.json"
 # stopping a live experiment because a laptop slept is worse than a guest
 # running an extra hour.
 DEFAULT_GRACE_MINUTES = 90
+# Consecutive idle checks before powering off. One idle sweep is not enough:
+# a controller between two commands, or a guest mid-reboot, both look idle for
+# a moment.
+DEFAULT_IDLE_CHECKS = 3
+STATE_PATH = "/var/lib/pxl-hostguard-state.json"
 
 
 def log(message):
@@ -148,13 +161,17 @@ def stop(guest):
 
 
 def record(connection, controller, vmid, lease, reason):
-    """Write what the guard did into the same ledger it read."""
+    """Write what the guard did into the same ledger it read.
+
+    vmid 0 with no lease is the host-level event (powering off), not a guest.
+    """
     import hashlib
 
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    event = "hostguard-powered-off" if reason == "host-idle" else "hostguard-stopped"
     payload = {
-        "timestamp": now, "event": "hostguard-stopped", "lease": lease,
-        "vmid": vmid, "reason": reason, "controller": controller,
+        "timestamp": now, "event": event, "lease": lease,
+        "vmid": vmid or None, "reason": reason, "controller": controller,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["event_id"] = hashlib.sha256(canonical.encode()).hexdigest()[:36]
@@ -162,9 +179,44 @@ def record(connection, controller, vmid, lease, reason):
         cursor.execute(
             "INSERT IGNORE INTO events (event_id, controller, timestamp, "
             "event, lease, vmid, data) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-            (payload["event_id"], controller, now, "hostguard-stopped",
-             lease, vmid, json.dumps(payload, sort_keys=True)),
+            (payload["event_id"], controller, now, event,
+             lease, vmid or None, json.dumps(payload, sort_keys=True)),
         )
+
+
+def read_state():
+    try:
+        with open(STATE_PATH) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {"idle_checks": 0}
+
+
+def write_state(state):
+    try:
+        with open(STATE_PATH, "w") as handle:
+            json.dump(state, handle)
+    except OSError:
+        pass
+
+
+def anything_running(all_guests, ledger_ctid):
+    """Guests running right now, infrastructure aside.
+
+    The test for "is this host idle" on purpose, rather than asking the ledger
+    which leases are open. A controller that has not been upgraded writes
+    nowhere this guard can read; its guests would look like nobody's work and
+    the host would be powered off underneath it.
+    """
+    return [
+        g for g in all_guests
+        if g["status"] == "running" and str(g["vmid"]) != str(ledger_ctid)
+    ]
+
+
+def power_off():
+    log("host idle; powering off")
+    subprocess.run(["/sbin/shutdown", "-h", "now"], check=False, timeout=60)
 
 
 def main():
@@ -205,9 +257,38 @@ def main():
                     f"{guest['lease']})")
             else:
                 log(f"could not stop vmid {guest['vmid']}")
-        log(f"done; {stopped} guest(s) stopped")
-    finally:
+
+        # Powering off is the other half of cleaning up. Guarded by a plain
+        # "is anything running", and by needing several idle sweeps in a row so
+        # a controller pausing between two commands does not lose its host.
+        state = read_state()
+        if not cfg.get("shutdown_when_idle", True):
+            log(f"done; {stopped} guest(s) stopped; shutdown disabled")
+            write_state({"idle_checks": 0})
+            return 0
+        busy = anything_running(guests(), ledger_ctid)
+        if busy:
+            if state.get("idle_checks"):
+                log(f"{len(busy)} guest(s) running; idle counter reset")
+            write_state({"idle_checks": 0})
+            log(f"done; {stopped} guest(s) stopped; host stays up")
+            return 0
+        needed = int(cfg.get("idle_checks", DEFAULT_IDLE_CHECKS))
+        seen = int(state.get("idle_checks", 0)) + 1
+        write_state({"idle_checks": seen})
+        if seen < needed:
+            log(f"done; {stopped} stopped; host idle ({seen}/{needed} checks)")
+            return 0
+        write_state({"idle_checks": 0})
+        record(connection, controller, 0, None, "host-idle")
         connection.close()
+        power_off()
+        return 0
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
     return 0
 
 

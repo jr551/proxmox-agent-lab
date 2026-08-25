@@ -71,12 +71,32 @@ def detect_backend() -> str:
 
 def legacy_keystore() -> str:
     """The OS keystore this machine would have used before secrets moved to
-    the environment. Read-only fallback; nothing new is written here."""
-    if shutil.which("security") and os.uname().sysname == "Darwin":
+    the environment. Read-only fallback; nothing new is written here.
+
+    ``os.uname`` does not exist on Windows, so the platform check goes through
+    ``platform.system()`` there rather than raising AttributeError on import
+    of a controller that never had a keystore to begin with.
+    """
+    if _is_darwin() and shutil.which("security"):
         return "keychain"
     if shutil.which("secret-tool"):
         return "secret-tool"
+    if _is_windows() and shutil.which("cmdkey"):
+        return "wincred"
     return ""
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _is_darwin() -> bool:
+    try:
+        return os.uname().sysname == "Darwin"  # type: ignore[attr-defined]
+    except AttributeError:  # pragma: no cover - Windows only
+        import platform
+
+        return platform.system() == "Darwin"
 
 
 def read_legacy(backend: str, name: str) -> str | None:
@@ -91,6 +111,10 @@ def read_legacy(backend: str, name: str) -> str | None:
     if backend == "keychain":
         argv = ["security", "find-generic-password", "-a", name,
                 "-s", APP_NAME, "-w"]
+    elif backend == "wincred":  # pragma: no cover - Windows only
+        # cmdkey cannot print a secret back, by design. A Windows controller
+        # that stored secrets there has to move them into the environment.
+        return None
     elif backend == "secret-tool":
         argv = ["secret-tool", "lookup", "service", APP_NAME, "account", name]
     else:
@@ -147,11 +171,15 @@ def _read_file_secret(config: Config, name: str) -> str | None:
     path = _file_path(config)
     if not path.is_file():
         return None
-    mode = path.stat().st_mode & 0o077
-    if mode:
-        raise SecretError(
-            f"{path} is readable by other users; run: chmod 600 {path}"
-        )
+    # Windows has no POSIX mode bits to check; NTFS ACLs are the equivalent
+    # and are not expressible here, so the check is skipped rather than
+    # refusing to read a perfectly ordinary file.
+    if not _is_windows():
+        mode = path.stat().st_mode & 0o077
+        if mode:
+            raise SecretError(
+                f"{path} is readable by other users; run: chmod 600 {path}"
+            )
     try:
         import tomllib
         with path.open("rb") as handle:

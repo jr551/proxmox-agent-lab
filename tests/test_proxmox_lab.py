@@ -2323,3 +2323,29 @@ class InfrastructureGuestTests(unittest.TestCase):
         api = mock.Mock()
         api.call.return_value = [{"vmid": 9005, "status": "running"}]
         self.assertEqual(LAB.running_guest_vmids(api), [9005])
+
+
+class UploadStorageDefaultTests(unittest.TestCase):
+    """Big images belong on bulk, not on the hypervisor's root filesystem.
+
+    Found live: 50 GB of ISOs had accumulated on the Proxmox root filesystem,
+    taking it to 96% full. A full root takes the hypervisor down with it, which
+    is a much worse failure than a slow ISO read.
+    """
+
+    def _default(self, upload: tuple, bulk: str) -> str:
+        """The rule cli.py applies at import time."""
+        return bulk if bulk in upload else (upload[0] if upload else "local")
+
+    def test_bulk_is_preferred_when_it_is_an_upload_target(self) -> None:
+        self.assertEqual(
+            self._default(("local", "usb-bulk"), "usb-bulk"), "usb-bulk"
+        )
+
+    def test_falls_back_when_bulk_is_not_an_upload_target(self) -> None:
+        """A config that never allowed bulk uploads must still work."""
+        self.assertEqual(self._default(("local",), "usb-bulk"), "local")
+
+    def test_the_shipped_default_is_not_the_root_filesystem(self) -> None:
+        """local is /var/lib/vz on the Proxmox root; bulk is not."""
+        self.assertIn(LAB.DEFAULT_UPLOAD_STORAGE, LAB.UPLOAD_STORAGES)

@@ -4,6 +4,37 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.13.0 - 2026-08-25
+
+### Added
+
+- **The host guard powers the host off when the lab goes idle.** It already
+  stopped guests whose lease had ended or gone quiet; a lab that cleans up but
+  stays awake has only solved half the problem -- the eight-day lease that
+  prompted the guard also meant eight days of electricity.
+
+  The condition is deliberately blunt: no guest running at all, infrastructure
+  aside, for several consecutive checks. Not "no lease the ledger knows about"
+  -- a controller that has not been upgraded writes nowhere the guard can
+  read, and its guests would look like an idle host. Set
+  `shutdown_when_idle` false in `/etc/pxl-hostguard.json` to disable it.
+
+- **Windows: the controller runs there now.** `import fcntl` is guarded and
+  falls back to `msvcrt` locking, and `os.uname` (POSIX-only) goes through
+  `platform.system()`. The 0o077 permission check on a file-backend secrets
+  file is skipped on Windows, where NTFS ACLs are the equivalent and the mode
+  bits meant every read was refused. Covered by tests that simulate Windows by
+  hiding `fcntl` and deleting `os.uname`, so they run on any platform.
+
+### Changed
+
+- **`upload` defaults to the bulk store, not `local`.** `local` is the Proxmox
+  root filesystem, and ISOs are the biggest thing this tool writes: this
+  project's own lab reached 96% full on ISOs alone, with 2.8 GB left. A full
+  root takes the hypervisor down with it, which is a worse failure than a
+  slower ISO read. Falls back to whatever `upload_storages` allows when the
+  bulk store is not one of them.
+
 ## 0.12.1 - 2026-08-25
 
 ### Fixed

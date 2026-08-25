@@ -11,7 +11,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
+try:
+    import fcntl  # POSIX advisory locks; absent on Windows
+except ImportError:  # pragma: no cover - Windows only
+    fcntl = None  # type: ignore[assignment]
 import io
 import json
 import os
@@ -86,6 +89,13 @@ GUEST_PATH_PREFIXES = (
     f"/nodes/{NODE}/lxc/",
 )
 UPLOAD_STORAGES = tuple(CONFIG.storage.upload_storages)
+# Big images belong on the bulk store, not on the hypervisor's root filesystem.
+# Falls back to whatever is allowed if bulk is not one of the upload targets.
+DEFAULT_UPLOAD_STORAGE = (
+    str(CONFIG.storage.bulk_storage)
+    if str(CONFIG.storage.bulk_storage) in UPLOAD_STORAGES
+    else (UPLOAD_STORAGES[0] if UPLOAD_STORAGES else "local")
+)
 HOST_CHANGE_MARKERS = (
     "/access",
     "/storage",
@@ -198,11 +208,53 @@ def _bind(lab: Any, fn: Any) -> Any:
     return lambda args: fn(lab, args)
 
 
+def _lock_file(handle: Any) -> None:
+    """Take an exclusive advisory lock, blocking until it is ours.
+
+    POSIX gets flock. Windows has no equivalent that blocks the same way, so
+    it takes the non-blocking one and continues either way: the lock exists to
+    stop two controllers on *one* machine interleaving, and a Windows box
+    without it is no worse off than it was before Windows was supported.
+    """
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return
+    try:  # pragma: no cover - Windows only
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    except (ImportError, OSError):
+        pass
+
+
+def _try_lock_file(handle: Any) -> bool:
+    """Take the lock if it is free. False when someone else holds it."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+    try:  # pragma: no cover - Windows only
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+    except ImportError:
+        # Neither flock nor msvcrt: not a platform that exists today. Proceed
+        # rather than report the lock permanently held -- this gate guards the
+        # backup sweep, and silently never running it is worse than the
+        # theoretical double-run it prevents.
+        return True
+
+
 @contextlib.contextmanager
 def controller_lock() -> Any:
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     with LOCK_PATH.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _lock_file(handle)
         yield
 
 
@@ -217,9 +269,7 @@ def sweep_lock(name: str) -> Any:
     """
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     with (STATE_ROOT / f"{name}.lock").open("a+") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        if not _try_lock_file(handle):
             yield False
             return
         yield True
@@ -2734,8 +2784,12 @@ def parser() -> argparse.ArgumentParser:
 
     upload = sub.add_parser("upload")
     upload.add_argument("--lease", required=True)
-    upload.add_argument("--storage", default="local",
-                        choices=UPLOAD_STORAGES)
+    # Bulk by default. ISOs are the biggest thing this tool writes, and the
+    # Proxmox root filesystem is small: this lab's filled to 96% on ISOs alone,
+    # which takes the hypervisor down with it long before it takes a lease down.
+    upload.add_argument("--storage", default=DEFAULT_UPLOAD_STORAGE,
+                        choices=UPLOAD_STORAGES,
+                        help="default: %(default)s (the configured bulk store)")
     upload.add_argument("--content", choices=("import", "iso"), default="import")
     upload.add_argument("--file", required=True)
     upload.add_argument("--timeout", type=int, default=1800)

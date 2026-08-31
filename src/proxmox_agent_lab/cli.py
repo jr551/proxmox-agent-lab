@@ -2787,9 +2787,15 @@ def parser() -> argparse.ArgumentParser:
     # Bulk by default. ISOs are the biggest thing this tool writes, and the
     # Proxmox root filesystem is small: this lab's filled to 96% on ISOs alone,
     # which takes the hypervisor down with it long before it takes a lease down.
+    # choices=None when nothing is configured, so the argument stays usable and
+    # cmd_upload's own check reports the problem instead of argparse refusing
+    # every value including the default.
     upload.add_argument("--storage", default=DEFAULT_UPLOAD_STORAGE,
-                        choices=UPLOAD_STORAGES,
-                        help="default: %(default)s (the configured bulk store)")
+                        choices=UPLOAD_STORAGES or None,
+                        help="default: %(default)s"
+                             + (" (the configured bulk store)"
+                                if DEFAULT_UPLOAD_STORAGE ==
+                                str(CONFIG.storage.bulk_storage) else ""))
     upload.add_argument("--content", choices=("import", "iso"), default="import")
     upload.add_argument("--file", required=True)
     upload.add_argument("--timeout", type=int, default=1800)

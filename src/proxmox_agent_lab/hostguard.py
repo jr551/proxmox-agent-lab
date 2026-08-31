@@ -24,6 +24,14 @@ controller that has not been upgraded yet writes nowhere this guard can read,
 and its work would look like an idle host. If something is running, somebody
 may be using it.
 
+The power-off does make one ledger consult: the long-term pin. A long-term
+lease promises the host stays on even with every guest stopped, and only a
+controller new enough to have the feature can create one -- so trusting the
+ledger there cannot pull the power out from under an un-upgraded controller.
+The same field answers the stop question: a long-term lease never heartbeats
+by design, so its silence must not read as abandonment. Only a recorded end
+(`lease-end`, `long-term-destroyed`, `long-term-released`) ends one.
+
 Installed by `proxmox-lab journal host-setup` alongside the ledger container.
 """
 
@@ -32,7 +40,11 @@ from __future__ import annotations
 # Written to /usr/local/lib/pxl-hostguard.py on the Proxmox host. Standard
 # library plus PyMySQL, which the ledger container's host already needs.
 GUARD_SCRIPT = r'''#!/usr/bin/env python3
-"""Stop guests whose lease is over. Runs on the Proxmox host, as root."""
+"""Stop guests whose lease is over. Runs on the Proxmox host, as root.
+
+A long-term lease is the exception in both directions: it never heartbeats,
+so its silence is not abandonment, and while one is active the host stays on
+even with nothing running. Only a recorded end ends one."""
 import json
 import os
 import subprocess
@@ -51,6 +63,11 @@ DEFAULT_GRACE_MINUTES = 90
 # a moment.
 DEFAULT_IDLE_CHECKS = 3
 STATE_PATH = "/var/lib/pxl-hostguard-state.json"
+# Every way a lease can be recorded as over. The long-term endings matter
+# because long-term leases never write lease-end -- destroy and release close
+# them under their own event names.
+LEASE_END_EVENTS = ("lease-end", "lease-abandoned",
+                    "long-term-destroyed", "long-term-released")
 
 
 def log(message):
@@ -80,7 +97,8 @@ def lease_state(connection):
         cursor.execute(
             "SELECT lease, event, MAX(timestamp) AS last_at FROM events "
             "WHERE lease IS NOT NULL AND event IN "
-            "('lease-begin','lease-heartbeat','lease-end','lease-abandoned') "
+            "('lease-begin','lease-heartbeat','lease-end','lease-abandoned',"
+            "'long-term-destroyed','long-term-released') "
             "GROUP BY lease, event"
         )
         rows = cursor.fetchall() or []
@@ -89,6 +107,27 @@ def lease_state(connection):
         entry = leases.setdefault(row["lease"], {})
         entry[row["event"]] = row["last_at"]
     return leases
+
+
+def lease_kinds(connection):
+    """The kind ("session" or "long-term") of each lease, from its begin
+    event's JSON payload. Leases whose begin event carries no kind, or an
+    unparseable one, read as ordinary session leases."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT lease, data FROM events "
+            "WHERE lease IS NOT NULL AND event = 'lease-begin'"
+        )
+        rows = cursor.fetchall() or []
+    kinds = {}
+    for row in rows:
+        try:
+            kind = json.loads(row["data"] or "{}").get("kind")
+        except ValueError:
+            continue
+        if kind:
+            kinds[row["lease"]] = str(kind)
+    return kinds
 
 
 def parse_ts(value):
@@ -100,10 +139,15 @@ def parse_ts(value):
         return None
 
 
-def is_over(events, grace):
-    """Has this lease ended, or gone quiet long enough to count as abandoned?"""
-    if events.get("lease-end") or events.get("lease-abandoned"):
+def is_over(events, grace, long_term=False):
+    """Has this lease ended, or gone quiet long enough to count as abandoned?
+
+    A long-term lease does not heartbeat by design, so quiet is its normal
+    state; only a recorded end ends one."""
+    if any(events.get(name) for name in LEASE_END_EVENTS):
         return "ended"
+    if long_term:
+        return None
     seen = max(
         (t for t in (parse_ts(events.get("lease-heartbeat")),
                      parse_ts(events.get("lease-begin"))) if t),
@@ -193,9 +237,15 @@ def read_state():
 
 
 def write_state(state):
+    """Persist the idle counter. Write-then-rename, so a kill mid-write can
+    only ever leave the previous state or the new one, never a truncated
+    file. Read failures already fail safe (counter reset to zero), but a
+    torn write would silently defeat the consecutive-checks rule."""
+    tmp = STATE_PATH + ".tmp"
     try:
-        with open(STATE_PATH, "w") as handle:
+        with open(tmp, "w") as handle:
             json.dump(state, handle)
+        os.replace(tmp, STATE_PATH)
     except OSError:
         pass
 
@@ -212,6 +262,23 @@ def anything_running(all_guests, ledger_ctid):
         g for g in all_guests
         if g["status"] == "running" and str(g["vmid"]) != str(ledger_ctid)
     ]
+
+
+def pinned_leases(leases, kinds):
+    """Active long-term leases: the one thing that keeps the host on with
+    nothing running.
+
+    Ordinary leases are invisible to this decision on purpose -- an
+    un-upgraded controller writes nowhere here, so trusting the ledger for
+    "is anything running" would power off real work. A long-term lease is
+    different in kind: only a controller new enough to have the feature can
+    create one, and its whole promise is that the host stays on even when
+    every guest is stopped."""
+    return sorted(
+        lease for lease, events in leases.items()
+        if kinds.get(lease) == "long-term"
+        and not any(events.get(name) for name in LEASE_END_EVENTS)
+    )
 
 
 def power_off():
@@ -231,8 +298,11 @@ def main():
         return 0
     try:
         leases = lease_state(connection)
+        kinds = lease_kinds(connection)
+        pinned = pinned_leases(leases, kinds)
+        all_guests = guests()
         stopped = 0
-        for guest in guests():
+        for guest in all_guests:
             if not guest["lease"] or guest["status"] != "running":
                 continue
             # Never touch the ledger container itself: stopping it would take
@@ -246,7 +316,8 @@ def main():
                 log(f"vmid {guest['vmid']}: lease {guest['lease']} unknown to "
                     "the ledger, leaving it running")
                 continue
-            reason = is_over(events, grace)
+            reason = is_over(events, grace,
+                             long_term=kinds.get(guest["lease"]) == "long-term")
             if not reason:
                 continue
             if stop(guest):
@@ -266,12 +337,17 @@ def main():
             log(f"done; {stopped} guest(s) stopped; shutdown disabled")
             write_state({"idle_checks": 0})
             return 0
-        busy = anything_running(guests(), ledger_ctid)
+        busy = anything_running(all_guests, ledger_ctid)
         if busy:
             if state.get("idle_checks"):
                 log(f"{len(busy)} guest(s) running; idle counter reset")
             write_state({"idle_checks": 0})
             log(f"done; {stopped} guest(s) stopped; host stays up")
+            return 0
+        if pinned:
+            write_state({"idle_checks": 0})
+            log(f"done; {stopped} guest(s) stopped; long-term lease "
+                f"{', '.join(pinned)} active; host stays up")
             return 0
         needed = int(cfg.get("idle_checks", DEFAULT_IDLE_CHECKS))
         seen = int(state.get("idle_checks", 0)) + 1

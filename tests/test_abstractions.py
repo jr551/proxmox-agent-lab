@@ -218,6 +218,9 @@ class SecretsTests(unittest.TestCase):
             secrets_store.store(config, "proxmox-token", "x")
 
     def test_file_backend_refuses_world_readable_files(self) -> None:
+        """Pinned to the POSIX branch: on Windows the mode bits are skipped
+        by design (NTFS ACLs are the equivalent), and test_windows_host pins
+        that side of the split."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "secrets.toml"
             path.write_text('proxmox-token = "abc"\n')
@@ -226,7 +229,9 @@ class SecretsTests(unittest.TestCase):
             config._values["secrets"].update(
                 {"backend": "file", "file_path": str(path)}
             )
-            with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(secrets_store, "_is_windows",
+                                   return_value=False):
                 with self.assertRaises(secrets_store.SecretError) as caught:
                     secrets_store.get(config, "proxmox-token")
         self.assertIn("chmod 600", str(caught.exception))
@@ -239,7 +244,11 @@ class SecretsTests(unittest.TestCase):
                 {"backend": "file", "file_path": str(path)}
             )
             secrets_store.store(config, "proxmox-token", "sekrit")
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            # Windows cannot express 0o600 (chmod there only toggles the
+            # read-only attribute), so the mode contract is POSIX-only; the
+            # read-back below is the part that must work everywhere.
+            if not secrets_store._is_windows():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             with mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(
                     secrets_store.get(config, "proxmox-token"), "sekrit"

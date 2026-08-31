@@ -1,8 +1,9 @@
 """The host-side lease guard.
 
 The guard runs unattended, as root, and can power the host off. That is a lot
-of authority for a component with no operator watching, so the two decisions
-it makes -- "is this lease over" and "is this host idle" -- are pinned here.
+of authority for a component with no operator watching, so the decisions it
+makes -- "is this lease over", "is this host idle", and "does a long-term
+lease pin the host on" -- are pinned here.
 
 The script is executed as source rather than imported: it is shipped as a
 string and written to /usr/local/lib/pxl-hostguard.py on the Proxmox host, so
@@ -12,8 +13,10 @@ testing the string is testing what actually runs.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 
@@ -76,6 +79,154 @@ class LeaseIsOverTests(unittest.TestCase):
     def test_an_unparseable_timestamp_does_not_end_a_lease(self) -> None:
         """Fail towards leaving the guest alone, not towards stopping it."""
         self.assertIsNone(self.guard.is_over({"lease-begin": "not-a-date"}, 90))
+
+
+class LongTermLeaseTests(unittest.TestCase):
+    """A long-term lease never heartbeats by design, so silence must not read
+    as abandonment -- and only a recorded end ends one."""
+
+    def setUp(self) -> None:
+        self.guard = _guard()
+
+    def test_a_silent_long_term_lease_is_not_abandoned(self) -> None:
+        """The pre-fix behaviour: a live long-term guest stopped as abandoned
+        after the grace window, because nothing ever heartbeats it."""
+        events = {"lease-begin": _stamp(300)}
+        self.assertIsNone(self.guard.is_over(events, 90, long_term=True))
+
+    def test_a_released_long_term_lease_is_ended(self) -> None:
+        events = {"lease-begin": _stamp(300),
+                  "long-term-released": _stamp(10)}
+        self.assertEqual(
+            self.guard.is_over(events, 90, long_term=True), "ended"
+        )
+
+    def test_a_destroyed_long_term_lease_is_ended(self) -> None:
+        events = {"lease-begin": _stamp(300),
+                  "long-term-destroyed": _stamp(10)}
+        self.assertEqual(
+            self.guard.is_over(events, 90, long_term=True), "ended"
+        )
+
+    def test_an_ordinary_lease_still_goes_abandoned(self) -> None:
+        events = {"lease-begin": _stamp(300)}
+        self.assertEqual(self.guard.is_over(events, 90), "abandoned")
+
+
+class LeaseKindTests(unittest.TestCase):
+    """The kind arrives inside the begin event's JSON payload, so a lease
+    this guard cannot classify must read as an ordinary session lease."""
+
+    def setUp(self) -> None:
+        self.guard = _guard()
+
+    @staticmethod
+    def _connection(rows):
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, *args, **kwargs):
+                pass
+
+            def fetchall(self):
+                return rows
+
+        class Connection:
+            def cursor(self):
+                return Cursor()
+
+        return Connection()
+
+    def test_kind_is_read_from_the_begin_event_data(self) -> None:
+        rows = [
+            {"lease": "lt", "data": json.dumps({"kind": "long-term"})},
+            {"lease": "s", "data": json.dumps({"kind": "session"})},
+        ]
+        self.assertEqual(
+            self.guard.lease_kinds(self._connection(rows)),
+            {"lt": "long-term", "s": "session"},
+        )
+
+    def test_an_unparseable_or_kindless_begin_reads_as_absent(self) -> None:
+        rows = [
+            {"lease": "broken", "data": "not json"},
+            {"lease": "empty", "data": None},
+            {"lease": "kindless", "data": json.dumps({"purpose": "x"})},
+        ]
+        self.assertEqual(
+            self.guard.lease_kinds(self._connection(rows)), {}
+        )
+
+    def test_the_shipped_query_knows_the_long_term_endings(self) -> None:
+        """Without them a destroyed long-term lease would pin the host on
+        forever: its end never arrives as a lease-end event."""
+        for event in ("long-term-destroyed", "long-term-released"):
+            self.assertIn(event, hostguard.GUARD_SCRIPT)
+
+
+class PinTests(unittest.TestCase):
+    """An active long-term lease keeps the host on with nothing running --
+    the one ledger consult the power-off makes, and the only safe one: no
+    controller old enough to lack the feature can create the pin."""
+
+    def setUp(self) -> None:
+        self.guard = _guard()
+
+    def test_an_active_long_term_lease_pins_the_host(self) -> None:
+        leases = {
+            "lt": {"lease-begin": _stamp()},
+            "s": {"lease-begin": _stamp()},
+        }
+        kinds = {"lt": "long-term", "s": "session"}
+        self.assertEqual(self.guard.pinned_leases(leases, kinds), ["lt"])
+
+    def test_an_ended_long_term_lease_does_not_pin(self) -> None:
+        for end_event in ("long-term-destroyed", "long-term-released",
+                          "lease-end", "lease-abandoned"):
+            leases = {"lt": {"lease-begin": _stamp(300), end_event: _stamp(5)}}
+            self.assertEqual(
+                self.guard.pinned_leases(leases, {"lt": "long-term"}), [],
+                f"end event {end_event} did not lift the pin",
+            )
+
+    def test_a_session_lease_never_pins(self) -> None:
+        leases = {"s": {"lease-begin": _stamp()}}
+        self.assertEqual(self.guard.pinned_leases(leases, {"s": "session"}), [])
+
+    def test_an_unclassified_lease_never_pins(self) -> None:
+        """No kind in the ledger means no pin: an un-upgraded controller's
+        world must look exactly as it did before the pin existed."""
+        leases = {"s": {"lease-begin": _stamp()}}
+        self.assertEqual(self.guard.pinned_leases(leases, {}), [])
+
+
+class GuardStateTests(unittest.TestCase):
+    """The idle counter survives between sweeps in a file, so a torn write
+    must never leave it half-written."""
+
+    def setUp(self) -> None:
+        self.guard = _guard()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.guard.STATE_PATH = str(Path(tmp.name) / "state.json")
+
+    def test_write_then_read_round_trips(self) -> None:
+        self.guard.write_state({"idle_checks": 2})
+        self.assertEqual(self.guard.read_state(), {"idle_checks": 2})
+
+    def test_an_unreadable_state_file_reads_as_zero(self) -> None:
+        Path(self.guard.STATE_PATH).write_text("{broken", encoding="utf-8")
+        self.assertEqual(self.guard.read_state(), {"idle_checks": 0})
+
+    def test_a_rewrite_leaves_no_temp_file_behind(self) -> None:
+        self.guard.write_state({"idle_checks": 2})
+        self.guard.write_state({"idle_checks": 3})
+        self.assertEqual(self.guard.read_state(), {"idle_checks": 3})
+        self.assertFalse(Path(self.guard.STATE_PATH + ".tmp").exists())
 
 
 class HostIdleTests(unittest.TestCase):

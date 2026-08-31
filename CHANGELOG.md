@@ -16,8 +16,9 @@ All notable changes to this project will be documented here. The format follows
   The condition is deliberately blunt: no guest running at all, infrastructure
   aside, for several consecutive checks. Not "no lease the ledger knows about"
   -- a controller that has not been upgraded writes nowhere the guard can
-  read, and its guests would look like an idle host. Set
-  `shutdown_when_idle` false in `/etc/pxl-hostguard.json` to disable it.
+  read, and its guests would look like an idle host. The one exception is the
+  long-term pin below. Set `shutdown_when_idle` false in
+  `/etc/pxl-hostguard.json` to disable it.
 
 - **Windows: the controller runs there now.** `import fcntl` is guarded and
   falls back to `msvcrt` locking, and `os.uname` (POSIX-only) goes through
@@ -33,7 +34,32 @@ All notable changes to this project will be documented here. The format follows
   project's own lab reached 96% full on ISOs alone, with 2.8 GB left. A full
   root takes the hypervisor down with it, which is a worse failure than a
   slower ISO read. Falls back to whatever `upload_storages` allows when the
-  bulk store is not one of them.
+  bulk store is not one of them. The `--storage` help now says which case
+  applies, and a config with an empty `upload_storages` no longer makes
+  argparse reject every value.
+
+### Fixed
+
+- **The host guard honors long-term leases.** A long-term lease never
+  heartbeats by design, so the guard read its silence as abandonment and
+  stopped its live guests after the grace window, and the idle power-off
+  would have pulled the host out from under an active long-term lease whose
+  guests happened to be stopped. The guard now reads each lease's `kind`
+  from the ledger: a long-term lease is never "abandoned", and while one is
+  active the host stays on. Only a recorded end (`lease-end`,
+  `long-term-destroyed`, `long-term-released`) ends one -- the long-term
+  endings were invisible to the guard's query before. The guard runs on the
+  host, so picking this up means re-running `proxmox-lab journal host-setup`
+  to rewrite `/usr/local/lib/pxl-hostguard.py`.
+- The guard's idle counter is now written atomically (write then rename), so
+  a kill mid-write cannot truncate it and silently defeat the
+  consecutive-checks rule.
+- The Windows tests now pass on real Windows, not only in simulation: the
+  lock test no longer asserts flock's same-handle reentrancy of msvcrt (and a
+  second test pins the two-handle contention rule with a fake msvcrt), and
+  the secrets-file tests patch the platform helper explicitly so both
+  branches are exercised on either real platform. Removed a stray shell
+  fragment accidentally committed to the repository root.
 
 ## 0.12.1 - 2026-08-25
 

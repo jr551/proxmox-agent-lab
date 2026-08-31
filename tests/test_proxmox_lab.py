@@ -2276,7 +2276,17 @@ class StateIsolationTests(unittest.TestCase):
         self.assertEqual(
             str(LAB.STATE_ROOT), os.environ["PROXMOX_AGENT_LAB_STATE"]
         )
-        self.assertNotIn(str(Path.home()), str(LAB.STATE_ROOT))
+        # The danger is the *default* root, where the live controller state
+        # actually lives -- not any path under the user profile: on Windows
+        # the whole temp tree sits inside it, so "under home" would condemn
+        # the suite's own isolation.
+        saved = os.environ.pop("PROXMOX_AGENT_LAB_STATE", None)
+        try:
+            real_default = LAB.config_module.state_dir()
+        finally:
+            if saved is not None:
+                os.environ["PROXMOX_AGENT_LAB_STATE"] = saved
+        self.assertNotEqual(str(LAB.STATE_ROOT), str(real_default))
 
 
 if __name__ == "__main__":
@@ -2347,5 +2357,18 @@ class UploadStorageDefaultTests(unittest.TestCase):
         self.assertEqual(self._default(("local",), "usb-bulk"), "local")
 
     def test_the_shipped_default_is_not_the_root_filesystem(self) -> None:
-        """local is /var/lib/vz on the Proxmox root; bulk is not."""
+        """local is /var/lib/vz on the Proxmox root; with the fixture's
+        config the default must actually be the bulk store."""
         self.assertIn(LAB.DEFAULT_UPLOAD_STORAGE, LAB.UPLOAD_STORAGES)
+        self.assertNotEqual(LAB.DEFAULT_UPLOAD_STORAGE, "local")
+
+    def test_the_parser_survives_an_empty_upload_storages_config(self) -> None:
+        """choices=() would make argparse refuse every value including the
+        default; with nothing configured the argument must stay usable and
+        cmd_upload's own check has to produce the readable error."""
+        with mock.patch.object(LAB, "UPLOAD_STORAGES", ()), \
+             mock.patch.object(LAB, "DEFAULT_UPLOAD_STORAGE", "local"):
+            args = LAB.parser().parse_args(
+                ["upload", "--lease", "l", "--file", "/tmp/x.iso"]
+            )
+        self.assertEqual(args.storage, "local")

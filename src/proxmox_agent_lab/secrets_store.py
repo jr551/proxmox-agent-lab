@@ -99,6 +99,21 @@ def _is_darwin() -> bool:
         return platform.system() == "Darwin"
 
 
+def _keystore_lookup(argv: list[str]) -> str | None:
+    """Read one secret through a legacy keystore binary.
+
+    A missing binary reads as "not stored" rather than crashing: a config
+    that names `keychain` while running on Windows (or `secret-tool` on a
+    box without libsecret) must fall through to the env var and the shared
+    store like any other miss, not die before `doctor` can speak."""
+    try:
+        result = subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, check=False)
+    except OSError:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def read_legacy(backend: str, name: str) -> str | None:
     """Read one secret from the pre-environment OS keystore.
 
@@ -119,9 +134,7 @@ def read_legacy(backend: str, name: str) -> str | None:
         argv = ["secret-tool", "lookup", "service", APP_NAME, "account", name]
     else:
         return None
-    result = subprocess.run(argv, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, check=False)
-    return result.stdout.strip() if result.returncode == 0 else None
+    return _keystore_lookup(argv)
 
 
 # The one credential a controller must be given directly. Everything else is
@@ -194,20 +207,14 @@ def get(config: Config, name: str, *, required: bool = True) -> str:
     value: str | None = None
 
     if backend == "keychain":
-        result = subprocess.run(
+        value = _keystore_lookup(
             ["security", "find-generic-password", "-a", name,
-             "-s", APP_NAME, "-w"],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            check=False,
+             "-s", APP_NAME, "-w"]
         )
-        value = result.stdout.strip() if result.returncode == 0 else None
     elif backend == "secret-tool":
-        result = subprocess.run(
-            ["secret-tool", "lookup", "service", APP_NAME, "account", name],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            check=False,
+        value = _keystore_lookup(
+            ["secret-tool", "lookup", "service", APP_NAME, "account", name]
         )
-        value = result.stdout.strip() if result.returncode == 0 else None
     elif backend == "env":
         value = os.environ.get(_env_name(name))
     elif backend == "file":
@@ -242,26 +249,38 @@ def store(config: Config, name: str, value: str) -> str:
     """Save one secret; returns the backend that accepted it."""
     backend = _resolve(config)
     if backend == "keychain":
-        subprocess.run(["security", "delete-generic-password", "-a", name,
-                        "-s", APP_NAME], capture_output=True, check=False)
-        # `-w` with no value prompts twice ("password data" + "retype"),
-        # reading both from stdin; passing the secret as an argument would
-        # leave it visible in `ps` output for the life of the process.
-        # `-U` must come before `-w`, or it is swallowed as the password.
-        result = subprocess.run(
-            ["security", "add-generic-password", "-a", name, "-s", APP_NAME,
-             "-U", "-w"],
-            input=f"{value}\n{value}\n",
-            capture_output=True, text=True, check=False,
-        )
+        try:
+            subprocess.run(["security", "delete-generic-password", "-a", name,
+                            "-s", APP_NAME], capture_output=True, check=False)
+            # `-w` with no value prompts twice ("password data" + "retype"),
+            # reading both from stdin; passing the secret as an argument would
+            # leave it visible in `ps` output for the life of the process.
+            # `-U` must come before `-w`, or it is swallowed as the password.
+            result = subprocess.run(
+                ["security", "add-generic-password", "-a", name, "-s", APP_NAME,
+                 "-U", "-w"],
+                input=f"{value}\n{value}\n",
+                capture_output=True, text=True, check=False,
+            )
+        except OSError:
+            raise SecretError(
+                "the macOS keychain is not available on this machine; set "
+                '[secrets] backend to "env" or "file"'
+            )
         if result.returncode:
             raise SecretError(f"keychain rejected the secret: {result.stderr.strip()}")
     elif backend == "secret-tool":
-        result = subprocess.run(
-            ["secret-tool", "store", "--label", f"{APP_NAME} {name}",
-             "service", APP_NAME, "account", name],
-            input=value, text=True, capture_output=True, check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["secret-tool", "store", "--label", f"{APP_NAME} {name}",
+                 "service", APP_NAME, "account", name],
+                input=value, text=True, capture_output=True, check=False,
+            )
+        except OSError:
+            raise SecretError(
+                "secret-tool is not available on this machine; set "
+                '[secrets] backend to "env" or "file"'
+            )
         if result.returncode:
             raise SecretError(f"secret-tool rejected the secret: {result.stderr.strip()}")
     elif backend == "file":

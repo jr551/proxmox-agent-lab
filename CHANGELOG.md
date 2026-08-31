@@ -54,6 +54,12 @@ All notable changes to this project will be documented here. The format follows
 - The guard's idle counter is now written atomically (write then rename), so
   a kill mid-write cannot truncate it and silently defeat the
   consecutive-checks rule.
+- A config that names the legacy `keychain` or `secret-tool` backend on a
+  machine without that binary -- any Windows box, for `keychain` -- now
+  falls through to the environment variable and the shared store instead of
+  dying with `FileNotFoundError` before `doctor` can run (issue #98).
+  Storing into a missing keystore raises the readable error naming the
+  backend to use instead.
 - The Windows tests now pass on real Windows, not only in simulation: the
   lock test no longer asserts flock's same-handle reentrancy of msvcrt (and a
   second test pins the two-handle contention rule with a fake msvcrt), and

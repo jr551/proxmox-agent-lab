@@ -217,6 +217,37 @@ class SecretsTests(unittest.TestCase):
         with self.assertRaises(secrets_store.SecretError):
             secrets_store.store(config, "proxmox-token", "x")
 
+    def test_a_keychain_config_survives_a_missing_security_binary(self) -> None:
+        """Issue #98: naming backend = "keychain" on a machine without the
+        macOS `security` binary -- any Windows box -- used to raise
+        FileNotFoundError before the env fallback could run. A missing
+        keystore must read as "not stored", like any other miss."""
+        config = config_module.defaults()
+        config._values["secrets"]["backend"] = "keychain"
+        with mock.patch.dict(
+            os.environ, {"PROXMOX_AGENT_LAB_PROXMOX_TOKEN": "from-env"}
+        ):
+            with mock.patch.object(
+                secrets_store.subprocess, "run",
+                side_effect=FileNotFoundError(2, "no such file", "security"),
+            ):
+                self.assertEqual(
+                    secrets_store.get(config, "proxmox-token"), "from-env"
+                )
+
+    def test_storing_to_a_missing_keystore_says_what_to_do(self) -> None:
+        """The store path cannot degrade -- there is nothing to degrade to --
+        so it must raise the user-facing error, not a raw FileNotFoundError."""
+        config = config_module.defaults()
+        config._values["secrets"]["backend"] = "keychain"
+        with mock.patch.object(
+            secrets_store.subprocess, "run",
+            side_effect=FileNotFoundError(2, "no such file", "security"),
+        ):
+            with self.assertRaises(secrets_store.SecretError) as caught:
+                secrets_store.store(config, "proxmox-token", "x")
+        self.assertIn('"env" or "file"', str(caught.exception))
+
     def test_file_backend_refuses_world_readable_files(self) -> None:
         """Pinned to the POSIX branch: on Windows the mode bits are skipped
         by design (NTFS ACLs are the equivalent), and test_windows_host pins

@@ -4,6 +4,20 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.13.1 - 2026-09-04
+
+### Fixed
+
+- `config` now rejects a TOML scalar where a table section is expected.
+- `memflow`/`netcap` no longer swallow `register_resource` errors, and `netcap mitm-setup --bridge` is validated.
+- `journal host-setup` validates `bridge`, `storage`, database/user names, and the bootstrap password.
+- Wake-on-LAN tries every broadcast target before failing.
+- PowerShell download/upload commands escape single quotes.
+- WebSocket client validates `Sec-WebSocket-Accept` and caps frame sizes.
+- Android bootstrap password is cleared in a `finally` block.
+- `install-watchdog` uses a project-scoped LaunchAgent label instead of a personal one.
+- Test fake WebSocket handshake now returns a valid accept header.
+
 ## 0.13.0 - 2026-08-25
 
 ### Added

@@ -242,12 +242,18 @@ def cmd_create(lab: Any, args: Any) -> None:
     if not template:
         raise AndroidError("pass --template <vmid> of a cloud-init image")
     name, _, _ = _create_device_vm(lab, api, lease, args, spec, template)
-    _run_android_steps(lab, api, args, spec, api_level, abi)
-    console.clear_bootstrap_password(lab, api, args.vmid)
     templated = False
-    if args.as_template:
-        _make_template(lab, api, lease, args.vmid)
-        templated = True
+    try:
+        _run_android_steps(lab, api, args, spec, api_level, abi)
+        if args.as_template:
+            _make_template(lab, api, lease, args.vmid)
+            templated = True
+    finally:
+        try:
+            console.clear_bootstrap_password(lab, api, args.vmid)
+        except Exception as exc:
+            print(f"warning: could not clear bootstrap password for "
+                  f"{args.vmid}: {exc}", file=sys.stderr)
     lab.audit("android-created", lease=args.lease, vmid=args.vmid,
               profile=args.profile, api_level=api_level, abi=abi,
               template=templated)

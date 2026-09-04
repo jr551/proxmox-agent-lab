@@ -181,7 +181,12 @@ def cmd_mitm_setup(lab: Any, args: Any) -> None:
     """
     _require_enabled(lab)
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    lease = lab.load_lease(args.lease)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", args.bridge):
+        raise lab.LabError(
+            "--bridge must be a simple bridge name (letters, digits, "
+            "dashes, underscores; up to 40 chars)"
+        )
     script = (MITM_SETUP_SCRIPT
               .replace("__LXC__", str(args.lxc))
               .replace("__BRIDGE__", args.bridge))
@@ -193,11 +198,7 @@ def cmd_mitm_setup(lab: Any, args: Any) -> None:
             "mitm-setup did not complete: "
             + (proc.stderr or proc.stdout).strip()[-600:]
         )
-    try:
-        lab.register_resource(lab.load_lease(args.lease), "lxc", args.lxc,
-                              "delete", "mitm-lab")
-    except Exception:  # pragma: no cover - best-effort registration
-        pass
+    lab.register_resource(lease, "lxc", args.lxc, "delete", "mitm-lab")
     ip = _pct(lab, args.lxc,
               ["bash", "-c", "hostname -I 2>/dev/null | awk '{print $1}'"],
               timeout=30).stdout.strip()

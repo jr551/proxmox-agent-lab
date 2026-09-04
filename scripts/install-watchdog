@@ -2,7 +2,7 @@
 set -eu
 
 skill="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-label="lol.rowe.proxmox-agent-lab-watchdog"
+label="proxmox-agent-lab-watchdog"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -14,7 +14,7 @@ import sys
 path = pathlib.Path(sys.argv[1])
 skill = pathlib.Path(sys.argv[2])
 payload = {
-    "Label": "lol.rowe.proxmox-agent-lab-watchdog",
+    "Label": "proxmox-agent-lab-watchdog",
     "ProgramArguments": [
         str(skill / "scripts" / "proxmox-lab"),
         "cleanup-expired",

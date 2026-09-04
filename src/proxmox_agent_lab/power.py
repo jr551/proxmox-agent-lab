@@ -62,11 +62,14 @@ def wake_on_lan(mac: str, broadcast: str, port: int = 9) -> None:
         # Send to the configured broadcast and the global one: a router that
         # drops directed broadcasts often still passes 255.255.255.255.
         targets = {broadcast or "255.255.255.255", "255.255.255.255"}
+        errors: list[str] = []
         for target in targets:
             try:
                 sock.sendto(packet, (target, port))
             except OSError as exc:
-                raise PowerError(f"could not send to {target}:{port}: {exc}")
+                errors.append(f"could not send to {target}:{port}: {exc}")
+        if len(errors) == len(targets):
+            raise PowerError("; ".join(errors))
 
 
 def _home_assistant(config: Config, entity_id: str) -> None:

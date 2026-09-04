@@ -2496,17 +2496,29 @@ def _provision_ledger(args: argparse.Namespace) -> dict[str, Any]:
 
     ctid = args.ctid or 9310
     storage = args.storage or str(CONFIG.storage.get("bulk_storage") or "local-lvm")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", storage):
+        raise LabError(f"invalid --storage value: {storage!r}")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", args.bridge):
+        raise LabError(f"invalid --bridge value: {args.bridge!r}")
+    database = str(CONFIG.audit.get("database") or "proxmox_lab")
+    user = str(CONFIG.audit.get("user") or "proxmox_lab")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", database):
+        raise LabError(f"invalid [audit] database name: {database!r}")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", user):
+        raise LabError(f"invalid [audit] user name: {user!r}")
     existing = secrets_store.get(
         CONFIG, secrets_store.BOOTSTRAP_SECRET, required=False
     )
     password = existing or secrets.token_urlsafe(24)
+    if any(c in password for c in "'`"):
+        raise LabError("audit ledger password may not contain single quotes or backticks")
     script = (
         mariadb_module.HOST_SETUP_SCRIPT
         .replace("__CTID__", str(ctid))
         .replace("__STORAGE__", storage)
         .replace("__BRIDGE__", str(args.bridge))
-        .replace("__DBNAME__", str(CONFIG.audit.get("database") or "proxmox_lab"))
-        .replace("__DBUSER__", str(CONFIG.audit.get("user") or "proxmox_lab"))
+        .replace("__DBNAME__", database)
+        .replace("__DBUSER__", user)
         .replace("__DBPASS__", password)
         .replace("__GUARD_INSTALL__", _guard_install_block(hostguard_module))
     )

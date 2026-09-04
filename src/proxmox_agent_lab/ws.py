@@ -13,6 +13,7 @@ console stream is not less sensitive than the REST API, so it follows the same
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import socket
 import ssl
@@ -30,6 +31,9 @@ OPCODE_BINARY = 0x2
 OPCODE_CLOSE = 0x8
 OPCODE_PING = 0x9
 OPCODE_PONG = 0xA
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_FRAME_SIZE = 64 * 1024 * 1024
 
 
 class WebSocket:
@@ -63,7 +67,7 @@ class WebSocket:
             raw, server_hostname=host if verify_tls else None
         )
         self._socket.settimeout(timeout)
-        key = base64.b64encode(os.urandom(16)).decode()
+        self._key = base64.b64encode(os.urandom(16)).decode()
         target = path + "?" + parse.urlencode(query)
         request_lines = [
             f"GET {target} HTTP/1.1",
@@ -71,7 +75,7 @@ class WebSocket:
             "Connection: Upgrade",
             "Upgrade: websocket",
             "Sec-WebSocket-Version: 13",
-            f"Sec-WebSocket-Key: {key}",
+            f"Sec-WebSocket-Key: {self._key}",
             f"Sec-WebSocket-Protocol: {', '.join(subprotocols)}",
         ]
         request_lines += [f"{name}: {value}" for name, value in headers.items()]
@@ -83,11 +87,21 @@ class WebSocket:
         status = text.split("\r\n", 1)[0]
         if "101" not in status:
             raise WebSocketError(f"WebSocket upgrade refused: {status.strip()}")
+        expected = base64.b64encode(
+            hashlib.sha1((self._key + WS_GUID).encode()).digest()
+        ).decode()
+        accept = ""
         self.subprotocol = ""
         for line in text.split("\r\n")[1:]:
             name, _, value = line.partition(":")
+            if name.strip().lower() == "sec-websocket-accept":
+                accept = value.strip()
             if name.strip().lower() == "sec-websocket-protocol":
                 self.subprotocol = value.strip().lower()
+        if accept != expected:
+            raise WebSocketError(
+                f"WebSocket accept mismatch: got {accept!r}, expected {expected!r}"
+            )
         self._base64 = self.subprotocol == "base64"
 
     def _read_until(self, marker: bytes) -> bytes:
@@ -134,6 +148,10 @@ class WebSocket:
             length = struct.unpack(">H", self._recv_exact(2))[0]
         elif length == 127:
             length = struct.unpack(">Q", self._recv_exact(8))[0]
+        if length > MAX_FRAME_SIZE:
+            raise WebSocketError(
+                f"Proxmox sent a WebSocket frame larger than {MAX_FRAME_SIZE} bytes"
+            )
         if second & 0x80:  # a server frame must not be masked
             raise WebSocketError("Proxmox sent a masked frame")
         return opcode, self._recv_exact(length)

@@ -213,8 +213,17 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     out = {key: dict(value) if isinstance(value, dict) else value
            for key, value in base.items()}
     for key, value in overlay.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
+        existing = out.get(key)
+        if isinstance(value, dict) and isinstance(existing, dict):
             out[key] = _merge(out[key], value)
+        elif isinstance(value, dict) != isinstance(existing, dict):
+            if isinstance(existing, dict):
+                raise ConfigError(
+                    f"section [{key}] must be a table, not a {type(value).__name__}"
+                )
+            raise ConfigError(
+                f"setting [{key}] must be a scalar, not a {type(value).__name__}"
+            )
         else:
             out[key] = value
     return out

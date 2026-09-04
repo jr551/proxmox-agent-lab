@@ -2056,14 +2056,17 @@ class ConsoleTlsTests(unittest.TestCase):
         context.wrap_socket = wrap_socket        # type: ignore[method-assign]
         wrapped.recv.side_effect = [
             b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Sec-WebSocket-Protocol: binary\r\n\r\n"
+            b"Sec-WebSocket-Protocol: binary\r\n"
+            b"Sec-WebSocket-Accept: 3SC6TZx4582OZaOogPVxMx5CGS0=\r\n\r\n"
         ]
         from proxmox_agent_lab import ws as lab_ws
 
         with mock.patch.object(lab_ws.ssl, "create_default_context",
                                return_value=context), \
              mock.patch.object(lab_ws.socket, "create_connection",
-                               return_value=mock.Mock()):
+                               return_value=mock.Mock()), \
+             mock.patch.object(lab_ws.os, "urandom",
+                               return_value=b"a" * 16):
             lab_ws.WebSocket(
                 "pve.example", 8006, "/api2/json/x", {}, {},
                 verify_tls=verify,

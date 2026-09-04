@@ -566,7 +566,7 @@ def cmd_ghidra_setup(lab: Any, args: Any) -> None:
     """
     _require_enabled(lab)
     api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
+    lease = lab.load_lease(args.lease)
     script = GHIDRA_SETUP_SCRIPT.replace("__LXC__", str(args.lxc))
     proc = _ssh(lab, ["bash", "-s"], timeout=args.timeout, stdin=script)
     if proc.stdout:
@@ -577,11 +577,7 @@ def cmd_ghidra_setup(lab: Any, args: Any) -> None:
             + (proc.stderr or proc.stdout).strip()[-600:]
         )
     # Register the container so lease-end cleans it up like any lab guest.
-    try:
-        lab.register_resource(lab.load_lease(args.lease), "lxc", args.lxc,
-                              "delete", "ghidra-lab")
-    except Exception:  # pragma: no cover - best-effort registration
-        pass
+    lab.register_resource(lease, "lxc", args.lxc, "delete", "ghidra-lab")
     lab.audit("memflow-ghidra-setup", lease=args.lease, lxc=args.lxc)
     print(json.dumps({"lxc": args.lxc, "prepared": True}, indent=2, sort_keys=True))
 

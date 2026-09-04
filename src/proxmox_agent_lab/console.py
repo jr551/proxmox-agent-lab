@@ -35,7 +35,6 @@ from . import ws
 
 WS_PATH_TEMPLATE = "/api2/json/nodes/{node}/{kind}/{vmid}/vncwebsocket"
 DEFAULT_SCREENSHOT_DIR = Path.home() / ".local" / "state" / "proxmox-agent-lab" / "screens"
-SAFE_KEY = re.compile(r"^[a-z0-9-]{1,40}$")
 
 # Vision prompt for click-target verification: filled at call time with the
 # concrete target label and cursor coordinate. Hoisted so the 50-line f-string
@@ -1781,12 +1780,17 @@ def cmd_exec(lab: Any, args: Any) -> None:
     print(json.dumps(result, indent=2))
 
 
+def _ps_quote(value: str) -> str:
+    """Single-quote a value for a PowerShell string, doubling embedded quotes."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _fetch_command(url: str, dest: str, windows: bool) -> list[str]:
     if windows:
         script = (
             "$ProgressPreference='SilentlyContinue'; "
-            f"Invoke-WebRequest -UseBasicParsing -Uri '{url}' "
-            f"-OutFile '{dest}'"
+            f"Invoke-WebRequest -UseBasicParsing -Uri {_ps_quote(url)} "
+            f"-OutFile {_ps_quote(dest)}"
         )
         return ["powershell.exe", "-NoProfile", "-Command", script]
     return [
@@ -1799,8 +1803,8 @@ def _upload_command(url: str, source: str, windows: bool) -> list[str]:
     if windows:
         script = (
             "$ProgressPreference='SilentlyContinue'; "
-            f"Invoke-WebRequest -UseBasicParsing -Method Put -Uri '{url}' "
-            f"-InFile '{source}'"
+            f"Invoke-WebRequest -UseBasicParsing -Method Put -Uri {_ps_quote(url)} "
+            f"-InFile {_ps_quote(source)}"
         )
         return ["powershell.exe", "-NoProfile", "-Command", script]
     return [

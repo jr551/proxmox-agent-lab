@@ -68,8 +68,10 @@ class _FileLock:
 class _ProcessThreadLock:
     """Combine an inter-process file lock with an in-process thread lock.
 
-    POSIX flock serializes separate processes but not threads within the same
-    process, so a threading.Lock is kept for the latter.
+    POSIX flock serializes separate processes, but flock on the same file
+    descriptor from multiple threads in one process can deadlock, so the
+    threading.Lock is acquired first and only one thread at a time touches
+    the file lock.
     """
 
     def __init__(self, file_lock: _FileLock, thread_lock: threading.Lock) -> None:
@@ -77,12 +79,12 @@ class _ProcessThreadLock:
         self._thread = thread_lock
 
     def __enter__(self) -> None:
-        self._file.__enter__()
         self._thread.acquire()
+        self._file.__enter__()
 
     def __exit__(self, *exc: Any) -> None:
-        self._thread.release()
         self._file.__exit__(*exc)
+        self._thread.release()
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 STATE_PATH = Path(os.environ.get("PXL_SHARE_STATE", "/var/lib/pxl-share/sessions.json"))

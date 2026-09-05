@@ -139,6 +139,133 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(server.SESSIONS.revoke_all(), 3)
             self.assertEqual(server.SESSIONS.listing(), [])
 
+    def test_threads_add_and_revoke_concurrently(self) -> None:
+        """In-process callers are serialised by the threading.Lock half of
+        _ProcessThreadLock; the final state must be internally consistent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            server = fresh_server_module(tmp)
+            tokens: set[str] = set()
+
+            def add_one(i: int) -> str:
+                return server.SESSIONS.add(vmid=i, minutes=5)["token"]
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+                for token in pool.map(add_one, range(32)):
+                    tokens.add(token)
+            self.assertEqual(len(tokens), 32)
+            self.assertEqual(len(server.SESSIONS.listing()), 32)
+
+            def revoke(token: str) -> None:
+                server.SESSIONS.revoke(token)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                pool.map(revoke, tokens)
+            self.assertEqual(server.SESSIONS.listing(), [])
+
+    def test_corrupt_store_is_tolerated(self) -> None:
+        """A damaged sessions.json on disk must not crash the server."""
+        with tempfile.TemporaryDirectory() as tmp:
+            server = fresh_server_module(tmp)
+            server.STATE_PATH.write_text("not valid json")
+            server.SESSIONS = server.Sessions()
+            self.assertEqual(server.SESSIONS.listing(), [])
+            entry = server.SESSIONS.add(vmid=9, minutes=5)
+            self.assertIsNotNone(server.SESSIONS.get(entry["token"]))
+            self.assertEqual(len(server.SESSIONS.listing()), 1)
+
+    def test_lock_file_and_store_have_restrictive_permissions(self) -> None:
+        """The lock file and sessions store are created with owner-only access."""
+        with tempfile.TemporaryDirectory() as tmp:
+            server = fresh_server_module(tmp)
+            server.SESSIONS.add(vmid=1, minutes=5)
+            self.assertTrue(server.STATE_PATH.with_suffix(".lock").exists())
+            self.assertEqual(server.STATE_PATH.stat().st_mode & 0o777, 0o600)
+
+    def test_module_import_does_not_create_state_directory(self) -> None:
+        """Importing share_server must not eagerly create /var/lib/pxl-share."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "missing" / "path"
+            state_path = state_dir / "sessions.json"
+            env = os.environ.copy()
+            env["PXL_SHARE_STATE"] = str(state_path)
+            env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+            code = "from proxmox_agent_lab import share_server"
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(state_dir.exists())
+
+    def test_subprocess_cli_add_list_revoke(self) -> None:
+        """The module can be run as `python -m proxmox_agent_lab.share_server`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            server = fresh_server_module(tmp)
+            env = os.environ.copy()
+            env["PXL_SHARE_STATE"] = str(server.STATE_PATH)
+            env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+            cmd = [sys.executable, "-m", "proxmox_agent_lab.share_server"]
+
+            add = subprocess.run(
+                [*cmd, "add", "--vmid", "42", "--minutes", "10", "--label", "cli"],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(add.returncode, 0, add.stderr)
+            entry = json.loads(add.stdout)
+            self.assertEqual(entry["vmid"], 42)
+            self.assertEqual(entry["label"], "cli")
+
+            listing = subprocess.run([*cmd, "list"], env=env, capture_output=True, text=True)
+            self.assertEqual(listing.returncode, 0, listing.stderr)
+            self.assertEqual(len(json.loads(listing.stdout)), 1)
+
+            revoke = subprocess.run(
+                [*cmd, "revoke", "--token", entry["token"]],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(revoke.returncode, 0, revoke.stderr)
+            self.assertEqual(json.loads(revoke.stdout)["revoked"], 1)
+
+            self.assertIsNone(server.SESSIONS.get(entry["token"]))
+
+    def test_concurrent_add_and_revoke_all_processes(self) -> None:
+        """A `revoke --all` racing several `add` processes must not corrupt
+        the JSON store."""
+        with tempfile.TemporaryDirectory() as tmp:
+            server = fresh_server_module(tmp)
+            env = os.environ.copy()
+            env["PXL_SHARE_STATE"] = str(server.STATE_PATH)
+            env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+            cmd = [sys.executable, "-m", "proxmox_agent_lab.share_server"]
+            add_code = (
+                "from proxmox_agent_lab import share_server\n"
+                "print(share_server.SESSIONS.add(vmid=7, minutes=5)['token'])"
+            )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                futures = []
+                for _ in range(5):
+                    futures.append(pool.submit(
+                        subprocess.run,
+                        [sys.executable, "-c", add_code],
+                        env=env, capture_output=True, text=True,
+                    ))
+                futures.append(pool.submit(
+                    subprocess.run, [*cmd, "revoke", "--all"],
+                    env=env, capture_output=True, text=True,
+                ))
+                results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+            for result in results:
+                self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(server.STATE_PATH.read_text())
+            self.assertIsInstance(data, dict)
+            final = server.SESSIONS.listing()
+            self.assertGreaterEqual(len(final), 0)
+            self.assertLessEqual(len(final), 5)
+
 
 class FramingTests(unittest.TestCase):
     def test_server_frames_are_unmasked_and_round_trip(self) -> None:
@@ -248,6 +375,42 @@ class AccessControlTests(unittest.TestCase):
         entry = self.server_module.SESSIONS.add(vmid=101, minutes=5)
         with self.assertRaises(urllib.error.HTTPError) as caught:
             self.get(f"/v/{entry['token']}/ws")
+        with caught.exception:
+            self.assertEqual(caught.exception.code, 404)
+
+    def _subprocess_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["PXL_SHARE_STATE"] = str(self.server_module.STATE_PATH)
+        env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        return env
+
+    def test_subprocess_cli_add_is_visible_to_running_server(self) -> None:
+        """The long-running HTTP server must notice a link minted by a
+        separate `python -m proxmox_agent_lab.share_server add` process."""
+        env = self._subprocess_env()
+        cmd = [sys.executable, "-m", "proxmox_agent_lab.share_server", "add",
+               "--vmid", "101", "--minutes", "5"]
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = json.loads(result.stdout)
+        with self.get(f"/v/{entry['token']}/") as response:
+            self.assertEqual(response.status, 200)
+
+    def test_subprocess_cli_revoke_is_visible_to_running_server(self) -> None:
+        """A `revoke` from the CLI must take effect immediately in the HTTP
+        server."""
+        entry = self.server_module.SESSIONS.add(vmid=101, minutes=5)
+        with self.get(f"/v/{entry['token']}/") as response:
+            self.assertEqual(response.status, 200)
+
+        env = self._subprocess_env()
+        cmd = [sys.executable, "-m", "proxmox_agent_lab.share_server",
+               "revoke", "--token", entry["token"]]
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.get(f"/v/{entry['token']}/")
         with caught.exception:
             self.assertEqual(caught.exception.code, 404)
 

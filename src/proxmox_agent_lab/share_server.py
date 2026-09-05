@@ -25,6 +25,7 @@ Standard library only, like the rest of the project.
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import html
 import json
@@ -41,6 +42,48 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib import error, parse, request
 
+
+class _FileLock:
+    """An advisory inter-process lock using POSIX flock.
+
+    The lock file is opened lazily so importing the module does not touch the
+    filesystem; the parent directory is created on first use.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fd: int | None = None
+
+    def __enter__(self) -> None:
+        if self._fd is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._fd = os.open(str(self._path), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+
+
+class _ProcessThreadLock:
+    """Combine an inter-process file lock with an in-process thread lock.
+
+    POSIX flock serializes separate processes but not threads within the same
+    process, so a threading.Lock is kept for the latter.
+    """
+
+    def __init__(self, file_lock: _FileLock, thread_lock: threading.Lock) -> None:
+        self._file = file_lock
+        self._thread = thread_lock
+
+    def __enter__(self) -> None:
+        self._file.__enter__()
+        self._thread.acquire()
+
+    def __exit__(self, *exc: Any) -> None:
+        self._thread.release()
+        self._file.__exit__(*exc)
+
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 STATE_PATH = Path(os.environ.get("PXL_SHARE_STATE", "/var/lib/pxl-share/sessions.json"))
 CONFIG_PATH = Path(os.environ.get("PXL_SHARE_CONFIG", "/etc/pxl-share/config.json"))
@@ -55,7 +98,10 @@ class Sessions:
     """Live share links, persisted to disk for cross-process sharing."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = _ProcessThreadLock(
+            _FileLock(STATE_PATH.with_suffix(".lock")),
+            threading.Lock(),
+        )
         self._sessions: dict[str, dict[str, Any]] = {}
         self._digest: str | None = None
         self._load()

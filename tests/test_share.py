@@ -20,8 +20,10 @@ shutil.rmtree(_TEST_STATE, ignore_errors=True)
 _TEST_STATE.mkdir(parents=True, exist_ok=True)
 os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
 import base64  # noqa: E402
+import concurrent.futures  # noqa: E402
 import json  # noqa: E402
 import struct  # noqa: E402
+import subprocess  # noqa: E402
 import sys  # noqa: E402
 import tempfile  # noqa: E402
 import threading  # noqa: E402
@@ -95,6 +97,39 @@ class SessionTests(unittest.TestCase):
             other.revoke(entry["token"])
             self.assertIsNone(server.SESSIONS.get(entry["token"]),
                               "a revoke from elsewhere must take effect")
+
+    def test_concurrent_process_writes_are_serialised(self) -> None:
+        """Several short-lived `add` processes racing one another must not
+        corrupt the store or lose links."""
+        with tempfile.TemporaryDirectory() as tmp:
+            server = fresh_server_module(tmp)
+            env = os.environ.copy()
+            env["PXL_SHARE_STATE"] = str(server.STATE_PATH)
+            env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+            code = (
+                "from proxmox_agent_lab import share_server\n"
+                "print(share_server.SESSIONS.add(vmid=7, minutes=5)['token'])"
+            )
+            n = 8
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+                futures = [
+                    pool.submit(
+                        subprocess.run,
+                        [sys.executable, "-c", code],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                    )
+                    for _ in range(n)
+                ]
+                results = [f.result() for f in concurrent.futures.as_completed(futures)]
+            for result in results:
+                self.assertEqual(result.returncode, 0, result.stderr)
+            tokens = {r.stdout.strip() for r in results}
+            self.assertEqual(len(tokens), n, "each process must add one unique link")
+            for token in tokens:
+                self.assertIsNotNone(server.SESSIONS.get(token))
+            self.assertEqual(len(server.SESSIONS.listing()), n)
 
     def test_revoke_all(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

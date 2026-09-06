@@ -6,6 +6,8 @@ All notable changes to this project will be documented here. The format follows
 
 ## Unreleased
 
+## 0.14.0 - 2026-09-06
+
 ### Added
 
 - **Windows PE (Hiren's BootCD PE) workflow.** New `proxmox-lab pe`

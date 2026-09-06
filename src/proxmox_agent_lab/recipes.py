@@ -322,9 +322,74 @@ ANDROID_X86 = {
     ],
 }
 
+WINDOWS_PE = {
+    "name": "pe",
+    "release": "user-supplied Windows PE media (e.g. a lawfully obtained "
+               "WinPE-based rescue ISO such as Hiren's BootCD PE)",
+    "media": {
+        "user_supplied": True,
+        "requirements": (
+            "A PE ISO the operator lawfully holds a license for. This tool "
+            "does not contain, download, or redistribute any copyrighted "
+            "material; the operator is solely responsible for the license "
+            "terms of the source media and any bundled tools."
+        ),
+        "download": None,
+    },
+    "commands": {
+        "catalog": "proxmox-lab pe catalog --iso <path>",
+        "extract": "proxmox-lab pe extract --iso <path> --out <dir> [--wim]",
+        "build": (
+            "proxmox-lab pe build --from-iso <path> --out <path> "
+            "--legal-accepted [--add <dir> ...] [--exclude <iso-path> ...] "
+            "[--wim-overlay <dir>] [--wim-script <script>]"
+        ),
+        "boot": (
+            "proxmox-lab pe boot --lease <id> --vmid <id> --iso <path> "
+            "--legal-accepted [--firmware auto|seabios|ovmf]"
+        ),
+    },
+    "external_tools": [
+        "7z or xorriso to extract the ISO",
+        "wimlib-imagex (Linux) or dism.exe (Windows) to inspect/apply/mount "
+        "boot.wim",
+        "xorriso to rebuild the ISO",
+    ],
+    "qemu": {
+        "firmware": "auto: OVMF when the ISO has a UEFI El Torito entry, "
+                    "SeaBIOS otherwise",
+        "disk": "scsi0=<storage>:8,ssd=1 (scratch disk; PE boots from CD)",
+        "cdrom": "ide2=<uploaded-iso>,media=cdrom",
+        "boot": "order=ide2;scsi0",
+        "network_model": "e1000",
+        "guest_agent": False,
+    },
+    "rules": COMMON_RULES[:1] + [
+        "Catalog the user-supplied PE ISO first; confirm bootable_bios or "
+        "bootable_uefi before choosing --firmware.",
+        "Boot the PE ISO with 'pe boot', which uploads it, creates a "
+        "lease-owned QEMU guest, and registers it to the lease.",
+    ] + COMMON_RULES[2:],
+    "phase_order": [
+        "lease-begin",
+        "catalog-user-supplied-pe-iso",
+        "pe-boot-upload-and-create",
+    ] + COMMON_PHASES[4:],
+    "invalid_shortcuts": COMMON_INVALID + [
+        "Do not download or redistribute PE media; only the operator's own "
+        "lawfully obtained ISO may be used.",
+        "pe build and pe boot require --legal-accepted; do not bypass it.",
+        "Do not expect a guest agent inside WinPE; drive it with console "
+        "screenshot/keys/click.",
+    ],
+}
+
 RECIPES = {
     item["name"]: item
-    for item in (REACTOS, DRAGONFLY, HAIKU, OPENBSD, WINDOWS_ME, ANDROID_X86)
+    for item in (
+        REACTOS, DRAGONFLY, HAIKU, OPENBSD, WINDOWS_ME, ANDROID_X86,
+        WINDOWS_PE,
+    )
 }
 
 

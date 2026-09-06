@@ -2869,6 +2869,7 @@ def parser() -> argparse.ArgumentParser:
     from . import netgw
     from . import isoinspect
     from . import oci
+    from . import pe
     from . import recipes
     from . import share
     from . import storage
@@ -2886,6 +2887,7 @@ def parser() -> argparse.ArgumentParser:
     netgw.register(sub, _module())
     isoinspect.register(sub, _module())
     oci.register(sub, _module())
+    pe.register(sub, _module())
     recipes.register(sub, _module())
     share.register(sub, _module())
     storage.register(sub, _module())

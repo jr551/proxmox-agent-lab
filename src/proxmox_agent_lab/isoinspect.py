@@ -40,10 +40,25 @@ def cmd_diagnose(lab: Any, args: Any) -> None:
         data = fh.read(read)
     info = bootstruct.parse_iso(data, file_bytes)
 
+    print(json.dumps({
+        "path": path,
+        "bytes_read": len(data),
+        "file_bytes": file_bytes,
+        **info,
+        **summarize(info, file_bytes),
+    }, indent=2, sort_keys=True))
+
+
+def summarize(info: dict[str, Any], file_bytes: int) -> dict[str, Any]:
+    """Condense ``bootstruct.parse_iso`` output into a bootability verdict.
+
+    Shared with ``pe catalog`` so both commands report the same warnings for
+    the same image rather than drifting into two dialects of "won't boot".
+    """
     et = info.get("el_torito") or {}
     tree = info.get("tree") or {}
     warnings: list[str] = []
-    if not info["is_iso9660"]:
+    if not info.get("is_iso9660"):
         warnings.append("not an ISO 9660 image; it will not boot as an optical "
                         "image")
     elif not et.get("present"):
@@ -64,21 +79,16 @@ def cmd_diagnose(lab: Any, args: Any) -> None:
             warnings.append("no bootable UEFI entry: an OVMF/UEFI guest will not "
                             "boot this ISO")
         warnings.extend(_entry_warnings(et, file_bytes))
-    if info["is_iso9660"] and not info.get("hybrid"):
+    if info.get("is_iso9660") and not info.get("hybrid"):
         warnings.append("no hybrid MBR/GPT: bootable as an optical image but not "
                         "by dd'ing to a USB/disk")
-
-    print(json.dumps({
-        "path": path,
-        "bytes_read": len(data),
-        "file_bytes": file_bytes,
-        **info,
+    return {
         "bootable_bios": bool(et.get("has_bios_boot")),
         "bootable_uefi": bool(et.get("has_uefi_boot")),
         "el_torito_ok": _el_torito_ok(et),
         "warnings": warnings,
-        "ok": info["is_iso9660"] and not warnings,
-    }, indent=2, sort_keys=True))
+        "ok": bool(info.get("is_iso9660")) and not warnings,
+    }
 
 
 def _no_boot_record_warnings(tree: dict[str, Any]) -> list[str]:

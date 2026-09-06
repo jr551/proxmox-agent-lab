@@ -15,8 +15,9 @@ no Proxmox account, and gets nothing but that one console.
 What a link grants
 ------------------
 One VMID, until its expiry, and nothing else. The token is the only
-credential; it is long, random, and never logged. Sessions are held in memory,
-so a restart revokes every link.
+credential; it is long, random, and never logged. Sessions are persisted to a
+small JSON file so the long-running server can notice links minted or revoked by
+separate short-lived `add`/`revoke` processes.
 
 Standard library only, like the rest of the project.
 """
@@ -24,6 +25,7 @@ Standard library only, like the rest of the project.
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import html
 import json
@@ -40,6 +42,50 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib import error, parse, request
 
+
+class _FileLock:
+    """An advisory inter-process lock using POSIX flock.
+
+    The lock file is opened lazily so importing the module does not touch the
+    filesystem; the parent directory is created on first use.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fd: int | None = None
+
+    def __enter__(self) -> None:
+        if self._fd is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._fd = os.open(str(self._path), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+
+
+class _ProcessThreadLock:
+    """Combine an inter-process file lock with an in-process thread lock.
+
+    POSIX flock serializes separate processes, but flock on the same file
+    descriptor from multiple threads in one process can deadlock, so the
+    threading.Lock is acquired first and only one thread at a time touches
+    the file lock.
+    """
+
+    def __init__(self, file_lock: _FileLock, thread_lock: threading.Lock) -> None:
+        self._file = file_lock
+        self._thread = thread_lock
+
+    def __enter__(self) -> None:
+        self._thread.acquire()
+        self._file.__enter__()
+
+    def __exit__(self, *exc: Any) -> None:
+        self._file.__exit__(*exc)
+        self._thread.release()
+
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 STATE_PATH = Path(os.environ.get("PXL_SHARE_STATE", "/var/lib/pxl-share/sessions.json"))
 CONFIG_PATH = Path(os.environ.get("PXL_SHARE_CONFIG", "/etc/pxl-share/config.json"))
@@ -51,31 +97,37 @@ def load_config() -> dict[str, Any]:
 
 
 class Sessions:
-    """Live share links. In memory, so a restart revokes everything."""
+    """Live share links, persisted to disk for cross-process sharing."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = _ProcessThreadLock(
+            _FileLock(STATE_PATH.with_suffix(".lock")),
+            threading.Lock(),
+        )
         self._sessions: dict[str, dict[str, Any]] = {}
-        self._mtime = 0.0
+        self._digest: str | None = None
         self._load()
 
     def _load(self) -> None:
-        """Re-read the store if it changed underneath us.
+        """Re-read the store from disk if another process changed it.
 
         `add` and `revoke` run as separate short-lived processes, so the
-        long-running server must notice their writes. Cheap: one stat per
-        lookup, and a reload only when the file actually moved.
+        long-running server must notice their writes. A content digest
+        catches changes even when the filesystem mtime has not advanced.
         """
         try:
-            mtime = STATE_PATH.stat().st_mtime
+            text = STATE_PATH.read_text()
         except OSError:
+            self._sessions = {}
+            self._digest = None
             return
-        if mtime == self._mtime:
+        new_digest = hashlib.sha256(text.encode()).hexdigest()
+        if new_digest == self._digest:
             return
         try:
-            self._sessions = json.loads(STATE_PATH.read_text())
-            self._mtime = mtime
-        except (OSError, ValueError):
+            self._sessions = json.loads(text)
+            self._digest = new_digest
+        except ValueError:
             pass
 
     def _persist(self) -> None:
@@ -91,14 +143,15 @@ class Sessions:
             STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp = STATE_PATH.with_name(
                 f".{STATE_PATH.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+            payload = json.dumps(self._sessions, sort_keys=True)
             with open(tmp, "w") as fh:
-                fh.write(json.dumps(self._sessions))
+                fh.write(payload)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, STATE_PATH)
             tmp = None
             STATE_PATH.chmod(0o600)
-            self._mtime = STATE_PATH.stat().st_mtime
+            self._digest = hashlib.sha256(payload.encode()).hexdigest()
         except OSError:
             pass
         finally:

@@ -75,7 +75,8 @@ def main() -> int:
         parser.error(str(exc))
 
     if args.notes_output is not None:
-        args.notes_output.write_text(f"# {version}\n\n{notes}\n")
+        args.notes_output.write_text(
+            f"# {version}\n\n{notes}\n", encoding="utf-8")
     print(f"Release metadata valid for v{version}.")
     return 0
 

@@ -29,6 +29,7 @@ One claim per row; dates are when the row was last watched on the node.
 | Android | Device built, booted to home screen, driven via console + adb | 2026-08-21 |
 | Android templates | Template clone booted to home screen ~1 min vs ~20 min build, across host power cycle | 2026-08-21 |
 | Windows install | Server 2022 unattended reached Server Manager desktop (partitioning, EULA, VirtIO, autologon; one Enter at language page) | 2026-08-21 |
+| Windows PE (Hiren's BootCD PE) | `pe catalog` parsed El Torito + `sources/boot.wim`, `pe boot` uploaded and booted VM 9500 to the Hiren's BootCD PE Windows 11 desktop (OVMF/q35) | 2026-09-06 |
 | `windows finish` | RDP/SSH enabled, addresses reported, answer ISO detached/deleted | 2026-08-21 |
 | qemu-guest-agent | Reachable after `vioserial` driver; missing driver was cause | 2026-08-21 |
 | Long-term leases | Proxmox refused to delete a protected guest | 2026-08-21 |

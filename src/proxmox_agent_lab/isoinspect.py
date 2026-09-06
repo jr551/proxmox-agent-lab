@@ -26,15 +26,16 @@ from typing import Any
 from . import bootstruct
 
 # Enough of the image to cover the volume descriptors and a nearby boot
-# catalog; El Torito catalogs on real installers sit within the first MiB.
-_READ_BYTES = 2 * 1024 * 1024
+# catalog; El Torito catalogs on real installers sit within the first MiB,
+# but large PE images such as Hiren's BootCD place the catalog later.
+_READ_BYTES = 64 * 1024 * 1024
 
 
 def cmd_diagnose(lab: Any, args: Any) -> None:
     path = os.path.expanduser(args.path)
     if not os.path.isfile(path):
         raise lab.LabError(f"no such ISO file: {path}")
-    read = min(_READ_BYTES, max(args.read_bytes, 64 * 1024))
+    read = max(args.read_bytes, 64 * 1024)
     file_bytes = os.path.getsize(path)
     with open(path, "rb") as fh:
         data = fh.read(read)

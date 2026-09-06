@@ -51,8 +51,12 @@ Debian/Ubuntu: `apt install p7zip-full xorriso wimtools`. Windows: install
 ### `pe catalog`
 
 ```
-proxmox-lab pe catalog --iso /path/to/pe.iso [--read-bytes 2097152]
+proxmox-lab pe catalog --iso /path/to/pe.iso [--read-bytes 67108864]
 ```
+
+The default `--read-bytes` is 64 MiB, which covers the El Torito boot catalog on
+large PE images such as Hiren's BootCD PE.  Smaller images will be read to
+their actual size.
 
 Prints one compact JSON object:
 

@@ -60,8 +60,9 @@ UEFI_BOOT_FILES = (
 )
 
 # The catalog command only ever reads this much of the ISO; the El Torito
-# structures and the first tree levels live inside the first MiB or two.
-_READ_BYTES = 2 * 1024 * 1024
+# structures and the first tree levels live inside the first MiB or two, but
+# large PE images such as Hiren's BootCD place the boot catalog much later.
+_READ_BYTES = 64 * 1024 * 1024
 
 
 def _find_tool(name: str) -> str | None:
@@ -107,7 +108,7 @@ def _require_legal(lab: Any, args: Any) -> None:
 def _parse_iso(path: Path, read_bytes: int = _READ_BYTES) -> dict[str, Any]:
     """Use the shared ISO parser to report bootability and tree."""
     size = path.stat().st_size
-    read = min(max(read_bytes, 64 * 1024), _READ_BYTES)
+    read = max(read_bytes, 64 * 1024)
     with open(path, "rb") as fh:
         data = fh.read(read)
     return bootstruct.parse_iso(data, size)

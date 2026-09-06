@@ -1391,11 +1391,12 @@ def cmd_upload(args: argparse.Namespace) -> None:
         f'header = "Authorization: PVEAPIToken={TOKEN_USER}!{TOKEN_NAME}={token}"\n'
     )
     with tempfile.NamedTemporaryFile(
-        mode="w", prefix="proxmox-upload-", delete=True
+        mode="w", prefix="proxmox-upload-", delete=False
     ) as config:
         os.chmod(config.name, 0o600)
         config.write(config_text)
         config.flush()
+    try:
         result = subprocess.run(
             upload_curl_argv(config.name, source, args.content, args.storage),
             text=True,
@@ -1404,6 +1405,8 @@ def cmd_upload(args: argparse.Namespace) -> None:
             timeout=args.timeout,
             check=False,
         )
+    finally:
+        Path(config.name).unlink(missing_ok=True)
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()[:1000]
         raise LabError(f"Proxmox upload failed: {detail}")

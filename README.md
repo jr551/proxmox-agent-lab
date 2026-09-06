@@ -294,6 +294,7 @@ traps that cost real debugging time.
 | 🧪 [oci.md](docs/oci.md) | Experimental OCI LXC: limits and guardrails |
 | 🔒 [network.md](docs/network.md) | VPN egress and leak testing |
 | 🪟 [windows.md](docs/windows.md) | Installing Windows |
+| 🚑 [pe.md](docs/pe.md) | Boot, inspect and customise a user-supplied Windows PE ISO |
 | 🧩 [reactos.md](docs/reactos.md) | Debugging ReactOS guests over serial and KDB |
 | ✅ [VERIFICATION.md](docs/VERIFICATION.md) | What has been run on real hardware, and what has not |
 | 📌 [long-term-leases.md](docs/long-term-leases.md) | Machines that stay |

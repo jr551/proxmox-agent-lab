@@ -11,10 +11,14 @@ from pathlib import Path
 
 def release_metadata(root: Path, tag: str | None = None) -> tuple[str, str]:
     """Return the validated version and its changelog section."""
-    project = tomllib.loads((root / "pyproject.toml").read_text())
+    project = tomllib.loads(
+        (root / "pyproject.toml").read_text(encoding="utf-8")
+    )
     version = project["project"]["version"]
 
-    init_text = (root / "src/proxmox_agent_lab/__init__.py").read_text()
+    init_text = (root / "src/proxmox_agent_lab/__init__.py").read_text(
+        encoding="utf-8"
+    )
     init_match = re.search(r'^__version__ = "([^"]+)"$', init_text, re.MULTILINE)
     if init_match is None:
         raise ValueError("src/proxmox_agent_lab/__init__.py has no __version__")
@@ -26,7 +30,7 @@ def release_metadata(root: Path, tag: str | None = None) -> tuple[str, str]:
 
     bootstrap_path = root / "bootstrap.sh"
     if bootstrap_path.exists():
-        bootstrap_text = bootstrap_path.read_text()
+        bootstrap_text = bootstrap_path.read_text(encoding="utf-8")
         bootstrap_match = re.search(
             r'^REQUIRED_VERSION="([^"]+)"$', bootstrap_text, re.MULTILINE
         )
@@ -41,7 +45,7 @@ def release_metadata(root: Path, tag: str | None = None) -> tuple[str, str]:
     if tag is not None and tag != expected_tag:
         raise ValueError(f"tag {tag!r} does not match {expected_tag!r}")
 
-    changelog = (root / "CHANGELOG.md").read_text()
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     heading = re.search(
         rf"^## {re.escape(version)} - \d{{4}}-\d{{2}}-\d{{2}}\s*$",
         changelog,

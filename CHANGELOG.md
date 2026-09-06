@@ -4,6 +4,18 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **Windows PE (Hiren's BootCD PE) workflow.** New `proxmox-lab pe`
+  subcommands — `catalog`, `extract`, `build`, `boot` — work on a
+  user-supplied WinPE ISO. They inspect the boot record and `boot.wim`, extract
+  the tool tree, rebuild a customised ISO, and boot a lease-owned Proxmox QEMU
+  guest. No copyrighted material is bundled or downloaded; `build` and `boot`
+  require `--legal-accepted` so the operator acknowledges responsibility for
+  the source media and bundled tools.
+
 ## 0.13.1 - 2026-09-04
 
 ### Fixed

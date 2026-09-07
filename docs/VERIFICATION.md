@@ -7,6 +7,14 @@ and off — and, just as usefully, what has not.
 Read it as a statement of confidence, not a feature list. Anything marked
 "unit-tested only" may work; it has simply never been watched working.
 
+## Console transport regression coverage (2026-09-07)
+
+Unit-tested only: WebSocket reads resume after timeouts inside frame headers
+and payloads, reassemble fragmented binary/base64 messages across interleaved
+ping frames, send masked pong replies, and reject invalid framing and oversized
+messages. The receive path also avoids an intermediate payload slice copy.
+These changes have not been exercised against a live Proxmox console.
+
 ## 🟢 Verified on hardware
 
 One claim per row; dates are when the row was last watched on the node.

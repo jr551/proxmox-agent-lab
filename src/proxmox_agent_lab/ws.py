@@ -54,6 +54,8 @@ class WebSocket:
         self.timeout = timeout
         self._recv_buffer = bytearray()
         self._payload_buffer = bytearray()
+        self._fragment_opcode: int | None = None
+        self._fragments = bytearray()
         context = ssl.create_default_context()
         # The console carries guest input and output, so it gets the same
         # certificate policy as the REST client -- [proxmox] verify_tls -- and
@@ -140,21 +142,43 @@ class WebSocket:
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
         self._socket.sendall(bytes(header) + masked)
 
-    def _read_frame(self) -> tuple[int, bytes]:
-        first, second = self._recv_exact(2)
+    def _peek_exact(self, count: int) -> None:
+        # Leave the entire frame buffered until complete: read_available may
+        # time out between any two bytes and resume on its next invocation.
+        while len(self._recv_buffer) < count:
+            chunk = self._socket.recv(65536)
+            if not chunk:
+                raise WebSocketError("connection closed by Proxmox")
+            self._recv_buffer += chunk
+
+    def _read_frame(self) -> tuple[bool, int, bytes]:
+        self._peek_exact(2)
+        first, second = self._recv_buffer[:2]
+        final = bool(first & 0x80)
         opcode = first & 0x0F
+        if first & 0x70:
+            raise WebSocketError("Proxmox sent unsupported WebSocket extensions")
+        if opcode not in (0, 1, 2, 8, 9, 10):
+            raise WebSocketError("Proxmox sent an unknown WebSocket opcode")
+        if second & 0x80:
+            raise WebSocketError("Proxmox sent a masked frame")
         length = second & 0x7F
-        if length == 126:
-            length = struct.unpack(">H", self._recv_exact(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", self._recv_exact(8))[0]
+        if opcode >= OPCODE_CLOSE and (not final or length > 125):
+            raise WebSocketError("Proxmox sent an invalid control frame")
+        offset = 2
+        if length in (126, 127):
+            width = 2 if length == 126 else 8
+            self._peek_exact(offset + width)
+            length = int.from_bytes(self._recv_buffer[offset:offset + width], "big")
+            offset += width
         if length > MAX_FRAME_SIZE:
             raise WebSocketError(
                 f"Proxmox sent a WebSocket frame larger than {MAX_FRAME_SIZE} bytes"
             )
-        if second & 0x80:  # a server frame must not be masked
-            raise WebSocketError("Proxmox sent a masked frame")
-        return opcode, self._recv_exact(length)
+        self._peek_exact(offset + length)
+        payload = bytes(memoryview(self._recv_buffer)[offset:offset + length])
+        del self._recv_buffer[:offset + length]
+        return final, opcode, payload
 
     def send(self, data: bytes) -> None:
         """Send application payload, encoding it if base64 was negotiated."""
@@ -166,7 +190,7 @@ class WebSocket:
     def recv(self) -> bytes:
         """Return the next application payload, handling control frames."""
         while True:
-            opcode, payload = self._read_frame()
+            final, opcode, payload = self._read_frame()
             if opcode == OPCODE_CLOSE:
                 raise WebSocketError("Proxmox closed the console stream")
             if opcode == OPCODE_PING:
@@ -174,6 +198,23 @@ class WebSocket:
                 continue
             if opcode == OPCODE_PONG:
                 continue
+            if opcode == OPCODE_CONTINUATION:
+                if self._fragment_opcode is None:
+                    raise WebSocketError("Proxmox sent an unexpected continuation")
+            elif self._fragment_opcode is not None:
+                raise WebSocketError("Proxmox interrupted a fragmented message")
+            else:
+                self._fragment_opcode = opcode
+            if len(self._fragments) + len(payload) > MAX_FRAME_SIZE:
+                raise WebSocketError("Proxmox sent an oversized WebSocket message")
+            if not final:
+                self._fragments += payload
+                continue
+            if self._fragments:
+                self._fragments += payload
+                payload = bytes(self._fragments)
+                self._fragments.clear()
+            self._fragment_opcode = None
             if self._base64:
                 payload = base64.b64decode(payload + b"=" * (-len(payload) % 4))
             return payload

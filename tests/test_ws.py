@@ -19,6 +19,7 @@ def frame(payload, opcode=2, final=True, width=0):
 class WebSocketReadTests(unittest.TestCase):
     def connection(self, chunks, base64_mode=False):
         client = ws.WebSocket.__new__(ws.WebSocket)
+        client._read_deadline = None
         client._recv_buffer = bytearray()
         client._payload_buffer = bytearray()
         client._fragment_opcode = None
@@ -78,3 +79,84 @@ class WebSocketReadTests(unittest.TestCase):
         client = self.connection([frame(b'ab', final=False) + frame(b'cdef', opcode=0)])
         self.assertEqual(client.read_exact(3), b'abc')
         self.assertEqual(client.read_available(0.01), b'def')
+
+    def test_poll_deadline_survives_continuous_ping_traffic(self):
+        import itertools
+        client = self.connection([])
+        client._socket.recv.side_effect = lambda count: frame(b'ping', opcode=9)
+        with mock.patch.object(ws.time, 'monotonic', side_effect=itertools.count(0, 0.1)):
+            self.assertEqual(client.read_available(0.5), b'')
+        self.assertGreater(client._socket.sendall.call_count, 0)
+        self.assertLess(client._socket.recv.call_count, 5)
+        self.assertIsNone(client._read_deadline)
+        self.assertEqual(client._socket.settimeout.call_args, mock.call(20))
+
+    def test_zero_timeout_returns_buffered_payload_without_socket_reads(self):
+        client = self.connection([])
+        self.assertEqual(client.read_available(0), b'')
+        client._payload_buffer += b'pending'
+        self.assertEqual(client.read_available(0), b'pending')
+        client._socket.recv.assert_not_called()
+
+    def test_invalid_base64_is_reported_as_a_console_error(self):
+        client = self.connection([frame(b'%%%%', opcode=1)], base64_mode=True)
+        with self.assertRaisesRegex(ws.WebSocketError, 'invalid base64'):
+            client.recv()
+
+
+class WebSocketHandshakeTests(unittest.TestCase):
+    RESPONSE = (b'HTTP/1.1 101 Switching Protocols\r\n'
+                b'Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n'
+                b'Sec-WebSocket-Protocol: binary\r\n'
+                b'Sec-WebSocket-Accept: 3SC6TZx4582OZaOogPVxMx5CGS0=\r\n\r\n')
+
+    def open(self, chunks, tls_error=None):
+        self.raw = mock.Mock()
+        self.wrapped = mock.Mock()
+        context = mock.Mock()
+        context.wrap_socket.return_value = self.wrapped
+        context.wrap_socket.side_effect = tls_error
+        def receive(count):
+            self.wrapped.sendall.assert_called_once()
+            sent = self.wrapped.sendall.call_args.args[0]
+            self.assertIn(b'GET /console?port=5900 HTTP/1.1\r\n', sent)
+            return next(chunks)
+        self.wrapped.recv.side_effect = receive
+        with mock.patch.object(ws.ssl, 'create_default_context', return_value=context), \
+             mock.patch.object(ws.socket, 'create_connection', return_value=self.raw), \
+             mock.patch.object(ws.os, 'urandom', return_value=b'a' * 16):
+            return ws.WebSocket('pve.example', 8006, '/console', {'port': '5900'}, {})
+
+    def test_upgrade_preserves_coalesced_application_data(self):
+        client = self.open(iter([self.RESPONSE + frame(b'ok')]))
+        self.assertEqual(client.recv(), b'ok')
+        self.wrapped.close.assert_not_called()
+        self.assertEqual(self.wrapped.settimeout.call_args, mock.call(20))
+
+    def test_failed_tls_wrap_closes_raw_socket(self):
+        with self.assertRaises(ws.ssl.SSLError):
+            self.open(iter([]), ws.ssl.SSLError('fixture'))
+        self.raw.close.assert_called_once()
+
+    def test_rejected_handshakes_close_tls_socket(self):
+        cases = [self.RESPONSE.replace(b'101 Switching', b'401 Error101'),
+                 self.RESPONSE.replace(b'Upgrade: websocket', b'Upgrade: other'),
+                 self.RESPONSE.replace(b'Connection: keep-alive, Upgrade', b'Connection: close'),
+                 self.RESPONSE.replace(b'3SC6TZx4582OZaOogPVxMx5CGS0=', b'wrong'),
+                 self.RESPONSE.replace(b'Protocol: binary', b'Protocol: unknown')]
+        for response in cases:
+            with self.subTest(response=response), self.assertRaises(ws.WebSocketError):
+                self.open(iter([response]))
+            self.wrapped.close.assert_called_once()
+
+    def test_unterminated_headers_are_bounded(self):
+        with mock.patch.object(ws, 'MAX_HANDSHAKE_SIZE', 64), self.assertRaisesRegex(ws.WebSocketError, 'too large'):
+            self.open(iter([b'x' * 64]))
+        self.wrapped.close.assert_called_once()
+        self.assertEqual(self.wrapped.recv.call_count, 1)
+
+    def test_dribbling_handshake_has_an_overall_deadline(self):
+        import itertools
+        with mock.patch.object(ws.time, 'monotonic', side_effect=itertools.count(0, 10)), self.assertRaises(TimeoutError):
+            self.open(iter([b'HTTP/1.1 101']))
+        self.wrapped.close.assert_called_once()

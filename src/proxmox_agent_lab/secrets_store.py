@@ -224,7 +224,7 @@ def get(config: Config, name: str, *, required: bool = True) -> str:
 
     if value:
         return value
-    # An env var always wins as a fallback, so CI can override any backend.
+    # Environment values are a fallback when the explicit backend is empty.
     fallback = os.environ.get(_env_name(name))
     if fallback:
         return fallback

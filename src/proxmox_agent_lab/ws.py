@@ -13,11 +13,13 @@ console stream is not less sensitive than the REST API, so it follows the same
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import os
 import socket
 import ssl
 import struct
+import time
 from urllib import parse
 
 
@@ -34,6 +36,7 @@ OPCODE_PONG = 0xA
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_FRAME_SIZE = 64 * 1024 * 1024
+MAX_HANDSHAKE_SIZE = 64 * 1024
 
 
 class WebSocket:
@@ -51,7 +54,10 @@ class WebSocket:
         timeout: float = 20.0,
         verify_tls: bool = True,
     ) -> None:
+        if timeout <= 0:
+            raise ValueError("WebSocket timeout must be positive")
         self.timeout = timeout
+        self._read_deadline: float | None = None
         self._recv_buffer = bytearray()
         self._payload_buffer = bytearray()
         self._fragment_opcode: int | None = None
@@ -65,10 +71,24 @@ class WebSocket:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
         raw = socket.create_connection((host, port), timeout=timeout)
-        self._socket = context.wrap_socket(
-            raw, server_hostname=host if verify_tls else None
-        )
-        self._socket.settimeout(timeout)
+        try:
+            self._socket = context.wrap_socket(
+                raw, server_hostname=host if verify_tls else None
+            )
+        except BaseException:
+            raw.close()
+            raise
+        try:
+            self._read_deadline = time.monotonic() + timeout
+            self._remaining_timeout()
+            self._handshake(host, port, path, query, headers, subprotocols)
+            self._read_deadline = None
+            self._socket.settimeout(timeout)
+        except BaseException:
+            self._socket.close()
+            raise
+
+    def _handshake(self, host, port, path, query, headers, subprotocols) -> None:
         self._key = base64.b64encode(os.urandom(16)).decode()
         target = path + "?" + parse.urlencode(query)
         request_lines = [
@@ -87,44 +107,52 @@ class WebSocket:
         self._recv_buffer += rest
         text = head.decode("latin-1")
         status = text.split("\r\n", 1)[0]
-        if "101" not in status:
+        if status.split()[:2] != ["HTTP/1.1", "101"]:
             raise WebSocketError(f"WebSocket upgrade refused: {status.strip()}")
         expected = base64.b64encode(
             hashlib.sha1((self._key + WS_GUID).encode()).digest()
         ).decode()
-        accept = ""
-        self.subprotocol = ""
+        response_headers = {}
         for line in text.split("\r\n")[1:]:
             name, _, value = line.partition(":")
-            if name.strip().lower() == "sec-websocket-accept":
-                accept = value.strip()
-            if name.strip().lower() == "sec-websocket-protocol":
-                self.subprotocol = value.strip().lower()
+            response_headers[name.strip().lower()] = value.strip()
+        if response_headers.get("upgrade", "").lower() != "websocket":
+            raise WebSocketError("WebSocket upgrade header missing or invalid")
+        connection = {part.strip().lower() for part in response_headers.get("connection", "").split(",")}
+        if "upgrade" not in connection:
+            raise WebSocketError("WebSocket connection upgrade was not confirmed")
+        accept = response_headers.get("sec-websocket-accept", "")
+        self.subprotocol = response_headers.get("sec-websocket-protocol", "")
         if accept != expected:
             raise WebSocketError(
                 f"WebSocket accept mismatch: got {accept!r}, expected {expected!r}"
             )
+        if self.subprotocol and self.subprotocol not in subprotocols:
+            raise WebSocketError("Proxmox selected an unsupported WebSocket subprotocol")
         self._base64 = self.subprotocol == "base64"
 
     def _read_until(self, marker: bytes) -> bytes:
         data = bytearray(self._recv_buffer)
         self._recv_buffer.clear()
         while marker not in data:
+            if len(data) >= MAX_HANDSHAKE_SIZE:
+                raise WebSocketError("WebSocket handshake headers are too large")
+            self._remaining_timeout()
             chunk = self._socket.recv(4096)
             if not chunk:
                 raise WebSocketError("connection closed during handshake")
             data += chunk
+        if data.index(marker) + len(marker) > MAX_HANDSHAKE_SIZE:
+            raise WebSocketError("WebSocket handshake headers are too large")
         return bytes(data)
 
-    def _recv_exact(self, count: int) -> bytes:
-        while len(self._recv_buffer) < count:
-            chunk = self._socket.recv(65536)
-            if not chunk:
-                raise WebSocketError("connection closed by Proxmox")
-            self._recv_buffer += chunk
-        out = bytes(self._recv_buffer[:count])
-        del self._recv_buffer[:count]
-        return out
+    def _remaining_timeout(self) -> None:
+        deadline = self._read_deadline
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("WebSocket read deadline exceeded")
+            self._socket.settimeout(remaining)
 
     def _send_frame(self, opcode: int, payload: bytes) -> None:
         header = bytearray([0x80 | opcode])
@@ -145,7 +173,9 @@ class WebSocket:
     def _peek_exact(self, count: int) -> None:
         # Leave the entire frame buffered until complete: read_available may
         # time out between any two bytes and resume on its next invocation.
+        self._remaining_timeout()
         while len(self._recv_buffer) < count:
+            self._remaining_timeout()
             chunk = self._socket.recv(65536)
             if not chunk:
                 raise WebSocketError("connection closed by Proxmox")
@@ -216,7 +246,12 @@ class WebSocket:
                 self._fragments.clear()
             self._fragment_opcode = None
             if self._base64:
-                payload = base64.b64decode(payload + b"=" * (-len(payload) % 4))
+                try:
+                    payload = base64.b64decode(
+                        payload + b"=" * (-len(payload) % 4), validate=True
+                    )
+                except binascii.Error:
+                    raise WebSocketError("Proxmox sent invalid base64 console data") from None
             return payload
 
     def read_exact(self, count: int) -> bytes:
@@ -233,13 +268,17 @@ class WebSocket:
             out = bytes(self._payload_buffer)
             self._payload_buffer.clear()
             return out
+        if timeout <= 0:
+            return b""
         previous = self._socket.gettimeout()
-        self._socket.settimeout(timeout)
+        previous_deadline = self._read_deadline
+        self._read_deadline = time.monotonic() + timeout
         try:
             return self.recv()
         except (TimeoutError, socket.timeout, ssl.SSLWantReadError):
             return b""
         finally:
+            self._read_deadline = previous_deadline
             self._socket.settimeout(previous)
 
     def close(self) -> None:

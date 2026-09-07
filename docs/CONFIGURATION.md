@@ -275,7 +275,7 @@ one-off run.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `backend` | `auto` | `keychain`, `secret-tool`, `env`, or `file` |
+| `backend` | `auto` | `auto` selects `env`; explicit options: `keychain`, `secret-tool`, `env`, `file` |
 | `file_path` | — | Only for the `file` backend |
 
 - **`keychain`** — macOS `security`.
@@ -286,8 +286,12 @@ one-off run.
 - **`file`** — a TOML file that must be `0600`. For headless boxes with no
   keyring. Least safe; a keyring is better where one exists.
 
-An environment variable always overrides the chosen backend, so you can point
-a single install at a different lab for one command.
+Lookup order is the configured backend, then the matching environment
+variable if that backend has no value, then the shared MariaDB secret store.
+An existing value in an explicit file/keychain backend takes precedence over
+an environment variable. To use environment values first, select `env` (or
+`auto`). The shared store requires the separate `mariadb-password` bootstrap
+credential; that credential never looks itself up in the shared store.
 
 ### Cloud vision providers
 

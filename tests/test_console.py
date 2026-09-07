@@ -2056,6 +2056,7 @@ class ConsoleTlsTests(unittest.TestCase):
         context.wrap_socket = wrap_socket        # type: ignore[method-assign]
         wrapped.recv.side_effect = [
             b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
             b"Sec-WebSocket-Protocol: binary\r\n"
             b"Sec-WebSocket-Accept: 3SC6TZx4582OZaOogPVxMx5CGS0=\r\n\r\n"
         ]

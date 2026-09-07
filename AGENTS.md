@@ -5,7 +5,7 @@
 
 ## Project Overview
 
-`proxmox-agent-lab` is a standard-library Python package and agent skill for operating a disposable Proxmox research lab. The `proxmox-lab` CLI powers on a spare host, creates or operates leased VMs/LXCs, exposes guest consoles and file/network tooling, records an audit trail, destroys lease-owned resources, and verifies host power-off.
+`proxmox-agent-lab` is a Python package and agent skill for operating a disposable Proxmox research lab. The `proxmox-lab` CLI powers on a spare host, creates or operates leased VMs/LXCs, exposes guest consoles and file/network tooling, records an audit trail, destroys lease-owned resources, and verifies host power-off.
 
 Use it only for systems the operator owns or is authorized to test. The safety model is part of the product: leases, ownership checks, expiry, audit redaction, fail-closed networking, explicit host-change gates, and verified shutdown must remain intact.
 
@@ -18,7 +18,7 @@ Use it only for systems the operator owns or is authorized to test. The safety m
 
 2. **Configuration and secrets**
    - `config.py` loads TOML with precedence from `PROXMOX_AGENT_LAB_CONFIG`, checkout/config locations, XDG config, and the default user config path. Site-specific values belong there, not in source.
-   - `secrets_store.py` retrieves tokens from the configured OS keychain backend (with documented development fallbacks). Secrets must not appear in argv, config, audit records, or committed files.
+   - `secrets_store.py` reads the configured backend first (`auto` selects environment variables), then environment and shared MariaDB fallbacks. OS keychains remain explicit options. Secrets must not appear in argv, config, audit records, or committed files.
    - Imports must survive missing or malformed configuration. `cli.py` records configuration errors so `init` and `doctor` can still diagnose and repair the install.
 
 3. **Lease, API, and cleanup flow**
@@ -35,7 +35,7 @@ Use it only for systems the operator owns or is authorized to test. The safety m
    - `memflow.py`, `usb.py`, and `netcap.py` are deliberate exceptions to the API-token boundary: they use opt-in SSH access to host-side tooling or disposable LXCs and require their documented authorization gates.
 
 5. **State and audit**
-   - Lease and activity state are JSON files under the runtime state directory, protected by the controller lock. The audit journal is append-only SQLite WAL by default (with the configured JSONL/private-sync alternatives) and redacts sensitive fields.
+   - Lease and activity state are JSON files under the runtime state directory, protected by the controller lock. The audit journal uses shared MariaDB with a local spool when the ledger is unreachable; legacy SQLite/JSONL data can be migrated. Audit fields are redacted.
    - Never put runtime state, journals, captures, or site topology in the repository.
 
 ## Key Directories
@@ -88,11 +88,11 @@ PROXMOX_AGENT_LAB_CONFIG=/tmp/missing.toml \
   /tmp/proxmox-agent-lab-smoke/bin/proxmox-lab --help
 ```
 
-For a release, update the version in `pyproject.toml` and `src/proxmox_agent_lab/__init__.py`, update the dated `CHANGELOG.md` section, then run `python3 scripts/check-release.py --tag vX.Y.Z`. The release workflow builds the wheel and sdist, smoke-installs the wheel, and writes SHA-256 checksums.
+For a release, update the version in `pyproject.toml`, `src/proxmox_agent_lab/__init__.py`, and `REQUIRED_VERSION` in `bootstrap.sh`, update the dated `CHANGELOG.md` section, then run `python3 scripts/check-release.py --tag vX.Y.Z`. The release workflow builds the wheel and sdist, smoke-installs the wheel, and writes SHA-256 checksums.
 
 ## Code Conventions & Common Patterns
 
-- Keep runtime code compatible with Python 3.11+ and standard-library-only. Existing modules use `from __future__ import annotations`, type annotations, snake_case names, and small focused helpers.
+- Keep runtime code compatible with Python 3.11+ and prefer the standard library. The shared MariaDB client already depends on `PyMySQL` and `cryptography`. Existing modules use `from __future__ import annotations`, type annotations, snake_case names, and small focused helpers.
 - Add commands through the existing `cmd_*`/parser and sibling-module registration conventions. Reuse `LabError`, `ConfigError`, API helpers, lease helpers, audit helpers, and shared configuration instead of duplicating them.
 - Preserve bounded behavior: use existing timeout/deadline polling for Proxmox tasks, guest operations, network calls, and power transitions. Map expected operational failures to the package's user-facing error path; do not swallow safety failures.
 - Treat configuration as process-wide cached state and runtime state as explicit files/databases. Tests may reset caches and patch state roots, but production code must keep locking, atomic writes, expiry, and audit behavior.
@@ -117,7 +117,7 @@ For a release, update the version in `pyproject.toml` and `src/proxmox_agent_lab
 
 ## Runtime/Tooling Preferences
 
-- Required runtime: system Python 3.11 or newer; CI covers 3.11–3.14. The package has no runtime dependencies and must work after a normal `pip install` without an extra dependency bundle.
+- Required runtime: system Python 3.11 or newer; CI covers 3.11–3.14. A normal `pip install` installs the declared `PyMySQL` and `cryptography` runtime dependencies. Imports and `--help` must also survive their absence so broken installs remain diagnosable.
 - Build backend: Hatchling. The optional `.[dev]` extra provides `pytest`, but the canonical suite is direct `unittest` discovery.
 - `scripts/proxmox-lab` is the preferred checkout runner; installed users use the same `proxmox-lab` command from PATH.
 - CI installs `xorriso` for ISO-related tests. Do not assume host-side Rust tools, Ghidra, tcpdump, mitmproxy, or other memflow/USB/netcap tooling is bundled in the Python package; those are installed on the hypervisor or disposable LXC during setup.

@@ -6,6 +6,28 @@ All notable changes to this project will be documented here. The format follows
 
 ## Unreleased
 
+## 0.14.1 - 2026-09-07
+
+### Fixed
+
+- Console reads preserve partial WebSocket frames across polling timeouts and
+  reassemble fragmented binary/base64 messages before decoding.
+- Continuous ping/pong traffic can no longer extend a console poll indefinitely.
+  Handshake reads have a deadline and a 64 KiB header limit; failed TLS or
+  HTTP upgrades close the connection instead of leaking sockets.
+- WebSocket upgrades validate the HTTP status, upgrade headers and selected
+  subprotocol. Malformed base64 is reported as a console error.
+
+### Changed
+
+- Simplified console receive handling by removing the unused duplicate reader
+  and avoiding an intermediate payload copy.
+- Updated installation, configuration and contributor documentation for
+  MariaDB dependencies, actual secret lookup precedence and the complete
+  release procedure. The quick-start tour now guarantees lease cleanup on exit.
+- Release and package smoke checks install and verify runtime dependencies
+  in addition to checking that CLI help works without them.
+
 ## 0.14.0 - 2026-09-06
 
 ### Added

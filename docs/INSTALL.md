@@ -9,7 +9,7 @@
 
 **Hard prerequisites** — fail fast if any is missing:
 
-- **Controller:** Python 3.11+ (`install.sh:70` probes `python3.13` → `python3.12` → `python3.11` → `python3`), `pipx` if available otherwise `pip --user` fallback (`install.sh:96-104`).
+- **Controller:** Python 3.11+ and `pipx` (preferred), or the installer's Python environment fallback. Package installation supplies `PyMySQL` and `cryptography` for the MariaDB ledger.
 - **Network:** wired NIC with Wake-on-LAN and a static IP (or DHCP reservation) for the Proxmox host.
 - **Proxmox:** VE 8 or 9 on the spare PC.
 

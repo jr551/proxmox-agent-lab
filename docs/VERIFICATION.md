@@ -13,7 +13,10 @@ Unit-tested only: WebSocket reads resume after timeouts inside frame headers
 and payloads, reassemble fragmented binary/base64 messages across interleaved
 ping frames, send masked pong replies, and reject invalid framing and oversized
 messages. The receive path also avoids an intermediate payload slice copy.
-These changes have not been exercised against a live Proxmox console.
+Additional offline regressions cover handshake failure cleanup, bounded
+handshake headers, polling deadlines under continuous control traffic, and
+invalid base64 errors. These changes have not been exercised against a live
+Proxmox console.
 
 ## 🟢 Verified on hardware
 

@@ -242,16 +242,20 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-
 and Python 3.11+ to drive it from. Wake-on-LAN is the default power-on and
 needs only the NIC's MAC address.
 
-**Zero dependencies.** VNC client, WebSockets, S3 signing, PNG encoding — all
-standard library.
+**Runtime dependencies:** installation includes `PyMySQL` and `cryptography`
+for the shared MariaDB ledger. The VNC client, WebSockets, S3 signing and PNG
+encoding use the Python standard library.
 
 📘 Full walkthrough: **[docs/INSTALL.md](docs/INSTALL.md)**
 
 ## 🚀 Five-minute tour
 
 ```bash
+(
+set -e
 L=$(proxmox-lab lease-begin --purpose "tour" \
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+trap 'proxmox-lab lease-end --lease "$L"' EXIT
 
 # Clone a golden template (9000) into a fresh throwaway guest for this lease
 proxmox-lab guest clone --lease "$L" --template 9000 --newid 9101
@@ -260,7 +264,7 @@ proxmox-lab guest probe --vmid 9101         # how can I reach this guest?
 proxmox-lab guest run --lease "$L" --vmid 9101 uname -a
 proxmox-lab console screenshot --vmid 9101  # what's on the screen?
 
-proxmox-lab lease-end --lease "$L"          # destroy the clone, power off
+)  # the exit trap destroys the clone and powers off, including on failure
 ```
 
 `lease-begin` wakes the PC; `lease-end` prints `"host_powered_off": true` and

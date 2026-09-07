@@ -4,8 +4,8 @@ Thanks for helping turn spare hardware into safer research infrastructure.
 
 ## Ground rules
 
-- Keep the runtime package standard-library only and compatible with Python
-  3.11+.
+- Keep the package compatible with Python 3.11+. Prefer the standard library;
+  the existing MariaDB client uses `PyMySQL` and `cryptography`.
 - Put values that differ between labs in `config.py`, with documentation and a
   safe default.
 - Never commit credentials, host addresses, MAC addresses, VMIDs, device
@@ -24,8 +24,9 @@ python3.11 -m venv .venv
 PYTHONWARNINGS=error .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The runtime has no third-party dependencies. `pytest` is optional development
-tooling; the canonical suite also runs directly through `unittest` with
+The editable install includes the runtime dependencies declared in
+`pyproject.toml`. `pytest` is optional development tooling; the canonical suite
+runs directly through `unittest` with
 warnings as errors (`PYTHONWARNINGS=error`).
 
 ## Testing expectations
@@ -40,6 +41,7 @@ PYTHONWARNINGS=error python3 -m unittest discover -s tests -q
 python3 -m compileall -q src tests
 python3 scripts/check-secrets.py .
 python3 scripts/check-public.py .
+python3 scripts/check-release.py
 git diff --check
 ```
 
@@ -58,13 +60,15 @@ into an issue or pull request.
 
 Maintainers release from a clean, green `main` branch:
 
-1. Update the version in `pyproject.toml` and
-   `src/proxmox_agent_lab/__init__.py` (both must match; current version is
-   `0.11.0`).
+1. Update the version in `pyproject.toml`, `src/proxmox_agent_lab/__init__.py`,
+   and `REQUIRED_VERSION` in `bootstrap.sh`. All three must match.
 2. Move the relevant changelog entries under a dated version heading in
    [CHANGELOG.md](CHANGELOG.md).
 3. Run `python scripts/check-release.py --tag vX.Y.Z` with the intended tag.
-4. Create and push the annotated `vX.Y.Z` tag.
+4. Push the release commit to `main` and wait for its CI checks to pass.
+5. Create and push the annotated `vX.Y.Z` tag at that tested commit.
+6. Confirm the Release workflow succeeds and the GitHub release contains the
+   wheel, source archive, and `SHA256SUMS`.
 
 The tag-gated release workflow reruns the tests and public-release guards,
 builds and smoke-installs the wheel, generates SHA-256 checksums, and publishes

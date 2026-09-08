@@ -1,7 +1,7 @@
 # Configuration
 
 Two things to know: **site settings** live in a TOML file, **secrets** live in
-your OS keyring. Nothing secret ever belongs in the config file.
+the configured secret backend (environment, keyring, file, or shared ledger). Nothing secret ever belongs in the config file.
 
 ## Where the config lives
 
@@ -30,6 +30,8 @@ Runtime state — leases, screenshots, the journal — goes to
 | `node` | — | Node name, i.e. its hostname — not the FQDN |
 | `token_user` | — | Token owner, e.g. `agent@pve` |
 | `token_name` | — | Token id, e.g. `lab` |
+| `ca_file` | — | Optional PEM CA bundle for REST, console and upload TLS verification; set automatically by onboarding. |
+| `guest_mode` | `all` | `lxc-only` restricts VPS operations and disables host shutdown; see [onboarding](onboarding.md). |
 | `verify_tls` | `false` | Verify the certificate. Off by default because a fresh Proxmox install is self-signed; turn it on once you have a trusted cert. |
 
 `verify_tls` is one switch for every connection to the node: REST calls, the

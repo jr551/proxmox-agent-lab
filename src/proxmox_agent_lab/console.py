@@ -129,6 +129,7 @@ def _open_websocket(lab: Any, kind: str, vmid: int, proxy: dict[str, Any],
         # keystrokes and screen contents, so it must not be the one path that
         # trusts any certificate.
         verify_tls=bool(getattr(lab, "VERIFY_TLS", True)),
+        ca_file=lab.CONFIG.proxmox.get("ca_file") or None,
     )
 
 

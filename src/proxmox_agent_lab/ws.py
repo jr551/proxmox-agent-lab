@@ -53,6 +53,7 @@ class WebSocket:
         subprotocols: tuple[str, ...] = ("binary", "base64"),
         timeout: float = 20.0,
         verify_tls: bool = True,
+        ca_file: str | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("WebSocket timeout must be positive")
@@ -62,7 +63,7 @@ class WebSocket:
         self._payload_buffer = bytearray()
         self._fragment_opcode: int | None = None
         self._fragments = bytearray()
-        context = ssl.create_default_context()
+        context = ssl.create_default_context(cafile=ca_file)
         # The console carries guest input and output, so it gets the same
         # certificate policy as the REST client -- [proxmox] verify_tls -- and
         # not a private exemption. Verification stays off only while the node
@@ -93,7 +94,7 @@ class WebSocket:
         target = path + "?" + parse.urlencode(query)
         request_lines = [
             f"GET {target} HTTP/1.1",
-            f"Host: {host}:{port}",
+            f"Host: {'[' + host + ']' if ':' in host else host}:{port}",
             "Connection: Upgrade",
             "Upgrade: websocket",
             "Sec-WebSocket-Version: 13",

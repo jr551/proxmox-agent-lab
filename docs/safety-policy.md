@@ -35,6 +35,24 @@ proxmox-lab cleanup-expired --orphans-only --host-change-authorized
 proxmox-lab lease-destroy --lease <id> --confirm
 ```
 
+## Initial onboarding and VPS policy
+
+`onboard prepare --mode iso` requires an exact disk serial, a root password
+hash file and `--wipe-confirmed`. This generates media; booting that media is
+what installs onto and erases the selected target disk. The embedded first-boot
+script configures the dedicated API principal, isolated bridge and requested
+Wi-Fi/SSH settings. It is an initial host setup operation before leases exist.
+The generated VPS script requires `--host-change-authorized` and
+`--reboot-authorized` on its first run, before host changes.
+
+An enrolled VPS uses `[proxmox] guest_mode = "lxc-only"`. This explicitly
+suspends automatic host shutdown, including the watchdog, while guest cleanup
+and ownership checks continue. QEMU, privileged LXC creation, cloning, host
+power writes and VM/device command families are blocked by the controller.
+The VPS API token has no host power permission. This is a controller capability
+policy, not a server-side separation between Proxmox's VM and LXC privileges.
+See [onboarding](onboarding.md) for the experimental limits and recovery steps.
+
 ## Invariants
 
 1. Every write belongs to one active lease.

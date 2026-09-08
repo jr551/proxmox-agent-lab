@@ -38,6 +38,17 @@ An unreachable host with `ok: true`, a populated `config_file`, and
 `proxmox_token_stored: true` usually means the spare PC is simply powered off;
 continue with `lease-begin` so the configured power path can wake it. Do not
 ask the user to re-enter configuration that `doctor` already found.
+## Experimental installer onboarding
+
+For a new host, see [onboarding](docs/onboarding.md): `onboard prepare`,
+`build-iso`, and `serve` generate installation media or a Debian VPS setup
+script and pair the resulting node. This path is not hardware-verified yet.
+A config with `[proxmox] guest_mode = "lxc-only"` deliberately leaves its VPS
+powered on after lease cleanup; report that policy rather than treating
+`host_powered_off: false` as failed physical shutdown. QEMU and VM/device tools
+are unavailable in this mode. Normal physical-host leases retain the verified
+shutdown requirement below.
+
 ## 🔑 Every task follows this shape
 
 Never call standalone `power-on` for agent work. It deliberately refuses

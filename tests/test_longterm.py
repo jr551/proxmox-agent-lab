@@ -179,6 +179,7 @@ class DestroyTests(unittest.TestCase):
         lab.finalize_lease.return_value = []
         lab.active_leases.return_value = []
         lab.shutdown_host.return_value = True
+        lab.host_power_policy.return_value = {}
         return lab
 
     def test_destroy_without_confirm_lists_what_would_be_lost(self) -> None:

@@ -58,7 +58,7 @@ CONFIG = config_module.get()      # ...but every module shares this instance
 HOST = CONFIG.proxmox.host
 PORT = int(CONFIG.proxmox.port)
 NODE = CONFIG.proxmox.node
-API_ROOT = f"https://{HOST}:{PORT}/api2/json"
+API_ROOT = f"https://{'[' + HOST + ']' if ':' in HOST else HOST}:{PORT}/api2/json"
 TOKEN_USER = CONFIG.proxmox.token_user
 TOKEN_NAME = CONFIG.proxmox.token_name
 VERIFY_TLS = bool(CONFIG.proxmox.verify_tls)
@@ -395,7 +395,9 @@ def keychain_secret() -> str:
 
 class ProxmoxAPI:
     def __init__(self) -> None:
-        self._ssl = ssl.create_default_context()
+        self._ssl = ssl.create_default_context(
+            cafile=CONFIG.proxmox.get("ca_file") or None
+        )
         if not VERIFY_TLS:
             # A fresh Proxmox install has a self-signed certificate, so this
             # is off by default. Set [proxmox] verify_tls once you have put a
@@ -411,6 +413,8 @@ class ProxmoxAPI:
         *,
         timeout: int = 30,
     ) -> Any:
+        from .host_policy import check_api
+        check_api(CONFIG, method, path, data)
         method = method.upper()
         if not path.startswith("/"):
             path = "/" + path
@@ -833,8 +837,19 @@ def _is_lab_infrastructure(resource: dict[str, Any]) -> bool:
     return INFRA_TAG in [tag.strip() for tag in tags.split(";")]
 
 
+def host_power_policy() -> dict[str, Any]:
+    from .host_policy import lxc_only
+    if lxc_only(CONFIG):
+        return {"host_left_running": True, "reason": "LXC-only VPS stays powered on by policy"}
+    return {}
+
+
 def shutdown_host(api: ProxmoxAPI) -> bool:
     """Shut the lab machine down and confirm it actually went off."""
+    from .host_policy import lxc_only
+    if lxc_only(CONFIG):
+        audit("lab-power-off-disabled", reason="LXC-only VPS stays powered on")
+        return False
     if not api.reachable():
         audit("lab-power-off-already-verified", host=HOST, node=NODE)
         return True
@@ -1364,6 +1379,8 @@ def upload_curl_argv(
     argv = ["curl", "--config", config_path]
     if not VERIFY_TLS:
         argv.append("--insecure")
+    elif CONFIG.proxmox.get("ca_file"):
+        argv.extend(["--cacert", str(CONFIG.proxmox.ca_file)])
     return [
         *argv,
         "--request", "POST",
@@ -1637,6 +1654,9 @@ def cmd_lease_end(args: argparse.Namespace) -> None:
         )
         result["to_power_off"] = "destroy them with 'lease-destroy', or "\
             "stop the host yourself"
+    elif CONFIG.proxmox.get("guest_mode", "all") == "lxc-only":
+        result["host_left_running"] = True
+        result["reason"] = "LXC-only VPS stays powered on by policy"
     elif not others and not host_powered_off:
         running = running_guest_vmids(api) if api.reachable() else []
         result["host_left_running"] = True
@@ -2055,8 +2075,8 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
         host_powered_off = False
         idle_seconds = int(mcp_idle_elapsed())
         idle_shutdown_triggered = False
-        if persistent:
-            # The whole promise of a long-term lease: the machine stays up.
+        if persistent or CONFIG.proxmox.get("guest_mode", "all") == "lxc-only":
+            # Long-term leases and VPS policy keep the host on.
             pass
         elif not remaining and (cleaned or args.all):
             host_powered_off = shutdown_host(api)
@@ -2129,6 +2149,7 @@ def cmd_cleanup_expired(args: argparse.Namespace) -> None:
                 "mcp_idle_shutdown_after_seconds": MCP_IDLE_SHUTDOWN_SECONDS,
                 "idle_shutdown_triggered": idle_shutdown_triggered,
                 "host_powered_off": host_powered_off,
+                **host_power_policy(),
                 **({"reclaimed_orphans": reclaimed} if reclaimed else {}),
             },
             indent=2,
@@ -2332,6 +2353,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         "host": HOST or None, "node": NODE or None,
         "token": f"{TOKEN_USER}!{TOKEN_NAME}" if TOKEN_USER else None,
         "verify_tls": VERIFY_TLS,
+        "guest_mode": CONFIG.proxmox.get("guest_mode", "all"),
     }
 
     backend = secrets_store.detect_backend() \
@@ -2872,6 +2894,7 @@ def parser() -> argparse.ArgumentParser:
     from . import netgw
     from . import isoinspect
     from . import oci
+    from . import onboarding
     from . import pe
     from . import recipes
     from . import share
@@ -2890,6 +2913,7 @@ def parser() -> argparse.ArgumentParser:
     netgw.register(sub, _module())
     isoinspect.register(sub, _module())
     oci.register(sub, _module())
+    onboarding.register(sub, _module())
     pe.register(sub, _module())
     recipes.register(sub, _module())
     share.register(sub, _module())
@@ -2954,6 +2978,8 @@ _EXPECTED_ERRORS = _expected_errors()
 def main() -> int:
     try:
         args = parser().parse_args()
+        from .host_policy import check_command
+        check_command(CONFIG, args.command)
         update_notice()
         args.func(args)
         return 0

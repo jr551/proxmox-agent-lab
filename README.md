@@ -32,6 +32,11 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/instal
   and the agent typed that text.</em>
 </p>
 
+**Experimental installer and pairing:** generate a Proxmox ISO, configure
+first-boot Wi-Fi, receive a LAN/WAN callback, or provision a fresh Debian VPS
+for LXC-only use. See [onboarding](docs/onboarding.md) for prerequisites and
+current limitations.
+
 ## Contents
 
 - [Why an old computer?](#why-an-old-computer)

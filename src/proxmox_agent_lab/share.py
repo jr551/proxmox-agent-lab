@@ -30,7 +30,6 @@ import base64
 import json
 from pathlib import Path
 from typing import Any
-from urllib import error, request
 
 from . import config as _config
 from . import console

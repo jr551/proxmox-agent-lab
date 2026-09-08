@@ -259,6 +259,7 @@ def cmd_destroy(lab: Any, args: Any) -> None:
         "destroyed_guests": guests,
         "failures": failures,
         "host_powered_off": host_powered_off,
+        **lab.host_power_policy(),
         "remaining_active_leases": [x["id"] for x in others],
     }, indent=2, sort_keys=True))
     if failures:
@@ -313,6 +314,7 @@ def cmd_release(lab: Any, args: Any) -> None:
         "retained_guests": guests,
         "failures": failures,
         "host_powered_off": host_powered_off,
+        **lab.host_power_policy(),
         "remaining_active_leases": [x["id"] for x in others],
     }, indent=2, sort_keys=True))
     if failures:

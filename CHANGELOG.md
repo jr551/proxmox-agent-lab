@@ -6,6 +6,22 @@ All notable changes to this project will be documented here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- Screenshot change highlighting uses a byte lookup table and skips pixel
+  loops for unchanged frames, preserving the existing output and thresholds.
+- Removed unused imports in sharing/S3 helpers.
+
+### Added
+
+- Experimental `onboard` workflow: checksum-verified ISO preparation with an
+  exact disk filter, optional first-boot WPA2 configuration, signed LAN
+  announcements, expiring TLS-authenticated enrollment, and verified controller
+  config generation. A fresh Debian 13 VPS path installs Proxmox across a
+  guarded reboot and selects LXC-only controller policy without host shutdown.
+- `[proxmox] ca_file` for enrolled host trust across API, console and upload
+  channels; `[proxmox] guest_mode` for LXC-only VPS operation.
+
 ## 0.14.1 - 2026-09-07
 
 ### Fixed

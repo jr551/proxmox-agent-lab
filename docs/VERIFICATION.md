@@ -14,9 +14,11 @@ into focused modules (`errors`, `state`, `api`, `audit`, `updates`, `leases`,
 `cleanup`, `diagnostics`, `host_transport`, `serial`, `guest_agent`,
 `transfer`) behind the unchanged `cli`/`console` facades, moved large remote
 programs into `src/proxmox_agent_lab/resources/`, and made share tokens never
-start with `-`. All of it is **unit-tested only** (the full offline suite,
-746 tests) — no command in this section has been re-run against the node
-since the move. Behavior is intended to be identical; treat that as
+start with `-`. All of it is **unit-tested only** — the full offline suite
+(746 tests) passes under Python 3.11, 3.13 and 3.14, every test module
+passes standalone, and the built wheel smoke-installs and serves
+`--help`/`doctor` on a missing config. No command in this section has been
+re-run against the node since the move. Behavior is intended to be identical; treat that as
 unverified until the next hardware pass.
 
 ## Console transport regression coverage (2026-09-07)

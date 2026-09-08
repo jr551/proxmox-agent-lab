@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(
-    Path(__file__).parent / "fixtures" / "config.toml"
-)
+import sys  # noqa: E402
+
+# Shared bootstrap: fixture configuration plus a per-process state directory,
+# applied before any proxmox_agent_lab import. `support` sits beside this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support import bootstrap  # noqa: E402,F401
 
 import argparse  # noqa: E402
 import base64  # noqa: E402

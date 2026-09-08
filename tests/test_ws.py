@@ -5,6 +5,9 @@ import sys
 import unittest
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support import bootstrap  # noqa: E402,F401
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from proxmox_agent_lab import ws
 

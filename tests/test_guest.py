@@ -12,6 +12,9 @@ from unittest import mock
 SRC = Path(__file__).parents[1] / "src"
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support import bootstrap  # noqa: E402,F401
+
 sys.path.insert(0, str(SRC))
 
 from proxmox_agent_lab import console as lab_console  # noqa: E402

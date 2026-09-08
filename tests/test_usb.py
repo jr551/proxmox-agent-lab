@@ -26,7 +26,7 @@ from unittest import mock  # noqa: E402
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import cli as LAB  # noqa: E402
-from proxmox_agent_lab import memflow as MF  # noqa: E402
+from proxmox_agent_lab import host_transport as HT  # noqa: E402
 from proxmox_agent_lab import usb  # noqa: E402
 
 
@@ -48,7 +48,7 @@ LSUSB = (
 
 class EnableGuardTests(unittest.TestCase):
     def test_off_without_host_ssh(self) -> None:
-        with mock.patch.object(MF, "ENABLED", False):
+        with mock.patch.object(HT, "ENABLED", False):
             with self.assertRaises(LAB.LabError):
                 usb._require_enabled(LAB)
 
@@ -73,7 +73,7 @@ class ResolveTests(unittest.TestCase):
 class AttachGateTests(unittest.TestCase):
     def test_attach_refuses_without_authorization(self) -> None:
         # The gate must trip before any host call.
-        with mock.patch.object(MF, "ENABLED", True), \
+        with mock.patch.object(HT, "ENABLED", True), \
              mock.patch.object(usb, "_ssh") as sshed:
             with self.assertRaises(LAB.LabError) as ctx:
                 usb.cmd_attach(LAB, Args(lease="L", vmid=101,
@@ -96,7 +96,7 @@ class SniffTests(unittest.TestCase):
 
         out = Path(tempfile.mkdtemp()) / "cap.pcap"
         audited: dict = {}
-        with mock.patch.object(MF, "ENABLED", True), \
+        with mock.patch.object(HT, "ENABLED", True), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(usb, "_ssh", side_effect=fake_ssh), \
              mock.patch.object(LAB, "audit",

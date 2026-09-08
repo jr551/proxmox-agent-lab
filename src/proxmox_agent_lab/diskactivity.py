@@ -218,12 +218,12 @@ def _volume_path(lab: Any, api: Any, volid: str) -> tuple[str | None, str]:
         detail = "the storage content endpoint reported no path"
     except lab.LabError as exc:
         detail = str(exc)[:160]
-    from . import memflow
+    from . import host_transport
 
-    if not memflow.host_ssh_enabled():
+    if not host_transport.host_ssh_enabled():
         return None, detail
     try:
-        proc = memflow.host_run(lab, ["pvesm", "path", volid], timeout=30)
+        proc = host_transport.host_run(lab, ["pvesm", "path", volid], timeout=30)
     except lab.LabError as exc:
         return None, f"{detail}; pvesm path failed: {str(exc)[:120]}"
     path = (proc.stdout or "").strip().splitlines()
@@ -271,9 +271,9 @@ def host_image_sizes(
     lab: Any, paths: dict[str, str]
 ) -> tuple[dict[str, int], str | None]:
     """Allocated bytes of each backing image, measured on the host with du."""
-    from . import memflow
+    from . import host_transport
 
-    if not memflow.host_ssh_enabled():
+    if not host_transport.host_ssh_enabled():
         return {}, (
             "the opt-in [memflow] host SSH channel is off, so the image file "
             "cannot be measured on the host; see docs/memflow.md"
@@ -290,7 +290,7 @@ def host_image_sizes(
         # --block-size=1 gives allocated bytes. `ls` would give the apparent
         # size of a sparse image, which for an untouched 100 GB qcow2 is 100
         # GB of I/O that never happened.
-        proc = memflow.host_run(
+        proc = host_transport.host_run(
             lab, ["du", "--block-size=1", "--", *targets],
             timeout=DU_TIMEOUT_SECONDS,
         )

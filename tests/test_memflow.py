@@ -25,6 +25,7 @@ from unittest import mock  # noqa: E402
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import cli as LAB  # noqa: E402
+from proxmox_agent_lab import host_transport  # noqa: E402
 from proxmox_agent_lab import memflow  # noqa: E402
 
 
@@ -39,32 +40,32 @@ def completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
 
 class OptInGuardTests(unittest.TestCase):
     def test_disabled_config_refuses(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", False):
+        with mock.patch.object(host_transport, "ENABLED", False):
             with self.assertRaises(LAB.LabError):
                 memflow._require_enabled(LAB)
 
     def test_missing_host_refuses_even_when_enabled(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True), \
-             mock.patch.object(memflow, "SSH_HOST", ""):
+        with mock.patch.object(host_transport, "ENABLED", True), \
+             mock.patch.object(host_transport, "SSH_HOST", ""):
             with self.assertRaises(LAB.LabError):
                 memflow._require_enabled(LAB)
 
 
 class SshChannelTests(unittest.TestCase):
     def test_key_is_referenced_by_path_never_inlined(self) -> None:
-        with mock.patch.object(memflow, "SSH_KEY", "/example/keys/pxl_vmi"):
-            argv = memflow._ssh_argv("id -un")
+        with mock.patch.object(host_transport, "SSH_KEY", "/example/keys/pxl_vmi"):
+            argv = host_transport._ssh_argv("id -un")
         self.assertIn("-i", argv)
         self.assertEqual(argv[argv.index("-i") + 1], "/example/keys/pxl_vmi")
 
     def test_batchmode_prevents_password_hangs(self) -> None:
-        self.assertIn("BatchMode=yes", memflow._ssh_argv("id -un"))
+        self.assertIn("BatchMode=yes", host_transport._ssh_argv("id -un"))
 
     def test_transport_failure_is_not_a_remote_failure(self) -> None:
         with mock.patch("subprocess.run",
                         return_value=completed(255, stderr="conn refused")):
             with self.assertRaises(LAB.LabError) as ctx:
-                memflow._ssh(LAB, ["id"])
+                host_transport.run(LAB, ["id"])
         self.assertIn("cannot SSH", str(ctx.exception))
 
     def test_missing_helper_points_at_host_setup(self) -> None:
@@ -98,7 +99,7 @@ class ReadPathGuardTests(unittest.TestCase):
         return api
 
     def test_stopped_guest_is_refused(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI",
                                return_value=self._fake_api("stopped")), \
              mock.patch.object(LAB, "load_lease", return_value={}):
@@ -107,7 +108,7 @@ class ReadPathGuardTests(unittest.TestCase):
         self.assertIn("not running", str(ctx.exception))
 
     def test_read_requires_a_lease(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI",
                                return_value=self._fake_api("running")), \
              mock.patch.object(LAB, "load_lease",
@@ -123,7 +124,7 @@ class ReadPathGuardTests(unittest.TestCase):
             audited["fields"] = fields
 
         rows = [{"pid": 4, "name": "System"}, {"pid": 404, "name": "smss.exe"}]
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI",
                                return_value=self._fake_api("running")), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
@@ -149,7 +150,7 @@ class WriteGateTests(unittest.TestCase):
         return api
 
     def test_write_refuses_without_i_understand(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True):
+        with mock.patch.object(host_transport, "ENABLED", True):
             with self.assertRaises(LAB.LabError) as ctx:
                 memflow.cmd_write(LAB, Args(lease="L", vmid=9040,
                                             addr="0x1000", hex="9090",
@@ -158,7 +159,7 @@ class WriteGateTests(unittest.TestCase):
 
     def test_write_rejects_bad_hex_before_touching_the_guest(self) -> None:
         # Odd-length / non-hex must fail before any lease load or helper call.
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "load_lease") as load, \
              mock.patch.object(memflow, "_helper_json") as helper:
             with self.assertRaises(LAB.LabError):
@@ -174,7 +175,7 @@ class WriteGateTests(unittest.TestCase):
         def fake_audit(event, **fields):
             audited.update({"event": event, "fields": fields})
 
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit", fake_audit), \
@@ -198,7 +199,7 @@ class PhysMemoryGuardTests(unittest.TestCase):
         return api
 
     def test_phys_write_refuses_without_i_understand(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True):
+        with mock.patch.object(host_transport, "ENABLED", True):
             with self.assertRaises(LAB.LabError) as ctx:
                 memflow.cmd_phys_write(LAB, Args(lease="L", vmid=9072,
                                                  addr="0x1000", hex="00",
@@ -206,7 +207,7 @@ class PhysMemoryGuardTests(unittest.TestCase):
         self.assertIn("--i-understand", str(ctx.exception))
 
     def test_phys_write_rejects_bad_hex_before_touching_the_guest(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "load_lease") as load, \
              mock.patch.object(memflow, "_helper_json") as helper:
             with self.assertRaises(LAB.LabError):
@@ -218,7 +219,7 @@ class PhysMemoryGuardTests(unittest.TestCase):
 
     def test_phys_write_audits_length_not_bytes(self) -> None:
         audited: dict = {}
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit",
@@ -234,7 +235,7 @@ class PhysMemoryGuardTests(unittest.TestCase):
         self.assertNotIn("ab", json.dumps(audited["fields"]))
 
     def test_scan_requires_running_guest(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI",
                                return_value=self._fake_api("stopped")), \
              mock.patch.object(LAB, "load_lease", return_value={}):
@@ -245,7 +246,7 @@ class PhysMemoryGuardTests(unittest.TestCase):
 
     def test_scan_audits_hit_count_not_addresses(self) -> None:
         audited: dict = {}
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit",
@@ -269,7 +270,7 @@ class DebugGuardTests(unittest.TestCase):
         return api
 
     def test_trace_requires_running_guest(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI",
                                return_value=self._fake_api("stopped")), \
              mock.patch.object(LAB, "load_lease", return_value={}):
@@ -280,7 +281,7 @@ class DebugGuardTests(unittest.TestCase):
 
     def test_trace_passes_over_flag_and_audits(self) -> None:
         audited: dict = {}
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit",
@@ -306,14 +307,14 @@ class AnalyzeGuardTests(unittest.TestCase):
         return api
 
     def test_len_is_capped(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True):
+        with mock.patch.object(host_transport, "ENABLED", True):
             with self.assertRaises(LAB.LabError):
                 memflow.cmd_analyze(LAB, Args(lease="L", vmid=9040, lxc=9041,
                                               addr="0x1000", len=99999999,
                                               base=None, timeout=600))
 
     def test_base_defaults_to_addr(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit"), \
@@ -328,7 +329,7 @@ class AnalyzeGuardTests(unittest.TestCase):
         self.assertEqual(passed[-1], "0xdeadbeef")
 
     def test_ghidra_error_is_raised_not_printed_as_success(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit"), \
@@ -357,7 +358,7 @@ class BootDiagnoseTests(unittest.TestCase):
         for key, value in arg_overrides.items():
             setattr(args, key, value)
         captured: list[str] = []
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI", return_value=self._fake_api()), \
              mock.patch.object(LAB, "load_lease", return_value={}), \
              mock.patch.object(LAB, "audit") as audit, \
@@ -405,7 +406,7 @@ class BootDiagnoseTests(unittest.TestCase):
         self.assertIn("booting slowly", result["verdict"])
 
     def test_stopped_guest_is_refused_before_any_scan(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", True), \
+        with mock.patch.object(host_transport, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI",
                                return_value=self._fake_api("stopped")), \
              mock.patch.object(LAB, "load_lease", return_value={}), \

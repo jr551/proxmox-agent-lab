@@ -24,7 +24,7 @@ import os
 import re
 from typing import Any
 
-from . import memflow as _mf
+from . import host_transport as _ht
 
 
 # --------------------------------------------------------------------------- #
@@ -39,10 +39,10 @@ NOT_ENABLED = (
 
 
 def _require_enabled(lab: Any) -> None:
-    _mf.require_host_ssh(lab, NOT_ENABLED)
+    _ht.require_host_ssh(lab, NOT_ENABLED)
 
 
-_ssh = _mf.host_run
+_ssh = _ht.host_run
 
 
 def _lsusb(lab: Any) -> list[dict[str, Any]]:
@@ -121,7 +121,7 @@ def cmd_list(lab: Any, args: Any) -> None:
         if len(parts) >= 3:
             passthrough.append({"vmid": int(parts[0]), "index": parts[1],
                                 "spec": " ".join(parts[2:])})
-    lab.audit("usb-list", host=_mf.SSH_HOST, count=len(devices))
+    lab.audit("usb-list", host=_ht.SSH_HOST, count=len(devices))
     print(json.dumps({"devices": devices, "passthrough": passthrough},
                      indent=2, sort_keys=True))
 
@@ -213,7 +213,7 @@ def cmd_sniff(lab: Any, args: Any) -> None:
     proc = _ssh(lab, ["bash", "-c", script], timeout=args.seconds + 60)
     if proc.returncode not in (0, None):
         raise lab.LabError(f"capture failed on the host: {(proc.stderr or '').strip()[:300]}")
-    pkts, data = _mf.decode_capture_output(proc.stdout or "")
+    pkts, data = _ht.decode_capture_output(proc.stdout or "")
     out = os.path.expanduser(args.out)
     with open(out, "wb") as fh:
         fh.write(data)

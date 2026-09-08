@@ -25,7 +25,7 @@ from unittest import mock  # noqa: E402
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import cli as LAB  # noqa: E402
-from proxmox_agent_lab import memflow as MF  # noqa: E402
+from proxmox_agent_lab import host_transport as HT  # noqa: E402
 from proxmox_agent_lab import netcap  # noqa: E402
 
 
@@ -40,7 +40,7 @@ def completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
 
 class EnableGuardTests(unittest.TestCase):
     def test_off_without_host_ssh(self) -> None:
-        with mock.patch.object(MF, "ENABLED", False):
+        with mock.patch.object(HT, "ENABLED", False):
             with self.assertRaises(LAB.LabError):
                 netcap._require_enabled(LAB)
 
@@ -124,7 +124,7 @@ class CaptureTests(unittest.TestCase):
 
         out = Path(tempfile.mkdtemp()) / "net.pcap"
         audited: dict = {}
-        with mock.patch.object(MF, "ENABLED", True), \
+        with mock.patch.object(HT, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI") as api, \
              mock.patch.object(LAB, "load_lease", return_value={}) as ll, \
              mock.patch.object(netcap, "_ssh", side_effect=fake_ssh), \

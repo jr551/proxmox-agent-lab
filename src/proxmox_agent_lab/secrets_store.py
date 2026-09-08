@@ -63,8 +63,9 @@ def detect_backend() -> str:
 
     Secrets travel as environment variables so a controller is reproducible
     and portable -- the same config works on a laptop, in CI and on a box with
-    no desktop keyring at all. An OS keystore is still read as a fallback (see
-    `get`) so a controller that predates this keeps working untouched.
+    no desktop keyring at all. `get` itself does not read a legacy keystore;
+    upgraded controllers are carried over by explicit one-time reads (see
+    `read_legacy`), not an implicit fallback.
     """
     return "env"
 

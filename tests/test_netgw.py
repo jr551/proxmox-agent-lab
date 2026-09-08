@@ -19,6 +19,7 @@ import base64
 import io
 
 from proxmox_agent_lab import console as lab_console  # noqa: E402
+from proxmox_agent_lab import guest_agent as lab_guest_agent  # noqa: E402
 from proxmox_agent_lab import netgw as lab_netgw  # noqa: E402
 
 
@@ -214,7 +215,8 @@ class ProvisionShellRegressionTests(unittest.TestCase):
 
     def test_exec_sends_the_script_to_bash(self) -> None:
         lab = mock.Mock()
-        with mock.patch.object(lab_netgw.console, "agent_exec") as agent_exec:
+        with mock.patch.object(
+            lab_guest_agent, "agent_exec") as agent_exec:
             lab_netgw._exec(lab, mock.Mock(), 101, "set -euo pipefail")
         argv = agent_exec.call_args.args[3]
         self.assertEqual(argv[0], "/bin/bash", f"dash cannot run these: {argv}")

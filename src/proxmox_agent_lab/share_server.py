@@ -163,7 +163,11 @@ class Sessions:
 
     def add(self, vmid: int, minutes: int, kind: str = "qemu",
             label: str = "", once: bool = False) -> dict[str, Any]:
+        # urlsafe tokens may start with '-', which argparse then reads as an
+        # option when the token is passed back via `revoke --token <value>`.
         token = secrets.token_urlsafe(24)
+        while token.startswith("-"):
+            token = secrets.token_urlsafe(24)
         entry = {
             "vmid": int(vmid),
             "kind": kind,

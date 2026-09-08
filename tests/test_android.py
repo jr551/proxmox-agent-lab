@@ -210,8 +210,10 @@ class StepShellRegressionTests(unittest.TestCase):
 
     def test_exec_runs_the_step_under_bash(self) -> None:
         lab = mock.Mock()
+        from proxmox_agent_lab import guest_agent
+
         with mock.patch.object(android.console, "write_guest_file"), \
-             mock.patch.object(android.console, "agent_exec") as agent_exec:
+             mock.patch.object(guest_agent, "agent_exec") as agent_exec:
             android._exec(lab, mock.Mock(), 101, "set -euo pipefail")
         argv = agent_exec.call_args.args[3]
         self.assertEqual(argv[0], "/bin/bash", f"dash cannot run these: {argv}")

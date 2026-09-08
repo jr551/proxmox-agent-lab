@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import cli as LAB  # noqa: E402
 from proxmox_agent_lab import diskactivity  # noqa: E402
-from proxmox_agent_lab import memflow  # noqa: E402
+from proxmox_agent_lab import host_transport  # noqa: E402
 
 
 VMID = 9001
@@ -252,7 +252,7 @@ class MonitorChannelTests(unittest.TestCase):
 class HostMeasurementTests(unittest.TestCase):
     def test_du_measures_allocated_bytes_of_the_resolved_image(self) -> None:
         runs = HostRuns(1048576)
-        with mock.patch.object(memflow, "host_run", runs):
+        with mock.patch.object(host_transport, "host_run", runs):
             sizes, problem = diskactivity.host_image_sizes(
                 LAB, {VOLID: IMAGE}
             )
@@ -263,7 +263,7 @@ class HostMeasurementTests(unittest.TestCase):
         self.assertEqual(runs.argv, [["du", "--block-size=1", "--", IMAGE]])
 
     def test_the_ssh_channel_being_off_is_reported_not_raised(self) -> None:
-        with mock.patch.object(memflow, "ENABLED", False):
+        with mock.patch.object(host_transport, "ENABLED", False):
             sizes, problem = diskactivity.host_image_sizes(
                 LAB, {VOLID: IMAGE}
             )
@@ -273,7 +273,7 @@ class HostMeasurementTests(unittest.TestCase):
     def test_a_block_device_is_reported_as_unmeasurable(self) -> None:
         """There is no file to grow on LVM or ZFS, so du would silently
         report zero for a guest writing at full speed."""
-        with mock.patch.object(memflow, "host_run", HostRuns(0)) as run:
+        with mock.patch.object(host_transport, "host_run", HostRuns(0)) as run:
             sizes, problem = diskactivity.host_image_sizes(
                 LAB, {"local-lvm:vm-9001-disk-0": "/dev/pve/vm-9001-disk-0"}
             )
@@ -283,7 +283,7 @@ class HostMeasurementTests(unittest.TestCase):
 
     def test_a_partial_du_failure_keeps_what_was_measured(self) -> None:
         runs = HostRuns(4096, returncode=1, stderr="du: cannot read '/x'")
-        with mock.patch.object(memflow, "host_run", runs):
+        with mock.patch.object(host_transport, "host_run", runs):
             sizes, problem = diskactivity.host_image_sizes(
                 LAB, {VOLID: IMAGE}
             )
@@ -303,14 +303,14 @@ class HostMeasurementTests(unittest.TestCase):
     def test_pvesm_resolves_a_volume_the_api_cannot(self) -> None:
         api = FakeAPI(volume_path=None)
         runs = HostRuns()
-        with mock.patch.object(memflow, "host_run", runs):
+        with mock.patch.object(host_transport, "host_run", runs):
             paths, _ = diskactivity.image_paths(LAB, api, VMID)
         self.assertEqual(paths, {VOLID: IMAGE})
         self.assertEqual(runs.argv, [["pvesm", "path", VOLID]])
 
     def test_an_unresolvable_image_is_a_reason_not_an_exception(self) -> None:
         api = FakeAPI(volume_path=None)
-        with mock.patch.object(memflow, "ENABLED", False):
+        with mock.patch.object(host_transport, "ENABLED", False):
             paths, problem = diskactivity.image_paths(LAB, api, VMID)
         self.assertEqual(paths, {})
         self.assertIn("no disk image resolved", problem)
@@ -354,7 +354,7 @@ class MeasurementTests(unittest.TestCase):
                         BLOCKSTATS.format(written=second_wr)],
         )
         runs = HostRuns(*du)
-        with mock.patch.object(memflow, "host_run", runs):
+        with mock.patch.object(host_transport, "host_run", runs):
             return api, runs, self._measure(api, ground_truth=True)
 
     def test_all_three_signals_are_reported_side_by_side(self) -> None:
@@ -406,7 +406,7 @@ class MeasurementTests(unittest.TestCase):
             monitor_error="Proxmox HTTP 403: Permission check failed",
         )
         runs = HostRuns(1048576, 2097152)
-        with mock.patch.object(memflow, "host_run", runs):
+        with mock.patch.object(host_transport, "host_run", runs):
             result = self._measure(api, ground_truth=True)
         self.assertFalse(result["signals"]["qmp_blockstats"]["available"])
         self.assertIn("403", result["signals"]["qmp_blockstats"]["reason"])
@@ -420,7 +420,7 @@ class MeasurementTests(unittest.TestCase):
             blockstats=[BLOCKSTATS.format(written=1024),
                         BLOCKSTATS.format(written=2048)],
         )
-        with mock.patch.object(memflow, "ENABLED", False):
+        with mock.patch.object(host_transport, "ENABLED", False):
             result = self._measure(api, ground_truth=True)
         self.assertFalse(result["signals"]["host_image_du"]["available"])
         self.assertIn("host SSH channel is off",
@@ -429,7 +429,7 @@ class MeasurementTests(unittest.TestCase):
 
     def test_neither_extra_signal_available_is_still_not_an_error(self) -> None:
         api = FakeAPI(diskwrite=[0, 0], monitor_error="HTTP 403")
-        with mock.patch.object(memflow, "ENABLED", False):
+        with mock.patch.object(host_transport, "ENABLED", False):
             result = self._measure(api, ground_truth=True)
         self.assertEqual(list(result["written_bytes"]), ["proxmox_diskwrite"])
         self.assertIsNone(result["writing"])
@@ -439,7 +439,7 @@ class MeasurementTests(unittest.TestCase):
         token and every disk is LVM: the note told the operator to rerun with
         --ground-truth on a run that already had it."""
         api = FakeAPI(diskwrite=[0, 0], monitor_error="HTTP 403")
-        with mock.patch.object(memflow, "ENABLED", False):
+        with mock.patch.object(host_transport, "ENABLED", False):
             asked = self._measure(api, ground_truth=True)
         self.assertNotIn("rerun with --ground-truth", asked["note"])
         self.assertIn("Sys.Audit", asked["note"])

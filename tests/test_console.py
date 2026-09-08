@@ -37,6 +37,7 @@ SCRIPTS = SRC / "proxmox_agent_lab"
 
 from proxmox_agent_lab import des as lab_des  # noqa: E402
 from proxmox_agent_lab import console as lab_console  # noqa: E402
+from proxmox_agent_lab import transfer as lab_transfer  # noqa: E402
 from proxmox_agent_lab import netgw as lab_netgw  # noqa: E402
 from proxmox_agent_lab import png as lab_png  # noqa: E402
 from proxmox_agent_lab import rfb as lab_rfb  # noqa: E402
@@ -1553,7 +1554,7 @@ class ChunkedTransferTests(unittest.TestCase):
         return parser.parse_args(list(argv))
 
     def test_fetch_parts_command_has_all_urls_and_hash(self) -> None:
-        command = lab_console._fetch_parts_command(
+        command = lab_transfer._fetch_parts_command(
             ["https://s3/part-0", "https://s3/part-1"], "/tmp/out.bin"
         )
         self.assertEqual(command[0], "/bin/sh")
@@ -1576,10 +1577,10 @@ class ChunkedTransferTests(unittest.TestCase):
             fake_s3 = mock.Mock()
             fake_s3.put_bytes.return_value = "push/abc/payload.bin"
             fake_s3.presign.return_value = "https://s3/part"
-            with mock.patch.object(lab_console, "SINGLE_OBJECT_MAX_MB", 0), \
-                 mock.patch.object(lab_console, "s3", fake_s3), \
+            with mock.patch.object(lab_transfer, "SINGLE_OBJECT_MAX_MB", 0), \
+                 mock.patch.object(lab_transfer, "s3", fake_s3), \
                  mock.patch.object(
-                     lab_console, "agent_exec",
+                     lab_transfer, "agent_exec",
                      return_value={
                          "exitcode": 0,
                          "stdout": hashlib.sha256(payload).hexdigest(),
@@ -1590,7 +1591,7 @@ class ChunkedTransferTests(unittest.TestCase):
                     lab, "push", "--lease", "L1", "--vmid", "7",
                     "--file", str(source), "--chunk-size", "1",
                 )
-                lab_console.cmd_push(lab, args)
+                lab_transfer.cmd_push(lab, args)
             keys = [c.args[0] for c in fake_s3.put_bytes.call_args_list]
             self.assertEqual(len(keys), 3)
             self.assertTrue(all(
@@ -1608,10 +1609,10 @@ class ChunkedTransferTests(unittest.TestCase):
             fake_s3 = mock.Mock()
             fake_s3.put_bytes.return_value = "push/abc/payload.bin"
             fake_s3.presign.return_value = "https://s3/part"
-            with mock.patch.object(lab_console, "SINGLE_OBJECT_MAX_MB", 0), \
-                 mock.patch.object(lab_console, "s3", fake_s3), \
+            with mock.patch.object(lab_transfer, "SINGLE_OBJECT_MAX_MB", 0), \
+                 mock.patch.object(lab_transfer, "s3", fake_s3), \
                  mock.patch.object(
-                     lab_console, "agent_exec",
+                     lab_transfer, "agent_exec",
                      return_value={"exitcode": 0, "stdout": "deadbeef",
                                    "stderr": ""},
                  ):
@@ -1621,7 +1622,7 @@ class ChunkedTransferTests(unittest.TestCase):
                     "--sha256", "0" * 64,
                 )
                 with self.assertRaises(RuntimeError) as caught:
-                    lab_console.cmd_push(lab, args)
+                    lab_transfer.cmd_push(lab, args)
             self.assertIn("sha256 mismatch", str(caught.exception))
 
     def test_pull_skips_when_local_file_already_matches(self) -> None:
@@ -1635,14 +1636,14 @@ class ChunkedTransferTests(unittest.TestCase):
             expected = hashlib.sha256(payload).hexdigest()
             api = mock.Mock()
             lab.ProxmoxAPI.return_value = api
-            with mock.patch.object(lab_console, "s3", mock.Mock()), \
-                 mock.patch.object(lab_console, "agent_exec") as execute:
+            with mock.patch.object(lab_transfer, "s3", mock.Mock()), \
+                 mock.patch.object(lab_transfer, "agent_exec") as execute:
                 args = self._args(
                     lab, "pull", "--lease", "L1", "--vmid", "7",
                     "--remote", "/tmp/artifact.iso", "--out", str(out),
                     "--sha256", expected,
                 )
-                lab_console.cmd_pull(lab, args)
+                lab_transfer.cmd_pull(lab, args)
             execute.assert_not_called()
 
     def test_pull_assembles_parts_and_checks_guest_hash(self) -> None:
@@ -1661,10 +1662,10 @@ class ChunkedTransferTests(unittest.TestCase):
             fake_s3.get_bytes.side_effect = [payload[:half],
                                              payload[half:]]
             fake_s3.presign.return_value = "https://s3/put"
-            with mock.patch.object(lab_console, "SINGLE_OBJECT_MAX_MB", 0), \
-                 mock.patch.object(lab_console, "s3", fake_s3), \
+            with mock.patch.object(lab_transfer, "SINGLE_OBJECT_MAX_MB", 0), \
+                 mock.patch.object(lab_transfer, "s3", fake_s3), \
                  mock.patch.object(
-                     lab_console, "agent_exec",
+                     lab_transfer, "agent_exec",
                      side_effect=[
                          {"exitcode": 0, "stdout": str(len(payload)),
                           "stderr": ""},
@@ -1678,7 +1679,7 @@ class ChunkedTransferTests(unittest.TestCase):
                     "--remote", "/tmp/artifact.iso", "--out", str(out),
                     "--chunk-size", "1",
                 )
-                lab_console.cmd_pull(lab, args)
+                lab_transfer.cmd_pull(lab, args)
             self.assertEqual(out.read_bytes(), payload)
             self.assertEqual(fake_s3.get_bytes.call_count, 2)
             self.assertEqual(fake_s3.delete_object.call_count, 2)
@@ -2175,10 +2176,10 @@ class MonitorScreenshotTests(unittest.TestCase):
     def _run(self, lab: mock.Mock, api: mock.Mock, memflow: mock.Mock,
              **overrides: object) -> dict:
         # Importing it first guarantees the package attribute exists, so the
-        # lazy 'from . import memflow' inside the command sees the double.
-        from proxmox_agent_lab import memflow as _real   # noqa: F401
+        # lazy 'from . import host_transport' inside the command sees the double.
+        from proxmox_agent_lab import host_transport as _real   # noqa: F401
 
-        with mock.patch("proxmox_agent_lab.memflow", memflow):
+        with mock.patch("proxmox_agent_lab.host_transport", memflow):
             return lab_console._screenshot_via_monitor(
                 lab, api, self._args(**overrides)
             )

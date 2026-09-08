@@ -95,11 +95,11 @@ def _build_write_script(payload_b64: str) -> str:
 
 
 def _run_host(lab: Any, argv: list[str], *, timeout: int = 120) -> str:
-    from . import memflow
+    from . import host_transport
 
-    memflow._require_enabled(lab)
+    host_transport.require_host_ssh(lab)
     script = _HOST_DISK_SCRIPT
-    proc = memflow._ssh(
+    proc = host_transport.run(
         lab, ["bash", "-s", "--", *argv], timeout=timeout, stdin=script)
     if proc.returncode != 0:
         raise lab.LabError(
@@ -197,10 +197,10 @@ def cmd_write(lab: Any, args: Any) -> None:
     _require_stopped(lab, api, args.vmid)
     with open(src, "rb") as fh:
         payload = base64.b64encode(fh.read()).decode()
-    from . import memflow
+    from . import host_transport
 
-    memflow._require_enabled(lab)
-    proc = memflow._ssh(
+    host_transport.require_host_ssh(lab)
+    proc = host_transport.run(
         lab, ["bash", "-s", "--", str(args.vmid), args.mount, args.dest],
         timeout=240, stdin=_build_write_script(payload),
     )
@@ -226,10 +226,10 @@ def cmd_host_setup(lab: Any, args: Any) -> None:
             "installing libguestfs is a host change. Re-run with "
             "--host-change-authorized only when the user asked for it."
         )
-    from . import memflow
+    from . import host_transport
 
-    memflow._require_enabled(lab)
-    proc = memflow._ssh(lab, ["bash", "-s"], timeout=args.timeout, stdin=script)
+    host_transport.require_host_ssh(lab)
+    proc = host_transport.run(lab, ["bash", "-s"], timeout=args.timeout, stdin=script)
     print(json.dumps(
         {"ok": proc.returncode == 0,
          "output": (proc.stdout or proc.stderr or "").strip()[:2000]},

@@ -430,7 +430,9 @@ class GuestShellRegressionTests(unittest.TestCase):
     def test_exec_guest_script_runs_under_bash(self) -> None:
         lab = mock.Mock()
         lab.NODE = "aipve"
-        with mock.patch.object(lab_console, "agent_exec") as agent_exec:
+        from proxmox_agent_lab import guest_agent
+
+        with mock.patch.object(guest_agent, "agent_exec") as agent_exec:
             lab_console.exec_guest_script(lab, mock.Mock(), 101, "set -euo pipefail")
         argv = agent_exec.call_args.args[3]
         self.assertEqual(argv[0], "/bin/bash", f"dash cannot run these: {argv}")

@@ -27,6 +27,9 @@ _GLYPHS = {
 }
 
 
+_DIM_RGB = bytes(value * 35 // 100 for value in range(256))
+
+
 def highlight_changes(width: int, height: int, current: bytes, previous: bytes,
                       threshold: int = 24) -> tuple[bytes, int]:
     """Dim stable pixels and outline regions changed since the prior frame.
@@ -41,22 +44,25 @@ def highlight_changes(width: int, height: int, current: bytes, previous: bytes,
         raise ValueError("current and previous RGB buffers must match the canvas")
     if not 0 <= threshold <= 255:
         raise ValueError("threshold must be between 0 and 255")
-    mask = bytearray(width * height)
+    pixels = width * height
+    if threshold == 0:
+        return current, pixels
+    dimmed = current.translate(_DIM_RGB)
+    if current == previous:
+        return dimmed, 0
+    mask = bytearray(pixels)
+    out = bytearray(dimmed)
     changed = 0
-    for pixel_index in range(width * height):
+    for pixel_index in range(pixels):
         offset = pixel_index * 3
-        if max(abs(current[offset + channel] - previous[offset + channel])
-               for channel in range(3)) >= threshold:
+        if (abs(current[offset] - previous[offset]) >= threshold
+                or abs(current[offset + 1] - previous[offset + 1]) >= threshold
+                or abs(current[offset + 2] - previous[offset + 2]) >= threshold):
             mask[pixel_index] = 1
             changed += 1
-    out = bytearray(len(current))
-    for pixel_index, is_changed in enumerate(mask):
-        offset = pixel_index * 3
-        if is_changed:
             out[offset:offset + 3] = current[offset:offset + 3]
-        else:
-            for channel in range(3):
-                out[offset + channel] = current[offset + channel] * 35 // 100
+    if not changed:
+        return dimmed, 0
     # Outline stable pixels immediately adjacent to a changed region.  This
     # makes tiny controls and progress deltas visible without filling them in.
     for y in range(height):

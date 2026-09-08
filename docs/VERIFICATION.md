@@ -18,6 +18,19 @@ handshake headers, polling deadlines under continuous control traffic, and
 invalid base64 errors. These changes have not been exercised against a live
 Proxmox console.
 
+## Experimental onboarding coverage (2026-09-07)
+
+Offline only: private bundle generation; answer-file construction and builder
+invocation; real localhost TLS callback delivery, token rejection and replay
+handling; signed discovery validation; controller config publication after an
+API probe; and LXC-only/power guards. The host script is syntax-checked and its
+installation guards are tested with fakes.
+
+No generated ISO has been booted, no Debian VPS has been converted, and no
+Wi-Fi association or provider reboot has been observed for this feature.
+The Linux ISO assistant is not available in the development environment, so
+actual ISO remastering remains unverified. See [onboarding](onboarding.md).
+
 ## 🟢 Verified on hardware
 
 One claim per row; dates are when the row was last watched on the node.

@@ -17,7 +17,6 @@ import datetime as dt
 import hashlib
 import hmac
 import json
-import subprocess
 from typing import Any
 from urllib import error, parse, request
 from xml.etree import ElementTree

@@ -37,6 +37,8 @@ DEFAULTS: dict[str, Any] = {
         "token_user": "",
         "token_name": "",
         "verify_tls": False,
+        "ca_file": "",
+        "guest_mode": "all",  # all | lxc-only (VPS, no host power-off)
     },
     "lease": {
         "default_ttl_seconds": 2 * 60 * 60,
@@ -325,7 +327,7 @@ TEMPLATE = """\
 #
 # Copy to ~/.config/proxmox-agent-lab/config.toml and edit. Every value here
 # is site-specific; nothing secret belongs in this file. Secrets live in your
-# OS keyring -- see 'proxmox-lab secrets --help'.
+# configured secret backend -- see 'proxmox-lab secrets --help'.
 
 [proxmox]
 host = "192.168.1.50"        # address of the Proxmox host
@@ -334,6 +336,8 @@ node = "pve"                 # node name, as shown in the Proxmox UI
 token_user = "agent@pve"     # API token owner
 token_name = "lab"           # API token id
 verify_tls = false           # true once you trust the host certificate
+ca_file = ""                # optional PEM CA bundle; supplied by onboarding
+guest_mode = "all"          # all | lxc-only (VPS, no host shutdown)
 
 [lease]
 default_ttl_seconds = 7200   # work is cleaned up if a lease is not renewed

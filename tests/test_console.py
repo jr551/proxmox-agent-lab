@@ -165,6 +165,28 @@ class PngTests(unittest.TestCase):
         self.assertEqual(highlighted[0:3], b"\xff\x00\xff")
         self.assertEqual(highlighted[6:9], b"\xff\x00\xff")
 
+    def test_unchanged_frame_dims_every_channel_with_integer_rounding(self) -> None:
+        current = bytes((0, 1, 255, 99, 100, 101))
+        output, changed = lab_png.highlight_changes(2, 1, current, current)
+        self.assertEqual(output, bytes((0, 0, 89, 34, 35, 35)))
+        self.assertEqual(changed, 0)
+
+    def test_zero_threshold_marks_even_identical_pixels_changed(self) -> None:
+        current = bytes((3, 40, 250)) * 2
+        self.assertEqual(lab_png.highlight_changes(2, 1, current, current, 0),
+                         (current, 2))
+
+    def test_threshold_applies_to_each_channel_inclusively(self) -> None:
+        for channel in range(3):
+            current = bytearray((100, 100, 100))
+            current[channel] = 124
+            self.assertEqual(lab_png.highlight_changes(1, 1, bytes(current), b"\x64" * 3),
+                             (bytes(current), 1))
+            current[channel] = 123
+            output, changed = lab_png.highlight_changes(1, 1, bytes(current), b"\x64" * 3)
+            self.assertEqual(changed, 0)
+            self.assertEqual(output[channel], 43)
+
     def test_change_highlight_rejects_mismatched_frames(self) -> None:
         with self.assertRaises(ValueError):
             lab_png.highlight_changes(2, 1, b"\x00" * 6, b"\x00" * 3)

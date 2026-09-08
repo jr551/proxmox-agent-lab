@@ -92,7 +92,7 @@ so it is opt-in.
 It is safe to re-run and touches nothing that already exists. Then skip to
 [step 4](#4-one-time-controller-setup).
 
-> Same one-liner is in [README.md](../README.md#-install) — detail stays here so this guide is self-contained.
+> Same one-liner is in [README.md](../README.md#install) — detail stays here so this guide is self-contained.
 
 ### 🔧 Or by hand
 
@@ -130,8 +130,8 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/instal
 
 It installs the CLI isolated via `pipx` when available, otherwise `pip --user`
 (`install.sh:96-104`), asks for the Proxmox address, node, API-token identity,
-power details, audit backend, and S3 scratch bucket, stores secrets in the OS
-keyring, writes a mode-600 config, and runs `doctor`. If you want an agent to
+power details, audit backend, and S3 scratch bucket, stores secrets in the
+configured secret backend, writes a mode-600 config, and runs `doctor`. If you want an agent to
 drive the install, copy the template in [Agent first message](#agent-first-message).
 
 Re-run it with `--configure` to safely replace configuration answers
@@ -155,20 +155,20 @@ protected CI secret environment.
 | `PXL_NODE` | Node name (hostname, e.g. `pve`) |
 | `PXL_TOKEN_USER` | API token user (`agent@pve`) |
 | `PXL_TOKEN_NAME` | API token name (`lab`) |
-| `PXL_TOKEN_SECRET` | API token secret (keyring, not TOML) |
+| `PXL_TOKEN_SECRET` | API token secret (configured secret backend, not TOML) |
 | `PXL_MAC` | Wired NIC MAC for Wake-on-LAN |
 | `PXL_S3_BACKEND` | `none` / `existing` / `lxc` |
 | `PXL_S3_ENDPOINT` | S3 endpoint (when `existing`) |
 | `PXL_S3_BUCKET` | Bucket name |
 | `PXL_S3_REGION` | Region (`us-east-1`) |
-| `PXL_S3_KEY_ID_SECRET` | S3 access-key ID (keyring) |
-| `PXL_S3_SECRET_KEY_SECRET` | S3 secret access key (keyring) |
+| `PXL_S3_KEY_ID_SECRET` | S3 access-key ID (configured secret backend) |
+| `PXL_S3_SECRET_KEY_SECRET` | S3 secret access key (configured secret backend) |
 | `PXL_ALLOW_HOST_ADMIN` | `proxmox-host-setup.sh` only — `1` grants host-admin (node/storage) |
 | `PXL_RECONFIGURE` | `y` forces reconfigure without `--configure` prompt |
 
 All `PXL_*` names match `ask VAR` in `install.sh` via `PXL_${VAR}` (`install.sh:43-44`). Secrets (`*_SECRET`) are piped to `proxmox-lab secrets set --stdin` and never written to config. For the host-setup flags see [`proxmox-host-setup.sh:27-29`](../proxmox-host-setup.sh#L27-L29) (`PXL_USER`/`PXL_TOKEN`/`PXL_ROLE`) and `PXL_ALLOW_HOST_ADMIN`.
 
-> **No install at all?** `bootstrap.sh` (same one-liner in [README.md](../README.md#-install)) builds a throwaway venv under `$TMPDIR/proxmox-agent-lab-env` and prints its `proxmox-lab` path — handy for an agent with no checkout: `PXL=$(curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/bootstrap.sh | sh) && "$PXL" doctor` (`bootstrap.sh:25-52`). This guide uses `install.sh`; bootstrap is the escape hatch.
+> **No install at all?** `bootstrap.sh` (same one-liner in [README.md](../README.md#install)) builds a throwaway venv under `$TMPDIR/proxmox-agent-lab-env` and prints its `proxmox-lab` path — handy for an agent with no checkout: `PXL=$(curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/bootstrap.sh | sh) && "$PXL" doctor` (`bootstrap.sh:25-52`). This guide uses `install.sh`; bootstrap is the escape hatch.
 
 ### The audit ledger
 
@@ -217,7 +217,7 @@ the Proxmox host**:
 curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/minio-host-setup.sh | bash
 ```
 
-> Same one-liner appears in [README.md](../README.md#-install) — detail stays here so this guide is self-contained.
+> Same one-liner appears in [README.md](../README.md#install) — detail stays here so this guide is self-contained.
 
 The host script asks for an LXC ID, storage, bridge, IP configuration, disk
 size, bucket name, and access key. It creates a persistent unprivileged
@@ -253,8 +253,8 @@ If I choose a new MinIO LXC, show me the root-only `minio-host-setup.sh`
 command and wait for me to run it on the Proxmox host. Do not expose the S3
 port to the Internet or change host firewall rules. After I provide the
 resulting trusted-LAN endpoint, bucket, region, access key, and secret key,
-finish the controller setup and confirm both secrets landed in the OS
-keyring, never in chat, config, or command arguments.
+finish the controller setup and confirm both secrets landed in the configured
+secret backend, never in chat, config, or command arguments.
 ```
 
 

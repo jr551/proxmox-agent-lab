@@ -7,6 +7,18 @@ and off — and, just as usefully, what has not.
 Read it as a statement of confidence, not a feature list. Anything marked
 "unit-tested only" may work; it has simply never been watched working.
 
+## Internal restructure (2026-09-07)
+
+The post-0.14.1 cleanup split `cli.py`/`console.py`/`memflow.py` internals
+into focused modules (`errors`, `state`, `api`, `audit`, `updates`, `leases`,
+`cleanup`, `diagnostics`, `host_transport`, `serial`, `guest_agent`,
+`transfer`) behind the unchanged `cli`/`console` facades, moved large remote
+programs into `src/proxmox_agent_lab/resources/`, and made share tokens never
+start with `-`. All of it is **unit-tested only** (the full offline suite,
+746 tests) — no command in this section has been re-run against the node
+since the move. Behavior is intended to be identical; treat that as
+unverified until the next hardware pass.
+
 ## Console transport regression coverage (2026-09-07)
 
 Unit-tested only: WebSocket reads resume after timeouts inside frame headers

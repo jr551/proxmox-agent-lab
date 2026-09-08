@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# One entry point for the checks CI runs, in CI's order. Pass --fast to skip
+# the test suite (guards only).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+FAST=0
+[ "${1:-}" = "--fast" ] && FAST=1
+
+if [ "$FAST" -eq 0 ]; then
+  PYTHONWARNINGS=error python3 -m unittest discover -s tests -q
+  python3 -m compileall -q src tests
+fi
+
+python3 scripts/check-secrets.py .
+python3 scripts/check-public.py .
+python3 scripts/check-release.py
+python3 scripts/check-docs.py
+
+for file in \
+  bootstrap.sh install.sh proxmox-host-setup.sh \
+  scripts/proxmox-lab scripts/install-watchdog scripts/check
+do
+  bash -n "$file"
+done
+
+git diff --check
+echo "all checks passed"

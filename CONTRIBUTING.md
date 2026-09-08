@@ -42,10 +42,11 @@ python3 -m compileall -q src tests
 python3 scripts/check-secrets.py .
 python3 scripts/check-public.py .
 python3 scripts/check-release.py
+python3 scripts/check-docs.py
 git diff --check
 ```
 
-Also run `bash -n` over changed shell scripts. Hardware-facing changes should
+Also run `bash -n` over changed shell scripts. `scripts/check` runs the whole set in one go (same commands, same order as CI); `scripts/check --fast` runs just the guards without the test suite. Hardware-facing changes should
 update [docs/VERIFICATION.md](docs/VERIFICATION.md) with exactly what was
 observed and what remains unit-tested only.
 

@@ -1,7 +1,9 @@
 # Configuration
 
 Two things to know: **site settings** live in a TOML file, **secrets** live in
-the configured secret backend (environment, keyring, file, or shared ledger). Nothing secret ever belongs in the config file.
+the configured secret backend. `auto` selects the `env` backend, so the default
+is `PROXMOX_AGENT_LAB_*` environment variables. Nothing secret ever belongs in
+the config file. See [`[secrets]`](#secrets) for the exact lookup order.
 
 ## Where the config lives
 
@@ -160,7 +162,7 @@ Only needed for forced-VPN egress ([network.md](network.md)).
 | `endpoint` | — | `host:port` of the WireGuard server |
 | `keepalive` | `25` | Keeps NAT mappings alive; `25` suits most NATs |
 
-Keys go in the keyring, never here:
+Store these as secrets, never in this file:
 
 ```sh
 proxmox-lab secrets set wg-private-key
@@ -168,9 +170,9 @@ proxmox-lab secrets set wg-preshared-key      # if your provider uses one
 proxmox-lab secrets set wg-peer-public-key
 ```
 
-The server's *public* key is in the keyring too. It is not secret, but keeping
-every WireGuard-shaped string out of config and version control means a secret
-scanner can flag all of them without exceptions.
+The server's *public* key is stored as a secret too. It is not secret, but
+keeping every WireGuard-shaped string out of config and version control means a
+secret scanner can flag all of them without exceptions. See [`[secrets]`](#secrets).
 
 ## `[s3]`
 
@@ -280,20 +282,33 @@ one-off run.
 | `backend` | `auto` | `auto` selects `env`; explicit options: `keychain`, `secret-tool`, `env`, `file` |
 | `file_path` | — | Only for the `file` backend |
 
-- **`keychain`** — macOS `security`.
+- **`env`** — read `PROXMOX_AGENT_LAB_<NAME>` (e.g.
+  `PROXMOX_AGENT_LAB_PROXMOX_TOKEN`). This is the default (`auto` selects it).
+  It is read-only: to set a secret here, export the variable instead of using
+  `proxmox-lab secrets set`.
+- **`file`** — a TOML file that must be `0600`. Useful for headless boxes with
+  no OS keyring. Least safe; `keychain` or `secret-tool` is safer where one is
+  available.
+- **`keychain`** — macOS `security` (legacy, explicit opt-in).
 - **`secret-tool`** — Linux libsecret (GNOME Keyring, KWallet). Install
-  `libsecret-tools`.
-- **`env`** — read `PROXMOX_AGENT_LAB_<NAME>`, e.g.
-  `PROXMOX_AGENT_LAB_PROXMOX_TOKEN`. Read-only; good for CI and containers.
-- **`file`** — a TOML file that must be `0600`. For headless boxes with no
-  keyring. Least safe; a keyring is better where one exists.
+  `libsecret-tools` (legacy, explicit opt-in).
 
-Lookup order is the configured backend, then the matching environment
-variable if that backend has no value, then the shared MariaDB secret store.
-An existing value in an explicit file/keychain backend takes precedence over
-an environment variable. To use environment values first, select `env` (or
-`auto`). The shared store requires the separate `mariadb-password` bootstrap
-credential; that credential never looks itself up in the shared store.
+**Lookup order.** The same search is used for every secret:
+
+1. The configured backend. `auto` resolves to `env`, so by default the matching
+   `PROXMOX_AGENT_LAB_*` environment variable is read first.
+2. If the backend has no value, the matching `PROXMOX_AGENT_LAB_*` environment
+   variable is tried again as a fallback. This lets an explicit `keychain` or
+   `file` value win, while still allowing an environment override when the
+   configured backend is empty.
+3. If the environment fallback is also unset, the shared MariaDB secret store
+   is used.
+
+The one exception is the `mariadb-password` bootstrap credential itself: it is
+never looked up in the shared store, because that would require the password to
+unlock the password. Give that one value directly (environment variable or
+`proxmox-lab secrets set` with a writable backend), and every other secret
+becomes available from the shared store.
 
 ### Cloud vision providers
 
@@ -332,7 +347,7 @@ screen inline as a bounded base64 PNG, and `console inspect` attaches the same
 thing when every provider fails. `console preflight` reports which routes have
 a key under `vision.provider_keys`.
 
-See also [console.md](console.md#optional-cloud-vision-console-inspect) for the full `console inspect` flow.
+See also [console.md](console.md#--for-model-and-console-inspect) for the full `console inspect` flow.
 ## `[audit]`
 
 The audit ledger is one shared MariaDB, running in a persistent container on

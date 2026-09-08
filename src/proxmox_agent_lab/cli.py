@@ -677,9 +677,12 @@ class ProxmoxAPI(api_module.ProxmoxAPI):
     """The API client bound to this process's configuration."""
 
     def __init__(self) -> None:
+        # The lambda, not keychain_secret itself: resolving the global at call
+        # time is what lets tests patch LAB.keychain_secret after the client
+        # is constructed.
         super().__init__(
             config=CONFIG, api_root=API_ROOT, token_user=TOKEN_USER,
-            token_name=TOKEN_NAME, token_secret=keychain_secret,
+            token_name=TOKEN_NAME, token_secret=lambda: keychain_secret(),
         )
 
 

@@ -217,3 +217,23 @@ class StepShellRegressionTests(unittest.TestCase):
             android._exec(lab, mock.Mock(), 101, "set -euo pipefail")
         argv = agent_exec.call_args.args[3]
         self.assertEqual(argv[0], "/bin/bash", f"dash cannot run these: {argv}")
+
+
+class CreateFailureTests(unittest.TestCase):
+    def test_password_cleanup_warning_preserves_original_failure(self):
+        import argparse
+        import contextlib
+        import io
+        lab = mock.Mock()
+        lab.load_lease.return_value = {"initial_vmids": []}
+        args = argparse.Namespace(lease="fixture", profile="galaxy-s20",
+                                  api=None, abi="x86_64", vmid=7, template=8)
+        output = io.StringIO()
+        with mock.patch.object(android, "_create_device_vm", return_value=("fixture", None, None)), \
+             mock.patch.object(android, "_run_android_steps", side_effect=android.AndroidError("provision failed")), \
+             mock.patch.object(android.console, "clear_bootstrap_password", side_effect=RuntimeError("cleanup failed")), \
+             contextlib.redirect_stderr(output):
+            with self.assertRaisesRegex(android.AndroidError, "provision failed"):
+                android.cmd_create(lab, args)
+        self.assertIn("cleanup failed", output.getvalue())
+        lab.audit.assert_not_called()

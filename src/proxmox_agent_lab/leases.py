@@ -12,8 +12,10 @@ from __future__ import annotations
 
 from . import inventory as inventory_module
 from . import power as power_module
+from .api import ProxmoxAPI
 from .errors import LabError
 from .state import iso_now, json_dump, utc_now
+from pathlib import Path
 from typing import Any
 import argparse
 import datetime as dt
@@ -284,7 +286,7 @@ def require_lease_resource(
         )
 
 
-def ensure_on(lab: Any, api: lab.ProxmoxAPI, timeout: int | None = None) -> bool:
+def ensure_on(lab: Any, api: ProxmoxAPI, timeout: int | None = None) -> bool:
     """Switch the lab machine on if it is not already up. Returns True if we
     had to wake it."""
     if api.reachable():

@@ -128,9 +128,16 @@ class WebSocket:
             raise WebSocketError(
                 f"WebSocket accept mismatch: got {accept!r}, expected {expected!r}"
             )
-        if self.subprotocol and self.subprotocol not in subprotocols:
+        selected = {
+            part.strip() for part in self.subprotocol.split(",") if part.strip()
+        }
+        if selected - set(subprotocols):
             raise WebSocketError("Proxmox selected an unsupported WebSocket subprotocol")
-        self._base64 = self.subprotocol == "base64"
+        # Real PVE (observed on 9.2.2 termproxy) echoes the whole offered list
+        # back instead of picking one; when "binary" is among the tokens the
+        # frames are raw -- that is what every release before the handshake
+        # validation treated them as.
+        self._base64 = "binary" not in selected and "base64" in selected
 
     def _read_until(self, marker: bytes) -> bytes:
         data = bytearray(self._recv_buffer)

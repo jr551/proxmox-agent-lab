@@ -136,6 +136,28 @@ class WebSocketHandshakeTests(unittest.TestCase):
         self.wrapped.close.assert_not_called()
         self.assertEqual(self.wrapped.settimeout.call_args, mock.call(20))
 
+    def test_a_server_that_echoes_the_offered_protocols_still_upgrades(self):
+        # Real PVE (observed on 9.2.2 termproxy) replies with the whole
+        # offered list, "binary, base64", instead of one token; that response
+        # must not be rejected and the frames that follow are binary.
+        echoed = self.RESPONSE.replace(
+            b'Sec-WebSocket-Protocol: binary',
+            b'Sec-WebSocket-Protocol: binary, base64')
+        client = self.open(iter([echoed + frame(b'ok')]))
+        self.assertFalse(client._base64)
+        self.assertEqual(client.recv(), b'ok')
+
+    def test_a_foreign_subprotocol_is_still_rejected(self):
+        for protocol in (b'mqtt', b'binary, mqtt'):
+            with self.subTest(protocol=protocol):
+                foreign = self.RESPONSE.replace(
+                    b'Sec-WebSocket-Protocol: binary',
+                    b'Sec-WebSocket-Protocol: ' + protocol)
+                with self.assertRaisesRegex(
+                        ws.WebSocketError, 'unsupported WebSocket subprotocol'):
+                    self.open(iter([foreign]))
+                self.wrapped.close.assert_called_once()
+
     def test_failed_tls_wrap_closes_raw_socket(self):
         with self.assertRaises(ws.ssl.SSLError):
             self.open(iter([]), ws.ssl.SSLError('fixture'))

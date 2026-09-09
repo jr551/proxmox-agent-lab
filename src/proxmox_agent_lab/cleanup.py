@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from . import inventory as inventory_module
 from . import power as power_module
+from .api import ProxmoxAPI
 from .errors import LabError
 from .state import iso_now, json_dump, utc_now
 from typing import Any
@@ -39,14 +40,14 @@ def _is_lab_infrastructure(resource: dict[str, Any]) -> bool:
     return INFRA_TAG in [tag.strip() for tag in tags.split(";")]
 
 
-def node_guests(lab: Any, api: lab.ProxmoxAPI) -> list[dict[str, Any]]:
+def node_guests(lab: Any, api: ProxmoxAPI) -> list[dict[str, Any]]:
     return [
         item for item in (api.call("GET", "/cluster/resources", {"type": "vm"}) or [])
         if isinstance(item, dict) and "vmid" in item
     ]
 
 
-def describe_guests(lab: Any, api: lab.ProxmoxAPI) -> list[dict[str, Any]]:
+def describe_guests(lab: Any, api: ProxmoxAPI) -> list[dict[str, Any]]:
     """Every guest on the node, with what the controller can prove about it."""
     return inventory_module.classify(
         lab.node_guests(api),
@@ -55,7 +56,7 @@ def describe_guests(lab: Any, api: lab.ProxmoxAPI) -> list[dict[str, Any]]:
     )
 
 
-def orphaned_guests(lab: Any, api: lab.ProxmoxAPI) -> list[dict[str, Any]]:
+def orphaned_guests(lab: Any, api: ProxmoxAPI) -> list[dict[str, Any]]:
     """Guests this tool created that no lease record or registry vouches for.
 
     Cleanup only ever finalizes resources listed in a lease, so a guest whose
@@ -66,7 +67,7 @@ def orphaned_guests(lab: Any, api: lab.ProxmoxAPI) -> list[dict[str, Any]]:
     return inventory_module.orphans(lab.describe_guests(api))
 
 
-def running_guest_vmids(lab: Any, api: lab.ProxmoxAPI) -> list[int]:
+def running_guest_vmids(lab: Any, api: ProxmoxAPI) -> list[int]:
     """VMIDs currently running on the node, lease or no lease.
 
     A guest can exist outside any lease's tracked resources -- a persistent
@@ -90,7 +91,7 @@ def host_power_policy(lab: Any) -> dict[str, Any]:
     return {}
 
 
-def shutdown_host(lab: Any, api: lab.ProxmoxAPI) -> bool:
+def shutdown_host(lab: Any, api: ProxmoxAPI) -> bool:
     """Shut the lab machine down and confirm it actually went off."""
     from .host_policy import lxc_only
     if lxc_only(lab.CONFIG):
@@ -147,12 +148,12 @@ def shutdown_host(lab: Any, api: lab.ProxmoxAPI) -> bool:
     return False
 
 
-def guest_status(lab: Any, api: lab.ProxmoxAPI, kind: str, vmid: int) -> str:
+def guest_status(lab: Any, api: ProxmoxAPI, kind: str, vmid: int) -> str:
     status = api.call("GET", f"/nodes/{lab.NODE}/{kind}/{vmid}/status/current")
     return status.get("status", "unknown")
 
 
-def stop_guest(lab: Any, api: lab.ProxmoxAPI, kind: str, vmid: int) -> None:
+def stop_guest(lab: Any, api: ProxmoxAPI, kind: str, vmid: int) -> None:
     try:
         if lab.guest_status(api, kind, vmid) == "stopped":
             return
@@ -174,7 +175,7 @@ def stop_guest(lab: Any, api: lab.ProxmoxAPI, kind: str, vmid: int) -> None:
         lab.wait_task(api, hard_upid, timeout=60)
 
 
-def _guest_is_gone(lab: Any, error: lab.LabError) -> bool:
+def _guest_is_gone(lab: Any, error: LabError) -> bool:
     message = str(error)
     # A prior finalizer run (or manual removal) beat us to it. Proxmox reports
     # this as a 404, or as a 500 whose body says the config file is absent.
@@ -183,13 +184,13 @@ def _guest_is_gone(lab: Any, error: lab.LabError) -> bool:
     )
 
 
-def _storage_io_error(lab: Any, error: lab.LabError) -> bool:
+def _storage_io_error(lab: Any, error: LabError) -> bool:
     message = str(error).lower()
     return "input/output error" in message or "i/o error" in message
 
 
 def _delete_guest(lab: Any, 
-    api: lab.ProxmoxAPI, kind: str, vmid: int, *, destroy_unreferenced_disks: bool
+    api: ProxmoxAPI, kind: str, vmid: int, *, destroy_unreferenced_disks: bool
 ) -> None:
     data: dict[str, int] = {"purge": 1}
     if destroy_unreferenced_disks:
@@ -206,7 +207,7 @@ def _forget_retained(lab: Any, kind: str, vmid: int) -> None:
         pass
 
 
-def delete_guest(lab: Any, api: lab.ProxmoxAPI, kind: str, vmid: int) -> None:
+def delete_guest(lab: Any, api: ProxmoxAPI, kind: str, vmid: int) -> None:
     try:
         lab._delete_guest(api, kind, vmid, destroy_unreferenced_disks=True)
         lab._forget_retained(kind, vmid)
@@ -266,7 +267,7 @@ def guest_load(record: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def recent_guest_activity(lab: Any, 
-    api: lab.ProxmoxAPI, kind: str, vmid: int, *,
+    api: ProxmoxAPI, kind: str, vmid: int, *,
     within: int = ORPHAN_ACTIVITY_WINDOW_SECONDS,
     record: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
@@ -343,7 +344,7 @@ def recent_guest_activity(lab: Any,
 
 
 def reclaim_orphans(lab: Any, 
-    api: lab.ProxmoxAPI, *, include_active: bool = False
+    api: ProxmoxAPI, *, include_active: bool = False
 ) -> dict[str, Any]:
     """Stop -- never delete -- guests no lease record or registry vouches for.
 
@@ -399,7 +400,7 @@ def reclaim_orphans(lab: Any,
     return result
 
 
-def finalize_lease(lab: Any, api: lab.ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
+def finalize_lease(lab: Any, api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
     failures: list[str] = []
     transferred: list[str] = []
     now = lab.utc_now()

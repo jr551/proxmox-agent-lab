@@ -1,6 +1,7 @@
 """Lease ownership, expiry and orphan reclamation against the lifecycle layer."""
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -843,3 +844,45 @@ class StateIsolationTests(unittest.TestCase):
         self.assertNotEqual(str(LAB.STATE_ROOT), str(real_default))
 
 
+
+
+class PowerOnFacadeTests(unittest.TestCase):
+    def test_commands_preserve_whether_the_host_was_awakened(self):
+        for woke in (False, True):
+            for command in ("power-on", "lease-begin"):
+                with self.subTest(woke=woke, command=command):
+                    api = mock.Mock()
+                    api.reachable.side_effect = [False, True] if woke else [True]
+                    api.call.return_value = []
+                    argv = (["power-on", "--standalone-authorized"]
+                            if command == "power-on" else
+                            ["lease-begin", "--purpose", "regression test"])
+                    args = LAB.parser().parse_args(argv)
+                    output = io.StringIO()
+                    with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
+                         mock.patch.object(LAB, "controller_lock", contextlib.nullcontext), \
+                         mock.patch.object(LAB, "save_lease") as saved, \
+                         mock.patch.object(LAB, "audit"), \
+                         mock.patch.object(LAB.power_module, "power_on", return_value={}) as power, \
+                         contextlib.redirect_stdout(output):
+                        args.func(args)
+                    result = json.loads(output.getvalue())
+                    key = ("power_on_requested" if command == "power-on"
+                           else "host_was_powered_on")
+                    self.assertIs(result[key], woke)
+                    self.assertEqual(power.call_count, int(woke))
+                    if command == "lease-begin":
+                        self.assertIs(saved.call_args.args[0][key], woke)
+
+
+class LifecycleAnnotationTests(unittest.TestCase):
+    def test_extracted_function_annotations_resolve(self):
+        import inspect
+        import typing
+        from proxmox_agent_lab import cleanup, leases
+
+        for module in (cleanup, leases):
+            for name, fn in inspect.getmembers(module, inspect.isfunction):
+                if fn.__module__ == module.__name__:
+                    with self.subTest(module=module.__name__, function=name):
+                        typing.get_type_hints(fn)

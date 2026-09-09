@@ -7,6 +7,19 @@ and off — and, just as usefully, what has not.
 Read it as a statement of confidence, not a feature list. Anything marked
 "unit-tested only" may work; it has simply never been watched working.
 
+## Post-merge regression review (2026-09-09)
+
+Offline tests exercise `power-on` and `lease-begin` through the public facade
+for both an already-running host and a simulated cold boot, including the
+saved lease's boolean power-on record. Annotation introspection covers the
+extracted lifecycle functions. Android failure coverage verifies that a
+password-cleanup warning preserves the original provisioning exception.
+WebSocket fixtures cover an echoed `binary, base64` protocol list and reject
+both a foreign protocol and a mixed offered/foreign list.
+
+These fixes are **unit-tested only** in this review. No live host, guest,
+network configuration, or power transition was exercised.
+
 ## Internal restructure (2026-09-07)
 
 The post-0.14.1 cleanup split `cli.py`/`console.py`/`memflow.py` internals

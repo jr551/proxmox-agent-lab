@@ -782,8 +782,8 @@ def register_resource(lease: dict[str, Any], kind: str, vmid: int,
         default_ttl=DEFAULT_TTL_SECONDS)
 
 
-def ensure_on(api: ProxmoxAPI, timeout: int | None = None) -> None:
-    leases_module.ensure_on(_module(), api, timeout)
+def ensure_on(api: ProxmoxAPI, timeout: int | None = None) -> bool:
+    return leases_module.ensure_on(_module(), api, timeout)
 
 
 def node_guests(api: ProxmoxAPI) -> list[dict[str, Any]]:

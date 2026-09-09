@@ -4,7 +4,18 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.15.0 - 2026-09-09
+
+### Fixed
+
+- Restore the power-on helper's boolean return through the CLI facade so
+  `power-on` output and lease `host_was_powered_on` records reflect whether
+  the controller awakened the host.
+- Accept Proxmox WebSocket responses that echo the offered `binary, base64`
+  protocol list, while still rejecting protocols the client did not offer.
+- Restore resolvable type annotations in the extracted lifecycle modules.
+- Preserve Android provisioning errors when bootstrap-password cleanup also
+  fails, instead of masking them with a missing `sys` import.
 
 ### Changed
 

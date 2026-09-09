@@ -20,6 +20,9 @@ import tempfile
 import types
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support import bootstrap  # noqa: E402,F401
+
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import hostguard  # noqa: E402

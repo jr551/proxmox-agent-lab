@@ -203,10 +203,11 @@ adds an `image` object to the JSON holding the screen as a bounded, downscaled
 base64 PNG with its `scale` factor and original dimensions, for a caller that
 reads images but cannot open a file here.
 
-There is no OCR. It only ever read a guest whose console font this controller
-already had, and a guest shipping its own font decoded to noise. `--ocr` and
-`console import-font` now error with a pointer to the above and are deleted in
-0.11.0.
+There is no OCR. Glyph matching only ever worked on a guest whose console font
+this controller already had, and a guest shipping its own font decoded to noise.
+`--ocr` and `console import-font` still exist as deprecated signposts: they
+error with a pointer to the screen-reading paths above. They will be removed only
+when the release notes announce a deliberate removal.
 
 ## 🔗 Sharing a console with a person
 

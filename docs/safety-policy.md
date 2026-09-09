@@ -102,7 +102,7 @@ After all leases are closed:
 - Refuse a `memflow write` or `memflow phys-write` (both mutate live guest memory -- kernel-virtual and physical/RAM-injection respectively) unless the user's current request explicitly authorizes it, then pass `--i-understand`. Never pass a USB device backing active storage through to a guest.
 - Capture and decrypt only a guest's own traffic, within a lease. `netcap intercept` is an active MITM: install its CA only in guests the user controls, for work the user has authorized, and never rewrite traffic the user did not ask to rewrite.
 - Do not log cloud-init passwords, tokens, authorization headers, SSH private keys, presigned S3 URLs, or full environment files. Guest memory, USB and network captures — and decrypted MITM flows — are never written to the ledger; only the fact of the capture is.
-- Refuse to write any credential into this repository. The S3 key ID and secret belong in the macOS Keychain; `scripts/check-secrets.py` blocks the common shapes at commit time.
+- Refuse to write any credential into this repository. The S3 key ID and secret belong in the configured secret backend; `scripts/check-secrets.py` blocks the common shapes at commit time.
 
 ## What a tag proves, and what owns a guest
 

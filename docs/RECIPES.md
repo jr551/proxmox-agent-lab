@@ -73,7 +73,7 @@ proxmox-lab pull --lease "$L" --vmid 9002 --remote /tmp/p.html --out ./p.html
 
 - `console text` takes an optional `--lease`; `pull` requires `--remote`
   (guest path) and writes locally via `--out`.
-- `console screenshot --ocr` and `console import-font` were removed in 0.11.0 — glyph matching could not read a guest's own font (see [console.md appendix](console.md#appendix-why-there-is-no-ocr)). Use `console text` for a real terminal or `console screenshot --for-model` / `console inspect` for a model-read screen.
+- `console screenshot --ocr` and `console import-font` now error with a pointer; they will be removed only when release notes announce it (see [console.md appendix](console.md#appendix-why-there-is-no-ocr)). Use `console text` for a real terminal or `console screenshot --for-model` / `console inspect` for a model-read screen.
 
 ## 3. Develop and test an app in a disposable environment
 
@@ -177,9 +177,10 @@ Expiring public noVNC link; the URL *is* the credential.
 
 ## Choosing a channel (cheat sheet)
 
-See [console.md §1 — Choosing a channel](console.md#1-choosing-a-channel) for
+See [console.md — Choosing a channel](console.md#choosing-a-channel) for
 the canonical channel table. Do not duplicate it here. Note: `console screenshot
---ocr` / `console import-font` were removed in 0.11.0 — use `console text`
+--ocr` / `console import-font` now error with a pointer and will be removed only
+when release notes announce it — use `console text`
 or `console screenshot --for-model` / `console inspect` (see
 [console.md appendix](console.md#appendix-why-there-is-no-ocr)).
 

@@ -5,19 +5,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(
-    Path(__file__).parent / "fixtures" / "config.toml"
-)
+import sys  # noqa: E402
 
+# Shared bootstrap: fixture configuration plus a per-process state directory,
+# applied before any proxmox_agent_lab import. `support` sits beside this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support import bootstrap  # noqa: E402,F401
 import shutil
 import tempfile
-# ...and at a disposable state directory: a test must never write into the
-# developer's real controller state. Cleared here so a previous run cannot
-# leak into this one; imports all happen before any test runs.
-_TEST_STATE = Path(tempfile.gettempdir()) / "proxmox-agent-lab-test-state"
-shutil.rmtree(_TEST_STATE, ignore_errors=True)
-_TEST_STATE.mkdir(parents=True, exist_ok=True)
-os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
 import re  # noqa: E402
 import sys  # noqa: E402
 import unittest  # noqa: E402
@@ -215,8 +210,10 @@ class StepShellRegressionTests(unittest.TestCase):
 
     def test_exec_runs_the_step_under_bash(self) -> None:
         lab = mock.Mock()
+        from proxmox_agent_lab import guest_agent
+
         with mock.patch.object(android.console, "write_guest_file"), \
-             mock.patch.object(android.console, "agent_exec") as agent_exec:
+             mock.patch.object(guest_agent, "agent_exec") as agent_exec:
             android._exec(lab, mock.Mock(), 101, "set -euo pipefail")
         argv = agent_exec.call_args.args[3]
         self.assertEqual(argv[0], "/bin/bash", f"dash cannot run these: {argv}")

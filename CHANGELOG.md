@@ -8,9 +8,25 @@ All notable changes to this project will be documented here. The format follows
 
 ### Changed
 
+- Internal cleanup, no CLI behavior change: the controller's internals are
+  split into focused modules (`errors`, `state`, `api`, `audit`, `updates`,
+  `leases`, `cleanup`, `diagnostics`, `host_transport`, `serial`,
+  `guest_agent`, `transfer`) behind the same `cli` facade; large remote
+  programs moved out of Python source into `src/proxmox_agent_lab/resources/`;
+  `console` now holds only screen, input and inspection handlers. The
+  `register(sub, lab)` callback contract, lease/cleanup/audit/shutdown
+  safety rules, configuration precedence and runtime state formats are
+  unchanged; `console.X` and `cli.X` compatibility names keep working.
+- Share tokens can no longer start with `-`, so `pxl-share revoke --token`
+  accepts every token the server issues.
 - Screenshot change highlighting uses a byte lookup table and skips pixel
   loops for unchanged frames, preserving the existing output and thresholds.
 - Removed unused imports in sharing/S3 helpers.
+- Documentation: README shortened to essentials; `docs/README.md` is a
+  task-oriented index; feature pages share a standard layout; a consolidated
+  `docs/troubleshooting.md` and `docs/architecture.md` were added;
+  `scripts/check-docs.py` validates doc links and `proxmox-lab` examples
+  offline; `scripts/check` runs the full local check set.
 
 ### Added
 
@@ -327,7 +343,9 @@ and how the old flags signpost it.
 
   `console screenshot --ocr` and `console import-font` are **kept registered**
   and fail with a message naming the replacement, so an upgrade does not land
-  on `unrecognized arguments`. Both are deleted in 0.11.0. Read a screen with
+  on `unrecognized arguments`. They were slated for deletion in 0.11.0 but
+  remain as signposts until a release note announces their removal. Read a
+  screen with
   `console screenshot --for-model`, `console inspect`, or `console text` for a
   real terminal stream.
 

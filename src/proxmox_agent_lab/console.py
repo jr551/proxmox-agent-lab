@@ -1,5 +1,10 @@
 """Console access for lab guests: VNC screenshots, keyboard, pointer,
-serial/LXC terminal text, guest-agent execution, and file transfer.
+serial/LXC terminal text, and screen inspection.
+
+The terminal session itself lives in `serial`, guest-agent primitives in
+`guest_agent`, and S3 file transfer in `transfer`; the names are
+re-exported here so `console.X` keeps working for feature modules and
+tests.
 
 Design notes
 ------------
@@ -19,8 +24,6 @@ import base64
 import json
 from pathlib import Path
 import re
-import secrets
-import shlex
 import struct
 import time
 from typing import Any
@@ -32,8 +35,17 @@ from . import secrets_store
 from . import textmode
 from . import vision
 from . import ws
+from . import transfer as transfer_module
+from .serial import (
+    TermFilter, TermSession, WS_PATH_TEMPLATE, _open_websocket,
+)
+from .guest_agent import (
+    agent_exec, agent_ready, bootstrap_guest_agent,
+    clear_bootstrap_password, ensure_agent, exec_guest,
+    exec_guest_script, prepare_cloudinit_worker, wait_agent_ready,
+    write_guest_file,
+)
 
-WS_PATH_TEMPLATE = "/api2/json/nodes/{node}/{kind}/{vmid}/vncwebsocket"
 DEFAULT_SCREENSHOT_DIR = Path.home() / ".local" / "state" / "proxmox-agent-lab" / "screens"
 
 # Vision prompt for click-target verification: filled at call time with the
@@ -63,9 +75,6 @@ supplied coordinates alone; judge from the image."""
 # retry resumes instead of restarting, and the assembled file is verified
 # against a SHA-256 on both ends. Linux guests only (curl + split); Windows
 # and --url-only keep the single-object path.
-SINGLE_OBJECT_MAX_MB = 32
-CHUNK_DEFAULT_MB = 64
-MAX_CHUNK_PARTS = 256
 
 
 def _api_error(lab: Any, message: str) -> Exception:
@@ -76,7 +85,8 @@ def _api_error(lab: Any, message: str) -> Exception:
 # guest whose console font the controller happens to hold, and a guest is free
 # to ship its own -- which is exactly what made it unusable in practice. These
 # two entry points stay registered so an upgrade fails with an explanation
-# instead of argparse's bare "unrecognized arguments". Delete both in 0.11.0.
+# instead of argparse's bare "unrecognized arguments". They are removed
+# only when a release note announces it.
 OCR_REMOVED = (
     "--ocr was removed: glyph-matching OCR could only read a guest whose "
     "console font this controller already had, and a guest with its own font "
@@ -96,7 +106,7 @@ IMPORT_FONT_REMOVED = (
 
 
 def cmd_import_font(lab: Any, args: Any) -> None:
-    """Removal signpost for the deleted OCR font import. Delete in 0.11.0."""
+    """Removal signpost for the deleted OCR font import."""
     raise _api_error(lab, IMPORT_FONT_REMOVED)
 
 
@@ -111,26 +121,6 @@ def _kind_of(lab: Any, api: Any, vmid: int) -> str:
     raise _api_error(lab, f"VMID {vmid} is not a QEMU VM or LXC container on {lab.NODE}")
 
 
-def _open_websocket(lab: Any, kind: str, vmid: int, proxy: dict[str, Any],
-                    timeout: float) -> ws.WebSocket:
-    token = lab.keychain_secret()
-    return ws.WebSocket(
-        lab.HOST,
-        lab.PORT,
-        WS_PATH_TEMPLATE.format(node=lab.NODE, kind=kind, vmid=vmid),
-        {"port": str(proxy["port"]), "vncticket": proxy["ticket"]},
-        {
-            "Authorization": (
-                f"PVEAPIToken={lab.TOKEN_USER}!{lab.TOKEN_NAME}={token}"
-            )
-        },
-        timeout=timeout,
-        # Same certificate policy as the REST client: a console carries guest
-        # keystrokes and screen contents, so it must not be the one path that
-        # trusts any certificate.
-        verify_tls=bool(getattr(lab, "VERIFY_TLS", True)),
-        ca_file=lab.CONFIG.proxmox.get("ca_file") or None,
-    )
 
 
 class VncSession:
@@ -179,503 +169,49 @@ class VncSession:
 #
 # The ack arrives alone, the record is CRLF-terminated, blank lines and console
 # echo can precede it, and guest output is split at arbitrary byte boundaries.
-TERM_STATUS_RECORDS = (
-    re.compile(rb"starting serial terminal on interface \S+"
-               rb"(?: \(press [^)]*\))?"),
-    re.compile(rb"Connected to tty \d+"),
-    re.compile(rb"Type <Ctrl\+a q> to exit the console"
-               rb"(?:, <Ctrl\+a Ctrl\+a> to enter Ctrl\+a itself)?"),
-    # A stopped guest is reported *in the stream*: termproxy issues a ticket,
-    # the websocket opens, and 'qm terminal' writes this and exits. It is a
-    # transport answer, not something the guest printed.
-    re.compile(rb"(?:VM|CT|Container) \d+ (?:is )?not running"),
-)
 # The literal openings of the records above, used to recognise one that is
 # still arriving: a websocket read is not a record boundary.
-TERM_STATUS_PREFIXES = (
-    b"starting serial terminal on interface",
-    b"Connected to tty",
-    b"Type <Ctrl+a q> to exit the console",
-)
 # 'VM <id> not running' is deliberately absent above: its opening is short and
 # generic, and it is matched only as a complete line.
-TERM_HANDSHAKE_ACK = b"OK"
 
 # A partial is only treated as a possibly-incomplete record once it is this
 # long. Below it, output goes straight through: an interactive prompt ends
 # without a newline, and must never be held back waiting for one.
-TERM_STATUS_PREFIX_MIN = 4
 # A record is well under this. Past it, whatever is buffered is guest output
 # that merely started like one.
-TERM_STATUS_PREFIX_MAX = 256
 # How much guest output is watched for a status record before the filter stops
 # looking. The records are emitted once, at session start.
-TERM_STATUS_WINDOW = 4096
 
 
-def _is_status_record(line: bytes) -> bool:
-    cleaned = line.strip(b"\r").strip()
-    return any(
-        pattern.fullmatch(cleaned) for pattern in TERM_STATUS_RECORDS
-    )
 
 
-def _is_blank_line(line: bytes) -> bool:
-    """True for a line with no visible characters once escapes are removed.
-
-    Blank lines and bare cursor/bracketed-paste sequences arrive around the
-    status records, so they must not be mistaken for the guest's first real
-    output and end the search early.
-    """
-    return not textmode.strip_ansi(line.decode("utf-8", "replace")).strip()
 
 
-def _may_grow_into_status_record(partial: bytes) -> bool:
-    """True while `partial` could still become a complete status record."""
-    cleaned = partial.strip(b"\r")
-    if not TERM_STATUS_PREFIX_MIN <= len(cleaned) <= TERM_STATUS_PREFIX_MAX:
-        return False
-    return any(
-        prefix.startswith(cleaned) or cleaned.startswith(prefix)
-        for prefix in TERM_STATUS_PREFIXES
-    )
 
 
-class TermFilter:
-    """Remove Proxmox terminal transport records from one session's stream.
-
-    Stateful on purpose, for three reasons. The handshake acknowledgement is
-    a bare "OK" that must be recognised exactly once, so a later guest line
-    beginning "OK" is not truncated -- which the old prefix test did. A record
-    can be split across websocket reads, so an undecidable tail is held rather
-    than guessed at. And a record is not always the first thing on the stream:
-    a blank line or the console's echo can precede it, so the search runs over
-    a bounded startup window instead of stopping at the first guest byte.
-
-    Nothing is held once the window closes, so an interactive session (the
-    bridge, a debugger prompt) is never delayed by this.
-    """
-
-    def __init__(self) -> None:
-        self._pending = bytearray()
-        self._handshake_done = False
-        self._watching = True
-        self._scanned = 0
-
-    def feed(self, data: bytes) -> bytes:
-        """Return the guest bytes in `data`, holding an incomplete record."""
-        if not self._watching:
-            return data
-        self._pending += data
-        return self._drain()
-
-    def flush(self) -> bytes:
-        """Release what is held, at the end of a session.
-
-        A tail that is still a prefix of a status record is the record that was
-        already being matched, truncated by the session ending, so it is
-        dropped. Anything else is guest output and is handed over.
-        """
-        pending = bytes(self._pending)
-        self._pending.clear()
-        self._watching = False
-        if not self._handshake_done:
-            self._handshake_done = True
-            if TERM_HANDSHAKE_ACK.startswith(pending):
-                return b""
-            if pending.startswith(TERM_HANDSHAKE_ACK):
-                pending = pending[len(TERM_HANDSHAKE_ACK):]
-        if _may_grow_into_status_record(pending):
-            return b""
-        return pending
-
-    def _take_handshake(self) -> bool:
-        """Consume the auth acknowledgement. False while it is still arriving."""
-        if self._pending[:2] == TERM_HANDSHAKE_ACK:
-            del self._pending[:2]
-            if self._pending[:2] == b"\r\n":
-                del self._pending[:2]
-            elif self._pending[:1] == b"\n":
-                del self._pending[:1]
-            self._handshake_done = True
-            return True
-        if TERM_HANDSHAKE_ACK.startswith(bytes(self._pending)):
-            return False            # only "O" so far; the rest is in flight
-        self._handshake_done = True  # no ack on this stream
-        return True
-
-    def _drain(self) -> bytes:
-        if not self._handshake_done and not self._take_handshake():
-            return b""
-        out = bytearray()
-        while self._pending:
-            newline = self._pending.find(b"\n")
-            if newline == -1:
-                tail = bytes(self._pending)
-                if _may_grow_into_status_record(tail):
-                    break               # hold: the record may still complete
-                out += tail
-                self._pending.clear()
-                self._scanned += len(tail)
-                if self._scanned > TERM_STATUS_WINDOW:
-                    self._watching = False
-                break
-            line = bytes(self._pending[:newline + 1])
-            del self._pending[:newline + 1]
-            if _is_status_record(line):
-                # An LXC console emits two of these back to back, so keep
-                # looking rather than stopping at the first.
-                continue
-            out += line
-            self._scanned += len(line)
-            if not _is_blank_line(line) or self._scanned > TERM_STATUS_WINDOW:
-                # The guest has started talking: nothing more is transport.
-                self._watching = False
-                break
-        if not self._watching and self._pending:
-            out += self._pending
-            self._pending.clear()
-        return bytes(out)
 
 
-class TermSession:
-    """A live Proxmox terminal session (LXC console or QEMU serial)."""
-
-    def __init__(self, lab: Any, api: Any, kind: str, vmid: int,
-                 timeout: float = 25.0) -> None:
-        self.lab = lab
-        proxy = api.call("POST", f"/nodes/{lab.NODE}/{kind}/{vmid}/termproxy")
-        if not isinstance(proxy, dict) or "ticket" not in proxy:
-            raise _api_error(
-                lab,
-                f"termproxy did not return a ticket for {kind}/{vmid}. A QEMU "
-                "guest needs a serial device (serial0: socket) for this path.",
-            )
-        self.socket = _open_websocket(lab, kind, vmid, proxy, timeout)
-        self.filter = TermFilter()
-        self.last_read_was_empty = True
-        # Proxmox's terminal protocol: authenticate, then set the window size.
-        self.socket.send(f"{proxy['user']}:{proxy['ticket']}\n".encode())
-        self.socket.send(b"1:120:40:")
-
-    def read_bytes(self, timeout: float) -> bytes:
-        """Guest bytes only. Transport records never reach the caller.
-
-        An empty return does not mean the socket was idle -- a read that
-        contained nothing but a transport record filters down to nothing -- so
-        `last_read_was_empty` records what actually arrived, for callers that
-        stop at the first gap in output.
-        """
-        raw = self.socket.read_available(timeout)
-        self.last_read_was_empty = not raw
-        return self.filter.feed(raw)
-
-    def flush_bytes(self) -> bytes:
-        """Guest bytes still held back when the session ends."""
-        return self.filter.flush()
-
-    def send_line(self, text: str) -> None:
-        # Proxmox's terminal frame is "0:<length>:<data>" where length counts
-        # bytes, not characters. Measuring the str would under-declare any
-        # non-ASCII payload and desynchronise the stream.
-        payload = (text + "\n").encode()
-        self.socket.send(b"0:" + str(len(payload)).encode() + b":" + payload)
-
-    def send_raw(self, text: str) -> None:
-        # No trailing newline: a kernel debugger prompt (KDB, GRUB, a paused
-        # bootloader) often acts on bare characters, and appending "\n" would
-        # change their meaning.
-        payload = text.encode()
-        if payload:
-            self.socket.send(b"0:" + str(len(payload)).encode() + b":" + payload)
-
-    def read(self, seconds: float) -> str:
-        deadline = time.monotonic() + seconds
-        chunks: list[bytes] = []
-        while time.monotonic() < deadline:
-            data = self.read_bytes(max(0.2, deadline - time.monotonic()))
-            if data:
-                chunks.append(data)
-            elif self.last_read_was_empty and chunks:
-                # Stop at a real gap in guest output. A read that held only a
-                # transport record is not a gap: stopping there would drop the
-                # prompt or boot line that follows it.
-                break
-        chunks.append(self.flush_bytes())
-        return b"".join(chunks).decode("utf-8", "replace")
-
-    def expect(self, patterns: tuple[str, ...], timeout: float = 60.0,
-               poke: bool = False) -> tuple[str, str]:
-        """Read until one of `patterns` appears. Returns (matched, transcript).
-
-        Cloud images print asynchronously and may already have drawn their
-        prompt before we attach, so `poke` sends a newline periodically to
-        make an idle console redraw it.
-        """
-        deadline = time.monotonic() + timeout
-        buffer = ""
-        last_poke = 0.0
-        while time.monotonic() < deadline:
-            chunk = self.read_bytes(1.5)
-            if chunk:
-                buffer += chunk.decode("utf-8", "replace")
-                for pattern in patterns:
-                    if pattern in buffer:
-                        return pattern, buffer
-            elif poke and time.monotonic() - last_poke > 5:
-                last_poke = time.monotonic()
-                self.send_line("")
-        raise TimeoutError(
-            f"none of {patterns} appeared within {timeout}s; last saw: "
-            + repr(textmode.strip_ansi(buffer)[-300:])
-        )
-
-    def login(self, user: str, password: str, timeout: float = 240.0) -> None:
-        """Log in at a getty prompt, or do nothing if already at a shell.
-
-        A serial console keeps whatever state the last session left, so a
-        second run would otherwise hang waiting for a login prompt that will
-        never be printed again.
-        """
-        self.send_line("")
-        try:
-            matched, _ = self.expect(("login:", "$ ", "# "), timeout=15)
-            if matched in ("$ ", "# "):
-                return
-        except TimeoutError:
-            pass
-        self.expect(("login:",), timeout=timeout, poke=True)
-        self.send_line(user)
-        # A guest with no password set -- an installer, a rescue shell, a
-        # stock appliance -- drops straight to a shell and never prints a
-        # password prompt. Waiting only for "assword:" hung there for the full
-        # timeout, which made an empty password useless even once it was
-        # allowed through.
-        matched, _ = self.expect(("assword:", "$ ", "# "), timeout=60)
-        if matched in ("$ ", "# "):
-            return
-        self.send_line(password)
-        matched, transcript = self.expect(
-            ("$ ", "# ", "Login incorrect"), timeout=60
-        )
-        if matched == "Login incorrect":
-            raise RuntimeError("serial login was rejected")
-
-    def run(self, command: str, timeout: float = 600.0) -> str:
-        """Run one shell command and return only its output."""
-        return self.run_status(command, timeout)[0]
-
-    def run_status(
-        self, command: str, timeout: float = 600.0
-    ) -> tuple[str, int | None]:
-        """Run one command; return (output, exit code).
-
-        The output is bracketed by two markers so the caller gets the
-        command's output alone. Without that, the transcript also contains
-        the console's echo of the command, which callers then have to parse
-        around -- a reliable source of subtle bugs, since a command
-        mentioning "nameserver" or "REACHABLE" looks just like its own result.
-
-        Each marker is typed with a split string literal (`__b""<token>__`)
-        that the shell rejoins but the echo cannot reproduce, so a marker can
-        never match its own echo -- including when the console hard-wraps the
-        command mid-token.
-        """
-        token = secrets.token_hex(4)
-        begin, end = f"__b{token}__", f"__e{token}__"
-        self.send_line(
-            f'echo "__b""{token}__"; {command}; echo "__e""{token}__$?"'
-        )
-        _, transcript = self.expect((end,), timeout=timeout)
-        text = textmode.strip_ansi(transcript).replace("\r", "")
-
-        opened = text.find(begin)
-        body_start = 0
-        if opened != -1:
-            newline = text.find("\n", opened)
-            body_start = len(text) if newline == -1 else newline + 1
-
-        closed = text.find(end, body_start)
-        if closed == -1:
-            return text[body_start:].strip("\n"), None
-        line_start = text.rfind("\n", body_start, closed) + 1
-        tail = text[closed + len(end):].split("\n", 1)[0].strip()
-        return (
-            text[body_start:line_start].strip("\n"),
-            int(tail) if tail.isdigit() else None,
-        )
-
-    def close(self) -> None:
-        self.socket.close()
-
-    def __enter__(self) -> "TermSession":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
 
 
 # --- guest agent ---------------------------------------------------------
 
 
-def agent_exec(lab: Any, api: Any, vmid: int, command: list[str], *,
-               input_data: str | None = None, timeout: int = 300) -> dict[str, Any]:
-    """Run a command through qemu-guest-agent and wait for its result."""
-    payload: dict[str, Any] = {"command": command}
-    if input_data is not None:
-        payload["input-data"] = base64.b64encode(input_data.encode()).decode()
-    started = api.call(
-        "POST", f"/nodes/{lab.NODE}/qemu/{vmid}/agent/exec", payload
-    )
-    pid = started.get("pid") if isinstance(started, dict) else None
-    if pid is None:
-        raise _api_error(lab, f"guest agent did not return a pid: {started}")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        status = api.call(
-            "GET", f"/nodes/{lab.NODE}/qemu/{vmid}/agent/exec-status", {"pid": pid}
-        )
-        if status.get("exited"):
-            def decode(field: str) -> str:
-                # Proxmox already decodes what qemu-guest-agent base64s, so
-                # out-data/err-data arrive as plain text. Decoding again
-                # corrupts any output that is *coincidentally* valid base64 --
-                # a bare timestamp, a hex digest -- while everything else
-                # raises and silently falls through looking correct.
-                raw = status.get(field, "")
-                return raw if isinstance(raw, str) else ""
-
-            exitcode = status.get("exitcode")
-            signal = status.get("signal")
-            if exitcode is None and signal is not None:
-                # qemu-guest-agent reports either exitcode or signal, never
-                # both. Every caller checks `exitcode not in (0, None)` to
-                # decide success -- leaving this as None would make a
-                # signal-killed process (OOM, crash, an external kill) look
-                # like the "no code available" case serial legitimately
-                # has, instead of the failure it actually is. 128+signal is
-                # the standard shell convention for "killed by signal N".
-                exitcode = 128 + int(signal)
-            return {
-                "exitcode": exitcode,
-                "signal": signal,
-                "stdout": decode("out-data"),
-                "stderr": decode("err-data"),
-                "truncated": bool(
-                    status.get("out-truncated") or status.get("err-truncated")
-                ),
-            }
-        time.sleep(1)
-    raise _api_error(lab, f"guest command did not finish within {timeout}s")
 
 
-def agent_ready(lab: Any, api: Any, vmid: int) -> bool:
-    try:
-        api.call("POST", f"/nodes/{lab.NODE}/qemu/{vmid}/agent/ping")
-        return True
-    except lab.LabError:
-        return False
 
 
-def wait_agent_ready(lab: Any, api: Any, vmid: int, timeout: int,
-                     interval: float = 5) -> bool:
-    """Poll until the guest agent responds, or the timeout expires."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if agent_ready(lab, api, vmid):
-            return True
-        time.sleep(interval)
-    return False
 
 
-def write_guest_file(lab: Any, api: Any, vmid: int, path: str,
-                     content: str) -> None:
-    """Write a file into a guest without the content touching the ledger."""
-    api.call(
-        "POST",
-        f"/nodes/{lab.NODE}/qemu/{vmid}/agent/file-write",
-        {
-            "file": path,
-            "content": base64.b64encode(content.encode()).decode(),
-            "encode": 0,
-        },
-    )
 
 
-def exec_guest(lab: Any, api: Any, vmid: int, argv: list[str],
-               timeout: int = 300) -> dict[str, Any]:
-    """Run a command through the guest agent (argv form)."""
-    return agent_exec(lab, api, vmid, argv, timeout=timeout)
 
 
-def exec_guest_script(lab: Any, api: Any, vmid: int, script: str,
-                      timeout: int = 300) -> dict[str, Any]:
-    """Run a shell script through the guest agent via bash.
-
-    bash, not /bin/sh: the scripts this runs declare ``#!/bin/bash`` and open
-    with ``set -euo pipefail``. dash only gained ``pipefail`` in 0.5.12
-    (Debian 13, Ubuntu 24.04), so on an older guest image /bin/sh aborts on
-    the second line. Run them under the interpreter they declare.
-    """
-    return exec_guest(lab, api, vmid, ["/bin/bash", "-c", script], timeout=timeout)
 
 
-def ensure_agent(lab: Any, api: Any, vmid: int, cloud_user: str,
-                 password: str, timeout: int) -> None:
-    """Wait for the agent; bootstrap over serial when it never appears."""
-    if wait_agent_ready(lab, api, vmid, timeout):
-        return
-    bootstrap_guest_agent(lab, api, vmid, cloud_user, password)
 
 
-def clear_bootstrap_password(lab: Any, api: Any, vmid: int) -> bool:
-    """Delete the one-time cipassword from the VM config. Returns cleared."""
-    try:
-        api.call(
-            "PUT",
-            f"/nodes/{lab.NODE}/qemu/{vmid}/config",
-            {"delete": "cipassword"},
-        )
-        return True
-    except lab.LabError:
-        return False
 
 
-def prepare_cloudinit_worker(
-    lab: Any,
-    api: Any,
-    vmid: int,
-    template_vmid: int,
-    config_updates: dict[str, Any],
-    *,
-    agent_timeout: int = 120,
-    start_timeout: int = 180,
-) -> tuple[str, str]:
-    """Shared cloud-init bootstrap: password, config, start, agent wait.
-
-    Generates a one-time password, resolves the template's cloud user,
-    applies ``config_updates`` plus the cloud-init identity, starts the guest,
-    and waits for the agent (bootstrapping over serial when needed). The
-    caller must call ``clear_bootstrap_password`` when the post-boot
-    provisioning has finished. Returns ``(cloud_user, password)``.
-    """
-    password = secrets.token_urlsafe(18)
-    template_config = api.call(
-        "GET", f"/nodes/{lab.NODE}/qemu/{template_vmid}/config"
-    )
-    cloud_user = template_config.get("ciuser") or "debian"
-    payload: dict[str, Any] = {
-        "ciuser": cloud_user,
-        "cipassword": password,
-        "agent": "enabled=1",
-        "onboot": 0,
-        **config_updates,
-    }
-    api.call("PUT", f"/nodes/{lab.NODE}/qemu/{vmid}/config", payload)
-    start = api.call("POST", f"/nodes/{lab.NODE}/qemu/{vmid}/status/start")
-    lab.wait_task(api, start, timeout=start_timeout)
-    ensure_agent(lab, api, vmid, cloud_user, password, agent_timeout)
-    return cloud_user, password
 
 
 # --- command handlers ----------------------------------------------------
@@ -1011,15 +547,15 @@ def _png_dimensions(data: bytes) -> tuple[int, int]:
 
 def _screenshot_via_monitor(lab: Any, api: Any, args: Any) -> dict[str, Any]:
     """Capture with QEMU screendump, fetch the PNG, delete the host copy."""
-    from . import memflow
+    from . import host_transport
 
     if not getattr(args, "lease", None):
         raise _api_error(lab, "console screenshot --via monitor requires --lease")
     _require_owned_qemu(lab, args.lease, args.vmid)
-    memflow.require_host_ssh(lab)
+    host_transport.require_host_ssh(lab)
     remote = _monitor_remote_path(args.lease, args.vmid)
     command = _screendump_command(remote)
-    memflow.host_mkdir(lab, remote.rsplit("/", 1)[0])
+    host_transport.host_mkdir(lab, remote.rsplit("/", 1)[0])
     timeout = max(30, int(getattr(args, "timeout", 25) or 25))
     removed = False
     try:
@@ -1034,11 +570,11 @@ def _screenshot_via_monitor(lab: Any, api: Any, args: Any) -> dict[str, Any]:
             raise _api_error(
                 lab, f"QEMU screendump refused: {answer.strip()[:300]}"
             )
-        data = memflow.host_read_bytes(lab, remote, timeout=timeout)
+        data = host_transport.host_read_bytes(lab, remote, timeout=timeout)
     finally:
-        removed = memflow.host_remove_file(lab, remote)
+        removed = host_transport.host_remove_file(lab, remote)
         # Best effort, and only if empty: leaves nothing of ours on the host.
-        memflow.host_remove_empty_dir(lab, remote.rsplit("/", 1)[0])
+        host_transport.host_remove_empty_dir(lab, remote.rsplit("/", 1)[0])
     width, height = _png_dimensions(data)
     target = _screenshot_path(args.vmid, getattr(args, "out", None), "-monitor")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1781,309 +1317,26 @@ def cmd_exec(lab: Any, args: Any) -> None:
     print(json.dumps(result, indent=2))
 
 
-def _ps_quote(value: str) -> str:
-    """Single-quote a value for a PowerShell string, doubling embedded quotes."""
-    return "'" + value.replace("'", "''") + "'"
 
 
-def _fetch_command(url: str, dest: str, windows: bool) -> list[str]:
-    if windows:
-        script = (
-            "$ProgressPreference='SilentlyContinue'; "
-            f"Invoke-WebRequest -UseBasicParsing -Uri {_ps_quote(url)} "
-            f"-OutFile {_ps_quote(dest)}"
-        )
-        return ["powershell.exe", "-NoProfile", "-Command", script]
-    return [
-        "/bin/sh", "-c",
-        f"curl -fsSL -A proxmox-agent-lab -o {shlex.quote(dest)} {shlex.quote(url)}",
-    ]
 
 
-def _upload_command(url: str, source: str, windows: bool) -> list[str]:
-    if windows:
-        script = (
-            "$ProgressPreference='SilentlyContinue'; "
-            f"Invoke-WebRequest -UseBasicParsing -Method Put -Uri {_ps_quote(url)} "
-            f"-InFile {_ps_quote(source)}"
-        )
-        return ["powershell.exe", "-NoProfile", "-Command", script]
-    return [
-        "/bin/sh", "-c",
-        f"curl -fsS -A proxmox-agent-lab -X PUT --data-binary "
-        f"@{shlex.quote(source)} {shlex.quote(url)}",
-    ]
 
 
-def _fetch_parts_command(urls: list[str], dest: str) -> list[str]:
-    """Download and reassemble chunk parts in the guest, printing the hash."""
-    steps = " && ".join(
-        f"curl -fsSL -A proxmox-agent-lab -o "
-        f"{shlex.quote(f'/tmp/pp-{i:04d}')} {shlex.quote(url)}"
-        for i, url in enumerate(urls)
-    )
-    script = (
-        f"rm -f {shlex.quote(dest)} /tmp/pp-*; {steps} "
-        f"&& cat /tmp/pp-* > {shlex.quote(dest)} && rm -f /tmp/pp-* "
-        f"&& sha256sum {shlex.quote(dest)} | cut -d' ' -f1"
-    )
-    return ["/bin/sh", "-c", script]
 
 
-def _upload_parts_command(urls: list[str], source: str, chunk: int) -> list[str]:
-    """Split a guest file into chunks, upload each, then report its hash."""
-    steps = " && ".join(
-        f"curl -fsS -A proxmox-agent-lab -X PUT --data-binary "
-        f"@{shlex.quote(f'/tmp/pp-{i:04d}')} {shlex.quote(url)}"
-        for i, url in enumerate(urls)
-    )
-    script = (
-        f"rm -f /tmp/pp-*; split -b {int(chunk)} -d -a 4 "
-        f"{shlex.quote(source)} /tmp/pp- && {steps} "
-        f"&& rm -f /tmp/pp-* && sha256sum {shlex.quote(source)} | cut -d' ' -f1"
-    )
-    return ["/bin/sh", "-c", script]
 
 
-def _chunk_size_mb(args: Any) -> int:
-    return max(1, getattr(args, "chunk_size", None) or CHUNK_DEFAULT_MB)
 
 
-def _push_chunked(lab: Any, api: Any, args: Any, source: Path,
-                  payload: bytes, name: str) -> dict[str, Any]:
-    chunk = _chunk_size_mb(args) * 1024 * 1024
-    parts = [payload[i:i + chunk] for i in range(0, len(payload), chunk)]
-    if len(parts) > MAX_CHUNK_PARTS:
-        raise _api_error(
-            lab,
-            f"{name} needs {len(parts)} parts (max {MAX_CHUNK_PARTS}); "
-            "raise --chunk-size",
-        )
-    base = args.key or f"push/{secrets.token_hex(6)}/{name}"
-    keys = [f"{base}/part-{i:04d}" for i in range(len(parts))]
-    for key, part in zip(keys, parts):
-        s3.put_bytes(key, part)
-    urls = [s3.presign(key, expires=args.url_expiry) for key in keys]
-    dest = args.dest or f"/tmp/{name}"
-    run = agent_exec(
-        lab, api, args.vmid, _fetch_parts_command(urls, dest),
-        timeout=args.timeout,
-    )
-    if run["exitcode"] not in (0, None):
-        raise _api_error(lab, f"guest fetch failed: {run['stderr'][:400]}")
-    guest_sha = run.get("stdout", "").strip()
-    if args.sha256 and guest_sha != args.sha256:
-        raise _api_error(
-            lab, f"sha256 mismatch on guest: {guest_sha} != {args.sha256}"
-        )
-    return {
-        "vmid": args.vmid, "s3_key": base, "bytes": len(payload),
-        "parts": len(parts), "dest": dest, "chunked": True,
-        "guest_sha256": guest_sha or None,
-    }
 
 
-def _pull_chunked(lab: Any, api: Any, args: Any, name: str) -> dict[str, Any]:
-    import hashlib
-    import math
-
-    chunk = _chunk_size_mb(args) * 1024 * 1024
-    base = args.key or f"pull/{args.vmid}/{name}"
-    out = Path(args.out).expanduser() if args.out else Path(name)
-    if args.sha256 and out.is_file():
-        if hashlib.sha256(out.read_bytes()).hexdigest() == args.sha256:
-            return {
-                "vmid": args.vmid, "path": str(out),
-                "bytes": out.stat().st_size, "sha256": args.sha256,
-                "s3_key": base, "already_verified": True, "chunked": True,
-            }
-    size_run = agent_exec(
-        lab, api, args.vmid,
-        ["/bin/sh", "-c", f"stat -c %s {shlex.quote(args.remote)}"],
-        timeout=args.timeout,
-    )
-    try:
-        size = int(size_run.get("stdout", "").strip())
-    except ValueError:
-        raise _api_error(
-            lab,
-            f"cannot read size of {args.remote}: "
-            f"{size_run.get('stderr', '')[:200]}",
-        ) from None
-    n_parts = max(1, math.ceil(size / chunk))
-    if n_parts > MAX_CHUNK_PARTS:
-        raise _api_error(
-            lab,
-            f"{name} needs {n_parts} parts (max {MAX_CHUNK_PARTS}); "
-            "raise --chunk-size",
-        )
-    keys = [f"{base}/part-{i:04d}" for i in range(n_parts)]
-    # Drop stale parts from an earlier interrupted attempt with the same key.
-    for obj in s3.list_objects(base):
-        key = str(obj.get("key", ""))
-        if key.startswith(base + "/"):
-            s3.delete_object(key)
-    urls = [s3.presign(key, method="PUT", expires=args.url_expiry)
-            for key in keys]
-    run = agent_exec(
-        lab, api, args.vmid,
-        _upload_parts_command(urls, args.remote, chunk),
-        timeout=args.timeout,
-    )
-    if run["exitcode"] not in (0, None):
-        raise _api_error(lab, f"guest upload failed: {run['stderr'][:400]}")
-    guest_sha = run.get("stdout", "").strip()
-    payload = b"".join(s3.get_bytes(key) for key in keys)
-    sha = hashlib.sha256(payload).hexdigest()
-    if guest_sha and sha != guest_sha:
-        raise _api_error(
-            lab, f"sha256 mismatch: assembled {sha} != guest {guest_sha}"
-        )
-    if args.sha256 and sha != args.sha256:
-        raise _api_error(
-            lab, f"sha256 mismatch: {sha} != expected {args.sha256}"
-        )
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(payload)
-    if not args.keep:
-        for key in keys:
-            s3.delete_object(key)
-    return {
-        "vmid": args.vmid, "path": str(out), "bytes": len(payload),
-        "sha256": sha, "parts": n_parts, "s3_key": base, "chunked": True,
-    }
 
 
-def cmd_push(lab: Any, args: Any) -> None:
-    """Copy a local file into a guest via the S3 scratch bucket."""
-    api = lab.ProxmoxAPI()
-    _require_owned_qemu(lab, args.lease, args.vmid)
-    source = Path(args.file).expanduser().resolve()
-    if not source.is_file():
-        raise _api_error(lab, f"not a regular file: {source}")
-    payload = source.read_bytes()
-    chunked = (
-        not args.windows and not args.url_only
-        and len(payload) > SINGLE_OBJECT_MAX_MB * 1024 * 1024
-    )
-    if chunked:
-        result = _push_chunked(lab, api, args, source, payload, source.name)
-        lab.audit("guest-push", lease=args.lease, vmid=args.vmid,
-                  s3_key=result["s3_key"], bytes=len(payload),
-                  parts=result["parts"], chunked=True)
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return
-    key = args.key or f"push/{secrets.token_hex(6)}/{source.name}"
-    s3.put_bytes(key, payload)
-    url = s3.presign(key, expires=args.url_expiry)
-    dest = args.dest or (
-        f"C:\\Windows\\Temp\\{source.name}" if args.windows else f"/tmp/{source.name}"
-    )
-    result: dict[str, Any] = {
-        "vmid": args.vmid,
-        "s3_key": key,
-        "bytes": len(payload),
-        "dest": dest,
-    }
-    if args.url_only:
-        result["fetch_url"] = url
-        result["hint"] = "run the fetch inside the guest yourself"
-    else:
-        run = agent_exec(
-            lab, api, args.vmid, _fetch_command(url, dest, args.windows),
-            timeout=args.timeout,
-        )
-        result["guest"] = run
-        if run["exitcode"] not in (0, None):
-            raise _api_error(lab, f"guest fetch failed: {run['stderr'][:400]}")
-    lab.audit("guest-push", lease=args.lease, vmid=args.vmid, s3_key=key,
-              bytes=len(payload), dest=dest)
-    print(json.dumps(result, indent=2, sort_keys=True))
 
 
-def cmd_pull(lab: Any, args: Any) -> None:
-    """Copy a file out of a guest via the S3 scratch bucket."""
-    import hashlib
-
-    api = lab.ProxmoxAPI()
-    _require_owned_qemu(lab, args.lease, args.vmid)
-    name = Path(args.remote).name
-    out = Path(args.out).expanduser() if args.out else Path(name)
-    # Resume: when the local file already matches the expected hash there is
-    # nothing to do, so make no guest or S3 traffic at all.
-    if args.sha256 and out.is_file():
-        if hashlib.sha256(out.read_bytes()).hexdigest() == args.sha256:
-            lab.audit("guest-pull", lease=args.lease, vmid=args.vmid,
-                      bytes=out.stat().st_size, sha256=args.sha256,
-                      already_verified=True)
-            print(json.dumps({
-                "vmid": args.vmid, "path": str(out),
-                "bytes": out.stat().st_size, "sha256": args.sha256,
-                "already_verified": True,
-            }, indent=2, sort_keys=True))
-            return
-    if not args.windows:
-        probe = agent_exec(
-            lab, api, args.vmid,
-            ["/bin/sh", "-c", f"stat -c %s {shlex.quote(args.remote)}"],
-            timeout=args.timeout,
-        )
-        try:
-            remote_size = int(probe.get("stdout", "").strip())
-        except ValueError:
-            remote_size = 0
-        if remote_size > SINGLE_OBJECT_MAX_MB * 1024 * 1024:
-            result = _pull_chunked(lab, api, args, name)
-            lab.audit("guest-pull", lease=args.lease, vmid=args.vmid,
-                      s3_key=result.get("s3_key", ""), bytes=result["bytes"],
-                      parts=result.get("parts"), chunked=True)
-            print(json.dumps(result, indent=2, sort_keys=True))
-            return
-    key = args.key or f"pull/{secrets.token_hex(6)}/{Path(args.remote).name}"
-    url = s3.presign(key, method="PUT", expires=args.url_expiry)
-    run = agent_exec(
-        lab, api, args.vmid, _upload_command(url, args.remote, args.windows),
-        timeout=args.timeout,
-    )
-    if run["exitcode"] not in (0, None):
-        raise _api_error(lab, f"guest upload failed: {run['stderr'][:400]}")
-    payload = s3.get_bytes(key)
-    target = Path(args.out).expanduser() if args.out else Path(Path(args.remote).name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(payload)
-    if not args.keep:
-        s3.delete_object(key)
-    lab.audit("guest-pull", lease=args.lease, vmid=args.vmid, s3_key=key,
-              bytes=len(payload))
-    print(json.dumps(
-        {"vmid": args.vmid, "path": str(target), "bytes": len(payload)}, indent=2
-    ))
 
 
-def cmd_s3(lab: Any, args: Any) -> None:
-    if args.s3_command == "health":
-        print(json.dumps(s3.health(), indent=2, sort_keys=True))
-    elif args.s3_command == "list":
-        print(json.dumps(s3.list_objects(args.prefix), indent=2, sort_keys=True))
-    elif args.s3_command == "put":
-        source = Path(args.file).expanduser().resolve()
-        key = args.key or f"upload/{secrets.token_hex(6)}/{source.name}"
-        s3.put_bytes(key, source.read_bytes())
-        print(json.dumps({"key": key, "bytes": source.stat().st_size}, indent=2))
-    elif args.s3_command == "get":
-        payload = s3.get_bytes(args.key)
-        target = Path(args.out).expanduser() if args.out else Path(Path(args.key).name)
-        target.write_bytes(payload)
-        print(json.dumps({"path": str(target), "bytes": len(payload)}, indent=2))
-    elif args.s3_command == "presign":
-        print(json.dumps(
-            {"url": s3.presign(args.key, method=args.method,
-                                   expires=args.expires)},
-            indent=2,
-        ))
-    elif args.s3_command == "delete":
-        s3.delete_object(args.key)
-        print(json.dumps({"deleted": args.key}))
 
 
 def cmd_preflight(lab: Any, args: Any) -> None:
@@ -2359,70 +1612,8 @@ def _register_console(console_sub: Any, lab: Any, add_after_screenshot: Any) -> 
     import_font.set_defaults(func=_bind(lab, cmd_import_font))
 
 
-def _register_transfer(sub: Any, lab: Any) -> None:
-    from .cli import _bind
-
-    push = sub.add_parser("push", help="copy a local file into a guest")
-    push.add_argument("--lease", required=True)
-    push.add_argument("--vmid", type=int, required=True)
-    push.add_argument("--file", required=True)
-    push.add_argument("--dest")
-    push.add_argument("--key", help="explicit S3 object key")
-    push.add_argument("--windows", action="store_true")
-    push.add_argument("--url-only", action="store_true",
-                      help="print a presigned URL instead of using the guest agent")
-    push.add_argument("--url-expiry", type=int, default=3600)
-    push.add_argument("--timeout", type=int, default=600)
-    push.add_argument("--chunk-size", type=int, metavar="MB", default=CHUNK_DEFAULT_MB,
-                      help="part size for large-file transfers (default 64)")
-    push.add_argument("--sha256",
-                      help="expected SHA-256 of the file; verified on the guest")
-    push.set_defaults(func=_bind(lab, cmd_push))
-
-    pull = sub.add_parser("pull", help="copy a file out of a guest")
-    pull.add_argument("--lease", required=True)
-    pull.add_argument("--vmid", type=int, required=True)
-    pull.add_argument("--remote", required=True)
-    pull.add_argument("--out")
-    pull.add_argument("--key")
-    pull.add_argument("--keep", action="store_true",
-                      help="keep the scratch object after download")
-    pull.add_argument("--windows", action="store_true")
-    pull.add_argument("--url-expiry", type=int, default=3600)
-    pull.add_argument("--timeout", type=int, default=600)
-    pull.add_argument("--chunk-size", type=int, metavar="MB", default=CHUNK_DEFAULT_MB,
-                      help="part size for large-file transfers (default 64)")
-    pull.add_argument("--sha256",
-                      help="expected SHA-256; skips the transfer when the "
-                           "local file already matches")
-    pull.set_defaults(func=_bind(lab, cmd_pull))
 
 
-def _register_s3(sub: Any, lab: Any) -> None:
-    from .cli import _bind
-
-    store = sub.add_parser("s3", help="scratch bucket operations")
-    store_sub = store.add_subparsers(dest="s3_command", required=True)
-    store_sub.add_parser("health").set_defaults(func=_bind(lab, cmd_s3))
-    listing = store_sub.add_parser("list")
-    listing.add_argument("--prefix", default="")
-    listing.set_defaults(func=_bind(lab, cmd_s3))
-    putter = store_sub.add_parser("put")
-    putter.add_argument("--file", required=True)
-    putter.add_argument("--key")
-    putter.set_defaults(func=_bind(lab, cmd_s3))
-    getter = store_sub.add_parser("get")
-    getter.add_argument("--key", required=True)
-    getter.add_argument("--out")
-    getter.set_defaults(func=_bind(lab, cmd_s3))
-    signer = store_sub.add_parser("presign")
-    signer.add_argument("--key", required=True)
-    signer.add_argument("--method", default="GET", choices=("GET", "PUT"))
-    signer.add_argument("--expires", type=int, default=3600)
-    signer.set_defaults(func=_bind(lab, cmd_s3))
-    remover = store_sub.add_parser("delete")
-    remover.add_argument("--key", required=True)
-    remover.set_defaults(func=_bind(lab, cmd_s3))
 
 
 def register(sub: Any, lab: Any) -> None:
@@ -2442,35 +1633,5 @@ def register(sub: Any, lab: Any) -> None:
     console = sub.add_parser("console", help="VNC, terminal and guest access")
     console_sub = console.add_subparsers(dest="console_command", required=True)
     _register_console(console_sub, lab, add_after_screenshot)
-    _register_transfer(sub, lab)
-    _register_s3(sub, lab)
-
-
-def bootstrap_guest_agent(lab: Any, api: Any, vmid: int, user: str,
-                          password: str) -> None:
-    """Install qemu-guest-agent through the serial.
-
-    Generic cloud images have no guest agent, so there is no way in until one
-    exists. The serial console is the only channel that needs nothing
-    preinstalled.
-    """
-    with TermSession(lab, api, "qemu", vmid, timeout=30) as term:
-        try:
-            term.login(user, password)
-        except (TimeoutError, RuntimeError) as exc:
-            raise lab.LabError(f"serial login to the gateway failed: {exc}")
-        term.run(
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq "
-            "&& sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
-            "qemu-guest-agent",
-            timeout=600,
-        )
-        term.run("sudo systemctl enable --now qemu-guest-agent", timeout=120)
-    if wait_agent_ready(lab, api, vmid, 180):
-        lab.audit("guest-agent-bootstrapped", vmid=vmid, via="serial")
-        return
-    raise lab.LabError(
-        "installed qemu-guest-agent over serial but the agent still does not "
-        "answer; check 'console text --vmid %s'" % vmid
-    )
-
+    transfer_module._register_transfer(sub, lab)
+    transfer_module._register_s3(sub, lab)

@@ -42,11 +42,14 @@ jobs:
           python scripts/check-secrets.py .
           python scripts/check-public.py .
           python scripts/check-release.py
+          python scripts/check-docs.py
       - name: Check shell syntax
         run: |
           for file in \
             bootstrap.sh install.sh proxmox-host-setup.sh \
-            scripts/proxmox-lab scripts/install-watchdog
+            scripts/proxmox-lab scripts/install-watchdog \
+            scripts/check \
+            src/proxmox_agent_lab/resources/*.sh
           do
             bash -n "$file"
           done

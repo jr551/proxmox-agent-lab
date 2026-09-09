@@ -114,12 +114,14 @@ A screen is read by a model. Work down this list:
    vision outage never leaves you with nothing to read.
 
 There is no OCR. Glyph matching only worked on a guest whose console font the
-controller already had; `--ocr` and `console import-font` now error with a
-pointer here and are deleted in 0.11.0. Never substitute Tesseract, crops, or
-image filters for actually looking at the screen.
+controller already had; `--ocr` and `console import-font` still exist as
+deprecated signposts that error with a pointer here. They will be removed only
+when the release notes announce a deliberate removal. Never substitute Tesseract,
+crops, or image filters for actually looking at the screen.
 
 ## 🩺 When something fails
 
+See [troubleshooting.md](troubleshooting.md) for a symptom-to-command guide.
 Work down this list before concluding the tool is broken.
 
 ```bash

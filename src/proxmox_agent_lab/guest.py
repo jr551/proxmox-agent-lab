@@ -49,8 +49,15 @@ class CommandResult:
 
     @property
     def ok(self) -> bool:
-        # A serial run cannot always report a code; absent means "no failure
-        # observed", which is the best that channel can honestly offer.
+        """True unless the command verifiably failed.
+
+        ``exit_code`` is ``None`` when the channel cannot report one -- a
+        serial run observes output but not the process status. ``None`` means
+        "no failure observed", which is the best that channel can honestly
+        offer, so ``ok`` is "succeeded or unknown", not "succeeded". Callers
+        that need a real exit code must use the agent channel or check
+        ``exit_code`` themselves.
+        """
         return self.exit_code in (0, None)
 
     def as_dict(self) -> dict[str, Any]:

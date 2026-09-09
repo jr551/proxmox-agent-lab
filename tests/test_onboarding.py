@@ -19,8 +19,9 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support import bootstrap  # noqa: E402,F401
 sys.path.insert(0, str(ROOT / "src"))
-os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(ROOT / "tests/fixtures/config.toml")
 from proxmox_agent_lab import cli, config, host_policy, onboarding as ob, onboarding_host as host
 
 

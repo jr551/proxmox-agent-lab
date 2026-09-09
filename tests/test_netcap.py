@@ -8,19 +8,14 @@ import base64
 import os
 from pathlib import Path
 
-os.environ["PROXMOX_AGENT_LAB_CONFIG"] = str(
-    Path(__file__).parent / "fixtures" / "config.toml"
-)
+import sys  # noqa: E402
 
+# Shared bootstrap: fixture configuration plus a per-process state directory,
+# applied before any proxmox_agent_lab import. `support` sits beside this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support import bootstrap  # noqa: E402,F401
 import shutil
 import tempfile
-# ...and at a disposable state directory: a test must never write into the
-# developer's real controller state. Cleared here so a previous run cannot
-# leak into this one; imports all happen before any test runs.
-_TEST_STATE = Path(tempfile.gettempdir()) / "proxmox-agent-lab-test-state"
-shutil.rmtree(_TEST_STATE, ignore_errors=True)
-_TEST_STATE.mkdir(parents=True, exist_ok=True)
-os.environ["PROXMOX_AGENT_LAB_STATE"] = str(_TEST_STATE)
 import subprocess  # noqa: E402
 import sys  # noqa: E402
 import tempfile  # noqa: E402
@@ -30,7 +25,7 @@ from unittest import mock  # noqa: E402
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import cli as LAB  # noqa: E402
-from proxmox_agent_lab import memflow as MF  # noqa: E402
+from proxmox_agent_lab import host_transport as HT  # noqa: E402
 from proxmox_agent_lab import netcap  # noqa: E402
 
 
@@ -45,7 +40,7 @@ def completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
 
 class EnableGuardTests(unittest.TestCase):
     def test_off_without_host_ssh(self) -> None:
-        with mock.patch.object(MF, "ENABLED", False):
+        with mock.patch.object(HT, "ENABLED", False):
             with self.assertRaises(LAB.LabError):
                 netcap._require_enabled(LAB)
 
@@ -129,7 +124,7 @@ class CaptureTests(unittest.TestCase):
 
         out = Path(tempfile.mkdtemp()) / "net.pcap"
         audited: dict = {}
-        with mock.patch.object(MF, "ENABLED", True), \
+        with mock.patch.object(HT, "ENABLED", True), \
              mock.patch.object(LAB, "ProxmoxAPI") as api, \
              mock.patch.object(LAB, "load_lease", return_value={}) as ll, \
              mock.patch.object(netcap, "_ssh", side_effect=fake_ssh), \

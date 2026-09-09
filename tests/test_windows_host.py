@@ -21,6 +21,9 @@ import tempfile
 import unittest
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from support import bootstrap  # noqa: E402,F401
+
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 
@@ -83,10 +86,11 @@ class WindowsImportTests(unittest.TestCase):
         """The lock stops two controllers on one machine interleaving. Without
         flock it must degrade, not raise."""
         from proxmox_agent_lab import cli as lab
+        from proxmox_agent_lab import state as state_module
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "x.lock"
-            with mock.patch.object(lab, "fcntl", None):
+            with mock.patch.object(state_module, "fcntl", None):
                 with path.open("a+") as handle:
                     lab._lock_file(handle)          # must not raise
                     # flock re-locks its own open description freely; msvcrt
@@ -100,11 +104,12 @@ class WindowsImportTests(unittest.TestCase):
         rather than pretending the lock was taken. Modelled with a fake
         msvcrt so the contention semantics are pinned on any platform."""
         from proxmox_agent_lab import cli as lab
+        from proxmox_agent_lab import state as state_module
 
         fake = _FakeMsvcrt()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "x.lock"
-            with mock.patch.object(lab, "fcntl", None), \
+            with mock.patch.object(state_module, "fcntl", None), \
                  mock.patch.dict(sys.modules, {"msvcrt": fake}):
                 with path.open("a+") as first:
                     lab._lock_file(first)           # must not raise

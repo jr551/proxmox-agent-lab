@@ -4,6 +4,23 @@ All notable changes to this project will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/).
 
+## 0.16.0 - 2026-09-10
+
+### Added
+
+- Private, pasteable connection export/import for additional development
+  machines: configuration, selected credentials and TLS trust travel together,
+  with optional explicit SSH-key transfer and fresh local controller state.
+- Optional Tailscale setup on the Proxmox host, with an explicit prompt,
+  bounded installation/login and reuse of an existing connection.
+
+### Fixed
+
+- Guided setup uses the writable private-file secret backend and reads prompts
+  from the controlling terminal when invoked through `curl | bash`.
+- Shared secret lookup accepts the audit bootstrap credential from the
+  configured local backend, including imported private files.
+
 ## 0.15.0 - 2026-09-09
 
 ### Fixed

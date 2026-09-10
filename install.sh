@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
 #
 # Installs the package, asks the one-time setup questions, writes a config,
-# stores secrets in the OS keyring, and runs the health check. Everything it
+# stores secrets in a private file, and runs the health check. Everything it
 # asks for is optional -- skip a prompt with Enter and edit the config later.
 #
 # Non-interactive:
@@ -36,15 +36,21 @@ for argument in "$@"; do
     esac
 done
 
+# Interactive prompts must also work when the installer arrives on stdin.
+PXL_INTERACTIVE=0
+if [ "$ASSUME_YES" -eq 0 ] && { exec 3<>/dev/tty; } 2>/dev/null; then
+    PXL_INTERACTIVE=1
+fi
+
 ask() { # ask VAR "prompt" "default"
     local __var=$1 __prompt=$2 __default=${3:-} __reply=""
     local __env="PXL_${__var}"
     __reply="${!__env:-}"
-    if [ -z "$__reply" ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+    if [ -z "$__reply" ] && [ "$PXL_INTERACTIVE" -eq 1 ]; then
         if [ -n "$__default" ]; then
-            read -r -p "  $__prompt [$__default]: " __reply || true
+            read -r -u 3 -p "  $__prompt [$__default]: " __reply || true
         else
-            read -r -p "  $__prompt: " __reply || true
+            read -r -u 3 -p "  $__prompt: " __reply || true
         fi
     fi
     printf -v "$__var" '%s' "${__reply:-$__default}"
@@ -63,8 +69,8 @@ ask_choice() { # ask_choice VAR "prompt" "default" choices...
 
 confirm() { # confirm "prompt"; true only for an explicit yes
     local __prompt=$1 __reply="${PXL_RECONFIGURE:-}"
-    if [ -z "$__reply" ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
-        read -r -p "  $__prompt [y/N]: " __reply || true
+    if [ -z "$__reply" ] && [ "$PXL_INTERACTIVE" -eq 1 ]; then
+        read -r -u 3 -p "  $__prompt [y/N]: " __reply || true
     fi
     [ "$__reply" = "y" ] || [ "$__reply" = "Y" ] \
         || [ "$__reply" = "yes" ] || [ "$__reply" = "YES" ]
@@ -209,6 +215,8 @@ if s3_endpoint:
     text = setkey(text, "s3", "endpoint", s3_endpoint, required=True)
     text = setkey(text, "s3", "bucket", s3_bucket, required=True)
     text = setkey(text, "s3", "region", s3_region, required=True)
+text = setkey(text, "secrets", "backend", "file", required=True)
+text = setkey(text, "secrets", "file_path", str(pathlib.Path(path).parent / "secrets.toml"), required=True)
 pathlib.Path(path).write_text(text)
 PY
     chmod 600 "$CONFIG"
@@ -218,7 +226,7 @@ fi
 # --------------------------------------------------------------- secrets ---
 keyring_unavailable() {
     local secret_name=${1:-proxmox-token}
-    warn "could not write to the OS keyring."
+    warn "could not store the secret in the configured backend."
     say  "     ${DIM}Headless box or no keyring? Choose another backend:${RESET}"
     say  "       [secrets] backend = \"file\"   # a 0600 file, in $CONFIG"
     say  "       [secrets] backend = \"env\"    # export the corresponding PROXMOX_AGENT_LAB_* variable"
@@ -226,7 +234,7 @@ keyring_unavailable() {
 }
 step "API token"
 if "$BIN" secrets list 2>/dev/null | grep -q '"proxmox-token": true'; then
-    say "  ${DIM}already stored in your keyring${RESET}"
+    say "  ${DIM}already stored${RESET}"
 elif [ -n "${PXL_TOKEN_SECRET:-}" ]; then
     if printf '%s\n' "$PXL_TOKEN_SECRET" \
          | "$BIN" secrets set proxmox-token --stdin >/dev/null 2>&1; then
@@ -234,7 +242,7 @@ elif [ -n "${PXL_TOKEN_SECRET:-}" ]; then
     else
         keyring_unavailable
     fi
-elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+elif [ "$PXL_INTERACTIVE" -eq 1 ]; then
     say "  ${DIM}Create one in Proxmox: Datacenter > Permissions > API Tokens.${RESET}"
     say "  ${DIM}Leave privilege separation ON, then grant the *token*${RESET}"
     say "  ${DIM}PVEVMAdmin on /vms. The secret is shown once.${RESET}"
@@ -253,7 +261,7 @@ if [ "${S3_BACKEND:-}" = "existing" ]; then
     step "S3 credentials"
     S3_KEY_ID_VALUE="${PXL_S3_KEY_ID_SECRET:-}"
     if "$BIN" secrets list 2>/dev/null | grep -q '"s3-key-id": true'; then
-        say "  ${DIM}already stored in your keyring${RESET}"
+        say "  ${DIM}already stored${RESET}"
     elif [ -n "$S3_KEY_ID_VALUE" ]; then
         if printf '%s\n' "$S3_KEY_ID_VALUE" \
              | "$BIN" secrets set s3-key-id --stdin >/dev/null 2>&1; then
@@ -261,7 +269,7 @@ if [ "${S3_BACKEND:-}" = "existing" ]; then
         else
             keyring_unavailable s3-key-id
         fi
-    elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+    elif [ "$PXL_INTERACTIVE" -eq 1 ]; then
         say "  ${DIM}The access key ID for your S3-compatible bucket.${RESET}"
         if "$BIN" secrets set s3-key-id; then
             say "  ${GREEN}stored${RESET}"
@@ -274,7 +282,7 @@ if [ "${S3_BACKEND:-}" = "existing" ]; then
 
     S3_SECRET_KEY_VALUE="${PXL_S3_SECRET_KEY_SECRET:-}"
     if "$BIN" secrets list 2>/dev/null | grep -q '"s3-secret-key": true'; then
-        say "  ${DIM}already stored in your keyring${RESET}"
+        say "  ${DIM}already stored${RESET}"
     elif [ -n "$S3_SECRET_KEY_VALUE" ]; then
         if printf '%s\n' "$S3_SECRET_KEY_VALUE" \
              | "$BIN" secrets set s3-secret-key --stdin >/dev/null 2>&1; then
@@ -282,8 +290,8 @@ if [ "${S3_BACKEND:-}" = "existing" ]; then
         else
             keyring_unavailable s3-secret-key
         fi
-    elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
-        say "  ${DIM}The secret key for your S3-compatible bucket; kept only in your OS keyring.${RESET}"
+    elif [ "$PXL_INTERACTIVE" -eq 1 ]; then
+        say "  ${DIM}The secret key for your S3-compatible bucket; stored in the configured private secret backend.${RESET}"
         if "$BIN" secrets set s3-secret-key; then
             say "  ${GREEN}stored${RESET}"
         else
@@ -309,3 +317,6 @@ else
     say "    proxmox-lab doctor"
     exit 1
 fi
+
+say "To connect another dev machine or agent, generate a private setup block:"
+say "  proxmox-lab connection export --out connection-setup.sh"

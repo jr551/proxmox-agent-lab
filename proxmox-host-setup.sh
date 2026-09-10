@@ -10,7 +10,8 @@
 # block to paste on your laptop. Safe to re-run: everything is idempotent, and
 # nothing that already exists is modified.
 #
-# It does NOT touch your network, storage, or existing guests.
+# Tailscale is offered explicitly; it is skipped unless accepted.
+# Storage and existing guests are not changed.
 
 set -euo pipefail
 
@@ -27,6 +28,11 @@ die()  { printf '%sx%s  %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 USER_ID="${PXL_USER:-agent@pve}"
 TOKEN_ID="${PXL_TOKEN:-lab}"
 ROLE="${PXL_ROLE:-PVEVMAdmin}"
+
+case "${PXL_TAILSCALE:-ask}" in
+    ask|yes|no) ;;
+    *) die "PXL_TAILSCALE must be ask, yes, or no" ;;
+esac
 
 [ "$(id -u)" -eq 0 ] || die "run this as root on the Proxmox host"
 command -v pveum >/dev/null 2>&1 || die "pveum not found -- is this a Proxmox host?"
@@ -138,6 +144,53 @@ else
     say "  ${DIM}Also enable Wake-on-LAN in the BIOS, or none of this helps.${RESET}"
 fi
 
+# -------------------------------------------------------------- tailscale ---
+step "Optional Tailscale access"
+TAILSCALE_IP=""
+TAILSCALE_CHOICE="${PXL_TAILSCALE:-ask}"
+if [ "$TAILSCALE_CHOICE" = "ask" ]; then
+    TAILSCALE_CHOICE="no"
+    # Read the controlling terminal: stdin may be the curl | bash script.
+    if { exec 3<>/dev/tty; } 2>/dev/null; then
+        printf '  Install/connect Tailscale on this Proxmox host for other dev machines? [y/N]: ' >&3
+        TAILSCALE_REPLY=""
+        read -r TAILSCALE_REPLY <&3 || true
+        exec 3>&-
+        case "$TAILSCALE_REPLY" in y|Y|yes|YES) TAILSCALE_CHOICE="yes" ;; esac
+    fi
+fi
+if [ "$TAILSCALE_CHOICE" = "yes" ]; then
+    if ! command -v tailscale >/dev/null 2>&1; then
+        command -v curl >/dev/null 2>&1 || die "curl is required to install Tailscale"
+        TS_INSTALLER=$(mktemp)
+        trap 'rm -f "$TS_INSTALLER"' EXIT
+        curl -fsSL --connect-timeout 15 --max-time 60 https://tailscale.com/install.sh -o "$TS_INSTALLER"
+        timeout 600 sh "$TS_INSTALLER"
+        rm -f "$TS_INSTALLER"
+        trap - EXIT
+    fi
+    timeout 30 systemctl enable --now tailscaled
+    TS_STATE=$(timeout 15 tailscale status --json 2>/dev/null | python3 -c \
+        'import json,sys; print(json.load(sys.stdin).get("BackendState", ""))' || true)
+    if [ "$TS_STATE" != "Running" ]; then
+        say "  Follow the Tailscale login URL below to join your tailnet."
+        # Host access only: do not enable subnet routing, exit-node or SSH services.
+        if ! timeout 150 tailscale up --accept-dns=false --timeout=2m; then
+            warn "Tailscale login is incomplete. Later run: tailscale up --accept-dns=false"
+        fi
+    fi
+    TS_STATE=$(timeout 15 tailscale status --json 2>/dev/null | python3 -c \
+        'import json,sys; print(json.load(sys.stdin).get("BackendState", ""))' || true)
+    if [ "$TS_STATE" = "Running" ]; then
+        TAILSCALE_IP=$(timeout 15 tailscale ip -4 2>/dev/null | head -1)
+        say "  Tailscale host address: ${TAILSCALE_IP:-unavailable}"
+        say "  Join the other dev machine to the same tailnet and allow access to the lab services."
+        say "  Tailscale cannot wake a powered-off host; keep a LAN wake relay or smart-plug power path."
+    fi
+else
+    say "  Skipped. Re-run with PXL_TAILSCALE=yes to enable it later."
+fi
+
 # --------------------------------------------------------------- summary ---
 IP=$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
 BROADCAST=$(printf '%s' "$IP" | awk -F. 'NF==4{print $1"."$2"."$3".255"}')
@@ -148,7 +201,7 @@ say "  ${DIM}~/.config/proxmox-agent-lab/config.toml${RESET}"
 say ""
 cat <<EOF
 [proxmox]
-host = "${IP:-CHANGE-ME}"
+host = "${TAILSCALE_IP:-${IP:-CHANGE-ME}}"
 node = "$NODE"
 token_user = "$USER_ID"
 token_name = "$TOKEN_ID"

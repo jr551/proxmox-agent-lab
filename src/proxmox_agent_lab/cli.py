@@ -1163,6 +1163,7 @@ def parser() -> argparse.ArgumentParser:
 
     from . import android
     from . import console
+    from . import connection
     from . import disk
     from . import guest
     from . import longterm
@@ -1182,6 +1183,7 @@ def parser() -> argparse.ArgumentParser:
 
     android.register(sub, _module())
     console.register(sub, _module())
+    connection.register(sub, _module())
     disk.register(sub, _module())
     guest.register(sub, _module())
     longterm.register(sub, _module())

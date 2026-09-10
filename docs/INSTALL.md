@@ -119,6 +119,9 @@ pveum user token add agent@pve lab --privsep 1
 pveum acl modify /vms --tokens 'agent@pve!lab' --roles PVEVMAdmin
 ```
 
+For optional Tailscale host access and a pasteable configuration/credential
+handoff to another dev machine, see [Share a lab connection](connections.md).
+
 ## 4. One-time controller setup
 
 On the machine you drive from — your laptop, not the lab host — run the
@@ -130,8 +133,8 @@ curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/instal
 
 It installs the CLI isolated via `pipx` when available, otherwise `pip --user`
 (`install.sh:96-104`), asks for the Proxmox address, node, API-token identity,
-power details, audit backend, and S3 scratch bucket, stores secrets in the
-configured secret backend, writes a mode-600 config, and runs `doctor`. If you want an agent to
+power details and S3 scratch bucket, stores secrets in a private mode-600 file,
+writes a mode-600 config, and runs `doctor`. Prompts also work through `curl | bash`. If you want an agent to
 drive the install, copy the template in [Agent first message](#agent-first-message).
 
 Re-run it with `--configure` to safely replace configuration answers

@@ -32,6 +32,7 @@ class GuidedSetupTests(unittest.TestCase):
                 "case \"$1\" in\n"
                 "  --version) echo proxmox-lab-test ;;\n"
                 "  init) cat > \"$3\" <<'EOF'\n"
+                "[secrets]\nbackend = \"auto\"\nfile_path = \"\"\n"
                 "[proxmox]\n"
                 "host = \"\"\nnode = \"\"\ntoken_user = \"\"\ntoken_name = \"\"\n"
                 "[power]\nmac = \"\"\nbroadcast = \"\"\n"
@@ -68,6 +69,8 @@ class GuidedSetupTests(unittest.TestCase):
 
         self.assertIn('host = "192.0.2.9"', text)
         self.assertIn('token_user = "agent@pve"', text)
+        self.assertIn('backend = "file"', text)
+        self.assertIn('secrets.toml"', text)
         # The install no longer asks about audit backends at all: the ledger is
         # provisioned once with 'journal host-setup' and shared from there.
         self.assertNotIn("pocketbase", text)
@@ -84,6 +87,7 @@ class GuidedSetupTests(unittest.TestCase):
             "case \"$1\" in\n"
             "  --version) echo proxmox-lab-test ;;\n"
             "  init) cat > \"$3\" <<'EOF'\n"
+            "[secrets]\nbackend = \"auto\"\nfile_path = \"\"\n"
             "[proxmox]\n"
             "host = \"\"\nnode = \"\"\ntoken_user = \"\"\ntoken_name = \"\"\n"
             "[power]\nmac = \"\"\nbroadcast = \"\"\n"

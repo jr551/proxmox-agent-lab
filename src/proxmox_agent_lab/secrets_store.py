@@ -30,6 +30,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 
 from .config import APP_NAME, Config
 
@@ -150,16 +151,19 @@ def _read_shared(config: Config, name: str) -> str | None:
     missing shared store must fall through to the local ones rather than
     turning every command into an error.
     """
-    # No bootstrap credential means nothing to authenticate with, so there is
-    # nothing to ask. Checked first because it is a dict lookup, where trying
-    # the connection anyway would block until the socket timed out on every
-    # secret read -- including in tests and on a laptop away from the lab.
-    if not os.environ.get(_env_name(BOOTSTRAP_SECRET)):
+    # Resolve the bootstrap locally before trying the network. get() never
+    # consults the shared store for BOOTSTRAP_SECRET, so this cannot recurse.
+    # It also lets an imported private-file connection use the shared store.
+    try:
+        bootstrap = get(config, BOOTSTRAP_SECRET, required=False)
+    except SecretError:
+        return None
+    if not bootstrap:
         return None
     try:
         from . import journal as _journal
 
-        settings = _journal.settings_from_config(config)
+        settings = _journal.settings_from_config(config, bootstrap)
         if settings is None:
             return None
         from . import mariadb as _mariadb
@@ -297,11 +301,23 @@ def store(config: Config, name: str, value: str) -> str:
         # a secret containing quotes can no longer corrupt the whole store
         # (audit 2026-08-24).
         body = "".join(
-            f'{key} = {json.dumps(val)}\n'
+            f'{json.dumps(key)} = {json.dumps(val)}\n'
             for key, val in sorted(existing.items())
         )
-        path.write_text("# proxmox-agent-lab secrets. Keep this file at 0600.\n" + body)
-        path.chmod(0o600)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=".secrets-", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write("# proxmox-agent-lab secrets. Keep this file at 0600.\n" + body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
     elif backend == "env":
         raise SecretError(
             "the env backend is read-only; export "

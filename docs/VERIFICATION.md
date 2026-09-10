@@ -7,6 +7,17 @@ and off — and, just as usefully, what has not.
 Read it as a statement of confidence, not a feature list. Anything marked
 "unit-tested only" may work; it has simply never been watched working.
 
+## Connection setup (2026-09-10)
+
+**Offline-tested only.** Tests execute the generated shell handoff against
+fake interpreter/CLI commands, round-trip quoted and multiline credentials,
+verify private file modes, reject malformed and overwriting imports, and
+check shared-store lookup with a file-backed bootstrap credential. Host setup
+runs with fake Proxmox/Tailscale commands covering decline, existing login,
+bounded failed login and invalid choices. No real Tailscale installation,
+tailnet enrollment, host networking change or second-machine connection was
+performed for this release.
+
 ## Post-merge regression review (2026-09-09)
 
 Offline tests exercise `power-on` and `lease-begin` through the public facade

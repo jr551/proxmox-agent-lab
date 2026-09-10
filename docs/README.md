@@ -71,3 +71,5 @@ Then follow one of:
 - **[AGENTS.md](../AGENTS.md)** (repository root) — architecture, conventions,
   and important files for contributors.
 - **[AUDIT-2026-08-24.md](AUDIT-2026-08-24.md)** — historical security review.
+
+- [Share a lab connection](connections.md): pasteable dev-machine setup and optional host Tailscale.

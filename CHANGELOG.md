@@ -13,6 +13,14 @@ All notable changes to this project will be documented here. The format follows
   with optional explicit SSH-key transfer and fresh local controller state.
 - Optional Tailscale setup on the Proxmox host, with an explicit prompt,
   bounded installation/login and reuse of an existing connection.
+- `virtio queues`: bounded, read-only virtqueue sampling through the QEMU
+  monitor with conservative split/packed-ring interpretation and explicit
+  unavailable states.
+- `io-workload`: deterministic record/replay of bounded scratch-file I/O with
+  portable JSONL traces, also runnable inside a guest via
+  `python -m proxmox_agent_lab.ioworkload`.
+- `crash`: offline, build-pinned crash address symbolization using a local
+  llvm-symbolizer, with SHA-256-verified module manifests.
 
 ### Fixed
 

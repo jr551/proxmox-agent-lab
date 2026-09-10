@@ -164,5 +164,137 @@ class InspectTests(unittest.TestCase):
             virtio.cmd_inspect(lab, args)
 
 
+QUEUE_PATH = "/machine/peripheral/virtio-net-0"
+
+
+def _queue_raw(*, used: int, avail: int = 10, inuse: int = 2) -> str:
+    return (
+        f"{QUEUE_PATH}:\n"
+        "  device_name:          virtio-net\n"
+        "  queue_index:          0\n"
+        f"  inuse:                {inuse}\n"
+        f"  used_idx:             {used}\n"
+        "  signalled_used:       9\n"
+        "  signalled_used_valid: true\n"
+        f"  last_avail_idx:       {avail}\n"
+        "  VRing:\n"
+        "    num:          256\n"
+        "    num_default:  256\n"
+        "    align:        4096\n"
+        "    desc:         0x0000000012340000\n"
+        "    avail:        0x0000000012350000\n"
+        "    used:         0x0000000012360000\n"
+        "  future_field:         retained\n"
+    )
+
+
+class QueueTests(unittest.TestCase):
+    def _api(self, responses: list[str]) -> mock.Mock:
+        api = mock.Mock()
+        iterator = iter(responses)
+
+        def call(method: str, path: str, data: dict | None = None):
+            if path.endswith("/status/current"):
+                return {"status": "running"}
+            if path.endswith("/monitor"):
+                command = (data or {}).get("command", "")
+                if command.startswith("info virtio-queue-status"):
+                    return next(iterator)
+                if command.startswith("info virtio-queue-element"):
+                    return ("/machine/peripheral/virtio-net-0:\n"
+                            "  device_name: virtio-net\n  index: 2\n"
+                            "  desc:\n    descs:\n"
+                            "        addr 0xff66000 len 1518 (write),\n"
+                            "  avail:\n    flags: 1\n    idx: 4\n    ring: 0\n"
+                            "  used:\n    flags: 1\n    idx: 3\n")
+            raise AssertionError(f"unexpected API call {method} {path} {data}")
+
+        api.call.side_effect = call
+        return api
+
+    def test_parser_retains_raw_unknown_fields_and_known_vring_fields(self) -> None:
+        parsed = virtio.parse_queue_status(_queue_raw(used=4))
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["fields"]["used_idx"], 4)
+        self.assertEqual(parsed["fields"]["vring_desc"], 0x12340000)
+        self.assertEqual(parsed["unknown_fields"][0]["key"], "vring_future_field")
+
+    def test_split_wrap_is_one_and_reset_is_unavailable(self) -> None:
+        old = {"parsed": virtio.parse_queue_status(_queue_raw(used=65535))}
+        new = {"parsed": virtio.parse_queue_status(_queue_raw(used=0))}
+        delta = virtio._queue_deltas([old, new], "split")[0]
+        self.assertEqual(delta["used_idx"], 1)
+        self.assertTrue(delta["fields"]["used_idx"]["wrapped"])
+        reset = virtio._counter_delta(100, 2, "split")
+        self.assertIsNone(reset["delta"])
+        self.assertTrue(reset["reset"])
+
+    def test_packed_does_not_use_split_counter_arithmetic(self) -> None:
+        old = {"parsed": virtio.parse_queue_status(_queue_raw(used=10))}
+        new = {"parsed": virtio.parse_queue_status(_queue_raw(used=11))}
+        delta = virtio._queue_deltas([old, new], "packed")[0]
+        self.assertNotIn("used_idx", delta)
+        self.assertIsNone(delta["fields"]["used_idx"]["delta"])
+        self.assertEqual(delta["fields"]["used_idx"]["available"], False)
+
+    def test_sampling_uses_exact_status_queries_and_reports_candidate(self) -> None:
+        api = self._api([_queue_raw(used=10), _queue_raw(used=10)])
+        lab = _Lab(api)
+        result = virtio.sample_queues(
+            lab, api, 9001, path=QUEUE_PATH, queue=0, samples=2,
+            interval=0, deadline=5, ring_format="split",
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["interpretation"]["stalled_candidate"], True)
+        self.assertEqual(result["interpretation"]["status"], "candidate")
+        self.assertEqual(result["snapshots"][0]["raw"], _queue_raw(used=10))
+        calls = [c for c in api.call.call_args_list if c.args[0] == "POST"]
+        self.assertEqual(
+            [c.args[2]["command"] for c in calls],
+            [f"info virtio-queue-status {QUEUE_PATH} 0"] * 2,
+        )
+
+    def test_unsupported_status_is_explicitly_unavailable(self) -> None:
+        api = mock.Mock()
+        api.call.side_effect = lambda method, path, data=None: (
+            {"status": "running"} if path.endswith("/status/current")
+            else (_ for _ in ()).throw(RuntimeError("HMP command unavailable"))
+        )
+        result = virtio.sample_queues(
+            _Lab(api), api, 9001, path=QUEUE_PATH, queue=0,
+            samples=2, interval=0, deadline=5, ring_format="split",
+        )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNone(result["interpretation"]["stalled_candidate"])
+
+    def test_path_injection_is_rejected_before_any_api_call(self) -> None:
+        api = mock.Mock()
+        lab = _Lab(api)
+        with self.assertRaisesRegex(RuntimeError, "absolute virtio"):
+            virtio.sample_queues(
+                lab, api, 9001,
+                path=f"{QUEUE_PATH}; system_powerdown", queue=0,
+            )
+        api.call.assert_not_called()
+
+    def test_optional_element_uses_bounded_read_only_command(self) -> None:
+        api = self._api([_queue_raw(used=10)])
+        result = virtio.sample_queues(
+            _Lab(api), api, 9001, path=QUEUE_PATH, queue=0, samples=1,
+            interval=0, deadline=5, ring_format="split", element_index=2,
+        )
+        self.assertEqual(result["element"]["status"], "ok")
+        element_fields = result["element"]["parsed"]["fields"]
+        self.assertEqual(element_fields["avail_idx"], 4)
+        self.assertEqual(element_fields["used_idx"], 3)
+        self.assertEqual(element_fields["index"], 2)
+        self.assertIn("addr 0xff66000 len 1518 (write),",
+                      result["element"]["parsed"]["unknown_lines"][0])
+        self.assertIn(
+            f"info virtio-queue-element {QUEUE_PATH} 0 2",
+            [c.args[2]["command"] for c in api.call.call_args_list if c.args[0] == "POST"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

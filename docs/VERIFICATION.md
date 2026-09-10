@@ -31,6 +31,31 @@ both a foreign protocol and a mixed offered/foreign list.
 These fixes are **unit-tested only** in this review. No live host, guest,
 network configuration, or power transition was exercised.
 
+## Diagnostics tooling review (2026-09-10)
+
+`virtio queues` parsing, counter deltas, stalled-candidate interpretation,
+monitor-command allowlisting, and argument bounds are unit-tested with fake
+API responses. `io-workload` record/replay/analyze and `crash`
+manifest/symbolize are exercised offline against temporary files and a fake
+symbolizer; a real `llvm-symbolizer` invocation is covered only when the tool
+is installed.
+
+Hardware-verified 2026-09-10 on aipve (QEMU 11.0.0, VM with virtio-net +
+virtio-scsi disk): `virtio queues` sampled a live queue through the Proxmox
+monitor API, parsed real `info virtio-queue-status` and
+`info virtio-queue-element` output, and reported `progress-or-idle` for an
+idle queue. Real output exposed two fixes: QEMU 11.0 omits
+`shadow_avail_idx` (now optional for interpretation) and queue-element nests
+`desc`/`avail`/`used` sections (now prefixed to avoid key collisions).
+`io-workload` record/analyze/replay and `crash` manifest-create/symbolize were
+run end-to-end locally, including a real `llvm-symbolizer` invocation against
+an ELF binary fetched from the host. `connection` export/import was verified
+with a real round-trip: imported config passed `doctor` against the live host.
+
+Note: the QEMU monitor endpoint requires `Sys.Audit` (or `Sys.Modify`) on the
+VM path; tokens with `privsep: 0` inherit the owning user's ACLs, so the grant
+must go to the user.
+
 ## Internal restructure (2026-09-07)
 
 The post-0.14.1 cleanup split `cli.py`/`console.py`/`memflow.py` internals

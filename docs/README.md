@@ -73,3 +73,6 @@ Then follow one of:
 - **[AUDIT-2026-08-24.md](AUDIT-2026-08-24.md)** — historical security review.
 
 - [Share a lab connection](connections.md): pasteable dev-machine setup and optional host Tailscale.
+- [VirtIO queue inspection](virtio-queues.md): read-only virtqueue sampling through the QEMU monitor.
+- [Portable I/O workloads](io-workloads.md): record and replay bounded scratch-file I/O traces.
+- [Offline crash reports](crash-reports.md): build-pinned address symbolization with a local llvm-symbolizer.

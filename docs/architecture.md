@@ -13,9 +13,10 @@ up into handlers.
 ```text
 cli.py                      parser, command policy gates, the lab facade
   |
-  +-- feature modules       android, console, disk, diskactivity, guest,
-  |   (register(sub, lab))  isoinspect, longterm, memflow, netcap, netgw,
-  |                         oci, onboarding, pe, recipes, share, storage,
+  +-- feature modules       android, connection, console, crash, disk,
+  |   (register(sub, lab))  diskactivity, guest, ioworkload, isoinspect,
+  |                         longterm, memflow, netcap, netgw, oci,
+  |                         onboarding, pe, recipes, share, storage,
   |                         usb, virtio, windows
   |
   +-- lifecycle             leases, cleanup, diagnostics

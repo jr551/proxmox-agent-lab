@@ -1164,12 +1164,14 @@ def parser() -> argparse.ArgumentParser:
     from . import android
     from . import console
     from . import connection
+    from . import crash
     from . import disk
     from . import guest
     from . import longterm
     from . import memflow
     from . import netcap
     from . import netgw
+    from . import ioworkload
     from . import isoinspect
     from . import oci
     from . import onboarding
@@ -1184,12 +1186,14 @@ def parser() -> argparse.ArgumentParser:
     android.register(sub, _module())
     console.register(sub, _module())
     connection.register(sub, _module())
+    crash.register(sub, _module())
     disk.register(sub, _module())
     guest.register(sub, _module())
     longterm.register(sub, _module())
     memflow.register(sub, _module())
     netcap.register(sub, _module())
     netgw.register(sub, _module())
+    ioworkload.register(sub, _module())
     isoinspect.register(sub, _module())
     oci.register(sub, _module())
     onboarding.register(sub, _module())

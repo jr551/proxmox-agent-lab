@@ -119,8 +119,10 @@ def prepare(args) -> dict:
             raise ValueError("ISO setup requires --disk-serial, --root-password-hash-file and --wipe-confirmed")
         answer = answer_file(settings, Path(args.root_password_hash_file).read_text().strip(),
                              args.disk_serial, args.country, args.timezone, args.keyboard, args.email)
-    elif any((args.disk_serial, args.root_password_hash_file, args.wipe_confirmed)):
+    elif args.mode == "vps" and any((args.disk_serial, args.root_password_hash_file, args.wipe_confirmed)):
         raise ValueError("VPS setup does not partition disks; omit ISO disk/password options")
+    elif args.mode == "existing" and any((args.disk_serial, args.root_password_hash_file, args.wipe_confirmed)):
+        raise ValueError("Existing-host onboarding does not partition disks; omit ISO disk/password options")
     directory = Path(args.directory).expanduser().resolve()
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     try:
@@ -139,8 +141,12 @@ def prepare(args) -> dict:
             private_write(directory / "answer.toml", answer)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError(f"Could not generate pairing bundle ({type(exc).__name__}); remove the incomplete directory before retrying") from None
+    next_step = ("onboard build-iso" if answer else
+                 "copy host-setup.py to the VPS and run with --host-change-authorized --reboot-authorized"
+                 if args.mode == "vps" else
+                 "copy host-setup.py to the Proxmox host and run with --host-change-authorized")
     return {"bundle": str(directory), "mode": args.mode, "expires_at": settings["expires_at"],
-            "next": "onboard build-iso" if answer else "copy host-setup.py to the VPS and run with --host-change-authorized --reboot-authorized"}
+            "next": next_step}
 
 
 def _is_ip(value):
@@ -412,7 +418,7 @@ def register(sub, lab):
     root = sub.add_parser("onboard", help="Generate an installer and pair a new lab host (experimental)")
     actions = root.add_subparsers(dest="onboard_action", required=True)
     p = actions.add_parser("prepare")
-    p.add_argument("--mode", choices=("iso", "vps"), required=True)
+    p.add_argument("--mode", choices=("iso", "vps", "existing"), required=True)
     p.add_argument("--directory", required=True)
     p.add_argument("--controller-host", required=True)
     p.add_argument("--port", type=int, default=8843)

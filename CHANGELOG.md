@@ -5,6 +5,17 @@ All notable changes to this project will be documented here. The format follows
 [Semantic Versioning](https://semver.org/).
 
 
+## 0.18.0 - 2026-09-10
+
+### Added
+
+- `onboard prepare --mode existing`: onboard a machine that already runs
+  Proxmox without reinstalling. The generated `host-setup.py` verifies
+  `pveum`, then provisions the API principal, ACLs, isolated guest bridge,
+  Wake-on-LAN and pairing — the same end state as the ISO path. It needs only
+  `--host-change-authorized` (no reboot), grants the power role, and enrolls
+  with `guest_mode = "all"`. The README now shows both onboarding paths.
+
 ## 0.17.0 - 2026-09-10
 
 ### Added

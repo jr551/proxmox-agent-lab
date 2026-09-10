@@ -273,7 +273,7 @@ def provision(settings, state):
         for path, role in (("/vms", "PVEVMAdmin"), ("/storage", "PVEDatastoreAdmin"), (f"/nodes/{node}", "PVEAuditor")):
             run("pveum", "acl", "modify", path, *target, "--roles", role)
     wol = ""
-    if settings["mode"] == "iso":
+    if settings["mode"] in ("iso", "existing"):
         roles = json.loads(run("pveum", "role", "list", "--output-format", "json"))
         role = "PXLOnboardingPower"
         if not any(r.get("roleid") == role for r in roles):
@@ -342,6 +342,11 @@ def entry(settings):
             if not {"--host-change-authorized", "--reboot-authorized"}.issubset(sys.argv):
                 raise RuntimeError("VPS installation requires --host-change-authorized --reboot-authorized")
             vps_preflight()
+        if settings["mode"] == "existing" and not resume:
+            if "--host-change-authorized" not in sys.argv:
+                raise RuntimeError("Existing-host onboarding requires --host-change-authorized")
+            if not shutil.which("pveum"):
+                raise RuntimeError("Proxmox is not installed on this host")
         ROOT.mkdir(mode=0o700, exist_ok=True)
         state.mkdir(mode=0o700, exist_ok=True)
         if not resume:
@@ -372,9 +377,6 @@ WantedBy=multi-user.target
             run("systemctl", "start", "--no-block", SERVICE.name)
             print("Onboarding service installed; check systemctl status proxmox-agent-lab-onboarding")
             return
-        if not (state / "host-setup.py").exists():
-            raise RuntimeError("Resume requires an authorized, installed onboarding service")
-        os.environ["DEBIAN_FRONTEND"] = "noninteractive"
         if settings["mode"] == "vps":
             stage = (state / "stage").read_text() if (state / "stage").exists() else "new"
             if stage == "new":
@@ -382,6 +384,8 @@ WantedBy=multi-user.target
                 return
             if stage == "kernel-installed":
                 install_proxmox(state)
+        # "existing" skips the Debian→Proxmox install entirely and goes
+        # straight to provisioning the API principal, bridge and pairing.
         payload_path = state / "enrollment.json"
         payload = json.loads(payload_path.read_text()) if payload_path.exists() else provision(settings, state)
         callback(settings, payload)

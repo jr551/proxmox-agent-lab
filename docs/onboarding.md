@@ -190,6 +190,36 @@ packages or that root cannot bypass it. Proxmox's VM permissions cover both
 QEMU and LXC. LXC shares the VPS kernel; do not use this path for untrusted
 code, malware, kernel debugging, Windows, Android or device emulation.
 
+## Existing Proxmox host
+
+Onboard a machine that **already runs Proxmox** without reinstalling. The
+`existing` mode skips the Debian→Proxmox install entirely: `host-setup.py`
+verifies `pveum` is present, then provisions the API principal, ACLs, isolated
+guest bridge, Wake-on-LAN and pairing — the same end state as the ISO path.
+
+```bash
+proxmox-lab onboard prepare --mode existing \
+  --directory ~/pxl-host-bundle \
+  --controller-host pc.example.com \
+  --fqdn lab.example.com
+
+proxmox-lab onboard serve --bundle ~/pxl-host-bundle \
+  --config-out ~/.config/proxmox-agent-lab/new-lab.toml
+```
+
+Copy `host-setup.py` to the Proxmox host over authenticated SSH and run it as
+root. It changes host configuration (API user, ACLs, bridge, WoL) but does not
+reboot, so only `--host-change-authorized` is needed:
+
+```bash
+python3 host-setup.py --host-change-authorized
+```
+
+Because this is a physical host, the issued token receives the
+`PXLOnboardingPower` role and `guest_mode = "all"` — QEMU guests and verified
+power-off work the same as an ISO-installed host. Set up a supported power-on
+method (WoL or otherwise) before the first lease if the machine has none.
+
 ## Finish and recover
 
 Point the controller at the generated file:

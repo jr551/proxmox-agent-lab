@@ -71,6 +71,44 @@ class OnboardingTests(unittest.TestCase):
             ob.prepare(args)
         mkdir.assert_not_called()
 
+    def test_existing_mode_onboards_installed_proxmox_without_disk_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "bundle"
+            args = cli.parser().parse_args([
+                "onboard", "prepare", "--mode", "existing", "--directory", str(directory),
+                "--controller-host", "127.0.0.1", "--fqdn", "pve.example.invalid",
+            ])
+            result = ob.prepare(args)
+            self.assertEqual(result["mode"], "existing")
+            self.assertIn("host-setup.py", result["next"])
+            self.assertNotIn("reboot-authorized", result["next"])
+            compile((directory / "host-setup.py").read_text(), "host-setup.py", "exec")
+            self.assertFalse((directory / "answer.toml").exists())
+            settings = ob.read_bundle(directory)
+            self.assertEqual(settings["mode"], "existing")
+            # Disk/partition options are meaningless for an installed host.
+            bad = cli.parser().parse_args([
+                "onboard", "prepare", "--mode", "existing", "--directory", str(Path(tmp) / "b2"),
+                "--controller-host", "127.0.0.1", "--fqdn", "pve.example.invalid",
+                "--disk-serial", "X", "--root-password-hash-file", "/dev/null", "--wipe-confirmed",
+            ])
+            with self.assertRaisesRegex(ValueError, "does not partition disks"):
+                ob.prepare(bad)
+
+    def test_existing_mode_accept_grants_full_guest_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            settings = {**self.settings, "mode": "existing"}
+            payload = {**self.payload(), "mode": "existing", "wol_mac": "aa:bb:cc:dd:ee:ff"}
+            ob.private_write(directory / "enrollment.json", json.dumps(payload))
+            output = directory / "config.toml"
+            response = io.BytesIO(b'{"data":{"uptime":123}}')
+            with mock.patch.object(ob, "read_bundle", return_value=settings), \
+                 mock.patch.object(ob.request.OpenerDirector, "open", return_value=response):
+                self.assertTrue(ob.accept(directory, output)["api_verified"])
+            configured = config.load(output)
+            self.assertEqual(configured.proxmox.guest_mode, "all")
+
     def test_wifi_passphrase_is_derived_and_never_in_generated_script(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

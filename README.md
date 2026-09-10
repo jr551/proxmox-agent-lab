@@ -45,6 +45,44 @@ Full setup — Proxmox host preparation and the audit ledger — is in
 [docs/INSTALL.md](docs/INSTALL.md). Every setting is in
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
+### Onboard a host
+
+Two ways to bring a machine under `proxmox-lab` control. Both end with
+`onboard serve` on the controller receiving the pairing callback and writing a
+verified config.
+
+**💿 New host — boot an auto-install ISO.** Generate a pairing bundle, build a
+Proxmox ISO that installs the host and pairs it on first boot, then boot the
+spare PC from it (UEFI required):
+
+```bash
+proxmox-lab onboard prepare --mode iso --directory ~/pxl-pc-bundle \
+  --controller-host pc.example.com --fqdn lab.example.com \
+  --disk-serial "$TARGET_DISK_ID_SERIAL" \
+  --root-password-hash-file ~/pxl-root-password.hash --wipe-confirmed
+proxmox-lab onboard build-iso --bundle ~/pxl-pc-bundle \
+  --source ~/Downloads/proxmox-ve.iso --sha256 "$OFFICIAL_ISO_SHA256"
+proxmox-lab onboard serve --bundle ~/pxl-pc-bundle \
+  --config-out ~/.config/proxmox-agent-lab/new-lab.toml
+```
+
+**🖥️ Existing Proxmox host — pair in place.** On a machine that already runs
+Proxmox, generate a bundle, copy `host-setup.py` to it, and run it as root to
+create the API principal, isolated bridge and pairing — no reinstall:
+
+```bash
+proxmox-lab onboard prepare --mode existing --directory ~/pxl-host-bundle \
+  --controller-host pc.example.com --fqdn lab.example.com
+proxmox-lab onboard serve --bundle ~/pxl-host-bundle \
+  --config-out ~/.config/proxmox-agent-lab/new-lab.toml
+# on the Proxmox host, as root:
+python3 host-setup.py --host-change-authorized
+```
+
+A fresh Debian VPS (no Proxmox yet) uses `--mode vps` instead — it installs
+the Proxmox kernel and packages first. Details and the Wi-Fi option are in
+[docs/onboarding.md](docs/onboarding.md).
+
 ## First safe workflow
 
 Every task follows this shape. `lease-end` sits in a `trap` so it runs even if

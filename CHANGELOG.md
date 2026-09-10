@@ -21,6 +21,11 @@ All notable changes to this project will be documented here. The format follows
   `python -m proxmox_agent_lab.ioworkload`.
 - `crash`: offline, build-pinned crash address symbolization using a local
   llvm-symbolizer, with SHA-256-verified module manifests.
+- `host sensors` and `host macs`: read-only host temperature and interface
+  inspection over the opt-in SSH channel.
+- `power.wowlan_mac`: optional wireless NIC MAC; `wake-on-lan+home-assistant`
+  now sends the wired magic packet, the Home Assistant call, and a silent
+  WoWLAN attempt concurrently instead of sequentially.
 
 ### Fixed
 

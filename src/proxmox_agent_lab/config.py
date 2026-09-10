@@ -59,6 +59,7 @@ DEFAULTS: dict[str, Any] = {
         # | wake-on-lan+home-assistant | command | none
         "mode": "wake-on-lan",
         "mac": "",
+        "wowlan_mac": "",
         "broadcast": "255.255.255.255",
         "wol_port": 9,
         "boot_timeout_seconds": 300,
@@ -354,6 +355,7 @@ long_term_backup_keep = 2
 mode = "wake-on-lan"         # wake-on-lan | home-assistant
                              # | wake-on-lan+home-assistant | command | none
 mac = "aa:bb:cc:dd:ee:ff"
+# wowlan_mac = ""  # optional wireless NIC MAC; wake is attempted silently
 broadcast = "192.168.1.255"
 boot_timeout_seconds = 300
 

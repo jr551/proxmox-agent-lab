@@ -76,3 +76,4 @@ Then follow one of:
 - [VirtIO queue inspection](virtio-queues.md): read-only virtqueue sampling through the QEMU monitor.
 - [Portable I/O workloads](io-workloads.md): record and replay bounded scratch-file I/O traces.
 - [Offline crash reports](crash-reports.md): build-pinned address symbolization with a local llvm-symbolizer.
+- [Host hardware inspection](host-info.md): temperature sensors and interface MACs over the opt-in SSH channel.

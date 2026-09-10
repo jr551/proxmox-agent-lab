@@ -30,6 +30,7 @@ import json
 import shlex
 import socket
 import subprocess
+import threading
 from typing import Any
 from urllib import error, request
 
@@ -131,21 +132,57 @@ def power_on(config: Config) -> dict[str, Any]:
             "power.mac", "the lab machine's NIC MAC, with Wake-on-LAN enabled in its BIOS"
         )
         entity = config.require("power.entity_on", "a Home Assistant script entity")
-        errors: list[str] = []
-        try:
-            wake_on_lan(mac, config.power.get("broadcast", ""),
-                        int(config.power.get("wol_port", 9)))
-        except PowerError as exc:
-            errors.append(f"wake-on-lan: {exc}")
-        try:
-            _home_assistant(config, entity)
-        except PowerError as exc:
-            errors.append(f"home-assistant: {exc}")
-        if len(errors) == 2:
-            raise PowerError("; ".join(errors))
+        broadcast = config.power.get("broadcast", "")
+        port = int(config.power.get("wol_port", 9))
+        wowlan_mac = config.power.get("wowlan_mac", "")
+
+        results: dict[str, str | None] = {"wowlan": "not configured"}
+
+        def _wol() -> None:
+            try:
+                wake_on_lan(mac, broadcast, port)
+                results["wake-on-lan"] = None
+            except PowerError as exc:
+                results["wake-on-lan"] = str(exc)
+
+        def _ha() -> None:
+            try:
+                _home_assistant(config, entity)
+                results["home-assistant"] = None
+            except PowerError as exc:
+                results["home-assistant"] = str(exc)
+
+        def _wowlan() -> None:
+            # Wireless wake is best-effort: many NICs drop the magic packet
+            # when associated, and a failure must never block the wired path.
+            try:
+                wake_on_lan(wowlan_mac, broadcast, port)
+                results["wowlan"] = None
+            except PowerError as exc:
+                results["wowlan"] = str(exc)
+
+        threads = [threading.Thread(target=_wol, daemon=True),
+                   threading.Thread(target=_ha, daemon=True)]
+        if wowlan_mac:
+            threads.append(threading.Thread(target=_wowlan, daemon=True))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        errors = [f"{name}: {err}" for name, err in results.items()
+                  if err and name != "wowlan"]
+        if results.get("wake-on-lan") and results.get("home-assistant"):
+            raise PowerError("; ".join(
+                f"{name}: {results[name]}" for name in ("wake-on-lan", "home-assistant")))
         return {
-            "mode": mode, "sent": "magic packet + home-assistant script",
-            "mac": mac, "entity_id": entity, "errors": errors or None,
+            "mode": mode,
+            "sent": "magic packet + home-assistant script"
+                    + (" + wowlan" if wowlan_mac else ""),
+            "mac": mac, "entity_id": entity,
+            "wowlan_mac": wowlan_mac or None,
+            "wowlan": results.get("wowlan"),
+            "errors": errors or None,
         }
     if mode == "command":
         command = config.require("power.on_command")

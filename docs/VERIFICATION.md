@@ -31,6 +31,14 @@ both a foreign protocol and a mixed offered/foreign list.
 These fixes are **unit-tested only** in this review. No live host, guest,
 network configuration, or power transition was exercised.
 
+## Host inspection and power-on (2026-09-10)
+
+`host sensors` and `host macs` were run against aipve over the configured SSH
+channel: k10temp/amdgpu (~87-97 degC under load), nvme (60-65 degC), and the
+wireless interface `wlp1s0` (MAC `e4:42:a6:e7:65:da`) were reported correctly.
+The parallel `wake-on-lan+home-assistant` path and silent WoWLAN are
+unit-tested; the concurrent send itself was not timed on hardware.
+
 ## Diagnostics tooling review (2026-09-10)
 
 `virtio queues` parsing, counter deltas, stalled-candidate interpretation,

@@ -170,6 +170,31 @@ class PowerTests(unittest.TestCase):
         self.assertIn("wol down", str(caught.exception))
         self.assertIn("ha down", str(caught.exception))
 
+    def test_composite_mode_wowlan_is_silent_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+            config.power._values["wowlan_mac"] = "e4:42:a6:e7:65:da"
+        calls = []
+        def wol(mac, broadcast, port):
+            calls.append(mac)
+            if mac == "e4:42:a6:e7:65:da":
+                raise power_module.PowerError("wlan unreachable")
+        with mock.patch.object(power_module, "wake_on_lan", side_effect=wol), \
+             mock.patch.object(power_module, "_home_assistant"):
+            result = power_module.power_on(config)
+        self.assertIsNone(result["errors"])
+        self.assertEqual(result["wowlan"], "wlan unreachable")
+        self.assertIn("e4:42:a6:e7:65:da", calls)
+
+    def test_composite_mode_wowlan_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._composite_config(tmp)
+        with mock.patch.object(power_module, "wake_on_lan"), \
+             mock.patch.object(power_module, "_home_assistant"):
+            result = power_module.power_on(config)
+        self.assertEqual(result["wowlan"], "not configured")
+        self.assertIsNone(result["wowlan_mac"])
+
     def test_composite_mode_force_off_goes_through_home_assistant(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._composite_config(tmp)

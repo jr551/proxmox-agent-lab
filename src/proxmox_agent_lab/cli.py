@@ -1167,6 +1167,7 @@ def parser() -> argparse.ArgumentParser:
     from . import crash
     from . import disk
     from . import guest
+    from . import hostinfo
     from . import longterm
     from . import memflow
     from . import netcap
@@ -1189,6 +1190,7 @@ def parser() -> argparse.ArgumentParser:
     crash.register(sub, _module())
     disk.register(sub, _module())
     guest.register(sub, _module())
+    hostinfo.register(sub, _module())
     longterm.register(sub, _module())
     memflow.register(sub, _module())
     netcap.register(sub, _module())

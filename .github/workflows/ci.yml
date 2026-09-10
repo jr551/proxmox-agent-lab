@@ -43,6 +43,7 @@ jobs:
           python scripts/check-public.py .
           python scripts/check-release.py
           python scripts/check-docs.py
+          python scripts/gen-commands.py --check
       - name: Check shell syntax
         run: |
           for file in \

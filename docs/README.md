@@ -45,6 +45,9 @@ Then follow one of:
 - **[gui-installers.md](gui-installers.md)** — bounded loop for driving installers.
 - **[onboarding.md](onboarding.md)** — experimental ISO/VPS onboarding.
 
+- **[commands.md](commands.md)** — generated map of every
+  `proxmox-lab` subcommand (regenerate with `scripts/gen-commands.py`).
+
 ## Troubleshoot
 
 - **[troubleshooting.md](troubleshooting.md)** — symptom → diagnostic command →

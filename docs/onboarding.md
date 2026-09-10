@@ -53,6 +53,16 @@ and automatic first-disk selection are refused. Booting the generated ISO will
 wipe the matching disk; `--wipe-confirmed` acknowledges that choice while
 preparing the bundle. It does not write any disks on your controller.
 
+**Boot the target in UEFI mode.** The generated ISO is verified working when
+the machine boots it via UEFI: the auto-installer then writes a complete
+`proxmox-boot-tool`/GRUB EFI system partition and the installed host boots to
+the Proxmox console. A legacy-BIOS (SeaBIOS/CSM) boot of the same ISO was
+observed to partition and populate the disk but leave the bootloader
+uninstalled — the auto-installer collects `grub-install i386-pc` errors into a
+non-fatal warning list and reboots anyway, producing a disk that hangs at
+"Booting from Hard Disk…". Enable UEFI on the spare PC before booting the ISO;
+do not rely on legacy BIOS for this flow.
+
 ```bash
 proxmox-lab onboard prepare --mode iso \
   --directory ~/pxl-pc-bundle \

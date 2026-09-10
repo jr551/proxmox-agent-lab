@@ -43,6 +43,7 @@ python3 scripts/check-secrets.py .
 python3 scripts/check-public.py .
 python3 scripts/check-release.py
 python3 scripts/check-docs.py
+python3 scripts/gen-commands.py --check
 git diff --check
 ```
 

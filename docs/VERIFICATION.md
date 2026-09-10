@@ -131,6 +131,7 @@ One claim per row; dates are when the row was last watched on the node.
 | Physical memory patch | Marker found/read via memflow, `phys-write` changed it, observed inside live Debian process | 2026-08-21 |
 | Compiled pin-check patch | Live conditional branch patched in RAM; client changed behaviour without restart | 2026-08-21 |
 | Guarded GUI click | Haiku 9060: `Installer`(900,700) rejected `clicked:false`; `Install Haiku`(781,582) accepted and frame changed to *Welcome to the Haiku Installer!* | 2026-08-21 |
+| Onboard auto-install ISO | `onboard build-iso` ISO booted in a nested VM: under **OVMF/UEFI** it installed and booted to the `pxl-onboard-test` login prompt (web UI at `https://192.168.69.55:8006/`); under **SeaBIOS** it partitioned and populated the disk but left PMBR/BIOS-boot/ESP empty — `grub-install i386-pc` errors are swallowed by a non-fatal `warn` list, so the disk is unbootable. UEFI required. | 2026-09-10 |
 
 <details>
 <summary>Annex: 2026-08-21 fix round — what the node actually showed</summary>

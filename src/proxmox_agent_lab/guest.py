@@ -320,10 +320,16 @@ def cmd_clone(lab: Any, args: Any) -> None:
     """Clone a lease-owned template into a new guest, registering it."""
 
     api = lab.ProxmoxAPI()
-    if not _lease_owns(lab, args.lease, args.kind, args.template):
+    # A clone source may be a guest this lease owns, or a retained template
+    # the registry vouches for -- cloning a kept template is the whole point
+    # of keeping it, and it never modifies the source.
+    from . import inventory as inventory_module
+    retained = inventory_module.entries(lab.STATE_ROOT)
+    is_retained = inventory_module.key(args.kind, args.template) in retained
+    if not is_retained and not _lease_owns(lab, args.lease, args.kind, args.template):
         raise lab.LabError(
             f"VMID {args.template} is not a {args.kind} guest registered to "
-            "this lease"
+            "this lease or the retained registry"
         )
     data: dict[str, Any] = {"newid": args.newid}
     if args.name:
@@ -362,10 +368,12 @@ def _snapshot_list(lab: Any, api: Any, args: Any, base: str) -> None:
     result = api.call("GET", base) or []
     snapshots = [
         {
-            "name": s.get("snapname"),
-            "type": s.get("snaptype"),
+            "name": s.get("name"),
             "created": s.get("snaptime"),
             "description": s.get("description"),
+            "parent": s.get("parent"),
+            "vmstate": bool(s.get("vmstate")),
+            "running": bool(s.get("running")),
         }
         for s in result if isinstance(s, dict)
     ]

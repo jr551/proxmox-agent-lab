@@ -656,6 +656,30 @@ def cmd_screenshot(lab: Any, args: Any) -> None:
 def _require_owned_qemu(lab: Any, lease_id: str, vmid: int) -> None:
     lab.require_lease_resource(lab.load_lease(lease_id), "qemu", vmid)
 
+def _require_keyboard_input(lab: Any, api: Any, vmid: int, force: bool) -> None:
+    """Refuse to send VNC input to a guest that provably cannot receive it.
+
+    RFB key/pointer events go to the emulated PS/2 keyboard, which only
+    exists when the guest has a graphical display. On `vga: serial*` the
+    screen still renders but input is silently dropped, so reporting
+    `keys_sent`/`characters_sent` would claim a delivery that never happened.
+    `--force` overrides for the rare case the config read is wrong.
+    """
+    # Only an explicit --force (a real True) bypasses; a truthy non-bool must
+    # not silently disable the guard.
+    if force is True:
+        return
+    config = api.call("GET", f"/nodes/{lab.NODE}/qemu/{vmid}/config") or {}
+    vga = str(config.get("vga") or "")
+    if vga.startswith("serial"):
+        raise _api_error(
+            lab,
+            f"VMID {vmid} has no graphical display (vga is serial), so VNC "
+            "keyboard/pointer input cannot reach it. Drive it over serial "
+            "('console text --send' / 'guest run'), or pass --force to send "
+            "anyway.",
+        )
+
 
 def cmd_screenshot_burst(lab: Any, args: Any) -> None:
     """Capture several screenshots over time as one stitched image.
@@ -802,6 +826,7 @@ def cmd_inspect(lab: Any, args: Any) -> None:
 def cmd_keys(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     _require_owned_qemu(lab, args.lease, args.vmid)
+    _require_keyboard_input(lab, api, args.vmid, getattr(args, "force", False))
     combos = args.keys
     screenshot = None
     if args.via == "api":
@@ -832,6 +857,7 @@ def cmd_keys(lab: Any, args: Any) -> None:
 def cmd_type(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     _require_owned_qemu(lab, args.lease, args.vmid)
+    _require_keyboard_input(lab, api, args.vmid, getattr(args, "force", False))
     text = args.text
     if args.text_stdin:
         import sys
@@ -932,6 +958,7 @@ def _emit_click_result(
 def cmd_click(lab: Any, args: Any) -> None:
     api = lab.ProxmoxAPI()
     _require_owned_qemu(lab, args.lease, args.vmid)
+    _require_keyboard_input(lab, api, args.vmid, getattr(args, "force", False))
     empty_space = args.empty_space
     target = str(getattr(args, "target", "") or "").strip()
     if empty_space:
@@ -1473,6 +1500,8 @@ def _register_console(console_sub: Any, lab: Any, add_after_screenshot: Any) -> 
     keys.add_argument("keys", nargs="+", help="e.g. ctrl-alt-delete f2 enter")
     keys.add_argument("--via", choices=("vnc", "api"), default="vnc")
     keys.add_argument("--delay", type=float, default=0.08)
+    keys.add_argument("--force", action="store_true",
+                      help="send even when the guest has no graphical display")
     add_after_screenshot(keys)
     keys.set_defaults(func=_bind(lab, cmd_keys))
 
@@ -1484,6 +1513,8 @@ def _register_console(console_sub: Any, lab: Any, add_after_screenshot: Any) -> 
                         help="read the text from stdin, keeping it out of argv")
     typing.add_argument("--enter", action="store_true")
     typing.add_argument("--delay", type=float, default=0.012)
+    typing.add_argument("--force", action="store_true",
+                        help="send even when the guest has no graphical display")
     add_after_screenshot(typing)
     typing.set_defaults(func=_bind(lab, cmd_type))
 
@@ -1510,6 +1541,8 @@ def _register_console(console_sub: Any, lab: Any, add_after_screenshot: Any) -> 
         choices=("auto", "nvidia", "openrouter-nemotron", "openrouter-free"),
         default="auto",
     )
+    click.add_argument("--force", action="store_true",
+                       help="send even when the guest has no graphical display")
     add_after_screenshot(click)
     click.set_defaults(func=_bind(lab, cmd_click))
 

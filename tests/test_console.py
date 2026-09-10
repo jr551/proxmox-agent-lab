@@ -2675,11 +2675,55 @@ class ConsoleLeaseGuardTests(unittest.TestCase):
              mock.patch.object(self.lab, "audit"), \
              mock.patch("builtins.print") as printed:
             lab_console.cmd_keys(self.lab, self._keys_args(self.second, "api"))
-        api.call.assert_called_once_with(
+        api.call.assert_any_call(
             "PUT", f"/nodes/{self.lab.NODE}/qemu/{self.VMID}/sendkey",
             {"key": "enter"},
         )
         self.assertEqual(json.loads(printed.call_args.args[0])["keys_sent"], 1)
+
+    def test_a_serial_display_guest_refuses_vnc_input(self) -> None:
+        """vga: serial means the PS/2 keyboard does not exist.
+
+        Reporting keys_sent on such a guest claimed a delivery that never
+        happened; the command must refuse before transmitting.
+        """
+        self.lab.register_resource(
+            self.lab.load_lease(self.second), "qemu", self.VMID, "retain",
+            "probe",
+        )
+        api = mock.Mock()
+        api.call.return_value = {"vga": "serial0"}
+        with mock.patch.object(self.lab, "ProxmoxAPI", return_value=api), \
+             mock.patch.object(self.lab, "audit"):
+            with self.assertRaises(RuntimeError) as caught:
+                lab_console.cmd_keys(
+                    self.lab, self._keys_args(self.second, "api"))
+        self.assertIn("no graphical display", str(caught.exception))
+        # The sendkey call must never be reached.
+        self.assertNotIn(
+            mock.call("PUT",
+                      f"/nodes/{self.lab.NODE}/qemu/{self.VMID}/sendkey",
+                      {"key": "enter"}),
+            api.call.call_args_list,
+        )
+
+    def test_force_overrides_the_serial_display_guard(self) -> None:
+        self.lab.register_resource(
+            self.lab.load_lease(self.second), "qemu", self.VMID, "retain",
+            "probe",
+        )
+        api = mock.Mock()
+        api.call.return_value = {"vga": "serial0"}
+        args = self._keys_args(self.second, "api")
+        args.force = True
+        with mock.patch.object(self.lab, "ProxmoxAPI", return_value=api), \
+             mock.patch.object(self.lab, "audit"), \
+             mock.patch("builtins.print"):
+            lab_console.cmd_keys(self.lab, args)
+        api.call.assert_any_call(
+            "PUT", f"/nodes/{self.lab.NODE}/qemu/{self.VMID}/sendkey",
+            {"key": "enter"},
+        )
 
 
 class InputDeliverySignalTests(unittest.TestCase):

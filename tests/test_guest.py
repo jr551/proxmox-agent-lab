@@ -102,6 +102,82 @@ class GuestTemplateTests(unittest.TestCase):
                 "guest-clone", lease="L1", kind="qemu", template=7, vmid=8,
             )
 
+    def test_clone_accepts_a_retained_template(self) -> None:
+        """A retained template is not lease-owned but must still clone.
+
+        Retained guests are deliberately kept out of lease records, so a
+        lease-ownership-only guard made the documented clone-a-template
+        workflow unreachable for them.
+        """
+        import json as _json
+        from proxmox_agent_lab import inventory as lab_inventory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = _lab(tmp)
+            # The template is NOT in the lease's resources.
+            lab.load_lease.return_value = {"resources": []}
+            api = mock.Mock()
+            api.call.return_value = {}
+            lab.ProxmoxAPI.return_value = api
+            # But it IS in the retained registry.
+            state_root = Path(lab.STATE_ROOT)
+            state_root.mkdir(parents=True, exist_ok=True)
+            lab_inventory.record(
+                state_root, kind="qemu", vmid=7, lease="old-lease",
+                now="2026-08-11T00:00:00Z", purpose="kept template",
+            )
+            lab_guest.cmd_clone(lab, _args(lab, "guest", "clone",
+                                           "--lease", "L1",
+                                           "--template", "7",
+                                           "--newid", "8"))
+            api.call.assert_any_call(
+                "POST", "/nodes/aipve/qemu/7/clone", {"newid": 8},
+            )
+            lab.register_resource.assert_called_once()
+
+    def test_clone_still_refuses_an_unvouched_guest(self) -> None:
+        """A guest that is neither lease-owned nor retained is refused."""
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = _lab(tmp)
+            lab.load_lease.return_value = {"resources": []}
+            api = mock.Mock()
+            lab.ProxmoxAPI.return_value = api
+            Path(lab.STATE_ROOT).mkdir(parents=True, exist_ok=True)
+            with self.assertRaises(RuntimeError) as caught:
+                lab_guest.cmd_clone(lab, _args(lab, "guest", "clone",
+                                               "--lease", "L1",
+                                               "--template", "7",
+                                               "--newid", "8"))
+            self.assertIn("retained registry", str(caught.exception))
+            api.call.assert_not_called()
+
+    def test_snapshot_list_reads_proxmox_field_names(self) -> None:
+        """Proxmox returns name/snaptime/description/parent, not snapname."""
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lab = _lab(tmp)
+            api = mock.Mock()
+            api.call.return_value = [
+                {"name": "snap1", "snaptime": 1789081046,
+                 "description": "test", "vmstate": 0},
+                {"name": "current", "parent": "snap1", "running": 1,
+                 "description": "You are here!"},
+            ]
+            lab.ProxmoxAPI.return_value = api
+            printed = []
+            with mock.patch("builtins.print",
+                            side_effect=lambda s: printed.append(s)):
+                lab_guest.cmd_snapshot(lab, _args(lab, "guest", "snapshot",
+                                                 "--lease", "L1", "--vmid", "7",
+                                                 "--mode", "list"))
+            snapshots = _json.loads(printed[0])["snapshots"]
+            self.assertEqual(snapshots[0]["name"], "snap1")
+            self.assertEqual(snapshots[0]["created"], 1789081046)
+            self.assertEqual(snapshots[1]["name"], "current")
+            self.assertEqual(snapshots[1]["parent"], "snap1")
+            self.assertTrue(snapshots[1]["running"])
+
 
 
 class GuestRunArgvTests(unittest.TestCase):

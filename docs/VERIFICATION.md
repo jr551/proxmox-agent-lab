@@ -7,6 +7,49 @@ and off — and, just as usefully, what has not.
 Read it as a statement of confidence, not a feature list. Anything marked
 "unit-tested only" may work; it has simply never been watched working.
 
+
+## Full feature test and bug hunt (2026-09-11)
+
+A live pass over the CLI surface against aipve under lease
+`20260910224626-1ff4082c` (host powered on by the lease, powered off by
+`lease-end`, `failures: []`, `host_powered_off: true`).
+
+**Verified on hardware:** `doctor`, `status`, `journal`, `secrets list`,
+`storage status`/`list-disks`, `host sensors`/`macs`, `guest clone` (both a
+retained template and a lease-owned template), `guest probe`, `guest run`
+over serial and over the LXC console, `guest disk-activity`, `guest
+snapshot` create/list/delete, `guest template`, `guest inventory`,
+`lease-register --allow-existing`, `console screenshot`/`screenshot-burst`/
+`text`/`keys`/`type`/`has-gui-locked-up`/`has-terminal-locked-up`/`bridge`,
+`memflow doctor`/`phys-read`/`registers`, `usb list`/`sniff` (real USB
+pcap), `netcap capture` (real Ethernet pcap), `oci pull`/`create` (Alpine
+LXC 9620), `io-workload generate`/`analyze`, `crash manifest-create`,
+`iso diagnose`, `pe catalog`, `connection export`, `disk ls`/`read`/`write`
+(offline guest disk), `net status`, `net verify` (correctly reported a dead
+tunnel), and `lease-end` cleanup.
+
+**Bugs found and fixed:**
+
+- `guest clone` refused a *retained* template because it required the source
+  be lease-registered; retained templates are never lease-owned, so the
+  documented clone-a-template workflow was unreachable. The guard now also
+  accepts a template the retained registry vouches for.
+- `guest snapshot --mode list` read `snapname`/`snaptype`/`snaptime`, but
+  Proxmox returns `name`/`snaptime`/`description`/`parent`/`vmstate`/
+  `running`; `name` and `type` were always null. Now reads the real fields.
+- `console keys`/`type`/`click` reported `keys_sent`/`characters_sent` on a
+  `vga: serial` guest where VNC input provably cannot arrive. They now
+  refuse unless `--force` is passed.
+
+**Environment/host limits (not code bugs):** `push`/`pull`/`s3` need
+`s3-key-id`/`s3-secret-key` (not stored); `console inspect` needs a working
+vision key (Kilo out of credit, OpenRouter 401); `virtio inspect`/`monitor`
+need `Sys.Audit|Sys.Modify` on the VM (token is deliberately least-privilege
+`PVEVMAdmin`); `memflow processes` needs a memflow OS-layer profile for the
+guest kernel; `net gateway-create` hit a hung `qemu-img convert` in
+`bdev_release`/`folio_wait_writeback` on the host thin pool (a host storage
+hang, not a tool bug); `share` needs worker VM 9030 (absent).
+
 ## Connection setup (2026-09-10)
 
 **Offline-tested only.** Tests execute the generated shell handoff against

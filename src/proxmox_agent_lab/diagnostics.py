@@ -1,4 +1,4 @@
-"""Diagnostics and provisioning: init, doctor, status, secrets, journal.
+"""Diagnostics: init, doctor, status, secrets, journal.
 
 These are the repair surface: they must work on a broken install, which
 is why they read configuration and errors through the `lab` facade
@@ -7,21 +7,14 @@ instead of holding import-time snapshots.
 
 from __future__ import annotations
 
-from . import audit as audit_module
 from . import config as config_module
 from . import inventory as inventory_module
 from . import journal as journal_module
-from . import mariadb as mariadb_module
-from . import power as power_module
 from . import secrets_store
-from .errors import LabError
-from .state import iso_now, json_dump, utc_now
 from pathlib import Path
 from typing import Any
 import argparse
 import json
-import re
-import secrets
 import sys
 
 def cmd_init(lab: Any, args: argparse.Namespace) -> None:
@@ -173,31 +166,7 @@ def cmd_doctor(lab: Any, args: argparse.Namespace) -> None:
         "config_file": str(lab.CONFIG.source) if lab.CONFIG.source else None,
         "config_expected_at": str(lab.CONFIG.intended),
         "state_dir": str(lab.STATE_ROOT),
-        "journal_dir": str(lab.JOURNAL_ROOT),
-        "audit": {
-            "ledger": lab.ledger().describe() if lab.ledger() else None,
-        },
     }
-    if lab.ledger() is None:
-        problems.append(
-            "[audit] no ledger configured. Run 'proxmox-lab journal "
-            "host-setup' to provision MariaDB on the Proxmox host."
-        )
-    spool = journal_module.spool_path(lab.JOURNAL_ROOT)
-    try:
-        spooled: int | None = sum(
-            1 for line in spool.read_text().splitlines() if line.strip()
-        ) if spool.exists() else 0
-    except OSError as exc:
-        spooled = None
-        problems.append(f"audit spool at {spool} could not be read: {exc}")
-    report["audit"]["spooled_records"] = spooled
-    if spooled:
-        problems.append(
-            f"{spooled} audit record(s) are still spooled locally at {spool}: "
-            "the ledger was unreachable. Upload the backlog with "
-            "'proxmox-lab journal --flush-spool'"
-        )
     if lab.CONFIG.unknown_sections:
         report["unknown_sections"] = lab.CONFIG.unknown_sections
         problems.append(
@@ -230,21 +199,9 @@ def cmd_doctor(lab: Any, args: argparse.Namespace) -> None:
         problems.append("Proxmox API token not stored; run "
                         "'proxmox-lab secrets set proxmox-token'")
 
-    settings = lab.ledger()
-    if settings is not None:
-        report["ledger_reachable"] = mariadb_module.ping(settings)
-        if not report["ledger_reachable"]:
-            # Not a problem: the lab host is off between leases by design, and
-            # events spool until it is back.
-            report["ledger_note"] = (
-                "ledger unreachable -- expected when the lab host is powered "
-                "off; events spool locally until it returns"
-            )
-        # The spool backlog is reported once, below, where it is counted.
     mode = lab.CONFIG.power.get("mode")
     report["power"] = {
         "mode": mode,
-        "can_force_off": power_module.can_force_off(lab.CONFIG),
         "boot_timeout_seconds": int(
             lab.CONFIG.power.get("boot_timeout_seconds", 300)
         ),
@@ -351,188 +308,35 @@ def cmd_doctor(lab: Any, args: argparse.Namespace) -> None:
         raise lab.LabError(f"{len(problems)} problem(s) found")
 
 
-def _guard_install_block(hostguard_module: Any) -> str:
-    """Shell that writes the lease guard onto the host and starts its timer.
-
-    The heredoc delimiter is quoted, so the shell expands nothing inside it and
-    the script travels verbatim.
-    """
-    return (
-        "cat > /usr/local/lib/pxl-hostguard.py <<'PXLGUARD'\n"
-        + hostguard_module.GUARD_SCRIPT
-        + "\nPXLGUARD\nchmod 755 /usr/local/lib/pxl-hostguard.py\n"
-        + hostguard_module.GUARD_UNITS
-    )
-
-
-def _provision_ledger(lab: Any, args: argparse.Namespace) -> dict[str, Any]:
-    """Provision MariaDB on the Proxmox host and seed the shared secrets.
-
-    A persistent, unprivileged container marked onboot, published on the
-    hypervisor's own address. Deliberately not lease-owned: the ledger has to
-    outlive the leases it records, so lease-end must never destroy it.
-    """
-    if not args.host_change_authorized:
-        raise lab.LabError(
-            "provisioning the audit ledger creates a container and a NAT rule "
-            "on the Proxmox host. Re-run with --host-change-authorized only "
-            "when the user asked for it."
-        )
-    from . import hostguard as hostguard_module
-    from . import host_transport as host_transport_module
-
-    ctid = args.ctid or 9310
-    storage = args.storage or str(lab.CONFIG.storage.get("bulk_storage") or "local-lvm")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", storage):
-        raise lab.LabError(f"invalid --storage value: {storage!r}")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", args.bridge):
-        raise lab.LabError(f"invalid --bridge value: {args.bridge!r}")
-    database = str(lab.CONFIG.audit.get("database") or "proxmox_lab")
-    user = str(lab.CONFIG.audit.get("user") or "proxmox_lab")
-    if not re.fullmatch(r"[A-Za-z0-9_]+", database):
-        raise lab.LabError(f"invalid [audit] database name: {database!r}")
-    if not re.fullmatch(r"[A-Za-z0-9_]+", user):
-        raise lab.LabError(f"invalid [audit] user name: {user!r}")
-    existing = secrets_store.get(
-        lab.CONFIG, secrets_store.BOOTSTRAP_SECRET, required=False
-    )
-    password = existing or secrets.token_urlsafe(24)
-    if any(c in password for c in "'`"):
-        raise lab.LabError("audit ledger password may not contain single quotes or backticks")
-    script = (
-        mariadb_module.HOST_SETUP_SCRIPT
-        .replace("__CTID__", str(ctid))
-        .replace("__STORAGE__", storage)
-        .replace("__BRIDGE__", str(args.bridge))
-        .replace("__DBNAME__", database)
-        .replace("__DBUSER__", user)
-        .replace("__DBPASS__", password)
-        .replace("__GUARD_INSTALL__", lab._guard_install_block(hostguard_module))
-    )
-    host_transport_module.require_host_ssh(lab._module())
-    proc = host_transport_module.run(
-        lab._module(), ["bash", "-s"], timeout=args.timeout, stdin=script
-    )
-    output = (proc.stdout or "") + (proc.stderr or "")
-    if proc.returncode not in (0, None) or "ledger-ready" not in output:
-        raise lab.LabError(
-            "audit ledger provisioning failed: " + output.strip()[-800:]
-        )
-
-    settings = journal_module.settings_from_config(lab.CONFIG, password)
-    if settings is None:
-        raise lab.LabError("ledger provisioned but [audit] host is not resolvable")
-    mariadb_module.ensure_schema(settings)
-
-    # Seed the shared store so a second controller needs only this password.
-    seeded = lab._seed_shared_secrets(settings)
-    env_var = secrets_store._env_name(secrets_store.BOOTSTRAP_SECRET)
-    audit_module.prime_ledger_cache(settings)
-    return {
-        "ctid": ctid,
-        "ledger": settings.describe(),
-        "reachable": mariadb_module.ping(settings),
-        "shared_secrets_seeded": seeded,
-        "bootstrap_env_var": env_var,
-        # Printed once, here, because there is nowhere else to get it: MariaDB
-        # keeps only a hash, and this is the credential every other controller
-        # needs. Re-running host-setup with it already in the environment keeps
-        # the same one rather than rotating it.
-        "bootstrap_export": f"export {env_var}='{password}'",
-        "bootstrap_password_was_generated": not existing,
-        "next": [
-            f"Put this in the environment of every controller:  export {env_var}=...",
-            "proxmox-lab journal --migrate    # carry this machine's history over",
-        ],
-        "host_output": output.strip()[-400:],
-    }
-
-
-def _seed_shared_secrets(lab: Any, settings: Any) -> list[str]:
-    """Copy this controller's secrets into the shared store, once.
-
-    This is what makes adding a machine a one-liner. Only secrets this
-    controller can actually read are copied, and an existing shared value is
-    never overwritten -- the first controller to set one wins.
-    """
-    now = lab.utc_now().isoformat().replace("+00:00", "Z")
-    existing = {row["name"] for row in mariadb_module.list_secrets(settings)}
-    seeded: list[str] = []
-    for name in secrets_store.KNOWN_SECRETS:
-        if name == secrets_store.BOOTSTRAP_SECRET or name in existing:
-            continue
-        try:
-            value = secrets_store.get(lab.CONFIG, name, required=False)
-        except secrets_store.SecretError:
-            value = ""
-        if not value:
-            # An upgraded controller may still hold this only in the OS
-            # keystore it used before secrets moved to the environment.
-            legacy = secrets_store.legacy_keystore()
-            value = (legacy and secrets_store.read_legacy(legacy, name)) or ""
-        if not value:
-            continue
-        mariadb_module.put_secret(
-            settings, name, value,
-            updated_by=lab._controller_id(), updated_at=now,
-        )
-        seeded.append(name)
-    return seeded
+#: Flags the MariaDB ledger took with it: the command surface is
+#: ``--lease``/``--since``/``--limit`` over the local store and nothing else.
+_REMOVED_JOURNAL_FLAGS = (
+    "host_setup",
+    "flush_spool",
+    "migrate",
+    "migrations",
+    "summary",
+    "event",
+    "controller",
+)
 
 
 def cmd_journal(lab: Any, args: argparse.Namespace) -> None:
-    """Read the shared audit ledger, or carry an old local one into it."""
-    if args.host_setup:
-        result = lab._provision_ledger(args)
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return
-
-    settings = lab.ledger()
-    if settings is None:
+    """Read the audit journal: the events in the local lab store."""
+    removed = [
+        name for name in _REMOVED_JOURNAL_FLAGS if getattr(args, name, None)
+    ]
+    if removed:
         raise lab.LabError(
-            "no audit ledger configured. Run 'proxmox-lab journal host-setup' "
-            "to provision MariaDB on the Proxmox host."
+            f"journal {'/'.join('--' + name.replace('_', '-') for name in removed)}"
+            " is gone with the shared ledger: every event is a row in the "
+            "local lab store, so there is nothing to upload, carry over, or "
+            "summarise. Filter with --lease/--since/--limit."
         )
-
-    if args.flush_spool:
-        with lab.controller_lock():
-            result = journal_module.flush_spool(
-                settings, lab.JOURNAL_ROOT, controller=lab._controller_id()
-            )
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return
-
-    if args.migrate:
-        with lab.controller_lock():
-            result = journal_module.migrate_legacy(
-                settings, lab.JOURNAL_ROOT, controller=lab._controller_id()
-            )
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return
-
-    if args.migrations:
-        print(json.dumps(
-            {"migrations": mariadb_module.migrations(settings)},
-            indent=2, sort_keys=True, default=str,
-        ))
-        return
-
-    if args.summary:
-        print(json.dumps(
-            journal_module.summary(settings),
-            indent=2, sort_keys=True, default=str,
-        ))
-        return
-
-    events = journal_module.query(
-        settings,
-        limit=args.limit,
-        lease=args.lease,
-        event=args.event,
-        since=args.since,
-        controller=args.controller,
+    rows = journal_module.query_events(
+        lease=args.lease, since=args.since, limit=args.limit,
     )
-    print(json.dumps(events, indent=2, sort_keys=True, default=str))
+    print(journal_module.format_events(rows))
 
 
 def cmd_status(lab: Any, args: argparse.Namespace) -> None:

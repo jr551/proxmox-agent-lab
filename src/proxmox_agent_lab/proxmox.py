@@ -521,3 +521,15 @@ class Proxmox:
         if not fields:
             raise ProxmoxError(f"sha256sum {path}: no digest in output")
         return fields[0]
+
+
+def from_config(config) -> "Proxmox":
+    """The Proxmox seam for one configuration (rework plan §G).
+
+    ``ssh`` to ``[ssh] target``, commands against ``[pve] node``. This is the
+    one construction site for the seam; lifecycle handlers reach it through
+    their module-level ``_make_proxmox`` so tests can substitute a double.
+    """
+    from . import ssh as ssh_module
+
+    return Proxmox(ssh_module.SSH(config.ssh.target), config.pve.node)

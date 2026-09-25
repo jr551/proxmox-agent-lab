@@ -1,6 +1,8 @@
-"""Doctor reports, spool visibility, inventory judgement and host-update checks."""
+"""Doctor's surviving checks, the store-backed journal command, host-update."""
 from __future__ import annotations
 
+import argparse
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -14,52 +16,124 @@ from support import bootstrap  # noqa: E402,F401
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from proxmox_agent_lab import cli as LAB  # noqa: E402
+from proxmox_agent_lab import config as config_module  # noqa: E402
+from proxmox_agent_lab import store as store_module  # noqa: E402
 
 
-class DoctorAuditTests(unittest.TestCase):
-    """Found live: 1,547 events sat in the local spool and doctor said nothing.
+class DoctorReportTests(unittest.TestCase):
+    """The checks that survive the ledger/spool removal still report, and the
+    report no longer carries ledger, spool, or force-off keys."""
 
-    The ledger is unreachable whenever the lab host is off, which is most of
-    the time, so a growing backlog is the thing worth reporting."""
-
-    def _doctor(self, audit_overrides: dict, journal_root: Path) -> dict:
-        import contextlib
-        import io
-
-        from proxmox_agent_lab import config as config_module
-
-        args = LAB.parser().parse_args(["doctor"])
-        stdout = io.StringIO()
-        audit = config_module.Section(
-            "audit", {**LAB.CONFIG.audit.as_dict(), **audit_overrides}
-        )
-        with mock.patch.object(LAB.CONFIG, "audit", audit), \
-             mock.patch.object(LAB, "JOURNAL_ROOT", journal_root), \
-             contextlib.redirect_stdout(stdout):
+    def _doctor(self, **overrides: object) -> dict:
+        # Hand-built args: these tests drive the command implementations, and
+        # cli.parser() is transitional surface a later wave rewrites.
+        values: dict[str, object] = {"host_checks": False}
+        values.update(overrides)
+        args = argparse.Namespace(**values)
+        out = io.StringIO()
+        # Without a stored API token the Proxmox blocks are skipped entirely:
+        # no network, no API client, just the local install checks.
+        with mock.patch.object(
+            LAB.secrets_store, "get",
+            side_effect=LAB.secrets_store.SecretError("not stored"),
+        ), contextlib.redirect_stdout(out):
             try:
                 LAB.cmd_doctor(args)
             except LAB.LabError:
                 pass
-        return json.loads(stdout.getvalue())
+        return json.loads(out.getvalue())
 
-    def test_a_local_audit_spool_backlog_is_reported(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            journal_root = Path(tmp) / "journal"
-            journal_root.mkdir()
-            (journal_root / "spool.jsonl").write_text(
-                '{"event": "lease-begin"}\n{"event": "lease-end"}\n'
-            )
-            report = self._doctor({}, journal_root)
-        self.assertEqual(report["audit"]["spooled_records"], 2)
-        self.assertTrue(any("flush-spool" in problem
-                            for problem in report["problems"]))
+    def test_a_broken_config_is_reported_as_a_problem(self) -> None:
+        with mock.patch.object(
+            LAB, "CONFIG_ERROR", "synthetic parse failure"
+        ):
+            report = self._doctor()
+        self.assertIn(
+            "config could not be read: synthetic parse failure",
+            report["problems"],
+        )
+        self.assertFalse(report["ok"])
 
-    def test_an_empty_spool_is_not_a_problem(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            report = self._doctor({}, Path(tmp) / "journal")
-        self.assertEqual(report["audit"]["spooled_records"], 0)
-        self.assertFalse(any("spool" in problem
-                             for problem in report["problems"]))
+    def test_the_state_dir_is_reported(self) -> None:
+        report = self._doctor()
+        self.assertEqual(report["state_dir"], str(LAB.STATE_ROOT))
+
+    def test_ledger_spool_and_force_off_are_gone_from_the_report(self) -> None:
+        report = self._doctor()
+        self.assertNotIn("audit", report)
+        self.assertNotIn("journal_dir", report)
+        self.assertNotIn("ledger_reachable", report)
+        self.assertNotIn("can_force_off", report["power"])
+
+
+class JournalCommandTests(unittest.TestCase):
+    """`proxmox-lab journal` reads the local store; the ledger flags are gone."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        patcher = mock.patch.object(
+            config_module, "state_dir", return_value=self.root
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.store = store_module.Store(self.root / "lab.db")
+        self.addCleanup(self.store.close)
+
+    def _journal(self, **overrides: object) -> list[dict]:
+        # Hand-built args: these tests drive the command implementation, and
+        # cli.parser() is transitional surface a later wave rewrites.
+        values: dict[str, object] = {
+            "lease": None, "since": None, "limit": 50,
+            "event": None, "controller": None,
+            "summary": False, "flush_spool": False, "migrate": False,
+            "migrations": False, "host_setup": False,
+        }
+        values.update(overrides)
+        args = argparse.Namespace(**values)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            LAB.cmd_journal(args)
+        return json.loads(out.getvalue())
+
+    def test_the_output_is_the_store_rows_with_legacy_columns(self) -> None:
+        self.store.record("guest-clone", lease="L1", vmid=7, data={"ok": True})
+        rows = self._journal(lease="L1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            set(rows[0]), {"id", "timestamp", "event", "lease", "vmid", "data"}
+        )
+        self.assertEqual(rows[0]["event"], "guest-clone")
+        self.assertEqual(rows[0]["lease"], "L1")
+        self.assertEqual(rows[0]["vmid"], 7)
+        self.assertEqual(json.loads(rows[0]["data"]), {"ok": True})
+
+    def test_since_and_limit_filter_the_output(self) -> None:
+        self.store.record("a", lease="L1", timestamp="2026-01-01T00:00:00Z")
+        self.store.record("b", lease="L1", timestamp="2026-01-02T00:00:00Z")
+        self.assertEqual(
+            [row["event"] for row in
+             self._journal(since="2026-01-02T00:00:00Z")],
+            ["b"],
+        )
+        self.assertEqual(
+            [row["event"] for row in self._journal(limit=1)], ["b"]
+        )
+
+    def test_the_ledger_flags_are_refused_loudly(self) -> None:
+        for overrides in (
+            {"flush_spool": True},
+            {"migrate": True},
+            {"migrations": True},
+            {"summary": True},
+            {"host_setup": True},
+            {"event": "guest-clone"},
+            {"controller": "pc-1"},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(LAB.LabError, "is gone"):
+                    self._journal(**overrides)
 
 
 class HostUpdateReportTests(unittest.TestCase):
@@ -117,116 +191,5 @@ class HostUpdateReportTests(unittest.TestCase):
         self.assertIn("memflow", report["reason"])
 
 
-class DoctorInventoryTests(unittest.TestCase):
-    """A running guest nothing owns is the reason the node stayed on for five
-    days, so doctor has to fail on it rather than mention it."""
-
-    def _doctor(self, guests: list[dict], tmp: str) -> dict:
-        import contextlib
-        import io
-
-        api = mock.Mock()
-        api.reachable.return_value = True
-        api.call.side_effect = lambda method, path, data=None: (
-            guests if path == "/cluster/resources"
-            else {"/vms": {name: 1 for name in (
-                "VM.Allocate", "VM.Config.Disk", "VM.PowerMgmt",
-                "VM.Console", "VM.Audit")}}
-            if path == "/access/permissions" else {}
-        )
-        args = LAB.parser().parse_args(["doctor"])
-        out = io.StringIO()
-        old = (LAB.LEASE_ROOT, LAB.STATE_ROOT, LAB.JOURNAL_ROOT)
-        LAB.LEASE_ROOT = Path(tmp) / "leases"
-        LAB.STATE_ROOT = Path(tmp)
-        LAB.JOURNAL_ROOT = Path(tmp) / "journal"
-        try:
-            with mock.patch.object(LAB, "ProxmoxAPI", return_value=api), \
-                 mock.patch.object(LAB.secrets_store, "get",
-                                   return_value="token"), \
-                 contextlib.redirect_stdout(out):
-                try:
-                    LAB.cmd_doctor(args)
-                except LAB.LabError:
-                    pass
-        finally:
-            LAB.LEASE_ROOT, LAB.STATE_ROOT, LAB.JOURNAL_ROOT = old
-        return json.loads(out.getvalue())
-
-    def test_a_running_orphan_is_a_problem(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            report = self._doctor(
-                [{"vmid": 9002, "type": "qemu", "status": "running",
-                  "tags": "codex-lab;lease-20260814100000-gone"}],
-                tmp,
-            )
-        self.assertEqual(report["guests"]["orphaned_running"], [9002])
-        self.assertTrue(any("cannot power off" in problem
-                            for problem in report["problems"]))
-        self.assertFalse(report["ok"])
-
-    def test_a_stopped_orphan_is_a_note_not_a_problem(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            report = self._doctor(
-                [{"vmid": 9003, "type": "qemu", "status": "stopped",
-                  "tags": "codex-lab;lease-20260814100000-gone"}],
-                tmp,
-            )
-        self.assertEqual(report["guests"]["orphaned"], 1)
-        self.assertEqual(report["guests"]["orphaned_running"], [])
-        self.assertIn("note", report["guests"])
-        self.assertFalse(any("cannot power off" in problem
-                             for problem in report["problems"]))
-
-    def test_an_untagged_guest_is_never_called_an_orphan(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            report = self._doctor(
-                [{"vmid": 100, "type": "qemu", "status": "running",
-                  "name": "not-ours"}],
-                tmp,
-            )
-        self.assertEqual(report["guests"]["orphaned"], 0)
-
-
-class InfrastructureGuestTests(unittest.TestCase):
-    """The audit ledger runs on the host and outlives every lease.
-
-    Found live: the first lease-end after provisioning it refused to power the
-    host off, naming the ledger container as an untracked running guest. Left
-    alone that means the machine can never power itself off again, which is
-    the entire point of it.
-    """
-
-    def _resources(self) -> list[dict]:
-        return [
-            {"vmid": 9310, "status": "running", "tags": "codex-lab-infra"},
-            {"vmid": 9001, "status": "running", "tags": "codex-lab;lease-x"},
-            {"vmid": 9002, "status": "stopped", "tags": ""},
-        ]
-
-    def test_the_ledger_container_is_not_an_untracked_guest(self) -> None:
-        api = mock.Mock()
-        api.call.return_value = self._resources()
-        self.assertEqual(LAB.running_guest_vmids(api), [9001])
-
-    def test_an_ordinary_running_guest_still_blocks_power_off(self) -> None:
-        api = mock.Mock()
-        api.call.return_value = [
-            {"vmid": 9001, "status": "running", "tags": "codex-lab;lease-x"},
-        ]
-        self.assertEqual(LAB.running_guest_vmids(api), [9001])
-
-    def test_comma_separated_tags_are_understood(self) -> None:
-        """Proxmox has used both separators; the guard must not depend on it."""
-        api = mock.Mock()
-        api.call.return_value = [
-            {"vmid": 9310, "status": "running", "tags": "codex-lab-infra,other"},
-        ]
-        self.assertEqual(LAB.running_guest_vmids(api), [])
-
-    def test_a_guest_with_no_tags_is_still_counted(self) -> None:
-        api = mock.Mock()
-        api.call.return_value = [{"vmid": 9005, "status": "running"}]
-        self.assertEqual(LAB.running_guest_vmids(api), [9005])
-
-
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

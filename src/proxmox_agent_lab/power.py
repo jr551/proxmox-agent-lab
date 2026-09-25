@@ -1,225 +1,154 @@
-"""Switching the lab machine on, and forcing it off when it will not go.
+"""Host power control: Wake-on-LAN, and shutdown that is verified, never assumed.
 
-Powering *on* cannot use the Proxmox API -- the machine is off. Powering
-*off* normally does use the API (a graceful node shutdown); the mechanisms
-here are the emergency finaliser for when that fails.
+``wake`` sends the standard Wake-on-LAN magic packet (6 x 0xFF + 16 copies of
+the MAC) to the configured broadcast address over stdlib UDP. ``shutdown_verified``
+initiates a host shutdown and then *proves* the power-off by repeated probe
+failure across ssh AND TCP :22 -- the host being down is a verified fact, never
+assumed from the shutdown request having been sent.
 
-Modes:
-
-* `wake-on-lan`    -- a magic packet. Needs only the NIC's MAC address, works
-                      on nearly any desktop, and is the default. It cannot
-                      force a machine off, so graceful shutdown is the only
-                      path down; that is usually what you want anyway.
-* `home-assistant` -- call scripts in Home Assistant, e.g. a smart plug or a
-                      KVM that presses the power button.
-* `wake-on-lan+home-assistant` -- send the magic packet and trigger the Home
-                      Assistant script together on every power-on. Useful
-                      when WoL alone is not reliable enough to trust by
-                      itself (a NIC that occasionally drops out of suspend,
-                      a BIOS that forgets the setting) but a smart-plug/KVM
-                      fallback is also available; force-off still goes
-                      through Home Assistant, since WoL cannot cut power.
-* `command`        -- run a local command. The escape hatch for IPMI, a PDU,
-                      or anything with a CLI.
-* `none`           -- no remote power control; the user switches it on.
+A shutdown that cannot be confirmed within the timeout is reported loudly
+(``host_powered_off: false``) and is the caller's non-zero exit. There is no
+force-off path: a host that refuses to die is reported, not killed.
 """
 
 from __future__ import annotations
 
-import json
-import shlex
+import re
 import socket
-import subprocess
-import threading
-from typing import Any
-from urllib import error, request
+import time
+from typing import Any, Callable
 
-from .config import Config, ConfigError
-from . import secrets_store
+from .errors import LabError
 
 
-class PowerError(RuntimeError):
-    pass
+class PowerError(LabError):
+    """A power operation could not be carried out as configured."""
 
 
-def _mac_bytes(mac: str) -> bytes:
-    cleaned = mac.replace(":", "").replace("-", "").replace(".", "").strip()
-    if len(cleaned) != 12:
+#: One shutdown-verification round probes both transports, in this order; the
+#: ``probe_fn`` calls therefore alternate ``"ssh"``/``"tcp"`` throughout.
+_PROBE_KINDS: tuple[str, str] = ("ssh", "tcp")
+
+#: Seconds ``shutdown_verified`` sleeps between probe rounds.
+_PROBE_INTERVAL = 5.0
+
+_MAC_HEX = re.compile(r"[0-9a-fA-F]{12}")
+
+
+def build_magic_packet(mac: str) -> bytes:
+    """Return the Wake-on-LAN magic packet for the hardware address ``mac``.
+
+    The packet is exactly ``b"\\xff" * 6 + mac_bytes * 16``: six 0xFF bytes
+    followed by sixteen copies of the six MAC bytes. Separators (``:``, ``-``,
+    ``.``) are optional, but anything that does not parse to six hex bytes
+    raises ``PowerError`` -- a malformed MAC never produces a wrong packet.
+    """
+    if not isinstance(mac, str):
         raise PowerError(f"not a MAC address: {mac!r}")
+    cleaned = mac.strip().replace(":", "").replace("-", "").replace(".", "")
+    if _MAC_HEX.fullmatch(cleaned) is None:
+        raise PowerError(f"not a MAC address: {mac!r}")
+    mac_bytes = bytes.fromhex(cleaned)
+    return b"\xff" * 6 + mac_bytes * 16
+
+
+def _default_sender(
+    sock: Callable[..., socket.socket], packet: bytes, addr: tuple[str, int]
+) -> None:
+    """Default ``wake`` transport: one UDP datagram to ``addr``.
+
+    ``sock`` is the socket factory (``socket.socket``). The packet goes out on
+    a fresh ``(AF_INET, SOCK_DGRAM)`` socket with ``SO_BROADCAST`` set -- the
+    broadcast address is not reachable without it -- and the socket is closed
+    in a ``finally`` so a failed send never leaks a descriptor.
+    """
+    handle = sock(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        return bytes.fromhex(cleaned)
-    except ValueError:
-        raise PowerError(f"not a MAC address: {mac!r}") from None
+        handle.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        handle.sendto(packet, addr)
+    finally:
+        handle.close()
 
 
-def magic_packet(mac: str) -> bytes:
-    return b"\xff" * 6 + _mac_bytes(mac) * 16
+def wake(config, *, sender: Callable[..., None] | None = None) -> dict[str, Any]:
+    """Send the Wake-on-LAN magic packet for the configured host.
+
+    The packet is addressed to ``config.power.broadcast:config.power.port`` and
+    carries the MAC from ``config.power.mac``. ``sender(sock, packet, addr)``
+    is the transport seam: it receives the socket factory, the magic packet and
+    the ``(broadcast, port)`` address; the default sender builds the UDP socket
+    described in ``_default_sender``. No socket is created when a sender is
+    injected, so callers and tests can supply their own transport.
+
+    Returns ``{"sent": True, "mac": ..., "broadcast": ..., "port": ...}``. The
+    MAC is configuration, not a secret; audit redaction is the auditor's job.
+    A malformed configured MAC raises ``PowerError`` before anything is sent.
+    """
+    mac = config.power.mac
+    packet = build_magic_packet(mac)
+    broadcast = config.power.broadcast
+    port = int(config.power.port)
+    send = _default_sender if sender is None else sender
+    send(socket.socket, packet, (broadcast, port))
+    return {"sent": True, "mac": mac, "broadcast": broadcast, "port": port}
 
 
-def wake_on_lan(mac: str, broadcast: str, port: int = 9) -> None:
-    packet = magic_packet(mac)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        # Send to the configured broadcast and the global one: a router that
-        # drops directed broadcasts often still passes 255.255.255.255.
-        targets = {broadcast or "255.255.255.255", "255.255.255.255"}
-        errors: list[str] = []
-        for target in targets:
+def shutdown_verified(
+    *,
+    request_fn: Callable[[], Any],
+    probe_fn: Callable[[str], bool],
+    timeout: float = 60.0,
+    min_failures: int = 6,
+    window: float = 30.0,
+    sleep: Callable[[float], Any] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Request host shutdown, then verify the host actually powered off.
+
+    Host power-off is VERIFIED by repeated probe failure across ssh AND TCP
+    :22, never assumed. ``request_fn()`` is called exactly once -- the caller
+    passes the detached ``shutdown -h now`` request, which must not block on a
+    dying sshd. The probe loop then alternates ``probe_fn("ssh")`` and
+    ``probe_fn("tcp")`` calls; one round is one of each. A round counts as a
+    failure only when BOTH probes report the host not answering (a probe that
+    raises ``OSError``/``TimeoutError`` counts as not answering). Any round
+    where a probe still reaches the host resets the failure count to zero --
+    a host that answers is plainly still up.
+
+    ``host_powered_off`` is ``True`` only when at least ``min_failures``
+    all-fail rounds have occurred AND at least ``window`` seconds have elapsed
+    since the shutdown request: six quick probe failures inside the window are
+    not proof of power-off. A timeout is reported loudly -- ``host_powered_off``
+    is ``False`` and the caller must exit non-zero; a shutdown that cannot be
+    confirmed is never silently rounded up to success. There is no force-off
+    path.
+
+    Returns ``{"host_powered_off": bool, "failures": int, "elapsed": float}``.
+    ``sleep``/``now`` are injectable so tests are instant and deterministic.
+    """
+    request_fn()
+    start = now()
+    failures = 0
+    while True:
+        elapsed = now() - start
+        if elapsed >= timeout:
+            return {"host_powered_off": False, "failures": failures, "elapsed": elapsed}
+        reachable = False
+        for kind in _PROBE_KINDS:
             try:
-                sock.sendto(packet, (target, port))
-            except OSError as exc:
-                errors.append(f"could not send to {target}:{port}: {exc}")
-        if len(errors) == len(targets):
-            raise PowerError("; ".join(errors))
-
-
-def _home_assistant(config: Config, entity_id: str) -> None:
-    url = config.require(
-        "power.home_assistant_url", "the base URL of your Home Assistant"
-    )
-    try:
-        token = secrets_store.get(config, "home-assistant-token")
-    except secrets_store.SecretError as exc:
-        raise PowerError(str(exc)) from None
-    payload = json.dumps({"entity_id": entity_id}).encode()
-    req = request.Request(
-        url.rstrip("/") + "/api/services/script/turn_on",
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with request.urlopen(req, timeout=20) as response:
-            if response.status not in (200, 201):
-                raise PowerError(f"Home Assistant returned {response.status}")
-    except error.HTTPError as exc:
-        raise PowerError(f"Home Assistant HTTP {exc.code} for {entity_id}")
-    except (error.URLError, TimeoutError, OSError) as exc:
-        raise PowerError(f"Home Assistant unreachable: {exc}")
-
-
-def _run_command(command: str, label: str) -> None:
-    result = subprocess.run(
-        shlex.split(command), capture_output=True, text=True, timeout=120,
-        check=False,
-    )
-    if result.returncode:
-        raise PowerError(
-            f"{label} command failed ({result.returncode}): "
-            f"{(result.stderr or result.stdout).strip()[:300]}"
-        )
-
-
-def power_on(config: Config) -> dict[str, Any]:
-    """Ask the machine to switch on. Does not wait for it."""
-    mode = config.power.get("mode", "wake-on-lan")
-    if mode == "wake-on-lan":
-        mac = config.require(
-            "power.mac", "the lab machine's NIC MAC, with Wake-on-LAN enabled in its BIOS"
-        )
-        wake_on_lan(mac, config.power.get("broadcast", ""),
-                    int(config.power.get("wol_port", 9)))
-        return {"mode": mode, "sent": "magic packet", "mac": mac}
-    if mode == "home-assistant":
-        entity = config.require("power.entity_on", "a Home Assistant script entity")
-        _home_assistant(config, entity)
-        return {"mode": mode, "entity_id": entity}
-    if mode == "wake-on-lan+home-assistant":
-        mac = config.require(
-            "power.mac", "the lab machine's NIC MAC, with Wake-on-LAN enabled in its BIOS"
-        )
-        entity = config.require("power.entity_on", "a Home Assistant script entity")
-        broadcast = config.power.get("broadcast", "")
-        port = int(config.power.get("wol_port", 9))
-        wowlan_mac = config.power.get("wowlan_mac", "")
-
-        results: dict[str, str | None] = {"wowlan": "not configured"}
-
-        def _wol() -> None:
-            try:
-                wake_on_lan(mac, broadcast, port)
-                results["wake-on-lan"] = None
-            except PowerError as exc:
-                results["wake-on-lan"] = str(exc)
-
-        def _ha() -> None:
-            try:
-                _home_assistant(config, entity)
-                results["home-assistant"] = None
-            except PowerError as exc:
-                results["home-assistant"] = str(exc)
-
-        def _wowlan() -> None:
-            # Wireless wake is best-effort: many NICs drop the magic packet
-            # when associated, and a failure must never block the wired path.
-            try:
-                wake_on_lan(wowlan_mac, broadcast, port)
-                results["wowlan"] = None
-            except PowerError as exc:
-                results["wowlan"] = str(exc)
-
-        threads = [threading.Thread(target=_wol, daemon=True),
-                   threading.Thread(target=_ha, daemon=True)]
-        if wowlan_mac:
-            threads.append(threading.Thread(target=_wowlan, daemon=True))
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=30)
-
-        errors = [f"{name}: {err}" for name, err in results.items()
-                  if err and name != "wowlan"]
-        if results.get("wake-on-lan") and results.get("home-assistant"):
-            raise PowerError("; ".join(
-                f"{name}: {results[name]}" for name in ("wake-on-lan", "home-assistant")))
-        return {
-            "mode": mode,
-            "sent": "magic packet + home-assistant script"
-                    + (" + wowlan" if wowlan_mac else ""),
-            "mac": mac, "entity_id": entity,
-            "wowlan_mac": wowlan_mac or None,
-            "wowlan": results.get("wowlan"),
-            "errors": errors or None,
-        }
-    if mode == "command":
-        command = config.require("power.on_command")
-        _run_command(command, "power-on")
-        return {"mode": mode, "command": command}
-    if mode == "none":
-        raise PowerError(
-            "power.mode is 'none': switch the machine on yourself, then re-run"
-        )
-    raise ConfigError(f"unknown power.mode: {mode!r}")
-
-
-def can_force_off(config: Config) -> bool:
-    mode = config.power.get("mode", "wake-on-lan")
-    if mode in ("home-assistant", "wake-on-lan+home-assistant"):
-        return bool(config.power.get("entity_off"))
-    if mode == "command":
-        return bool(config.power.get("off_command"))
-    return False
-
-
-def force_off(config: Config) -> dict[str, Any]:
-    """Emergency finaliser, only after a graceful shutdown has failed."""
-    mode = config.power.get("mode", "wake-on-lan")
-    if mode in ("home-assistant", "wake-on-lan+home-assistant"):
-        # Wake-on-LAN cannot cut power, so Home Assistant is the only path
-        # down in the composite mode too.
-        entity = config.require(
-            "power.entity_off", "a Home Assistant script that cuts power"
-        )
-        _home_assistant(config, entity)
-        return {"mode": mode, "entity_id": entity}
-    if mode == "command":
-        command = config.require("power.off_command")
-        _run_command(command, "force-off")
-        return {"mode": mode, "command": command}
-    raise PowerError(
-        f"power.mode {mode!r} cannot force the machine off. The graceful "
-        "shutdown did not complete; switch it off by hand and check the host."
-    )
+                if probe_fn(kind):
+                    reachable = True
+            except (OSError, TimeoutError):
+                pass  # a probe that cannot complete: the host is not answering
+        if reachable:
+            failures = 0
+        else:
+            failures += 1
+            elapsed = now() - start
+            if failures >= min_failures and elapsed >= window:
+                return {
+                    "host_powered_off": True,
+                    "failures": failures,
+                    "elapsed": elapsed,
+                }
+        sleep(_PROBE_INTERVAL)

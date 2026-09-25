@@ -692,7 +692,7 @@ def wait_task(api: ProxmoxAPI, upid: str,
 
 
 def audit(event: str, **fields: Any) -> None:
-    audit_module.audit(CONFIG, JOURNAL_ROOT, event, **fields)
+    audit_module.audit(event, **fields)
 
 
 def ledger() -> Any:
@@ -749,7 +749,7 @@ def idle_shutdown_due(*, reachable: bool, active_lease_count: int,
 
 def _leases_in_states(states: tuple[str, ...],
                     excluding: str | None = None) -> list[dict[str, Any]]:
-    return leases_module._leases_in_states(LEASE_ROOT, states, excluding)
+    return leases_module.leases_in_states(LEASE_ROOT, states, excluding)
 
 
 def active_leases(excluding: str | None = None) -> list[dict[str, Any]]:

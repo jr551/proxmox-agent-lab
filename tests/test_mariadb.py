@@ -1,4 +1,4 @@
-"""The audit ledger against a real MariaDB.
+"""The MariaDB module's own behavior against a real MariaDB.
 
 Skipped unless PXL_TEST_MARIADB points at a throwaway server, e.g.
 
@@ -8,19 +8,16 @@ Skipped unless PXL_TEST_MARIADB points at a throwaway server, e.g.
     PXL_TEST_MARIADB=proxmox_lab:labtest@127.0.0.1:13306/proxmox_lab \\
       python3 -m unittest tests.test_mariadb
 
-A stub cannot tell you that INSERT IGNORE really is idempotent, that the
-unique index really does absorb a replayed spool, or that GET_LOCK really
-serialises two controllers. Those are the properties the ledger is built on,
-so they are checked against the real server.
+A stub cannot tell you that INSERT IGNORE really is idempotent or that
+GET_LOCK really serialises two clients. Those are the properties the module
+is built on, so they are checked against the real server.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -28,7 +25,6 @@ from support import bootstrap  # noqa: E402,F401
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from proxmox_agent_lab import journal as journal_module  # noqa: E402
 from proxmox_agent_lab import mariadb  # noqa: E402
 
 DSN = os.environ.get("PXL_TEST_MARIADB", "")
@@ -75,7 +71,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(rows[0]["event"], "lease-begin")
 
     def test_a_replayed_event_is_ignored_not_duplicated(self) -> None:
-        """The property the spool and the migration both depend on."""
+        """Replaying the same event must land once, not twice."""
         event = self._event("guest-run")
         mariadb.append(self.settings, event)
         mariadb.append(self.settings, event)
@@ -151,105 +147,6 @@ class LedgerTests(unittest.TestCase):
 
     def test_a_missing_secret_is_none_not_an_error(self) -> None:
         self.assertIsNone(mariadb.get_secret(self.settings, "never-stored"))
-
-
-@unittest.skipUnless(DSN, "set PXL_TEST_MARIADB to run ledger integration tests")
-class MigrationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.settings = _settings()
-        connection = mariadb.connect(self.settings)
-        with connection.cursor() as cursor:
-            cursor.execute("DROP TABLE IF EXISTS events")
-            cursor.execute("DROP TABLE IF EXISTS migrations")
-        connection.close()
-        mariadb.ensure_schema(self.settings)
-
-    def _legacy(self, root: Path, events: list[str]) -> None:
-        import sqlite3
-
-        root.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(journal_module.legacy_database_path(root))
-        connection.execute(
-            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "timestamp TEXT, event TEXT, lease TEXT, vmid INTEGER, data TEXT)"
-        )
-        for name in events:
-            record = {"timestamp": "2026-01-01T00:00:00Z", "event": name}
-            connection.execute(
-                "INSERT INTO events (timestamp, event, data) VALUES (?, ?, ?)",
-                (record["timestamp"], name, json.dumps(record, sort_keys=True)),
-            )
-        connection.commit()
-        connection.close()
-
-    def test_a_second_controller_adds_only_its_own_events(self) -> None:
-        """The case that matters: two machines, overlapping histories."""
-        with tempfile.TemporaryDirectory() as tmp:
-            one = Path(tmp) / "pc1"
-            self._legacy(one, ["a", "b", "c"])
-            first = journal_module.migrate_legacy(
-                self.settings, one, controller="pc-1")
-            self.assertEqual(first["uploaded"], 3)
-            self.assertEqual(first["migrated_by_others"], [])
-
-            two = Path(tmp) / "pc2"
-            self._legacy(two, ["a", "b", "c", "d"])  # 3 shared, 1 of its own
-            second = journal_module.migrate_legacy(
-                self.settings, two, controller="pc-2")
-            self.assertEqual(second["uploaded"], 1)
-            self.assertEqual(second["already_present"], 3)
-            self.assertEqual(second["migrated_by_others"], ["pc-1"])
-            self.assertFalse(second["repeat_migration"])
-
-            self.assertEqual(mariadb.count(self.settings), 4)
-
-    def test_re_running_a_migration_is_a_no_op(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "pc1"
-            self._legacy(root, ["a", "b"])
-            journal_module.migrate_legacy(self.settings, root, controller="pc-1")
-            again = journal_module.migrate_legacy(
-                self.settings, root, controller="pc-1")
-            self.assertEqual(again["uploaded"], 0)
-            self.assertTrue(again["repeat_migration"])
-            self.assertEqual(mariadb.count(self.settings), 2)
-
-    def test_the_registry_records_who_has_migrated(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "pc1"
-            self._legacy(root, ["a"])
-            journal_module.migrate_legacy(self.settings, root, controller="pc-1")
-            rows = mariadb.migrations(self.settings)
-            self.assertEqual([r["controller"] for r in rows], ["pc-1"])
-
-    def test_a_spool_flushes_and_clears(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for name in ("x", "y"):
-                journal_module.record(
-                    None, root,
-                    {"timestamp": "2026-01-01T00:00:00Z", "event": name},
-                    controller="pc-1",
-                )
-            self.assertEqual(len(journal_module.read_spool(root)), 2)
-            result = journal_module.flush_spool(
-                self.settings, root, controller="pc-1")
-            self.assertEqual(result["uploaded"], 2)
-            self.assertTrue(result["cleared"])
-            self.assertEqual(journal_module.read_spool(root), [])
-
-    def test_flushing_the_same_spool_twice_does_not_duplicate(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            entry = {"timestamp": "2026-01-01T00:00:00Z", "event": "z"}
-            journal_module.record(None, root, entry, controller="pc-1")
-            journal_module.flush_spool(self.settings, root, controller="pc-1")
-            journal_module.record(None, root, entry, controller="pc-1")
-            result = journal_module.flush_spool(
-                self.settings, root, controller="pc-1")
-            self.assertEqual(result["uploaded"], 0)
-            self.assertEqual(result["already_present"], 1)
-            self.assertEqual(mariadb.count(self.settings), 1)
 
 
 if __name__ == "__main__":

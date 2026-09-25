@@ -22,6 +22,7 @@ and answered, so nothing raises.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import posixpath
 import shlex
 import subprocess
 from typing import Any, Callable, Sequence
@@ -94,6 +95,32 @@ _PXL_TEMP_PREFIX = "/tmp/pxl-"
 _PXL_INSTALL_PREFIX = "/usr/local/sbin/pxl-"
 
 
+def _confine(
+    command: str, argument: str, prefixes: tuple[str, ...], verb: str
+) -> None:
+    """Raise ``PolicyError`` unless ``argument`` resolves inside ``prefixes``.
+
+    Two layers, because the seam runs as root and a bare ``startswith`` check
+    is bypassable by traversal: ``..`` anywhere in the argument is refused
+    outright (it can be glued inside a segment, as in ``/tmp/pxl-../evil``,
+    so a segment-exact match is not enough), and the path is
+    ``posixpath.normpath``-ed before the prefix test, so
+    ``/tmp/pxl-../../etc/shadow`` normalizes out of the namespace (to
+    ``/tmp/etc/shadow`` here; with the extra slash, ``/tmp/pxl-/../../etc``
+    reaches ``/etc``) and is refused cleanly.
+    """
+    if ".." in argument:
+        raise PolicyError(
+            f"refused: {command} path contains '..': {argument!r}"
+        )
+    normalized = posixpath.normpath(argument)
+    if not normalized.startswith(prefixes):
+        allowed = " or ".join(f"{prefix}*" for prefix in prefixes)
+        raise PolicyError(
+            f"refused: {command} {verb} only {allowed}, not {argument!r}"
+        )
+
+
 def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
     """Raise ``PolicyError`` unless ``argv`` may run on the host.
 
@@ -102,12 +129,12 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
     ``HOST_CHANGE_COMMANDS`` additionally requires ``host_change=True`` --
     except exactly ``crontab -l``, which only reads the crontab and changes
     nothing, so a status report needs no authorization while ``crontab -``
-    and every other invocation stay gated; for ``argv[0] == "cat"`` every
-    argument must start with ``/tmp/pxl-`` so the seam cannot read host files
-    outside its own temp namespace; for ``"tee"`` every destination must
-    start with ``/tmp/pxl-``; and for ``"rm"`` every path argument must start
-    with ``/tmp/pxl-`` or ``/usr/local/sbin/pxl-``, so the seam can only
-    stage, install and remove pxl's own files.
+    and every other invocation stay gated; and for ``"cat"``/``"tee"``/``"rm"``
+    every path argument must *resolve* inside its allowed prefix -- no ``..``
+    anywhere in the argument, and posix-normalized before the prefix test --
+    so the seam cannot read, write or remove host files outside
+    ``/tmp/pxl-*`` (and, for ``rm``, ``/usr/local/sbin/pxl-*``) no matter how
+    the path is spelled.
 
     This replaces the old API-path policy gate (``host_policy.check_api``):
     the gate moved from URL parsing to argv policy. What the gate never did --
@@ -129,31 +156,22 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
             )
     if command == "cat":
         for argument in argv[1:]:
-            if not argument.startswith(_PXL_TEMP_PREFIX):
-                raise PolicyError(
-                    f"refused: cat reads only {_PXL_TEMP_PREFIX}* files, not {argument!r}"
-                )
+            _confine("cat", argument, (_PXL_TEMP_PREFIX,), "reads")
     if command == "tee":
         for argument in argv[1:]:
             if argument.startswith("-"):
                 continue
-            if not argument.startswith(_PXL_TEMP_PREFIX):
-                raise PolicyError(
-                    f"refused: tee writes only {_PXL_TEMP_PREFIX}* files, "
-                    f"not {argument!r}"
-                )
+            _confine("tee", argument, (_PXL_TEMP_PREFIX,), "writes")
     if command == "rm":
         for argument in argv[1:]:
             if argument.startswith("-"):
                 continue
-            if not (
-                argument.startswith(_PXL_TEMP_PREFIX)
-                or argument.startswith(_PXL_INSTALL_PREFIX)
-            ):
-                raise PolicyError(
-                    f"refused: rm removes only {_PXL_TEMP_PREFIX}* or "
-                    f"{_PXL_INSTALL_PREFIX}*, not {argument!r}"
-                )
+            _confine(
+                "rm",
+                argument,
+                (_PXL_TEMP_PREFIX, _PXL_INSTALL_PREFIX),
+                "removes",
+            )
 
 
 class SSH:

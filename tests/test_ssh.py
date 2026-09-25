@@ -173,6 +173,38 @@ class RunPolicyTests(unittest.TestCase):
                 self.assertTrue(make_ssh(runner).run(argv, host_change=True).ok)
                 self.assertEqual(len(runner.calls), 1)
 
+    def test_parent_traversal_is_refused_before_spawn(self) -> None:
+        """`..` defeats a bare prefix check, so cat/tee/rm reject it (and
+        normalize before the prefix test) -- nothing reaches the host."""
+        cases = {
+            "cat with .. segments": ["cat", "/tmp/pxl-../../etc/shadow"],
+            "tee with .. glued in a segment": ["tee", "/tmp/pxl-../evil"],
+            "rm with .. segments": ["rm", "/tmp/pxl-../../etc"],
+            "rm reaching outside via /tmp/pxl-/../..": [
+                "rm",
+                "-f",
+                "/tmp/pxl-/../../important",
+            ],
+        }
+        for name, argv in cases.items():
+            with self.subTest(name=name):
+                runner = RecordingRunner()
+                # host_change=True: the refusal must come from the path rule,
+                # not from the (also correct) authorization gate.
+                with self.assertRaises(ssh_module.PolicyError):
+                    make_ssh(runner).run(argv, host_change=True)
+                self.assertEqual(runner.calls, [])
+
+    def test_confined_paths_still_pass(self) -> None:
+        for argv in (
+            ["rm", "/tmp/pxl-gc-staging"],
+            ["rm", "-f", "/usr/local/sbin/pxl-gc"],
+        ):
+            with self.subTest(argv=argv):
+                runner = RecordingRunner()
+                self.assertTrue(make_ssh(runner).run(argv, host_change=True).ok)
+                self.assertEqual(len(runner.calls), 1)
+
 
 class RunTransportTests(unittest.TestCase):
     def test_timeout_is_transport_error(self) -> None:

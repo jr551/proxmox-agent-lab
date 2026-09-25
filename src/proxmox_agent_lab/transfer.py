@@ -1,387 +1,227 @@
-"""Guest file transfer: S3-mediated push/pull and the ``s3`` subcommands.
+"""Guest file transfer: push/pull over chunked base64 guest exec.
 
-Files move through the configured S3 scratch bucket using presigned URLs; no
-credential reaches the guest, argv or the audit ledger. The chunked path
-splits large payloads so retries resume, and verifies a SHA-256 on both ends.
+The only transport is ``proxmox.push_bytes``/``proxmox.pull_bytes`` (chunked
+base64 fed through guest exec, rework plan §D). The S3 scratch-bucket path
+this module used to mediate -- uploads, presigned URLs, chunk tables -- is
+cut entirely.
+
+Ownership first: every command starts with ``guest.require_owned`` against the
+lease registry (``kind=None``: whichever kind the lease registers) before any
+host call. The guest kind is taken from the registry row, the same convention
+``guest.py`` uses -- no ``qm``/``pct`` probing and never a seam call ahead of
+the gate.
+
+Digest policy. ``--sha256`` names the payload digest the caller expects. Push
+refuses a mismatching local file before the guest is touched and reports the
+guest-verified digest ``push_bytes`` recomputes in the guest; pull removes the
+written file and fails when the pulled bytes do not match ``--sha256``.
+``pull_bytes`` independently compares the reassembled bytes against the
+guest's own sha256 before returning them, so a digest mismatch never reaches
+disk.
+
+``--timeout`` (default 300 s, bounded) is the transfer budget: ``push_bytes``
+and ``pull_bytes`` own their guest execs and take no timeout of their own, so
+the budget is enforced around the seam call here.
 """
+
 from __future__ import annotations
 
-from .guest_agent import agent_exec
-from . import leases as leases_module
-from . import s3
-from pathlib import Path
-from typing import Any
+import argparse
+import hashlib
 import json
-import secrets
-import shlex
+import os
+import threading
+from pathlib import Path
+from typing import Any, Callable
+
+from . import guest as guest_module
+from . import proxmox as proxmox_module
+from .errors import LabError
+
+DEFAULT_TIMEOUT = 300
+MAX_TIMEOUT = 86400
 
 
-SINGLE_OBJECT_MAX_MB = 32
+def _make_proxmox(config: Any) -> proxmox_module.Proxmox:
+    """The proxmox seam for this configuration (tests substitute a double)."""
+    return proxmox_module.from_config(config)
 
 
-CHUNK_DEFAULT_MB = 64
-
-
-MAX_CHUNK_PARTS = 256
-
-
-def _ps_quote(value: str) -> str:
-    """Single-quote a value for a PowerShell string, doubling embedded quotes."""
-    return "'" + value.replace("'", "''") + "'"
-
-
-def _fetch_command(url: str, dest: str, windows: bool) -> list[str]:
-    if windows:
-        script = (
-            "$ProgressPreference='SilentlyContinue'; "
-            f"Invoke-WebRequest -UseBasicParsing -Uri {_ps_quote(url)} "
-            f"-OutFile {_ps_quote(dest)}"
-        )
-        return ["powershell.exe", "-NoProfile", "-Command", script]
-    return [
-        "/bin/sh", "-c",
-        f"curl -fsSL -A proxmox-agent-lab -o {shlex.quote(dest)} {shlex.quote(url)}",
-    ]
-
-
-def _upload_command(url: str, source: str, windows: bool) -> list[str]:
-    if windows:
-        script = (
-            "$ProgressPreference='SilentlyContinue'; "
-            f"Invoke-WebRequest -UseBasicParsing -Method Put -Uri {_ps_quote(url)} "
-            f"-InFile {_ps_quote(source)}"
-        )
-        return ["powershell.exe", "-NoProfile", "-Command", script]
-    return [
-        "/bin/sh", "-c",
-        f"curl -fsS -A proxmox-agent-lab -X PUT --data-binary "
-        f"@{shlex.quote(source)} {shlex.quote(url)}",
-    ]
-
-
-def _fetch_parts_command(urls: list[str], dest: str) -> list[str]:
-    """Download and reassemble chunk parts in the guest, printing the hash."""
-    steps = " && ".join(
-        f"curl -fsSL -A proxmox-agent-lab -o "
-        f"{shlex.quote(f'/tmp/pp-{i:04d}')} {shlex.quote(url)}"
-        for i, url in enumerate(urls)
-    )
-    script = (
-        f"rm -f {shlex.quote(dest)} /tmp/pp-*; {steps} "
-        f"&& cat /tmp/pp-* > {shlex.quote(dest)} && rm -f /tmp/pp-* "
-        f"&& sha256sum {shlex.quote(dest)} | cut -d' ' -f1"
-    )
-    return ["/bin/sh", "-c", script]
-
-
-def _upload_parts_command(urls: list[str], source: str, chunk: int) -> list[str]:
-    """Split a guest file into chunks, upload each, then report its hash."""
-    steps = " && ".join(
-        f"curl -fsS -A proxmox-agent-lab -X PUT --data-binary "
-        f"@{shlex.quote(f'/tmp/pp-{i:04d}')} {shlex.quote(url)}"
-        for i, url in enumerate(urls)
-    )
-    script = (
-        f"rm -f /tmp/pp-*; split -b {int(chunk)} -d -a 4 "
-        f"{shlex.quote(source)} /tmp/pp- && {steps} "
-        f"&& rm -f /tmp/pp-* && sha256sum {shlex.quote(source)} | cut -d' ' -f1"
-    )
-    return ["/bin/sh", "-c", script]
-
-
-def _chunk_size_mb(args: Any) -> int:
-    return max(1, getattr(args, "chunk_size", None) or CHUNK_DEFAULT_MB)
-
-
-def _push_chunked(lab: Any, api: Any, args: Any, source: Path,
-                  payload: bytes, name: str) -> dict[str, Any]:
-    chunk = _chunk_size_mb(args) * 1024 * 1024
-    parts = [payload[i:i + chunk] for i in range(0, len(payload), chunk)]
-    if len(parts) > MAX_CHUNK_PARTS:
-        raise lab.LabError(f"{name} needs {len(parts)} parts (max {MAX_CHUNK_PARTS}); "
-            "raise --chunk-size",
-        )
-    base = args.key or f"push/{secrets.token_hex(6)}/{name}"
-    keys = [f"{base}/part-{i:04d}" for i in range(len(parts))]
-    for key, part in zip(keys, parts):
-        s3.put_bytes(key, part)
-    urls = [s3.presign(key, expires=args.url_expiry) for key in keys]
-    dest = args.dest or f"/tmp/{name}"
-    run = agent_exec(
-        lab, api, args.vmid, _fetch_parts_command(urls, dest),
-        timeout=args.timeout,
-    )
-    if run["exitcode"] not in (0, None):
-        raise lab.LabError(f"guest fetch failed: {run['stderr'][:400]}")
-    guest_sha = run.get("stdout", "").strip()
-    if args.sha256 and guest_sha != args.sha256:
-        raise lab.LabError(f"sha256 mismatch on guest: {guest_sha} != {args.sha256}"
-        )
-    return {
-        "vmid": args.vmid, "s3_key": base, "bytes": len(payload),
-        "parts": len(parts), "dest": dest, "chunked": True,
-        "guest_sha256": guest_sha or None,
-    }
-
-
-def _pull_chunked(lab: Any, api: Any, args: Any, name: str) -> dict[str, Any]:
-    import hashlib
-    import math
-
-    chunk = _chunk_size_mb(args) * 1024 * 1024
-    base = args.key or f"pull/{args.vmid}/{name}"
-    out = Path(args.out).expanduser() if args.out else Path(name)
-    if args.sha256 and out.is_file():
-        if hashlib.sha256(out.read_bytes()).hexdigest() == args.sha256:
-            return {
-                "vmid": args.vmid, "path": str(out),
-                "bytes": out.stat().st_size, "sha256": args.sha256,
-                "s3_key": base, "already_verified": True, "chunked": True,
-            }
-    size_run = agent_exec(
-        lab, api, args.vmid,
-        ["/bin/sh", "-c", f"stat -c %s {shlex.quote(args.remote)}"],
-        timeout=args.timeout,
-    )
+def _timeout_seconds(value: str) -> int:
+    """argparse type: a bounded transfer budget in seconds."""
     try:
-        size = int(size_run.get("stdout", "").strip())
-    except ValueError:
-        raise lab.LabError(f"cannot read size of {args.remote}: "
-            f"{size_run.get('stderr', '')[:200]}",
-        ) from None
-    n_parts = max(1, math.ceil(size / chunk))
-    if n_parts > MAX_CHUNK_PARTS:
-        raise lab.LabError(f"{name} needs {n_parts} parts (max {MAX_CHUNK_PARTS}); "
-            "raise --chunk-size",
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"not a whole number of seconds: {value!r}"
+        ) from exc
+    if not 1 <= seconds <= MAX_TIMEOUT:
+        raise argparse.ArgumentTypeError(
+            f"timeout must be between 1 and {MAX_TIMEOUT} seconds"
         )
-    keys = [f"{base}/part-{i:04d}" for i in range(n_parts)]
-    # Drop stale parts from an earlier interrupted attempt with the same key.
-    for obj in s3.list_objects(base):
-        key = str(obj.get("key", ""))
-        if key.startswith(base + "/"):
-            s3.delete_object(key)
-    urls = [s3.presign(key, method="PUT", expires=args.url_expiry)
-            for key in keys]
-    run = agent_exec(
-        lab, api, args.vmid,
-        _upload_parts_command(urls, args.remote, chunk),
-        timeout=args.timeout,
-    )
-    if run["exitcode"] not in (0, None):
-        raise lab.LabError(f"guest upload failed: {run['stderr'][:400]}")
-    guest_sha = run.get("stdout", "").strip()
-    payload = b"".join(s3.get_bytes(key) for key in keys)
-    sha = hashlib.sha256(payload).hexdigest()
-    if guest_sha and sha != guest_sha:
-        raise lab.LabError(f"sha256 mismatch: assembled {sha} != guest {guest_sha}"
-        )
-    if args.sha256 and sha != args.sha256:
-        raise lab.LabError(f"sha256 mismatch: {sha} != expected {args.sha256}"
-        )
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(payload)
-    if not args.keep:
-        for key in keys:
-            s3.delete_object(key)
-    return {
-        "vmid": args.vmid, "path": str(out), "bytes": len(payload),
-        "sha256": sha, "parts": n_parts, "s3_key": base, "chunked": True,
-    }
+    return seconds
+
+
+def _bounded(call: Callable[[], Any], timeout: float, what: str) -> Any:
+    """Run one seam transfer under the ``--timeout`` budget.
+
+    The seam call is blocking and owns its own guest execs, so the budget is
+    enforced here: the call runs on a daemon worker and the command fails
+    (with nothing partial kept) when it overruns.
+    """
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise LabError(f"{what} did not finish within {timeout:g}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
+def _require_guest(lab: Any, args: Any) -> str:
+    """Gate on lease ownership first; return the registered guest kind.
+
+    ``require_owned`` reads only the registry (no seam call), so the gate
+    always precedes the first host command.
+    """
+    row = guest_module.require_owned(lab, args.lease, None, args.vmid)
+    return str(row["kind"])
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` with mode 0600, never leaving a partial file."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError as exc:
+        raise LabError(f"cannot write {path}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.chmod(path, 0o600)  # an existing file keeps its old mode otherwise
+    except OSError as exc:
+        path.unlink(missing_ok=True)  # a file we opened is ours to remove
+        raise LabError(f"cannot write {path}: {exc}") from exc
 
 
 def cmd_push(lab: Any, args: Any) -> None:
-    """Copy a local file into a guest via the S3 scratch bucket."""
-    api = lab.ProxmoxAPI()
-    leases_module.require_owned_qemu(lab, args.lease, args.vmid)
+    """Copy a local file into a guest via chunked base64 guest exec."""
+    kind = _require_guest(lab, args)
     source = Path(args.file).expanduser().resolve()
     if not source.is_file():
-        raise lab.LabError(f"not a regular file: {source}")
-    payload = source.read_bytes()
-    chunked = (
-        not args.windows and not args.url_only
-        and len(payload) > SINGLE_OBJECT_MAX_MB * 1024 * 1024
+        raise LabError(f"not a regular file: {source}")
+    data = source.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    expected = getattr(args, "sha256", None)
+    if expected and digest != expected:
+        # Refused before the guest is touched: nothing happened to audit.
+        raise LabError(f"sha256 mismatch: {source} is {digest}, expected {expected}")
+    dest = str(args.dest)
+    timeout = getattr(args, "timeout", None) or DEFAULT_TIMEOUT
+    prox = _make_proxmox(lab.CONFIG)
+    guest_sha = _bounded(
+        lambda: prox.push_bytes(kind, args.vmid, dest, data),
+        timeout,
+        f"push to {dest}",
     )
-    if chunked:
-        result = _push_chunked(lab, api, args, source, payload, source.name)
-        lab.audit("guest-push", lease=args.lease, vmid=args.vmid,
-                  s3_key=result["s3_key"], bytes=len(payload),
-                  parts=result["parts"], chunked=True)
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return
-    key = args.key or f"push/{secrets.token_hex(6)}/{source.name}"
-    s3.put_bytes(key, payload)
-    url = s3.presign(key, expires=args.url_expiry)
-    dest = args.dest or (
-        f"C:\\Windows\\Temp\\{source.name}" if args.windows else f"/tmp/{source.name}"
+    lab.audit(
+        "guest-push",
+        lease=args.lease,
+        vmid=args.vmid,
+        remote_path=dest,
+        bytes=len(data),
+        sha256=guest_sha,
     )
-    result: dict[str, Any] = {
+    print(json.dumps({
+        "lease_id": args.lease,
         "vmid": args.vmid,
-        "s3_key": key,
-        "bytes": len(payload),
-        "dest": dest,
-    }
-    if args.url_only:
-        result["fetch_url"] = url
-        result["hint"] = "run the fetch inside the guest yourself"
-    else:
-        run = agent_exec(
-            lab, api, args.vmid, _fetch_command(url, dest, args.windows),
-            timeout=args.timeout,
-        )
-        result["guest"] = run
-        if run["exitcode"] not in (0, None):
-            raise lab.LabError(f"guest fetch failed: {run['stderr'][:400]}")
-    lab.audit("guest-push", lease=args.lease, vmid=args.vmid, s3_key=key,
-              bytes=len(payload), dest=dest)
-    print(json.dumps(result, indent=2, sort_keys=True))
+        "local_path": str(source),
+        "remote_path": dest,
+        "bytes": len(data),
+        "sha256": guest_sha,
+    }, indent=2, sort_keys=True))
 
 
 def cmd_pull(lab: Any, args: Any) -> None:
-    """Copy a file out of a guest via the S3 scratch bucket."""
-    import hashlib
-
-    api = lab.ProxmoxAPI()
-    leases_module.require_owned_qemu(lab, args.lease, args.vmid)
-    name = Path(args.remote).name
-    out = Path(args.out).expanduser() if args.out else Path(name)
-    # Resume: when the local file already matches the expected hash there is
-    # nothing to do, so make no guest or S3 traffic at all.
-    if args.sha256 and out.is_file():
-        if hashlib.sha256(out.read_bytes()).hexdigest() == args.sha256:
-            lab.audit("guest-pull", lease=args.lease, vmid=args.vmid,
-                      bytes=out.stat().st_size, sha256=args.sha256,
-                      already_verified=True)
-            print(json.dumps({
-                "vmid": args.vmid, "path": str(out),
-                "bytes": out.stat().st_size, "sha256": args.sha256,
-                "already_verified": True,
-            }, indent=2, sort_keys=True))
-            return
-    if not args.windows:
-        probe = agent_exec(
-            lab, api, args.vmid,
-            ["/bin/sh", "-c", f"stat -c %s {shlex.quote(args.remote)}"],
-            timeout=args.timeout,
-        )
-        try:
-            remote_size = int(probe.get("stdout", "").strip())
-        except ValueError:
-            remote_size = 0
-        if remote_size > SINGLE_OBJECT_MAX_MB * 1024 * 1024:
-            result = _pull_chunked(lab, api, args, name)
-            lab.audit("guest-pull", lease=args.lease, vmid=args.vmid,
-                      s3_key=result.get("s3_key", ""), bytes=result["bytes"],
-                      parts=result.get("parts"), chunked=True)
-            print(json.dumps(result, indent=2, sort_keys=True))
-            return
-    key = args.key or f"pull/{secrets.token_hex(6)}/{Path(args.remote).name}"
-    url = s3.presign(key, method="PUT", expires=args.url_expiry)
-    run = agent_exec(
-        lab, api, args.vmid, _upload_command(url, args.remote, args.windows),
-        timeout=args.timeout,
+    """Copy a file out of a guest via chunked base64 guest exec."""
+    kind = _require_guest(lab, args)
+    remote = str(args.remote)
+    timeout = getattr(args, "timeout", None) or DEFAULT_TIMEOUT
+    prox = _make_proxmox(lab.CONFIG)
+    # pull_bytes verifies the reassembled bytes against the guest's sha256
+    # before returning them; a mismatch raises and nothing is written.
+    data = _bounded(
+        lambda: prox.pull_bytes(kind, args.vmid, remote),
+        timeout,
+        f"pull from {remote}",
     )
-    if run["exitcode"] not in (0, None):
-        raise lab.LabError(f"guest upload failed: {run['stderr'][:400]}")
-    payload = s3.get_bytes(key)
-    target = Path(args.out).expanduser() if args.out else Path(Path(args.remote).name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(payload)
-    if not args.keep:
-        s3.delete_object(key)
-    lab.audit("guest-pull", lease=args.lease, vmid=args.vmid, s3_key=key,
-              bytes=len(payload))
-    print(json.dumps(
-        {"vmid": args.vmid, "path": str(target), "bytes": len(payload)}, indent=2
-    ))
+    digest = hashlib.sha256(data).hexdigest()
+    out = Path(args.out).expanduser()
+    _write_private(out, data)
+    expected = getattr(args, "sha256", None)
+    if expected and digest != expected:
+        out.unlink(missing_ok=True)  # never leave a bad pull behind
+        raise LabError(f"sha256 mismatch: {remote} is {digest}, expected {expected}")
+    lab.audit(
+        "guest-pull",
+        lease=args.lease,
+        vmid=args.vmid,
+        remote_path=remote,
+        bytes=len(data),
+        sha256=digest,
+    )
+    print(json.dumps({
+        "lease_id": args.lease,
+        "vmid": args.vmid,
+        "local_path": str(out),
+        "remote_path": remote,
+        "bytes": len(data),
+        "sha256": digest,
+    }, indent=2, sort_keys=True))
 
 
-def cmd_s3(lab: Any, args: Any) -> None:
-    if args.s3_command == "health":
-        print(json.dumps(s3.health(), indent=2, sort_keys=True))
-    elif args.s3_command == "list":
-        print(json.dumps(s3.list_objects(args.prefix), indent=2, sort_keys=True))
-    elif args.s3_command == "put":
-        source = Path(args.file).expanduser().resolve()
-        key = args.key or f"upload/{secrets.token_hex(6)}/{source.name}"
-        s3.put_bytes(key, source.read_bytes())
-        print(json.dumps({"key": key, "bytes": source.stat().st_size}, indent=2))
-    elif args.s3_command == "get":
-        payload = s3.get_bytes(args.key)
-        target = Path(args.out).expanduser() if args.out else Path(Path(args.key).name)
-        target.write_bytes(payload)
-        print(json.dumps({"path": str(target), "bytes": len(payload)}, indent=2))
-    elif args.s3_command == "presign":
-        print(json.dumps(
-            {"url": s3.presign(args.key, method=args.method,
-                                   expires=args.expires)},
-            indent=2,
-        ))
-    elif args.s3_command == "delete":
-        s3.delete_object(args.key)
-        print(json.dumps({"deleted": args.key}))
-
-
-def _register_transfer(sub: Any, lab: Any) -> None:
+def register(sub: Any, lab: Any) -> None:
+    """The ``push`` and ``pull`` parsers (transfer owns both)."""
     from .cli import _bind
 
     push = sub.add_parser("push", help="copy a local file into a guest")
     push.add_argument("--lease", required=True)
     push.add_argument("--vmid", type=int, required=True)
     push.add_argument("--file", required=True)
-    push.add_argument("--dest")
-    push.add_argument("--key", help="explicit S3 object key")
-    push.add_argument("--windows", action="store_true")
-    push.add_argument("--url-only", action="store_true",
-                      help="print a presigned URL instead of using the guest agent")
-    push.add_argument("--url-expiry", type=int, default=3600)
-    push.add_argument("--timeout", type=int, default=600)
-    push.add_argument("--chunk-size", type=int, metavar="MB", default=CHUNK_DEFAULT_MB,
-                      help="part size for large-file transfers (default 64)")
-    push.add_argument("--sha256",
-                      help="expected SHA-256 of the file; verified on the guest")
+    push.add_argument("--dest", required=True)
+    push.add_argument(
+        "--sha256",
+        help="expected SHA-256 of the file; verified before it is sent",
+    )
+    push.add_argument(
+        "--timeout",
+        type=_timeout_seconds,
+        default=DEFAULT_TIMEOUT,
+        help=f"transfer budget in seconds (default {DEFAULT_TIMEOUT})",
+    )
     push.set_defaults(func=_bind(lab, cmd_push))
 
     pull = sub.add_parser("pull", help="copy a file out of a guest")
     pull.add_argument("--lease", required=True)
     pull.add_argument("--vmid", type=int, required=True)
     pull.add_argument("--remote", required=True)
-    pull.add_argument("--out")
-    pull.add_argument("--key")
-    pull.add_argument("--keep", action="store_true",
-                      help="keep the scratch object after download")
-    pull.add_argument("--windows", action="store_true")
-    pull.add_argument("--url-expiry", type=int, default=3600)
-    pull.add_argument("--timeout", type=int, default=600)
-    pull.add_argument("--chunk-size", type=int, metavar="MB", default=CHUNK_DEFAULT_MB,
-                      help="part size for large-file transfers (default 64)")
-    pull.add_argument("--sha256",
-                      help="expected SHA-256; skips the transfer when the "
-                           "local file already matches")
+    pull.add_argument("--out", required=True)
+    pull.add_argument(
+        "--sha256",
+        help="expected SHA-256 of the pulled file; a mismatch removes it and fails",
+    )
+    pull.add_argument(
+        "--timeout",
+        type=_timeout_seconds,
+        default=DEFAULT_TIMEOUT,
+        help=f"transfer budget in seconds (default {DEFAULT_TIMEOUT})",
+    )
     pull.set_defaults(func=_bind(lab, cmd_pull))
-
-
-def _register_s3(sub: Any, lab: Any) -> None:
-    from .cli import _bind
-
-    store = sub.add_parser("s3", help="scratch bucket operations")
-    store_sub = store.add_subparsers(dest="s3_command", required=True)
-    store_sub.add_parser("health").set_defaults(func=_bind(lab, cmd_s3))
-    listing = store_sub.add_parser("list")
-    listing.add_argument("--prefix", default="")
-    listing.set_defaults(func=_bind(lab, cmd_s3))
-    putter = store_sub.add_parser("put")
-    putter.add_argument("--file", required=True)
-    putter.add_argument("--key")
-    putter.set_defaults(func=_bind(lab, cmd_s3))
-    getter = store_sub.add_parser("get")
-    getter.add_argument("--key", required=True)
-    getter.add_argument("--out")
-    getter.set_defaults(func=_bind(lab, cmd_s3))
-    signer = store_sub.add_parser("presign")
-    signer.add_argument("--key", required=True)
-    signer.add_argument("--method", default="GET", choices=("GET", "PUT"))
-    signer.add_argument("--expires", type=int, default=3600)
-    signer.set_defaults(func=_bind(lab, cmd_s3))
-    remover = store_sub.add_parser("delete")
-    remover.add_argument("--key", required=True)
-    remover.set_defaults(func=_bind(lab, cmd_s3))

@@ -115,6 +115,101 @@ def encode_png(width: int, height: int, rgb: bytes, level: int = 6) -> bytes:
     )
 
 
+_PPM_WHITESPACE = b" \t\r\n\v\f"
+
+
+def _ppm_field(data: bytes, position: int, what: str) -> tuple[int, int]:
+    """Read one decimal PPM header field, skipping whitespace and # comments."""
+    end = len(data)
+    while True:
+        while position < end and data[position:position + 1] in _PPM_WHITESPACE:
+            position += 1
+        if position < end and data[position:position + 1] == b"#":
+            newline = data.find(b"\n", position)
+            if newline < 0:
+                raise ValueError(
+                    f"PPM comment runs to the end of the file before the {what}"
+                )
+            position = newline + 1
+            continue
+        break
+    start = position
+    while position < end and 48 <= data[position] <= 57:  # '0'..'9'
+        position += 1
+    if position == start:
+        if position >= end:
+            raise ValueError(f"PPM header ends before the {what}")
+        raise ValueError(
+            f"PPM {what} is not a number: {data[start:start + 16]!r}"
+        )
+    return int(data[start:position]), position
+
+
+def _decode_ppm(data: bytes) -> tuple[int, int, bytes]:
+    """Decode a binary PPM (P6) into (width, height, packed RGB).
+
+    Header whitespace and `#` comments are honoured wherever the format
+    allows them; the raster must be exactly width*height*3 bytes, so a
+    truncated or oversized input raises instead of producing a partial
+    image. Only 8-bit color P6 is accepted: P3/P5 and any maxval other
+    than 255 (16-bit PPMs included) raise with a message that names the
+    reason.
+    """
+    if len(data) < 2:
+        raise ValueError("not a PPM: too short for the P6 magic")
+    magic = data[:2]
+    if magic == b"P5":
+        raise ValueError(
+            "P5 is a grayscale PPM; only binary color P6 is supported"
+        )
+    if magic == b"P3":
+        raise ValueError(
+            "P3 is an ASCII PPM; only binary color P6 is supported"
+        )
+    if magic != b"P6":
+        raise ValueError(f"not a PPM: expected the P6 magic, got {magic!r}")
+    width, position = _ppm_field(data, 2, "width")
+    height, position = _ppm_field(data, position, "height")
+    maxval, position = _ppm_field(data, position, "maxval")
+    if maxval != 255:
+        hint = " (16-bit PPM)" if maxval > 255 else ""
+        raise ValueError(
+            f"only 8-bit PPMs (maxval 255) are supported, "
+            f"got maxval {maxval}{hint}"
+        )
+    if width < 1 or height < 1:
+        raise ValueError(f"PPM has no pixels: {width}x{height}")
+    # The header ends with exactly one whitespace byte; everything after it
+    # is raster, even when the first pixel byte looks like whitespace.
+    if position >= len(data) or data[position:position + 1] not in _PPM_WHITESPACE:
+        raise ValueError(
+            "PPM header is missing the whitespace before the pixel data"
+        )
+    payload = data[position + 1:]
+    expected = width * height * 3
+    if len(payload) != expected:
+        raise ValueError(
+            f"PPM pixel data length mismatch: {width}x{height} needs "
+            f"{expected} bytes, got {len(payload)}"
+        )
+    return width, height, payload
+
+
+def ppm_to_png(data: bytes, level: int = 6) -> bytes:
+    """Convert a binary PPM (P6) blob -- QEMU screendump's format -- to PNG.
+
+    `screendump` writes raw PPM to the host; this brings it home in the same
+    8-bit non-interlaced PNG shape everything else here produces, through
+    this module's own `encode_png`. Bad input never converts: P3/P5 magic,
+    a maxval other than 255, a header that stops early, zero dimensions or
+    a payload whose length is not exactly width*height*3 all raise
+    `ValueError` with the reason -- no crash, no silently partial image.
+    `level` is the zlib compression level, as in `encode_png`.
+    """
+    width, height, rgb = _decode_ppm(data)
+    return encode_png(width, height, rgb, level)
+
+
 def downscale_rgb(width: int, height: int, rgb: bytes,
                   max_edge: int) -> tuple[int, int, bytes]:
     """Shrink a packed RGB buffer so its longest edge fits `max_edge`.

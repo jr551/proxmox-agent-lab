@@ -8,11 +8,13 @@ back off.**
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-The `proxmox-lab` CLI powers a spare Proxmox host on and off, creates and
-destroys lease-owned guests, drives screens, runs commands, moves files, and
-records an audit trail. All work happens inside a **lease**: ordinary leases
-clean up and verify shutdown when they end; long-term leases deliberately keep
-the host on for persistent machines.
+`proxmox-lab` is an SSH + SQLite skill and CLI for a spare Proxmox host: the
+controller drives the host **as root over ssh**, keeps every lease, resource
+record and journal event in **one local SQLite file**, and talks to agents
+either as CLI commands or as an MCP server over stdio. The only thing that
+ever runs on the host itself is the optional garbage-collector script —
+nothing is installed there, no daemon, no listener, no credentials beyond
+your own ssh key.
 
 > **New here?** The [documentation index](docs/README.md) lists the shortest
 > path for every task.
@@ -21,67 +23,26 @@ the host on for persistent machines.
 
 - A spare PC running [Proxmox VE 8 or 9](https://www.proxmox.com), with a wired
   NIC and Wake-on-LAN (or another power mode).
-- Python 3.11+ on the controller.
-- A secrets backend. The default `auto` reads `PROXMOX_AGENT_LAB_*` environment
-  variables; `keychain`, `secret-tool` and `file` are explicit options. See the
-  [secrets guide](docs/CONFIGURATION.md#secrets).
+- Python 3.11+ on the controller — the package is **stdlib only**: zero
+  runtime dependencies to install.
+- Root ssh access to the host, set up once with
+  `ssh-copy-id root@proxmox`.
+- One TOML config file. Nothing secret ever goes in it.
 
 ## Install
 
-One command installs, configures, stores secrets, and health-checks:
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
+python -m pip install proxmox-agent-lab
+proxmox-lab init        # writes the starter config
+$EDITOR ~/.config/proxmox-agent-lab/config.toml
+proxmox-lab doctor      # checks the install end to end; non-zero if anything fails
 ```
 
-No install? `bootstrap.sh` drops a throwaway environment under
-`$TMPDIR/proxmox-agent-lab-env` and prints the path:
-
-```bash
-PXL=$(curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/bootstrap.sh | sh) && "$PXL" doctor
-```
-
-Full setup — Proxmox host preparation and the audit ledger — is in
-[docs/INSTALL.md](docs/INSTALL.md). Every setting is in
+From a checkout, `scripts/proxmox-lab` runs the same commands without
+installing. Full setup — host preparation, ssh trust, the doctor checklist
+and the optional garbage collector — is in
+[docs/INSTALL.md](docs/INSTALL.md); every setting with its default is in
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
-
-### Onboard a host
-
-Two ways to bring a machine under `proxmox-lab` control. Both end with
-`onboard serve` on the controller receiving the pairing callback and writing a
-verified config.
-
-**💿 New host — boot an auto-install ISO.** Generate a pairing bundle, build a
-Proxmox ISO that installs the host and pairs it on first boot, then boot the
-spare PC from it (UEFI required):
-
-```bash
-proxmox-lab onboard prepare --mode iso --directory ~/pxl-pc-bundle \
-  --controller-host pc.example.com --fqdn lab.example.com \
-  --disk-serial "$TARGET_DISK_ID_SERIAL" \
-  --root-password-hash-file ~/pxl-root-password.hash --wipe-confirmed
-proxmox-lab onboard build-iso --bundle ~/pxl-pc-bundle \
-  --source ~/Downloads/proxmox-ve.iso --sha256 "$OFFICIAL_ISO_SHA256"
-proxmox-lab onboard serve --bundle ~/pxl-pc-bundle \
-  --config-out ~/.config/proxmox-agent-lab/new-lab.toml
-```
-
-**🖥️ Existing Proxmox host — pair in place.** On a machine that already runs
-Proxmox, generate a bundle, copy `host-setup.py` to it, and run it as root to
-create the API principal, isolated bridge and pairing — no reinstall:
-
-```bash
-proxmox-lab onboard prepare --mode existing --directory ~/pxl-host-bundle \
-  --controller-host pc.example.com --fqdn lab.example.com
-proxmox-lab onboard serve --bundle ~/pxl-host-bundle \
-  --config-out ~/.config/proxmox-agent-lab/new-lab.toml
-# on the Proxmox host, as root:
-python3 host-setup.py --host-change-authorized
-```
-
-A fresh Debian VPS (no Proxmox yet) uses `--mode vps` instead — it installs
-the Proxmox kernel and packages first. Details and the Wi-Fi option are in
-[docs/onboarding.md](docs/onboarding.md).
 
 ## First safe workflow
 
@@ -95,58 +56,60 @@ L=$(proxmox-lab lease-begin --purpose "first run" \
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 trap 'proxmox-lab lease-end --lease "$L"' EXIT
 
-proxmox-lab guest clone --lease "$L" --template 9000 --newid 9101
+proxmox-lab guest clone --lease "$L" --source 9000 --vmid 9101
 proxmox-lab guest probe --vmid 9101
 proxmox-lab guest run --lease "$L" --vmid 9101 uname -a
 )  # the trap destroys the clone and powers the host off, including on failure
 ```
 
-`lease-end` must report `"host_powered_off": true`. If cleanup fails, run
-`proxmox-lab cleanup-expired --all` and report the exact blocker. The full
-lease skeleton is in [SKILL.md](SKILL.md); fixes are in
+`lease-begin` wakes the host if needed and records what the lease owns;
+`lease-end` destroys exactly that and verifies the host is actually off.
+Long work renews with `lease-heartbeat --lease "$L"`. If cleanup cannot
+finish, run `proxmox-lab cleanup-expired` and report the exact blocker. The
+full lease skeleton is in [SKILL.md](SKILL.md); fixes are in
 [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## What it can do
 
 | Capability | Command | Guide |
 |---|---|---|
-| Disposable Linux/Windows/Android guests | `guest clone` / `guest run` | [SKILL.md](SKILL.md), [docs/RECIPES.md](docs/RECIPES.md) |
-| Drive the screen | `console screenshot`, `console type`, `console click` | [docs/console.md](docs/console.md) |
-| Cloud vision | `console inspect` | [docs/console.md](docs/console.md) |
-| File transfer | `push` / `pull` | [docs/storage.md](docs/storage.md) |
-| VPN egress and leak testing | `net gateway-create` / `net leak-test` | [docs/network.md](docs/network.md) |
-| Install Windows | `windows install` | [docs/windows.md](docs/windows.md) |
-| Android emulators | `android create` | [docs/android.md](docs/android.md) |
-| Memory introspection | `memflow processes` / `scan` / `write` | [docs/memflow.md](docs/memflow.md) |
-| USB/network capture | `usb sniff` / `netcap capture` / `intercept` | [docs/usb.md](docs/usb.md), [docs/netcap.md](docs/netcap.md) |
-| Long-running persistent guests | `lease-begin --long-term` | [docs/long-term-leases.md](docs/long-term-leases.md) |
+| Disposable guests (create, clone, run) | `guest create` / `guest clone` / `guest run` | [SKILL.md](SKILL.md), [docs/commands.md](docs/commands.md) |
+| Drive the screen | `console screenshot`, `console type`, `console keys` | [docs/commands.md](docs/commands.md) |
+| File transfer | `push` / `pull` | [docs/commands.md](docs/commands.md) |
+| Power | `power wake`, `power status`, `power shutdown` | [docs/INSTALL.md](docs/INSTALL.md) |
+| Leases, including machines that stay on | `lease-begin --long-term`, `lease-destroy` | [docs/long-term-leases.md](docs/long-term-leases.md) |
+| Audit journal (local SQLite) | `journal` | [docs/commands.md](docs/commands.md) |
+| MCP server — 23 tools over stdio | `proxmox-lab mcp` | [SKILL.md](SKILL.md) |
+| Host-side lease garbage collector | `gc install` / `gc status` / `gc uninstall` | [docs/INSTALL.md](docs/INSTALL.md) |
 
 Every subcommand is mapped in [docs/commands.md](docs/commands.md).
 
 ## Lifecycle and safety
 
 An ordinary lease wakes the host, clones a guest, runs the work, then
-`lease-end` destroys the lease's guests and verifies the host is off. A
+`lease-end` destroys the lease's guests and verifies the host is off.
 `lease-begin --long-term` keeps the host and its guests running until
-`lease-destroy --confirm`. Details in
+`lease-destroy --confirm` — the guests are stamped `pxl-expiry=0` so the
+host-side collector never touches them either. Details in
 [docs/long-term-leases.md](docs/long-term-leases.md).
 
-Shutdown is verified, not assumed: `lease-end` reports whether the API stopped
-answering. If cleanup or power-off fails, the failure is recorded,
-`cleanup-expired` retries, and the host stays on when shutdown cannot be
-verified. The enforced rules are in [docs/safety-policy.md](docs/safety-policy.md):
+The enforced rules are in [docs/safety-policy.md](docs/safety-policy.md):
 
-- **Lease-owned guests only** — cleanup deletes only what the lease created.
-- **Verified shutdown** — `lease-end` does not claim success until the API
-  stops answering, twice.
-- **Host changes refused by default** — networking, storage, disks and
-  permissions need `--host-change-authorized`.
-- **Destructive actions are pinned** — formatting a disk requires the serial
-  number to match.
-- **Fails closed** — with VPN egress on, a dropped tunnel stops guest traffic
-  rather than leaking to your home connection.
-- **Secrets stay in the configured backend** — never in `argv`, the config
-  file, or the audit log.
+- **Lease-owned guests only** — cleanup deletes only what the lease created;
+  a guest without pxl metadata is never touched.
+- **Verified shutdown** — success is claimed only after the host stops
+  answering across repeated probes; a shutdown that cannot be confirmed is
+  reported as a failure, never assumed.
+- **Host changes refused by default** — anything that edits the host itself
+  needs `--host-change-authorized`; standalone `power wake` / `power shutdown`
+  need `--standalone-authorized`.
+- **Destructive actions are pinned** — `guest destroy` refuses without
+  `--confirm`, and only for guests the lease owns.
+- **Fails closed** — a missing lease, a missing flag or an unreachable host
+  stops the action; guest metadata that does not parse is warned about and
+  skipped, never "cleaned up" on a guess.
+- **No secrets anywhere** — your ssh agent and keys are the only credential;
+  nothing secret enters argv, the config file, or the journal.
 
 This project is for systems you own or are authorized to test. See
 [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) and [SECURITY.md](SECURITY.md).
@@ -154,23 +117,24 @@ This project is for systems you own or are authorized to test. See
 ## Documentation
 
 - [docs/README.md](docs/README.md) — task-oriented index
-- [docs/INSTALL.md](docs/INSTALL.md) — install and first boot
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every setting and secret
+- [docs/INSTALL.md](docs/INSTALL.md) — host preparation, ssh trust, first run
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every setting and default
 - [SKILL.md](SKILL.md) — copy-paste lease skeleton and quick reference
-- [docs/commands.md](docs/commands.md) — generated map of every subcommand
 - [docs/AGENTS.md](docs/AGENTS.md) — how an agent should drive it
-- [docs/RECIPES.md](docs/RECIPES.md) — common agent workflows
+- [docs/commands.md](docs/commands.md) — generated map of every subcommand
 - [docs/troubleshooting.md](docs/troubleshooting.md) — fix a failure
 - [docs/safety-policy.md](docs/safety-policy.md) — enforced rules
+- [docs/architecture.md](docs/architecture.md) — how the pieces fit together
 - [docs/VERIFICATION.md](docs/VERIFICATION.md) — hardware-tested vs unit-tested
 - [CONTRIBUTING.md](CONTRIBUTING.md) — developer setup and checks
 
 ## Status
 
-Beta. Core lifecycle, console, storage, transfer, VPN, Android and Windows
-paths have been exercised against real hardware. Advanced capabilities clearly
-mark what has and has not been observed end to end. Interfaces may change
-before 1.0; compatibility for the package name and `proxmox-lab` command is a
-goal.
+Beta. The 0.x series is mid-rework onto the SSH + SQLite architecture
+described here — core lifecycle, store, transport and the garbage collector
+have landed; the CLI surface and MCP server are completing now, and
+interfaces may change before 1.0. Compatibility for the package name and the
+`proxmox-lab` command is a goal. What has actually been verified lives in
+[docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 MIT licensed — see [LICENSE](LICENSE).

@@ -67,7 +67,7 @@ the existing `register(sub, lab)` + `_bind` callback pattern from
 | `leases.py` | REWRITE | `leases.py` + `longterm.py`; keeps the MCP idle-activity clock |
 | `cleanup.py` | REWRITE | same orchestration, now through `qm`/`pct` |
 | `power.py` | REWRITE | WoL magic packet (stdlib UDP) + verified shutdown; Home-Assistant HTTP path cut |
-| `guest.py` | REWRITE | guest lifecycle + run/probe/list/snapshot |
+| `guest.py` | REWRITE | guest lifecycle + run/probe/list |
 | `transfer.py` | REWRITE | push/pull over ssh/`qm guest`; S3/MinIO path cut |
 | `console.py` | REWRITE | screenshot/type/key via `qm monitor` screendump + `qm sendkey`; VNC/websocket/vision cut |
 | `png.py` | KEEP | plus PPM→PNG (QM `screendump` writes PPM) |
@@ -142,7 +142,7 @@ The eight invariants of [architecture.md](architecture.md) survive, re-expressed
   (the wheel already force-includes `.agents/`).
 - CLI surface (pinned; MCP tools mirror it in §E): `init`, `doctor`, `journal`, `mcp`,
   `gc install|status|uninstall`, `lease-begin|heartbeat|end|list|destroy|register`,
-  `guest create|clone|start|stop|destroy|probe|list|run|snapshot`, `push`, `pull`,
+  `guest create|clone|start|stop|destroy|probe|list|run`, `push`, `pull`,
   `console screenshot|type|keys`, `cleanup-expired`, `power wake|status|shutdown`
   (standalone `power wake`/`power shutdown` gated `--standalone-authorized`).
 ## B. Disposition matrix
@@ -173,7 +173,7 @@ Every file in the repository (180 tracked + `docs/rework-inventory.md` + `docs/r
 | src/proxmox_agent_lab/disk.py | CUT | Disk-management feature cut entirely. |
 | src/proxmox_agent_lab/diskactivity.py | CUT | Disk-activity monitoring cut entirely. |
 | src/proxmox_agent_lab/errors.py | KEEP | LabError/ConfigError unchanged. |
-| src/proxmox_agent_lab/guest.py | REWRITE | Guest create/clone/start/stop/destroy/probe/list/run/snapshot via proxmox.py. |
+| src/proxmox_agent_lab/guest.py | REWRITE | Guest create/clone/start/stop/destroy/probe/list/run via proxmox.py. |
 | src/proxmox_agent_lab/guest_agent.py | CUT | Guest-agent primitives move to proxmox.py (`qm guest`/`pct exec`). |
 | src/proxmox_agent_lab/host_policy.py | CUT | API-path gate dies; re-expressed as the ssh.py command allowlist. |
 | src/proxmox_agent_lab/host_transport.py | CUT | Subprocess-ssh skeleton becomes ssh.py (gated on new `[ssh] target`). |
@@ -267,11 +267,11 @@ Every file in the repository (180 tracked + `docs/rework-inventory.md` + `docs/r
 | tests/test_leases.py | NEW | Lease begin/heartbeat/end/list/destroy/register incl. long-term kind + idle-activity plumbing. |
 | tests/test_cleanup.py | NEW | Finalize-lease, cleanup-expired, shared-guest/ownership checks, idempotency. |
 | tests/test_power.py | NEW | WoL magic-packet bytes + verified power-off (repeated probe failure). |
-| tests/test_guest.py | NEW | Guest create/clone/start/stop/destroy/probe/list/run/snapshot over FakeSSH. |
+| tests/test_guest.py | NEW | Guest create/clone/start/stop/destroy/probe/list/run over FakeSSH. |
 | tests/test_transfer.py | NEW | push/pull via ssh + `qm guest`/`pct exec`. |
 | tests/test_console.py | NEW | screendump PPM->PNG + sendkey sequencing. |
 | tests/test_gc.py | NEW | Real resources/pxl-gc.py driven with tests/support/fakeqm stubs. |
-| tests/test_mcp.py | NEW | stdio JSON-RPC 2.0: initialize/tools-list/tools-call, 24 tools, idle shutdown sweep. |
+| tests/test_mcp.py | NEW | stdio JSON-RPC 2.0: initialize/tools-list/tools-call, 23 tools, idle shutdown sweep. |
 | tests/test_journal.py | NEW | Journal query over SQLite incl. legacy-events readback. |
 | tests/test_diagnostics.py | NEW | init/doctor on healthy and broken installs (import-without-config). |
 
@@ -371,7 +371,7 @@ Every file in the repository (180 tracked + `docs/rework-inventory.md` + `docs/r
 | src/proxmox_agent_lab/ssh.py | NEW | SSH transport + command allowlist (replaces api.py, host_transport.py, host_policy.py). |
 | src/proxmox_agent_lab/proxmox.py | NEW | qm/pct/pvesh wrappers + task wait (replaces api.py + guest_agent.py primitives). |
 | src/proxmox_agent_lab/store.py | NEW | SQLite store (replaces state.py JSON + mariadb.py + journal spool; reuses legacy events DDL). |
-| src/proxmox_agent_lab/mcp.py | NEW | stdlib stdio JSON-RPC 2.0 MCP server; 24 pinned tools; keeps idle-shutdown plumbing. |
+| src/proxmox_agent_lab/mcp.py | NEW | stdlib stdio JSON-RPC 2.0 MCP server; 23 pinned tools; keeps idle-shutdown plumbing. |
 | src/proxmox_agent_lab/gc.py | NEW | `gc install|status|uninstall` — one root crontab line for the bundled GC. |
 | src/proxmox_agent_lab/resources/pxl-gc.py | NEW | Standalone host-side GC script (python3, stdlib only, no package install). |
 | tests/support/fakessh.py | NEW | FakeSSH runner: records argv, scripted outputs keyed by command-pattern regex, scriptable failures/timeouts. |
@@ -524,19 +524,19 @@ isolated inside `proxmox.py`, so a flag correction is a one-line change.
 | Host shutdown (verified) | `ssh <target> "nohup sh -c 'sleep 1; shutdown -h now' >/dev/null 2>&1 &"` | Detached so the request cannot hang on dying sshd. Then probe: ≥ 6 failures across ≥ 30 s, alternating `ssh <target> true` and TCP connect to `<host>:22`. Two consecutive successes cancel. Timeout ⇒ `host_powered_off=false`, non-zero exit, audit `ok=0`. **Never assumed.** No force-off path exists any more (the NanoKVM hook dies with `hostguard`) — a host that refuses to die is reported, loudly |
 | Node status / version | `pvesh get /nodes/<node>/status --output-format json`; `pveversion` | `<node>` from `[pve] node`; doctor cross-checks `hostname -s` |
 | Guest create (QEMU) | `qm create <vmid> --name <n> --net0 virtio,bridge=vmbr0 --scsi0 <storage>:<size> --tags 'pxl;lease-<id>' --description 'pxl-lease=<id> pxl-expiry=<epoch>'` | Storage/bridge defaults collapse to config flags; the tag + description pair is written in the SAME call so a crash cannot leave an untagged guest |
-| Guest create (LXC) | `pct create <vmid> <ostemplate> --hostname <n> --tags 'pxl;lease-<id>' --description 'pxl-lease=<id> pxl-expiry=<epoch>'` | `pct create --tags` `[UNVERIFIED]` — fallback `pct set <vmid> --tags … --description …` immediately after create (same command pair exists for `qm set`) |
+| Guest create (LXC) | `pct create <vmid> <ostemplate> --hostname <n> --tags 'pxl;lease-<id>' --description 'pxl-lease=<id> pxl-expiry=<epoch>'` | `pct create --tags` is `[UNVERIFIED]`: both branches implemented and unit-tested — pass tags/description on create, and fall back to create-then-`pct set <vmid> --tags … --description …`; live confirmation deferred to the VERIFICATION honesty list |
 | Clone | `qm clone <template> <vmid> --name <n>`; `pct clone <template> <vmid>` | clone source must be a registered/retained template; metadata is re-stamped with `qm set`/`pct set` after clone (clone does not copy our per-lease expiry) |
 | Metadata refresh (heartbeat) | `qm set <vmid> --description 'pxl-lease=<id> pxl-expiry=<epoch>'` / `pct set …` | every heartbeat rewrites expiry on every registered guest (§F requirement) |
-| Start / stop / graceful shutdown / destroy | `qm start <vmid>`; `qm shutdown <vmid> --timeout 120`; `qm stop <vmid>`; `qm destroy <vmid> --purge 1`; `pct start\|shutdown\|stop\|destroy <vmid>` | teardown order: `shutdown` → wait stopped (120 s) → `stop` → `destroy`; `pct shutdown --timeout` `[UNVERIFIED]` (fallback: poll `pct status` and `pct stop`); destroy only for pxl-tagged, lease-registered guests |
+| Start / stop / graceful shutdown / destroy | `qm start <vmid>`; `qm shutdown <vmid> --timeout 120`; `qm stop <vmid>`; `qm destroy <vmid> --purge 1`; `pct start\|shutdown\|stop\|destroy <vmid>` | teardown order: `shutdown` → wait stopped (120 s) → `stop` → `destroy`; `pct shutdown --timeout` is `[UNVERIFIED]`: both branches unit-tested — the timeout variant, falling back to plain `pct shutdown` + `pct status` polling + `pct stop`; live confirmation deferred to the VERIFICATION honesty list; destroy only for pxl-tagged, lease-registered guests |
 | Status / probe | `qm status <vmid>`; `pct status <vmid>`; `qm guest ping <vmid>`; `qm guest network-get-interfaces <vmid>` | `guest ping` succeeding ⇒ agent channel usable (real exit codes); interface output gives the guest IP for the ssh fallback |
 | Guest run (LXC) | `pct exec <vmid> -- <cmd> <args…>` | blocking, real exit code, stdout/stderr captured |
-| Guest run (QEMU) | `qm guest exec <vmid> -- <cmd> <args…>` then `qm guest exec-status <vmid> <pid>` polling | bounded deadline (default 120 s, override per call); `out-data`/`err-data` are base64; `--synchronous` variant `[UNVERIFIED]` — the poll loop is the portable path. Fallback channel: direct `ssh <guest>` when the agent is absent (probe reports which channel exists before anything runs) |
-| Push (file to guest) | LXC: `pct push <vmid> <localfile-on-host> <dest> [--perms …]` staged via ssh/scp; QEMU: `qm guest file-write <vmid> <dest> <src>` `[UNVERIFIED]`, fallback `qm guest exec -- sh -c 'base64 -d > <dest>'` fed chunked base64 | binary-safe base64 framing; large files chunked (64 KiB payload per exec); checksum (sha256) recomputed in the guest and compared |
-| Pull (file from guest) | LXC: `pct exec <vmid> -- cat <src>` (stdout, base64-wrapped); QEMU: `qm guest file-read <vmid> <src>` `[UNVERIFIED]`, fallback `qm guest exec -- base64 <src>`; `qm guest file-pull <vmid> <src> <host-dest>` `[UNVERIFIED]` | same framing rules as push |
+| Guest run (QEMU) | `qm guest exec <vmid> -- <cmd> <args…>` then `qm guest exec-status <vmid> <pid>` polling | bounded deadline (default 120 s, override per call); `out-data`/`err-data` are base64; `--synchronous` is `[UNVERIFIED]`: both branches unit-tested — try `qm guest exec --synchronous --timeout N …`, fall back to async exec + `exec-status` polling when the CLI rejects the flag; live confirmation deferred to the VERIFICATION honesty list. Fallback channel: direct `ssh <guest>` when the agent is absent (probe reports which channel exists before anything runs) |
+| Push (file to guest) | chunked base64 via guest exec ONLY: `qm guest exec <vmid> -- sh -c 'base64 -d >> <dest>'` / `pct exec <vmid> -- sh -c 'base64 -d >> <dest>'`, each chunk fed on stdin | PRIMARY AND ONLY transfer path (director decision): `qm guest file-write`/`file-read`/`file-pull` and `pct push` are NOT used — nothing unverified is depended on. 64 KiB payload per exec; first chunk truncates (`>`), later chunks append (`>>`); sha256 recomputed in the guest and compared |
+| Pull (file from guest) | chunked base64 via guest exec ONLY: `qm guest exec <vmid> -- base64 <src>` / `pct exec <vmid> -- base64 <src>` | chunks reassembled and decoded controller-side; sha256 compared; same framing rules as push |
 | Console screenshot | `printf 'screendump /tmp/pxl-<vmid>-<ts>.ppm\nquit\n' \| ssh <target> qm monitor <vmid>`; then `ssh <target> cat /tmp/pxl-… .ppm` | QM `screendump` writes PPM; `png.py` converts PPM→PNG in the controller; host temp file deleted in a `finally` even on error; unique name per call |
 | Console keys | `qm sendkey <vmid> <key…>` | first-class `qm` shortcut for the monitor `sendkey` (verified present in qm(1)); fallback `printf 'sendkey …\nquit\n' \| ssh <target> qm monitor <vmid>`. Key names are QEMU's (`ret`, `f2`, `spc`, `ctrl-alt-delete`, `shift-a`) |
 | Console type | `qm sendkey <vmid> <key…>` per character | char→key translation table (shift-modified glyph names, `spc` for space, `dot`, `comma`, `minus`, …) with bounded pacing (≤ ~20 keys/s); text is never audited |
-| Snapshots | `qm snapshot <vmid> <name>`; `qm listsnapshot <vmid>`; `qm rollback <vmid> <name>`; `qm delsnapshot <vmid> <name>` | snapshot is best-effort per guest ("snapshot-if-any"): LXC has **no** `pct snapshot` — the capability reports `unsupported` for containers instead of faking it |
+| Snapshots | — CUT — | Dropped from `guest.py`, the CLI and MCP by director decision (minimal surface); the `qm snapshot` family is not wrapped |
 | Task waiting | `qm`/`pct` CLI calls block until their task ends (the ssh call IS the wait); final state re-verified with `qm status`/`pct status` | where a UPID is captured (e.g. `pvesh create` output), poll `pvesh get /nodes/<node>/tasks/<upid>/status --output-format json` until `stopped`, then read `exitstatus`; bounded by the same deadline machinery |
 | GC install/status/uninstall | `ssh <target> install -m 0755 /tmp/pxl-gc /usr/local/sbin/pxl-gc`; `ssh <target> crontab -l`; `ssh <target> crontab -` (script on stdin) | see §F; upload via `ssh <target> cat > /tmp/pxl-gc`; every step idempotent and reported |
 
@@ -579,7 +579,7 @@ Transport: JSON-RPC 2.0 over stdin/stdout, **newline-delimited JSON — one comp
 ← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"proxmox-agent-lab","version":"<__version__>"}}}
 ```
 
-`tools/list` takes no meaningful params and returns the **static** list of 24 tools — built once at startup from a module-level spec (name, one-line description, JSON Schema `inputSchema` with `properties` / `required` / `additionalProperties: false`). The list never changes at runtime.
+`tools/list` takes no meaningful params and returns the **static** list of 23 tools — built once at startup from a module-level spec (name, one-line description, JSON Schema `inputSchema` with `properties` / `required` / `additionalProperties: false`). The list never changes at runtime.
 
 `tools/call` dispatches onto the same functions the slim CLI uses (shared `lab` facade; `cli.py` and `mcp.py` bind the same callables):
 
@@ -601,7 +601,7 @@ Pinned error shape — a JSON-RPC error object, never a result with an error str
 {"jsonrpc":"2.0","id":5,"error":{"code":-32603,"message":"guest_stop failed for vmid 101: <redacted>"}}
 ```
 
-- `-32602` (bad params): unknown tool name, schema violation, wrong type, unknown `guest_snapshot.action`, unknown `console_keys` key name, missing/`false` `confirm`. The message names the offending field, never its value.
+- `-32602` (bad params): unknown tool name, schema violation, wrong type, unknown `console_keys` key name, missing/`false` `confirm`. The message names the offending field, never its value.
 - `-32603` (action failure): dispatch happened and the action failed (`LabError`). The message is redacted through the audit redaction path — no secrets, no typed text, no tracebacks, no raw remote output that could embed credentials.
 
 Every `tools/call` — read-only or mutating, success or failure — refreshes `last_mcp_activity` (see below) and records an audit event carrying **tool name + ok + target only** (target = `vmid` / `lease`), never text or secret arguments (`console_type.text`, `guest_run.command`, file contents are excluded entirely). This is safety-policy invariant 9.
@@ -630,7 +630,6 @@ Reason this exists: an untracked guest would otherwise keep the host powered on 
 | `guest_probe` | `vmid: integer (required)` | `{vmid, exists, running, agent_ok, ip}` |
 | `guest_list` | `lease_id: string (optional)`; `state: enum(running\|stopped\|all) (optional, default all)` | `{guests: [{vmid, kind, name, lease_id, state, tags, pxl_expiry}]}` |
 | `guest_run` | `lease_id: string (required)`; `vmid: integer (required)`; `command: string (required)`; `timeout: integer (optional, default 300)`; `stdin: string (optional)` | `{lease_id, vmid, exit_code, stdout, stderr, duration_ms}` |
-| `guest_snapshot` | `lease_id: string (required)`; `vmid: integer (required)`; `action: enum(create\|list\|rollback\|delete) (required)`; `name: string (required for create/rollback/delete, ignored by list)`; `description: string (optional)` | `{action, vmid, name, ok}`, or for `list` `{snapshots: [{name, description, parent, vmstate}]}` |
 | `push_file` | `lease_id: string (required)`; `vmid: integer (required)`; `local_path: string (required)`; `remote_path: string (required)` | `{lease_id, vmid, local_path, remote_path, bytes}` |
 | `pull_file` | `lease_id: string (required)`; `vmid: integer (required)`; `local_path: string (required)`; `remote_path: string (required)` | `{lease_id, vmid, local_path, remote_path, bytes}` |
 | `console_screenshot` | `lease_id: string (required)`; `vmid: integer (required)` | `{lease_id, vmid, png_base64, width, height, taken_at}` — `qm monitor screendump` + PPM→PNG |
@@ -645,8 +644,8 @@ Rules encoded in the schemas above:
 
 - **Lease scope.** Every mutating tool except the lease_* family carries `lease_id: string (required)`: over MCP every mutation belongs to a lease (safety invariant 1). `cleanup_expired` is therefore lease-scoped over the wire; the unscoped whole-host sweep is the operator's CLI call. `vmid: integer (required)` wherever the tool acts on one guest. The lease_* family addresses its lease as `lease: string (required)` (mirroring CLI `--lease`); `lease_begin` creates one and takes none.
 - **Destructive tools require `confirm: boolean` = true** — `guest_destroy`, `lease_destroy`, `cleanup_expired` (it can destroy, so the flag is always demanded and checked before any destruction). Absent or `false` → `-32602`. This mirrors CLI `--confirm`; there is never an interactive prompt.
-- **Read-only tools** — `doctor`, `power_status`, `journal_query`, `lease_list`, `guest_list`, `guest_probe` — take no `lease_id`, mutate nothing, and are safe for any caller; the other 18 are mutating (even `console_screenshot`, which drives `qm monitor`).
-- `guest_snapshot` is selected by `action: enum(create|list|rollback|delete)` + `name`; `console_keys` takes `keys: string[]` of Proxmox key names (`ret`, `f2`, `ctrl-alt-delete`); `console_type` takes `text: string` + `enter: boolean` and its text is never logged or audited; `push_file`/`pull_file` take `vmid` + local path + remote path; `journal_query` takes optional `lease_id`, `since`, `limit`.
+- **Read-only tools** — `doctor`, `power_status`, `journal_query`, `lease_list`, `guest_list`, `guest_probe` — take no `lease_id`, mutate nothing, and are safe for any caller; the other 17 are mutating (even `console_screenshot`, which drives `qm monitor`).
+- `console_keys` takes `keys: string[]` of Proxmox key names (`ret`, `f2`, `ctrl-alt-delete`); `console_type` takes `text: string` + `enter: boolean` and its text is never logged or audited; `push_file`/`pull_file` take `vmid` + local path + remote path; `journal_query` takes optional `lease_id`, `since`, `limit`.
 
 CLI-only commands and why:
 
@@ -677,7 +676,7 @@ qm set   <vmid> --description "pxl-lease=<id> pxl-expiry=<epoch>"
 pct set  <vmid> --description "pxl-lease=<id> pxl-expiry=<epoch>"
 ```
 
-Long-term leases write `pxl-expiry=0` and never refresh. **Heartbeat MUST refresh expiry metadata on every registered guest** — a live guest whose metadata goes stale looks expired and the GC would kill live work; the GC itself stays stateless regardless of who writes the metadata. The GC touches a guest only if its tags contain `pxl` **and** the description line parses.
+Long-term leases write `pxl-expiry=0` and never refresh. **Heartbeat MUST refresh expiry metadata on every registered guest** — a live guest whose metadata goes stale looks expired and the GC would kill live work; the GC itself stays stateless regardless of who writes the metadata. The GC touches a guest only if its tags contain `pxl` **and** the description line parses. Long-term protection is tag/description-based **ONLY** (`pxl-expiry=0`) — the PVE guest `protect` flag is deliberately not used (unverified across versions; one mechanism only).
 
 ### Replacing the host guard
 
@@ -724,7 +723,7 @@ Install reads `crontab -l`, strips any existing `# pxl-gc` block (marker line + 
 - Graceful shutdown (120s) before any hard stop; the hard stop applies only to the expired pxl guest itself. Never a forced power-off of the host — the host runs `shutdown -h now` only via the clear rule, and never while any guest is running (someone else's work is untouchable, pxl or not).
 - Never powers off while any pxl guest has unexpired metadata (`pxl-expiry=0` long-term leases pin the host on).
 - Never reads the controller's SQLite or any controller state — the GC knows only guest metadata plus its own host-local stamp; "stateless" means no controller-side state is required.
-- Residual race, documented: the controller has woken the host (`lease_begin` → WoL) but not yet created a guest, so the host looks clear. Bounded to ≤ one GC interval (10 min) by the two-run rule — the first clear run only stamps; the guest and its fresh metadata appear within the interval and break the clear condition before the second run. If the host does power off first, the next `lease_begin` wakes it again: recoverable, never data loss.
+- Residual race — known, bounded behavior (accepted by the director): the controller has woken the host (`lease_begin` → WoL) but not yet created a guest, so the host looks clear. Bounded to ≤ one GC interval (10 min) by the two-run rule — the first clear run only stamps; the guest and its fresh metadata appear within the interval and break the clear condition before the second run. If the host does power off first, the next `lease_begin` wakes it again: recoverable, never data loss.
 - Idempotent and concurrency-safe: per-vmid `flock` under `/var/lock`; an already-gone guest is a success no-op.
 
 ### gc install|status|uninstall behavior
@@ -833,14 +832,14 @@ install is never a prerequisite for diagnosing one.
 |---|---|
 | ssh transport | argv construction + quoting; timeout mapping; command-allowlist refusal of arbitrary shell |
 | store/SQLite | legacy-events DDL reuse + schema version; CAS state transitions; WAL concurrency; redaction-before-insert; journal query filters |
-| leases | begin requires reachable host and stamps guest metadata; heartbeat REFRESHES guest expiry metadata; expiry computation; long-term `pxl-expiry=0` protection |
+| leases | begin requires reachable host and stamps guest metadata; heartbeat REFRESHES guest expiry metadata; expiry computation; long-term `pxl-expiry=0` protection (tag/description only — no PVE `protect` flag) |
 | cleanup | idempotent finalize (second run no-op); only lease-owned pxl-tagged resources destroyed; `cleanup_failed` recorded and retried next sweep; shared-guest cross-reference refusal; lease-end pre-check refusal |
 | power | magic-packet bytes == 6×0xFF + 16×MAC golden test; verified shutdown: probe-failure counting, never assumed, timeout path reports `host_powered_off=false` + non-zero exit |
 | guest lifecycle | create/clone stamped tags+description; destroy refuses unregistered/untagged |
-| transfer | push/pull framing + base64 + qm guest file IO on FakeSSH |
+| transfer | push/pull chunked base64 via guest exec on FakeSSH (the only transfer path; sha256 verify) |
 | console | sendkey translation incl. shift glyphs + `ret`/`f2`/`ctrl-alt-delete`; PPM->PNG golden fixture; type pacing bounded |
 | gc script | stubbed qm: destroys only expired pxl guests; skips `pxl-expiry=0`; warns-skips unparseable description; idempotent; `--dry-run`; refuses templates; power-off-when-idle fires only when zero running guests AND two consecutive clear runs — assert the two-run rule |
-| mcp | stdio smoke: spawn `python3 -m proxmox_agent_lab mcp`, initialize -> result, tools/list -> exactly 24 tools with schemas, tools/call read-only (doctor) + mutating through FakeSSH, JSON-RPC error shape on bad params; idle clock: `last_mcp_activity` refresh + idle-shutdown sweep fires after threshold with no active lease |
+| mcp | stdio smoke: spawn `python3 -m proxmox_agent_lab mcp`, initialize -> result, tools/list -> exactly 23 tools with schemas, tools/call read-only (doctor) + mutating through FakeSSH, JSON-RPC error shape on bad params; idle clock: `last_mcp_activity` refresh + idle-shutdown sweep fires after threshold with no active lease |
 | diagnostics | doctor on missing config |
 
 ### Canonical commands
@@ -931,8 +930,8 @@ canonical gates green.
 
 ### 4. Guest, transfer, console, PNG
 
-Lands `guest.py` (REWRITE — create/clone/start/stop/destroy/probe/list/run/
-snapshot; stamps tags + description at creation), `transfer.py` (REWRITE —
+Lands `guest.py` (REWRITE — create/clone/start/stop/destroy/probe/list/run;
+stamps tags + description at creation), `transfer.py` (REWRITE —
 push/pull over ssh + `qm guest`/`pct exec` file IO), `console.py` (REWRITE —
 `qm monitor` screendump + `qm sendkey`), `png.py` (KEEP + new PPM->PNG
 conversion).
@@ -968,16 +967,16 @@ green.
 
 Lands `mcp.py` (NEW — stdlib-only stdio JSON-RPC 2.0: `initialize`,
 `tools/list`, `tools/call` as thin wrappers over the same lab functions the slim
-CLI uses; exactly the 24 pinned snake_case tools; refreshes `last_mcp_activity`
+CLI uses; exactly the 23 pinned snake_case tools; refreshes `last_mcp_activity`
 on every `tools/call`; idle-shutdown sweep when idle past `idle_shutdown_seconds`
 with no active lease). No MCP SDK.
 Deletes: the old `leases.record_mcp_activity` / `mcp_idle_shutdown` plumbing
 folds into the server; no orphaned copies left.
 Tests: `tests/test_mcp.py` — stdio smoke spawning `python3 -m proxmox_agent_lab
-mcp`: initialize -> result; tools/list -> exactly 24 tools with schemas;
+mcp`: initialize -> result; tools/list -> exactly 23 tools with schemas;
 tools/call read-only (doctor) and mutating through FakeSSH; JSON-RPC error shape
 on bad params; idle-clock behavior.
-**Acceptance:** the 24-tool contract and idle-shutdown behavior proven over real
+**Acceptance:** the 23-tool contract and idle-shutdown behavior proven over real
 stdio; canonical gates green.
 
 ### 7. Deletion pass

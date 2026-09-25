@@ -77,8 +77,16 @@ class ParserBuildTests(unittest.TestCase):
             ["console", "screenshot", "--help"],
             ["console", "type", "--help"],
             ["console", "keys", "--help"],
+            ["guest", "create", "--help"],
+            ["guest", "clone", "--help"],
+            ["guest", "start", "--help"],
+            ["guest", "stop", "--help"],
+            ["guest", "destroy", "--help"],
             ["guest", "probe", "--help"],
+            ["guest", "list", "--help"],
             ["guest", "run", "--help"],
+            ["push", "--help"],
+            ["pull", "--help"],
         ):
             with self.subTest(argv=argv):
                 with self.assertRaises(SystemExit) as ctx:

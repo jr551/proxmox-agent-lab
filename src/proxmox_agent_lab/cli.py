@@ -736,45 +736,37 @@ def parser() -> argparse.ArgumentParser:
                          help="required by --reclaim-orphans")
     cleanup.set_defaults(func=cmd_cleanup_expired)
 
-    from . import android
     from . import console
     from . import connection
     from . import crash
     from . import disk
     from . import guest
     from . import hostinfo
-    from . import netgw
     from . import ioworkload
     from . import isoinspect
     from . import oci
     from . import onboarding
-    from . import pe
     from . import recipes
-    from . import share
     from . import storage
+    from . import transfer
     from . import usb
     from . import virtio
-    from . import windows
 
-    android.register(sub, _module())
     console.register(sub, _module())
     connection.register(sub, _module())
     crash.register(sub, _module())
     disk.register(sub, _module())
     guest.register(sub, _module())
     hostinfo.register(sub, _module())
-    netgw.register(sub, _module())
     ioworkload.register(sub, _module())
     isoinspect.register(sub, _module())
     oci.register(sub, _module())
     onboarding.register(sub, _module())
-    pe.register(sub, _module())
     recipes.register(sub, _module())
-    share.register(sub, _module())
     storage.register(sub, _module())
+    transfer.register(sub, _module())
     usb.register(sub, _module())
     virtio.register(sub, _module())
-    windows.register(sub, _module())
     return root
 
 
@@ -811,8 +803,7 @@ def _expected_errors() -> tuple[type[BaseException], ...]:
         json.JSONDecodeError,
     ]
     for name in (
-        "android", "console", "guest", "rfb", "s3", "netgw", "share",
-        "vision", "ws",
+        "console", "guest", "s3",
     ):
         try:
             module = __import__(f"{__package__}.{name}", fromlist=[name])

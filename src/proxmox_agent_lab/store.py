@@ -237,8 +237,18 @@ class Store:
         *,
         error: str | None = None,
         ended: bool = False,
-    ) -> None:
+        from_state: str | None = None,
+    ) -> bool:
         """Set a lease's state, optionally recording ``error`` and/or ``ended_at``.
+
+        Transitions that matter MUST pass ``from_state`` (or use
+        :meth:`claim_lease`): with ``from_state`` this is a compare-and-swap --
+        ``True`` iff the row transitioned from ``from_state`` to ``state``,
+        ``False`` on mismatch (including an unknown lease), leaving the row
+        untouched. The unconditional form (``from_state=None``) is only for
+        post-claim updates like recording ``last_error``/``ended_at`` on a lease
+        this caller already owns; it raises :class:`StoreError` for an unknown
+        lease and returns ``True`` once the row is updated.
 
         ``error=None`` leaves any recorded ``last_error`` untouched; ``ended=True``
         stamps ``ended_at`` with the current time.
@@ -252,11 +262,18 @@ class Store:
             sets.append("ended_at = ?")
             params.append(utc_now())
         params.append(lease_id)
+        where = "id = ?"
+        if from_state is not None:
+            where += " AND state = ?"
+            params.append(from_state)
         cursor = self._conn.execute(
-            f"UPDATE leases SET {', '.join(sets)} WHERE id = ?", params
+            f"UPDATE leases SET {', '.join(sets)} WHERE {where}", params
         )
+        if from_state is not None:
+            return cursor.rowcount == 1
         if cursor.rowcount == 0:
             raise StoreError(f"unknown lease {lease_id!r}")
+        return True
 
     def heartbeat(
         self, lease_id: str, *, expires_at: int, now: str | None = None

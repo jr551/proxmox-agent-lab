@@ -1,5 +1,6 @@
 """Tests for the SQLite store: schema setup, lease lifecycle, CAS transitions,
-redaction-before-insert, event queries, and legacy journal.db readability.
+WAL concurrency, redaction-before-insert, event queries, and legacy
+journal.db readability.
 
 Everything runs against a per-test ``TemporaryDirectory`` database -- no
 external services, no network, no shared state between tests.
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 import json  # noqa: E402
 import sqlite3  # noqa: E402
 import tempfile  # noqa: E402
+import threading  # noqa: E402
 import time  # noqa: E402
 import unittest  # noqa: E402
 
@@ -161,6 +163,44 @@ class StoreTest(unittest.TestCase):
             self.store.claim_lease("lease-a", from_state="ending", to_state="ended")
         )
 
+    def test_set_lease_state_from_state_is_compare_and_swap(self) -> None:
+        self.store.create_lease("lease-a", expires_at=1)
+        self.assertTrue(
+            self.store.set_lease_state("lease-a", "ending", from_state="active")
+        )
+        lease = self.store.get_lease("lease-a")
+        assert lease is not None
+        self.assertEqual(lease["state"], "ending")
+        # A mismatch returns False and leaves the row -- including error and
+        # ended_at -- untouched.
+        self.assertFalse(
+            self.store.set_lease_state(
+                "lease-a", "ended", error="boom", ended=True, from_state="active"
+            )
+        )
+        lease = self.store.get_lease("lease-a")
+        assert lease is not None
+        self.assertEqual(lease["state"], "ending")
+        self.assertIsNone(lease["last_error"])
+        self.assertIsNone(lease["ended_at"])
+        # A match transitions and applies the post-claim columns.
+        self.assertTrue(
+            self.store.set_lease_state(
+                "lease-a", "ended", ended=True, from_state="ending"
+            )
+        )
+        lease = self.store.get_lease("lease-a")
+        assert lease is not None
+        self.assertEqual(lease["state"], "ended")
+        self.assertIsNotNone(lease["ended_at"])
+        # CAS against an unknown lease is a mismatch (False), while the
+        # unconditional form keeps raising StoreError.
+        self.assertFalse(
+            self.store.set_lease_state("lease-missing", "ended", from_state="active")
+        )
+        with self.assertRaises(StoreError):
+            self.store.set_lease_state("lease-missing", "ended")
+
     def test_cleanup_failed_records_error_and_keeps_lease(self) -> None:
         self.store.create_lease("lease-a", expires_at=1)
         self.store.set_lease_state(
@@ -179,6 +219,112 @@ class StoreTest(unittest.TestCase):
         lease = self.store.get_lease("lease-a")
         assert lease is not None
         self.assertEqual(lease["last_error"], "qm destroy 101 failed")
+
+    # -- WAL concurrency --------------------------------------------------
+
+    def test_two_connections_race_one_finalizer_wins(self) -> None:
+        self.store.create_lease("lease-a", expires_at=1)
+        other = Store(self.db_path)
+        self.addCleanup(other.close)
+        # A contended write must wait, not fail: the connection carries a
+        # non-zero busy_timeout.
+        self.assertNotEqual(
+            self.store._conn.execute("PRAGMA busy_timeout").fetchone()[0], 0
+        )
+        self.assertNotEqual(
+            other._conn.execute("PRAGMA busy_timeout").fetchone()[0], 0
+        )
+        results = [
+            self.store.claim_lease("lease-a", from_state="active", to_state="ending"),
+            other.claim_lease("lease-a", from_state="active", to_state="ending"),
+        ]
+        self.assertEqual(sorted(results), [False, True])
+        lease = self.store.get_lease("lease-a")
+        assert lease is not None
+        self.assertEqual(lease["state"], "ending")
+
+    def test_busy_timeout_lets_a_contended_writer_wait_out_the_holder(self) -> None:
+        self.store.create_lease("lease-a", expires_at=1)
+
+        ready = threading.Event()  # the writer's own Store is open
+        hold = threading.Event()  # the write lock is held; go write
+        attempt = threading.Event()  # the writer is queuing its write
+        outcome: dict = {}
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            try:
+                with Store(self.db_path) as store:
+                    outcome["busy_timeout"] = store._conn.execute(
+                        "PRAGMA busy_timeout"
+                    ).fetchone()[0]
+                    ready.set()
+                    hold.wait(10)
+                    attempt.set()
+                    started = time.monotonic()
+                    outcome["changed"] = store.set_lease_state(
+                        "lease-a", "ending", from_state="active"
+                    )
+                    outcome["elapsed"] = time.monotonic() - started
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        self.assertTrue(ready.wait(10))
+
+        holder = sqlite3.connect(self.db_path, isolation_level=None)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")  # take the single write lock
+        hold.set()
+        self.assertTrue(attempt.wait(10))
+        # The holder rolls back once the write is queued; waiting it out is
+        # only legal because the writer's busy_timeout is non-zero.
+        self.assertNotEqual(outcome["busy_timeout"], 0)
+        holder.execute("ROLLBACK")
+
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])  # no unhandled exception
+        self.assertTrue(outcome["changed"])  # the write completed
+        self.assertGreaterEqual(outcome["elapsed"], 0)
+        # One-winner semantics survive the contention.
+        lease = self.store.get_lease("lease-a")
+        assert lease is not None
+        self.assertEqual(lease["state"], "ending")
+        self.assertFalse(
+            self.store.set_lease_state("lease-a", "ending", from_state="active")
+        )
+
+    def test_two_threads_racing_finalizers_yield_one_winner(self) -> None:
+        self.store.create_lease("lease-a", expires_at=1)
+        start = threading.Barrier(2)
+        results: list[bool] = []
+        errors: list[BaseException] = []
+
+        def finalize() -> None:
+            try:
+                with Store(self.db_path) as store:
+                    start.wait(10)
+                    results.append(
+                        store.claim_lease(
+                            "lease-a", from_state="active", to_state="ending"
+                        )
+                    )
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=finalize) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [False, True])
+        lease = self.store.get_lease("lease-a")
+        assert lease is not None
+        self.assertEqual(lease["state"], "ending")
 
     # -- resources --------------------------------------------------------
 

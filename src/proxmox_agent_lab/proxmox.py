@@ -203,8 +203,13 @@ class Proxmox:
         hostname: str,
         tags: str,
         description: str,
+        rootfs: str | None = None,
     ) -> None:
         """Create an LXC guest, stamping tags+description in the same call.
+
+        ``rootfs`` is the pct volume spec for the container root, e.g.
+        ``local-lvm,size=8`` — required on hosts where the ``local`` dir
+        storage lacks the ``rootdir`` content type.
 
         Fallback: when ``pct create`` rejects the metadata flags as unknown
         options (older ``pct``), create without them and stamp with ``pct
@@ -213,6 +218,8 @@ class Proxmox:
         """
         action = f"pct create {vmid}"
         base = ["pct", "create", str(vmid), ostemplate, "--hostname", hostname]
+        if rootfs is not None:
+            base += ["--rootfs", rootfs]
         metadata = ["--tags", tags, "--description", description]
         first = self._ssh.run(base + metadata, timeout=CREATE_TIMEOUT)
         if first.ok:

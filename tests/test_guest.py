@@ -283,6 +283,25 @@ class CreateTests(GuestCase):
         # no `pct set` fallback: one call carried the metadata
         self.assertEqual(len(self.argvs()), 2)
 
+    def test_fresh_lxc_create_passes_the_storage_rootfs(self) -> None:
+        # Hosts whose 'local' dir storage lacks rootdir need --storage:
+        # pct create gets --rootfs <storage>:<gb>.
+        self.open_lease()
+        self.fake.add(r"^pct create 102")
+        self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        self.run_cmd(
+            "guest", "create", "--lease", LEASE, "--vmid", "102",
+            "--kind", "lxc", "--fresh", "--name", "ct8",
+            "--ostemplate", "local:vztmpl/debian-12.tar.zst",
+            "--storage", "local-lvm", "--disk-gb", "4",
+        )
+        tags, description = lab_guest.metadata_for(LEASE, EXPIRY)
+        self.assertEqual(self.argvs()[0], [
+            "pct", "create", "102", "local:vztmpl/debian-12.tar.zst",
+            "--hostname", "ct8", "--rootfs", "local-lvm:4",
+            "--tags", tags, "--description", description,
+        ])
+
     def test_create_registers_the_resource_before_it_starts(self) -> None:
         self.open_lease()
         self.fake.add(r"^qm clone 9000 101")
@@ -525,6 +544,27 @@ class DestroyTests(GuestCase):
         self.lab.audit.assert_called_once_with(
             "guest-destroy", lease=LEASE, vmid=101, kind="qemu", purged=True
         )
+    def test_destroy_stops_a_running_guest_before_destroying(self) -> None:
+        # pct/qm destroy refuse a running guest; destroy must stop it first.
+        self.open_lease()
+        self.register_guest(LEASE, "lxc", 102, name="beta")
+        self.fake.add(
+            r"^pct config 102",
+            stdout=b"tags: pxl;lease-abs-guest-lease\n"
+                   b"description: pxl-lease=abs-guest-lease "
+                   b"pxl-expiry=1800000000\n",
+        )
+        self.fake.add(r"^pct status 102", stdout=b"status: running\n", times=1)
+        self.fake.add(r"^pct shutdown 102")
+        self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        self.fake.add(r"^pct destroy 102")
+        payload = self.run_cmd(
+            "guest", "destroy", "--lease", LEASE, "--vmid", "102",
+            "--confirm",
+        )
+        self.assertTrue(payload["destroyed"])
+        seq = [" ".join(c["argv"][:2]) for c in self.fake.calls]
+        self.assertLess(seq.index("pct shutdown"), seq.index("pct destroy"))
 
 
 class RunTests(GuestCase):

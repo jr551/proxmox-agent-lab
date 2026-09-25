@@ -247,19 +247,29 @@ def cmd_create(lab: Any, args: Any) -> dict:
                     "a fresh lxc guest needs --ostemplate "
                     "(e.g. local:vztmpl/debian-12.tar.zst)"
                 )
+            rootfs = None
+            if args.storage:
+                disk_gb = int(args.disk_gb or 8)
+                rootfs = f"{args.storage}:{disk_gb}"
             prox.lxc_create(
                 vmid,
                 ostemplate=str(args.ostemplate),
                 hostname=name,
                 tags=tags,
                 description=description,
+                rootfs=rootfs,
             )
         else:
+            scsi0 = None
+            if args.storage:
+                disk_gb = int(args.disk_gb or 32)
+                scsi0 = f"{args.storage}:{disk_gb}"
             prox.qemu_create(
                 vmid,
                 name=name,
                 tags=tags,
                 description=description,
+                scsi0=scsi0,
                 memory=args.memory,
                 cores=args.cores,
             )
@@ -448,6 +458,14 @@ def cmd_destroy(lab: Any, args: Any) -> dict:
             f"only pxl-tagged, lease-registered guests are ever destroyed, so "
             f"a machine somebody else owns can never be taken for ours."
         )
+    try:
+        if prox.status(kind, vmid) == "running":
+            if not prox.shutdown(kind, vmid):
+                prox.stop(kind, vmid)
+    except proxmox_module.ProxmoxError:
+        # Vanished between the ownership check and now -- a destroy that
+        # finds nothing to destroy is still a success.
+        pass
     prox.destroy(kind, vmid)
     with _open_store(lab) as store:
         store.mark_destroyed(lease_id, kind, vmid)
@@ -612,6 +630,15 @@ def register(sub: Any, lab: Any) -> None:
     create.add_argument("--cores", type=int, help="qemu only")
     create.add_argument("--start", action="store_true",
                         help="start the guest once it is registered")
+    create.add_argument("--ostemplate",
+                        help="LXC ostemplate (fresh lxc create only)")
+    create.add_argument("--storage",
+                        help="fresh-create target storage, e.g. local-lvm "
+                             "(LXC rootfs / QEMU scsi0)")
+    create.add_argument("--disk-gb", type=int, default=None,
+                        help="rootfs/disk size in GB for fresh creates "
+                             "(default: 8 LXC, 32 QEMU)")
+    create.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
     create.add_argument(
         "--template",
         help="source template vmid; empty (or --fresh) builds from scratch "
@@ -619,9 +646,6 @@ def register(sub: Any, lab: Any) -> None:
     )
     create.add_argument("--fresh", action="store_true",
                         help="build from scratch instead of cloning a template")
-    create.add_argument("--ostemplate",
-                        help="LXC ostemplate (fresh lxc create only)")
-    create.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
     create.set_defaults(func=_bind(lab, cmd_create))
 
     clone = guest_sub.add_parser(

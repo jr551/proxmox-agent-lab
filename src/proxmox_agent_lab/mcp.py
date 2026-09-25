@@ -162,6 +162,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             memory=_INT,
             cores=_INT,
             start=_BOOL,
+            ostemplate=_STR,
+            storage=_STR,
+            disk_gb=_INT,
         ),
     },
     {
@@ -449,7 +452,9 @@ def _dispatch_guest_create(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
             start=a.get("start", True),
             template=None,
             fresh=False,
-            ostemplate=None,
+            ostemplate=a.get("ostemplate"),
+            storage=a.get("storage"),
+            disk_gb=a.get("disk_gb"),
         ),
     )
 

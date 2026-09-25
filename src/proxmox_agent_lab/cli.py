@@ -14,16 +14,12 @@ import contextlib
 import datetime as dt
 import io
 import json
-import os
 from pathlib import Path
-import re
 import secrets
 import socket
 import uuid
 import ssl
-import subprocess
 import sys
-import tempfile
 import time
 import types
 from typing import Any
@@ -37,7 +33,6 @@ from . import power as power_module
 from . import journal as journal_module
 from . import mariadb as mariadb_module
 from . import secrets_store
-from . import api as api_module
 from . import audit as audit_module
 from . import cleanup as cleanup_module
 from . import diagnostics as diagnostics_module
@@ -87,18 +82,6 @@ LOCK_PATH = STATE_ROOT / "controller.lock"
 # installed package -- site-packages is not writable, and an operator's audit
 # trail is not part of the software.
 JOURNAL_ROOT = Path(CONFIG.audit.get("journal_dir") or (STATE_ROOT / "journal"))
-SAFE_WRITE_PREFIXES = (
-    f"/nodes/{NODE}/qemu",
-    f"/nodes/{NODE}/lxc",
-    f"/nodes/{NODE}/tasks",
-    f"/nodes/{NODE}/status",
-)
-# The subset of the safe write surface that addresses an individual guest, and
-# therefore must resolve to a (kind, vmid) the lease owns before it is sent.
-GUEST_PATH_PREFIXES = (
-    f"/nodes/{NODE}/qemu/",
-    f"/nodes/{NODE}/lxc/",
-)
 UPLOAD_STORAGES = tuple(CONFIG.storage.upload_storages)
 # Big images belong on the bulk store, not on the hypervisor's root filesystem.
 # Falls back to whatever is allowed if bulk is not one of the upload targets.
@@ -106,17 +89,6 @@ DEFAULT_UPLOAD_STORAGE = (
     str(CONFIG.storage.bulk_storage)
     if str(CONFIG.storage.bulk_storage) in UPLOAD_STORAGES
     else (UPLOAD_STORAGES[0] if UPLOAD_STORAGES else "local")
-)
-HOST_CHANGE_MARKERS = (
-    "/access",
-    "/storage",
-    "/cluster",
-    "/network",
-    "/sdn",
-    "/firewall",
-    "/disks",
-    "/hardware",
-    "/ceph",
 )
 
 
@@ -267,345 +239,6 @@ def _audit_through_boot(event: str, **fields: Any) -> None:
 
 
 
-def parse_data(values: list[str]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for item in values:
-        if "=" not in item:
-            raise LabError(f"Expected key=value data, got: {item}")
-        key, value = item.split("=", 1)
-        if not key:
-            raise LabError("Data key may not be empty")
-        result[key] = value
-    return result
-
-
-def path_resource(path: str) -> tuple[str, int] | None:
-    match = re.match(rf"^/nodes/{re.escape(NODE)}/(qemu|lxc)/(\d+)(?:/|$)", path)
-    if not match:
-        return None
-    return match.group(1), int(match.group(2))
-
-
-
-
-def _boot_order_devices(value: str) -> list[str]:
-    """Normalized device list of a PVE `boot` value.
-
-    PVE documents ``boot`` as ``[order=]dev;dev`` — the ``order=`` prefix is
-    optional, so a bare ``boot=ide2;ide0`` is valid and must parse the same.
-    """
-    order = value.strip()
-    if order.startswith("order="):
-        order = order[len("order="):]
-    return [
-        device.strip().lower()
-        for device in order.split(";")
-        if device.strip()
-    ]
-
-
-DISK_CONFIG_KEY = re.compile(
-    r"\A(?:scsi|virtio|ide|sata|efidisk|tpmstate|rootfs|mp|unused)\d*\Z"
-)
-
-
-def slow_storage_disks(data: dict[str, Any]) -> list[str]:
-    """Disk specs in `data` that would place a guest disk on bulk storage.
-
-    An ISO *mounted* from the bulk store is exactly what the docs recommend,
-    so `media=cdrom` is excluded. A guest's own disk there is a different
-    thing: the lab's USB directory store measured about 25 MB/s sequential
-    write, which is slow enough that an I/O comparison run on it measures the
-    cable rather than the guest.
-    """
-    bulk = str(CONFIG.storage.bulk_storage or "")
-    if not bulk:
-        return []
-    found: list[str] = []
-    for key, value in data.items():
-        if not DISK_CONFIG_KEY.fullmatch(str(key)) or not isinstance(value, str):
-            continue
-        if "media=cdrom" in value:
-            continue
-        if value.split(":", 1)[0].strip() == bulk:
-            found.append(f"{key}={value}")
-    return sorted(found)
-
-
-def cmd_api(args: argparse.Namespace) -> None:
-    api = ProxmoxAPI()
-    method = args.method.upper()
-    data = parse_data(args.data)
-    if args.password_stdin:
-        key = args.password_key
-        if method == "GET" or key in data:
-            raise LabError(
-                f"--password-stdin is only valid for a write without {key}=data"
-            )
-        password = sys.stdin.readline().rstrip("\r\n")
-        if not password:
-            # Deliberately stricter than the guest-console paths. There an
-            # empty password is a fact about a guest that already has none;
-            # here it would be *written* into a Proxmox object, creating a
-            # blank credential nobody asked for. `guest run --password-stdin`
-            # is the command that accepts an empty console password.
-            raise LabError(
-                f"--password-stdin received an empty password for {key}. A "
-                "write would store a blank credential; to log into a guest "
-                "that has no password, use 'guest run --password-stdin'."
-            )
-        data[key] = password
-    write = method != "GET"
-    lease: dict[str, Any] | None = None
-    if write:
-        if not args.lease:
-            raise LabError("Every Proxmox write requires --lease")
-        lease = load_lease(args.lease)
-        if any(marker in args.path for marker in HOST_CHANGE_MARKERS):
-            if not args.host_change_authorized:
-                raise LabError(
-                    "Host-level change refused without --host-change-authorized"
-                )
-        if not args.path.startswith(SAFE_WRITE_PREFIXES) and (
-            not args.host_change_authorized
-        ):
-            raise LabError(f"Write path is outside the leased guest surface: {args.path}")
-        resource = path_resource(args.path)
-        create_match = re.fullmatch(
-            rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
-        )
-        if resource:
-            require_lease_resource(lease, *resource)
-        elif not create_match and args.path.startswith(GUEST_PATH_PREFIXES):
-            # A guest path the resource regex cannot read is not a path whose
-            # ownership can be checked. `/nodes/N/qemu//9246/sendkey` reaches
-            # the same guest but parses as no guest at all, so accepting it
-            # would mutate a guest with the ownership check skipped.
-            raise LabError(
-                f"Write path names no readable guest: {args.path}. Use "
-                f"/nodes/{NODE}/<qemu|lxc>/<vmid>/... so the lease ownership "
-                "check can run."
-            )
-        if method == "POST" and create_match:
-            if "vmid" not in data:
-                raise LabError("Guest creation requires an explicit vmid")
-            vmid = int(data["vmid"])
-            if vmid in lease["initial_vmids"]:
-                raise LabError(f"VMID {vmid} existed before this lease")
-            lease_tag = "lease-" + args.lease
-            tags = [x for x in data.get("tags", "").split(";") if x]
-            for tag in ("codex-lab", lease_tag):
-                if tag not in tags:
-                    tags.append(tag)
-            data["tags"] = ";".join(tags)
-            data.setdefault("onboot", "0")
-    slow_disks: list[str] = []
-    if write:
-        slow_disks = slow_storage_disks(data)
-        if slow_disks and not args.slow_storage_accepted:
-            print(
-                f"warning: {', '.join(slow_disks)} puts a guest disk on "
-                f"'{CONFIG.storage.bulk_storage}', the configured bulk store. "
-                "It is the right home for ISOs and cold images, not for a "
-                "running or benchmarked guest -- 'storage status' reports "
-                "class fast|bulk. Pass --slow-storage-accepted to silence "
-                "this.",
-                file=sys.stderr,
-            )
-        # The intent is durable before the external mutation. A failed ledger
-        # must block the request rather than make a completed write look failed.
-        audit(
-            "proxmox-api-write-intent",
-            lease=args.lease,
-            method=method,
-            path=args.path,
-            data=data,
-        )
-    result = api.call(method, args.path, data)
-    # Register the created guest BEFORE waiting on its task: if the wait
-    # times out or errors, the guest already exists and must belong to this
-    # lease, or lease-end leaves it behind as an orphan (audit 2026-08-24).
-    registered_early = False
-    if write and lease and method == "POST":
-        create_match_early = re.fullmatch(
-            rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
-        )
-        if create_match_early and str(data.get("vmid", "")).isdigit():
-            kind_created = create_match_early.group(1)
-            policy = "retain" if is_long_term(lease) else args.policy
-            with controller_lock():
-                fresh = load_lease(args.lease)
-                register_resource(
-                    fresh, kind_created, int(data["vmid"]), policy,
-                    data.get("name") or data.get("hostname"),
-                )
-            registered_early = True
-    task_status = None
-    if args.wait_task and isinstance(result, str) and result.startswith("UPID:"):
-        task_status = wait_task(api, result, timeout=args.task_timeout)
-    if write and lease and method == "POST" and registered_early:
-        create_match = re.fullmatch(
-            rf"/nodes/{re.escape(NODE)}/(qemu|lxc)/?", args.path
-        )
-        kind_created = create_match.group(1)
-        created_vmid = int(data["vmid"])
-        if is_long_term(lease):
-            from . import longterm
-            try:
-                longterm.set_protection(
-                    _module(), api, kind_created, created_vmid, True
-                )
-            except LabError as exc:
-                print(f"warning: could not protect {created_vmid}: {exc}",
-                      file=sys.stderr)
-    report: dict[str, Any] = {"data": result, "task_status": task_status}
-    try:
-        audit(
-            "proxmox-api-write",
-            lease=args.lease,
-            method=method,
-            path=args.path,
-            data=data,
-            result=result,
-            task_status=task_status,
-        )
-    except (LabError, OSError, journal_module.sqlite3.Error) as exc:
-        report["operation_succeeded"] = True
-        report["audit_recording_failed"] = str(exc)
-    if write and method == "PUT" and "boot" in data:
-        config_match = re.fullmatch(
-            rf"/nodes/{re.escape(NODE)}/qemu/(\d+)/config", args.path
-        )
-        if config_match:
-            vmid = config_match.group(1)
-            requested = _boot_order_devices(data["boot"])
-            try:
-                persisted = _boot_order_devices(
-                    api.call("GET", f"/nodes/{NODE}/qemu/{vmid}/config").get(
-                        "boot", ""
-                    )
-                )
-            except LabError:
-                persisted = None
-            if persisted is not None and requested and persisted != requested:
-                persisted_text = ";".join(persisted) or "(none)"
-                print(
-                    f"warning: PVE persisted boot order '{persisted_text}' "
-                    f"instead of requested '{';'.join(requested)}' — set ide2/disk "
-                    "attach and boot order in separate calls",
-                    file=sys.stderr,
-                )
-    if write:
-        print(json.dumps(redact(report), indent=2, sort_keys=True))
-        return
-    print(
-        json.dumps(
-            redact({"data": result, "task_status": task_status}),
-            indent=2,
-            sort_keys=True,
-        )
-    )
-
-
-def upload_curl_argv(
-    config_path: str, source: Path, content: str, storage: str
-) -> list[str]:
-    """The curl argv for one storage upload.
-
-    Certificate policy comes from the same [proxmox] verify_tls switch the API
-    client uses. An operator who has put a trusted certificate on the node and
-    turned verification on must not get an unverified upload channel, or a
-    man-in-the-middle could swap the ISO while every REST call stays safe.
-    The token is only ever in the 0600 curl config file, never in argv.
-    """
-    argv = ["curl", "--config", config_path]
-    if not VERIFY_TLS:
-        argv.append("--insecure")
-    elif CONFIG.proxmox.get("ca_file"):
-        argv.extend(["--cacert", str(CONFIG.proxmox.ca_file)])
-    return [
-        *argv,
-        "--request", "POST",
-        "--form", f"content={content}",
-        "--form", f"filename=@{source}",
-        f"{API_ROOT}/nodes/{NODE}/storage/{storage}/upload",
-    ]
-
-
-def cmd_upload(args: argparse.Namespace) -> None:
-    if args.storage not in UPLOAD_STORAGES:
-        raise LabError(
-            f"Storage {args.storage!r} is not allowlisted for upload; "
-            f"choose one of {', '.join(sorted(UPLOAD_STORAGES))}"
-        )
-    source = Path(args.file).expanduser().resolve()
-    if not source.is_file():
-        raise LabError(f"Upload source is not a regular file: {source}")
-    lease = load_lease(args.lease)
-    token = keychain_secret()
-    config_text = (
-        "silent\n"
-        "show-error\n"
-        "fail-with-body\n"
-        f'header = "Authorization: PVEAPIToken={TOKEN_USER}!{TOKEN_NAME}={token}"\n'
-    )
-    with tempfile.NamedTemporaryFile(
-        mode="w", prefix="proxmox-upload-", delete=False
-    ) as config:
-        os.chmod(config.name, 0o600)
-        config.write(config_text)
-        config.flush()
-    try:
-        result = subprocess.run(
-            upload_curl_argv(config.name, source, args.content, args.storage),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=args.timeout,
-            check=False,
-        )
-    finally:
-        Path(config.name).unlink(missing_ok=True)
-    if result.returncode:
-        detail = (result.stderr or result.stdout).strip()[:1000]
-        raise LabError(f"Proxmox upload failed: {detail}")
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise LabError("Proxmox upload returned invalid JSON") from exc
-    upid = payload.get("data")
-    if not upid:
-        raise LabError(f"Proxmox upload did not return a task ID: {payload}")
-    status = wait_task(ProxmoxAPI(), upid, timeout=args.task_timeout)
-    audit(
-        "proxmox-storage-upload",
-        lease=lease["id"],
-        storage=args.storage,
-        content=args.content,
-        filename=source.name,
-        size=source.stat().st_size,
-        task_id=upid,
-        status=status,
-    )
-    print(
-        json.dumps(
-            {"data": upid, "filename": source.name, "status": status},
-            indent=2,
-            sort_keys=True,
-        )
-    )
-
-
-
-
-
-
-
-
-
-
-
-
 # How recently a guest must have been touched to count as in use. Tasks that
 # only ever mean "something stopped this guest" are excluded, or our own stop
 # would make every later run think the guest is busy.
@@ -646,8 +279,8 @@ def cmd_upload(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Facade: the lifecycle, state, audit, API and diagnostics implementations
-# now live in leases, cleanup, diagnostics, audit, api, state and updates.
+# Facade: the lifecycle, state, audit and diagnostics implementations
+# now live in leases, cleanup, diagnostics, audit, state and updates.
 # These wrappers keep the same names on this module so feature modules
 # (which receive it as `lab`) and the tests keep working, and so patched
 # configuration values are read at call time rather than captured at import.
@@ -667,28 +300,6 @@ def _lock_file(handle: Any) -> None:
 
 def _try_lock_file(handle: Any) -> bool:
     return state_module._try_lock_file(handle)
-
-
-def keychain_secret() -> str:
-    return api_module.token_secret(CONFIG, host=HOST, node=NODE)
-
-
-class ProxmoxAPI(api_module.ProxmoxAPI):
-    """The API client bound to this process's configuration."""
-
-    def __init__(self) -> None:
-        # The lambda, not keychain_secret itself: resolving the global at call
-        # time is what lets tests patch LAB.keychain_secret after the client
-        # is constructed.
-        super().__init__(
-            config=CONFIG, api_root=API_ROOT, token_user=TOKEN_USER,
-            token_name=TOKEN_NAME, token_secret=lambda: keychain_secret(),
-        )
-
-
-def wait_task(api: ProxmoxAPI, upid: str,
-              timeout: int = 180) -> dict[str, Any]:
-    return api_module.wait_task(api, NODE, upid, timeout)
 
 
 def audit(event: str, **fields: Any) -> None:
@@ -782,23 +393,23 @@ def register_resource(lease: dict[str, Any], kind: str, vmid: int,
         default_ttl=DEFAULT_TTL_SECONDS)
 
 
-def ensure_on(api: ProxmoxAPI, timeout: int | None = None) -> bool:
+def ensure_on(api: Any, timeout: int | None = None) -> bool:
     return leases_module.ensure_on(_module(), api, timeout)
 
 
-def node_guests(api: ProxmoxAPI) -> list[dict[str, Any]]:
+def node_guests(api: Any) -> list[dict[str, Any]]:
     return cleanup_module.node_guests(_module(), api)
 
 
-def describe_guests(api: ProxmoxAPI) -> list[dict[str, Any]]:
+def describe_guests(api: Any) -> list[dict[str, Any]]:
     return cleanup_module.describe_guests(_module(), api)
 
 
-def orphaned_guests(api: ProxmoxAPI) -> list[dict[str, Any]]:
+def orphaned_guests(api: Any) -> list[dict[str, Any]]:
     return cleanup_module.orphaned_guests(_module(), api)
 
 
-def running_guest_vmids(api: ProxmoxAPI) -> list[int]:
+def running_guest_vmids(api: Any) -> list[int]:
     return cleanup_module.running_guest_vmids(_module(), api)
 
 
@@ -806,23 +417,23 @@ def host_power_policy() -> str:
     return cleanup_module.host_power_policy(_module())
 
 
-def shutdown_host(api: ProxmoxAPI) -> dict[str, Any]:
+def shutdown_host(api: Any) -> dict[str, Any]:
     return cleanup_module.shutdown_host(_module(), api)
 
 
-def guest_status(api: ProxmoxAPI, kind: str, vmid: int) -> str:
+def guest_status(api: Any, kind: str, vmid: int) -> str:
     return cleanup_module.guest_status(_module(), api, kind, vmid)
 
 
-def stop_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
+def stop_guest(api: Any, kind: str, vmid: int) -> None:
     cleanup_module.stop_guest(_module(), api, kind, vmid)
 
 
-def delete_guest(api: ProxmoxAPI, kind: str, vmid: int) -> None:
+def delete_guest(api: Any, kind: str, vmid: int) -> None:
     cleanup_module.delete_guest(_module(), api, kind, vmid)
 
 
-def _delete_guest(api: ProxmoxAPI, kind: str, vmid: int, *,
+def _delete_guest(api: Any, kind: str, vmid: int, *,
                   destroy_unreferenced_disks: bool) -> None:
     cleanup_module._delete_guest(
         _module(), api, kind, vmid,
@@ -849,20 +460,20 @@ def guest_load(record: dict[str, Any]) -> float | None:
     return cleanup_module.guest_load(record)
 
 
-def recent_guest_activity(api: ProxmoxAPI, kind: str, vmid: int, *,
+def recent_guest_activity(api: Any, kind: str, vmid: int, *,
                           within: int = 1800,
                           record: dict[str, Any] | None = None) -> bool:
     return cleanup_module.recent_guest_activity(
         _module(), api, kind, vmid, within=within, record=record)
 
 
-def reclaim_orphans(api: ProxmoxAPI, *,
+def reclaim_orphans(api: Any, *,
                     include_active: bool = False) -> dict[str, Any]:
     return cleanup_module.reclaim_orphans(
         _module(), api, include_active=include_active)
 
 
-def finalize_lease(api: ProxmoxAPI, lease: dict[str, Any]) -> list[str]:
+def finalize_lease(api: Any, lease: dict[str, Any]) -> list[str]:
     return cleanup_module.finalize_lease(_module(), api, lease)
 
 
@@ -1065,57 +676,6 @@ def parser() -> argparse.ArgumentParser:
     register.add_argument("--allow-existing", action="store_true")
     register.set_defaults(func=cmd_lease_register)
 
-    api = sub.add_parser("api")
-    api.add_argument("--lease")
-    api.add_argument(
-        "--method", type=str.upper,
-        choices=("GET", "POST", "PUT", "DELETE"), required=True,
-        help="HTTP method (case-insensitive)",
-    )
-    api.add_argument("--path", required=True)
-    api.add_argument("--data", action="append", default=[])
-    api.add_argument("--policy", choices=("delete", "retain"), default="delete")
-    api.add_argument("--host-change-authorized", action="store_true")
-    api.add_argument(
-        "--slow-storage-accepted", action="store_true",
-        help="acknowledge placing a guest disk on the configured bulk "
-             "storage, which is slow enough to distort any I/O measurement",
-    )
-    api.add_argument(
-        "--password-stdin",
-        action="store_true",
-        help="Read a password value from stdin without exposing it in argv. "
-             "It must not be empty: a write stores the credential",
-    )
-    api.add_argument(
-        "--password-key",
-        default="password",
-        help="Field the stdin password fills, e.g. cipassword for cloud-init",
-    )
-    api.add_argument("--wait-task", action="store_true")
-    api.add_argument("--task-timeout", type=int, default=1800)
-    api.set_defaults(func=cmd_api)
-
-    upload = sub.add_parser("upload")
-    upload.add_argument("--lease", required=True)
-    # Bulk by default. ISOs are the biggest thing this tool writes, and the
-    # Proxmox root filesystem is small: this lab's filled to 96% on ISOs alone,
-    # which takes the hypervisor down with it long before it takes a lease down.
-    # choices=None when nothing is configured, so the argument stays usable and
-    # cmd_upload's own check reports the problem instead of argparse refusing
-    # every value including the default.
-    upload.add_argument("--storage", default=DEFAULT_UPLOAD_STORAGE,
-                        choices=UPLOAD_STORAGES or None,
-                        help="default: %(default)s"
-                             + (" (the configured bulk store)"
-                                if DEFAULT_UPLOAD_STORAGE ==
-                                str(CONFIG.storage.bulk_storage) else ""))
-    upload.add_argument("--content", choices=("import", "iso"), default="import")
-    upload.add_argument("--file", required=True)
-    upload.add_argument("--timeout", type=int, default=1800)
-    upload.add_argument("--task-timeout", type=int, default=1800)
-    upload.set_defaults(func=cmd_upload)
-
     end = sub.add_parser("lease-end")
     end.add_argument("--lease", required=True)
     end.add_argument(
@@ -1133,6 +693,21 @@ def parser() -> argparse.ArgumentParser:
     abandon.add_argument("--lease", required=True)
     abandon.add_argument("--confirm", action="store_true")
     abandon.set_defaults(func=cmd_lease_abandon)
+
+    listing = sub.add_parser("lease-list", help="show active leases")
+    listing.set_defaults(func=_bind(_module(), leases_module.cmd_lease_list))
+
+    destroy = sub.add_parser(
+        "lease-destroy",
+        help="permanently destroy a lease and its machines (long-term: the "
+             "only way out)",
+    )
+    destroy.add_argument("--lease", required=True)
+    destroy.add_argument(
+        "--confirm", action="store_true",
+        help="required: this deletes registered machines",
+    )
+    destroy.set_defaults(func=_bind(_module(), cleanup_module.cmd_lease_destroy))
 
     cleanup = sub.add_parser("cleanup-expired")
     cleanup.add_argument("--all", action="store_true")
@@ -1168,9 +743,6 @@ def parser() -> argparse.ArgumentParser:
     from . import disk
     from . import guest
     from . import hostinfo
-    from . import longterm
-    from . import memflow
-    from . import netcap
     from . import netgw
     from . import ioworkload
     from . import isoinspect
@@ -1191,9 +763,6 @@ def parser() -> argparse.ArgumentParser:
     disk.register(sub, _module())
     guest.register(sub, _module())
     hostinfo.register(sub, _module())
-    longterm.register(sub, _module())
-    memflow.register(sub, _module())
-    netcap.register(sub, _module())
     netgw.register(sub, _module())
     ioworkload.register(sub, _module())
     isoinspect.register(sub, _module())

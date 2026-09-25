@@ -35,9 +35,11 @@ and one DRIFT (D4) belong to the parallel lane and are reported, not fixed.
 - Evidence: `python3 scripts/check-secrets.py .` now prints
   `Potential secrets found:` for all three lines (it was green at `68a8a80`; the
   pattern has zero hits at HEAD — these are new in the parallel lane's edits).
-  `test_abstractions.py:286` contains `"PVEAPIToken=user@pve!name=zzz"`, which
-  matches the scanner's `PVEAPIToken\s*=\s*[A-Za-z0-9._~!@#$%^&*+-]{12,}` rule;
-  `test_audit.py` supplies `password="fake-password"`, `ssh_key="fake-key-material"`
+  `test_abstractions.py:286` contains a `PVEAPIToken=` fixture literal of the
+  form `user@pve!<name>=zzz` (17 characters after `=`), which matches the
+  scanner's `PVEAPIToken` rule (12+ character value);
+  `test_audit.py` supplies a 13-character `password=` fixture, a
+  `ssh_key="fake-key-material"` fixture
   and a `PVEAPIToken=…deadbeef=cafe` fixture string.
 - Violated: AGENTS.md — *"Before committing, do not include credentials, private
   keys, presigned URLs, host addresses, MAC addresses, VMIDs, disk serials,

@@ -70,7 +70,6 @@ ALLOWED_COMMANDS: frozenset[str] = frozenset(
         "pveversion",
         "hostname",
         "ip",
-        "ethtool",
         "cat",
         "base64",
         "true",
@@ -79,13 +78,15 @@ ALLOWED_COMMANDS: frozenset[str] = frozenset(
 
 #: The subset that changes the host itself. Runnable, but only with
 #: ``host_change=True`` (plumbed from the CLI authorization flags) on top of
-#: the allowlist membership. ``tee`` and ``rm`` write and remove host files
-#: and are path-confined by ``check_allowed`` (``tee`` to the pxl temp
-#: namespace, ``rm`` to it or to the ``/usr/local/sbin/pxl-*`` install
-#: namespace) -- the GC install/uninstall flow needs them because the seam's
-#: quoting leaves no shell redirect to stage the script.
+#: the allowlist membership. ``ethtool`` is here because §D names it in the
+#: host-changing subset (it can *set* link parameters, not just read them).
+#: ``tee`` and ``rm`` write and remove host files and are path-confined by
+#: ``check_allowed`` (``tee`` to the pxl temp namespace, ``rm`` to it or to
+#: the ``/usr/local/sbin/pxl-*`` install namespace) -- the GC install/
+#: uninstall flow needs them because the seam's quoting leaves no shell
+#: redirect to stage the script.
 HOST_CHANGE_COMMANDS: frozenset[str] = frozenset(
-    {"shutdown", "crontab", "install", "tee", "rm"}
+    {"shutdown", "crontab", "install", "ethtool", "tee", "rm"}
 )
 
 #: The only host paths ``cat`` may read (host temp hygiene).
@@ -93,6 +94,9 @@ _PXL_TEMP_PREFIX = "/tmp/pxl-"
 
 #: The install namespace ``rm`` may delete from (currently the GC script).
 _PXL_INSTALL_PREFIX = "/usr/local/sbin/pxl-"
+
+#: The pxl log namespace ``base64`` may read (the GC's cron log).
+_PXL_LOG_PREFIX = "/var/log/pxl-"
 
 
 def _confine(
@@ -130,11 +134,15 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
     except exactly ``crontab -l``, which only reads the crontab and changes
     nothing, so a status report needs no authorization while ``crontab -``
     and every other invocation stay gated; and for ``"cat"``/``"tee"``/``"rm"``
-    every path argument must *resolve* inside its allowed prefix -- no ``..``
-    anywhere in the argument, and posix-normalized before the prefix test --
-    so the seam cannot read, write or remove host files outside
-    ``/tmp/pxl-*`` (and, for ``rm``, ``/usr/local/sbin/pxl-*``) no matter how
-    the path is spelled.
+    / ``"base64"`` every path argument must *resolve* inside its allowed
+    prefix -- no ``..`` anywhere in the argument, and posix-normalized before
+    the prefix test -- so the seam cannot read, write or remove host files
+    outside the pxl namespaces no matter how the path is spelled: ``cat`` and
+    ``tee`` stay in ``/tmp/pxl-*``, ``rm`` may also touch
+    ``/usr/local/sbin/pxl-*``, and ``base64`` (a reader, so it is confined
+    exactly like ``cat``) reads ``/tmp/pxl-*``, ``/usr/local/sbin/pxl-*`` and
+    ``/var/log/pxl-*``. Flag arguments (``-d``, ``-f`` …) are skipped for
+    ``tee``, ``rm`` and ``base64`` (``cat`` checks every argument, as before).
 
     This replaces the old API-path policy gate (``host_policy.check_api``):
     the gate moved from URL parsing to argv policy. What the gate never did --
@@ -171,6 +179,16 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
                 argument,
                 (_PXL_TEMP_PREFIX, _PXL_INSTALL_PREFIX),
                 "removes",
+            )
+    if command == "base64":
+        for argument in argv[1:]:
+            if argument.startswith("-"):
+                continue
+            _confine(
+                "base64",
+                argument,
+                (_PXL_TEMP_PREFIX, _PXL_INSTALL_PREFIX, _PXL_LOG_PREFIX),
+                "reads",
             )
 
 

@@ -47,6 +47,12 @@ CRON_MARKER = "# pxl-gc"
 CRON_LINE = "*/10 * * * * /usr/local/sbin/pxl-gc >>/var/log/pxl-gc.log 2>&1"
 CRON_BLOCK = CRON_MARKER + "\n" + CRON_LINE + "\n"
 
+#: The host-side log the crontab line appends to; ``gc status`` tails it.
+LOG_PATH = "/var/log/pxl-gc.log"
+
+#: How many trailing log lines ``gc status`` reports.
+TAIL_LINES = 20
+
 #: The copy bundled with this package; the remote copy is checksummed
 #: against it for ``status`` and re-uploaded when it differs.
 BUNDLED_SCRIPT = Path(__file__).resolve().parent / "resources" / "pxl-gc.py"
@@ -174,10 +180,13 @@ def install(ssh: Any, *, host_change: bool) -> dict:
 
 
 def status(ssh: Any) -> dict:
-    """Read-only: is the script present, does it match, is the line in place.
+    """Read-only: script presence, checksum, crontab line, and the log tail.
 
-    Never requires host-change authorization -- this is what ``gc status``
-    and doctor's "GC crontab" info check call.
+    Four elements (§F): the installed script's presence, its checksum against
+    the bundled copy, the crontab line, and the last :data:`TAIL_LINES` lines
+    of :data:`LOG_PATH` read through the confined ``base64`` reader. A missing
+    or unreadable log reports ``"absent"`` -- status never errors on it.
+    Never requires host-change authorization: every call is ``host_change=False``.
     """
     bundled_digest = hashlib.sha256(_bundled_script()).hexdigest()
     remote = _remote_script(ssh, host_change=False)
@@ -196,11 +205,24 @@ def status(ssh: Any) -> dict:
         if crontab_text and SCRIPT_INSTALL_PATH in crontab_text
         else "absent"
     )
+    log_report: object = "absent"
+    log_read = ssh.run(["base64", LOG_PATH], host_change=False)
+    if log_read.ok:
+        try:
+            lines = (
+                base64.b64decode(log_read.stdout, validate=False)
+                .decode("utf-8", "replace")
+                .splitlines()
+            )
+            log_report = lines[-TAIL_LINES:]
+        except (ValueError, TypeError):
+            log_report = "absent"
     return {
         "script": script,
         "path": SCRIPT_INSTALL_PATH,
         "checksum": checksum,
         "crontab": crontab,
+        "log": log_report,
     }
 
 

@@ -187,6 +187,10 @@ class StatusTests(GcTestCase):
     def test_status_reports_present_and_matching_without_any_flag(self):
         self.script_present()
         self.crontab_is("# mine\n" + gc.CRON_BLOCK)
+        self.fake.add(
+            f"^base64 {gc.LOG_PATH}$",
+            stdout=base64.b64encode(b"pxl-gc: started\npxl-gc: idle\n"),
+        )
 
         report = self.run_cmd(gc.cmd_status, argparse.Namespace())
 
@@ -197,14 +201,37 @@ class StatusTests(GcTestCase):
                 "path": SCRIPT,
                 "checksum": "match",
                 "crontab": "present",
+                "log": ["pxl-gc: started", "pxl-gc: idle"],
             },
         )
-        self.assert_argv_sequence([["base64", SCRIPT], ["crontab", "-l"]])
+        self.assert_argv_sequence(
+            [["base64", SCRIPT], ["crontab", "-l"], ["base64", gc.LOG_PATH]]
+        )
         # Read-only: every call carries host_change=False, and the seam's own
-        # policy accepts both argvs with no authorization at all.
+        # policy accepts every argv with no authorization at all.
         self.assertTrue(all(not call["host_change"] for call in self.fake.calls))
         ssh_module.check_allowed(["base64", SCRIPT])
+        ssh_module.check_allowed(["base64", gc.LOG_PATH])
         ssh_module.check_allowed(["crontab", "-l"])
+
+    def test_status_log_tail_is_the_last_twenty_lines(self):
+        self.script_present()
+        self.crontab_is(gc.CRON_BLOCK)
+        body = "".join(f"line-{index}\n" for index in range(25))
+        self.fake.add(f"^base64 {gc.LOG_PATH}$", stdout=base64.b64encode(body.encode()))
+
+        report = self.run_cmd(gc.cmd_status, argparse.Namespace())
+
+        self.assertEqual(report["log"], [f"line-{index}" for index in range(5, 25)])
+
+    def test_status_unreadable_log_reports_absent_not_error(self):
+        self.script_present()
+        self.crontab_is(gc.CRON_BLOCK)
+        self.fake.add(f"^base64 {gc.LOG_PATH}$", stdout=b"not valid base64!!!")
+
+        report = self.run_cmd(gc.cmd_status, argparse.Namespace())
+
+        self.assertEqual(report["log"], "absent")
 
     def test_status_reports_absent_everywhere(self):
         self.script_absent()
@@ -215,6 +242,7 @@ class StatusTests(GcTestCase):
         self.assertEqual(report["script"], "absent")
         self.assertEqual(report["checksum"], "n/a")
         self.assertEqual(report["crontab"], "absent")
+        self.assertEqual(report["log"], "absent")
 
     def test_status_flags_a_drifted_script(self):
         self.script_present(payload=base64.b64encode(b"an older gc\n"))
@@ -351,6 +379,7 @@ class RegisterTests(GcTestCase):
         report = json.loads(buffer.getvalue())
         self.assertEqual(report["script"], "present")
         self.assertEqual(report["crontab"], "present")
+        self.assertEqual(report["log"], "absent")
         self.assertTrue(all(not c["host_change"] for c in self.fake.calls))
 
 

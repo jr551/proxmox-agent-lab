@@ -145,6 +145,8 @@ class RunPolicyTests(unittest.TestCase):
                 "/tmp/pxl-gc",
                 "/usr/local/sbin/pxl-gc",
             ],
+            "ethtool without flag": ["ethtool", "-s", "eth0", "wol", "g"],
+            "base64 outside pxl namespaces": ["base64", "/etc/shadow"],
             "cat outside pxl temp": ["cat", "/etc/shadow"],
             "cat mixing pxl and other paths": ["cat", "/tmp/pxl-x", "/etc/shadow"],
             "empty argv": [],
@@ -167,15 +169,29 @@ class RunPolicyTests(unittest.TestCase):
             ["shutdown", "-h", "now"],
             ["crontab", "-"],
             ["install", "-m", "0755", "/tmp/pxl-gc", "/usr/local/sbin/pxl-gc"],
+            ["ethtool", "eth0"],
         ):
             with self.subTest(argv=argv):
                 runner = RecordingRunner()
                 self.assertTrue(make_ssh(runner).run(argv, host_change=True).ok)
                 self.assertEqual(len(runner.calls), 1)
 
+    def test_base64_readers_are_confined_but_usable(self) -> None:
+        """status reads the installed script and the GC log -- nothing else."""
+        for argv in (
+            ["base64", "/usr/local/sbin/pxl-gc"],
+            ["base64", "/var/log/pxl-gc.log"],
+            ["base64", "/tmp/pxl-gc"],
+            ["base64", "-d", "/tmp/pxl-gc"],  # flags are skipped by the rule
+        ):
+            with self.subTest(argv=argv):
+                runner = RecordingRunner()
+                self.assertTrue(make_ssh(runner).run(argv).ok)
+                self.assertEqual(len(runner.calls), 1)
+
     def test_parent_traversal_is_refused_before_spawn(self) -> None:
-        """`..` defeats a bare prefix check, so cat/tee/rm reject it (and
-        normalize before the prefix test) -- nothing reaches the host."""
+        """`..` defeats a bare prefix check, so cat/tee/rm/base64 reject it
+        (and normalize before the prefix test) -- nothing reaches the host."""
         cases = {
             "cat with .. segments": ["cat", "/tmp/pxl-../../etc/shadow"],
             "tee with .. glued in a segment": ["tee", "/tmp/pxl-../evil"],
@@ -185,6 +201,7 @@ class RunPolicyTests(unittest.TestCase):
                 "-f",
                 "/tmp/pxl-/../../important",
             ],
+            "base64 with .. segments": ["base64", "/tmp/pxl-../../etc/passwd"],
         }
         for name, argv in cases.items():
             with self.subTest(name=name):

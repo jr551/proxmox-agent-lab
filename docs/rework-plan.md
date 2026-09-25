@@ -548,12 +548,18 @@ isolated inside `proxmox.py`, so a flag correction is a one-line change.
   argument is `shlex.quote`d at the seam — including guest-supplied strings. No caller
   composes remote shell strings by hand.
 - **Command allowlist (the new least-privilege boundary).** `ssh.py` refuses any remote
-  command outside the allowlist — `qm`, `pct`, `pvesh`, `pveversion`, `hostname`, `ip`,
-  `ethtool`, `cat` (pxl temp files only), `install`, `crontab`, `shutdown`, `base64`,
-  `true`. Arbitrary root shell is not a feature. The host-changing subset (`shutdown`,
-  `crontab`, `install`, `ethtool`) additionally requires the explicit authorization
+  command outside two sets: `ALLOWED_COMMANDS` = `qm`, `pct`, `pvesh`, `pveversion`,
+  `hostname`, `ip`, `cat`, `base64`, `true`; and `HOST_CHANGE_COMMANDS` = `shutdown`,
+  `crontab`, `install`, `ethtool`, `tee`, `rm`. Arbitrary root shell is not a feature.
+  The host-changing set additionally requires the explicit authorization
   flags (`--host-change-authorized` / `--standalone-authorized`) checked in `cli.py`
-  before the call is built. This replaces both the scoped API token of the old world and
+  before the call is built, and the path-taking commands are confined to the pxl
+  namespaces (`cat`/`tee`/`rm` under `/tmp/pxl-*`, `rm` also under
+  `/usr/local/sbin/pxl-*` for the GC script itself, `base64` only under
+  `/var/log/pxl-*` for the GC log) — `..` is refused outright and the path is
+  `posixpath.normpath`-ed before the prefix test. Exactly `crontab -l` is the one
+  ungated host-change invocation (a flagless read, so `gc status` needs no
+  authorization); `crontab -` and every other invocation stay gated. This replaces both the scoped API token of the old world and
   `host_policy.check_api`'s API-path gate (the gate moved from URL parsing to argv
   policy; the *category* of what needs authorization is unchanged).
 - **Bounded everything.** Every call carries a timeout (default 30 s, per-call override;
@@ -729,10 +735,10 @@ Install reads `crontab -l`, strips any existing `# pxl-gc` block (marker line + 
 ### gc install|status|uninstall behavior
 
 - **install** (gated `--host-change-authorized`): scp the bundled `resources/pxl-gc.py` to `/usr/local/sbin/pxl-gc` (mode 0755), ensure `/var/lib/pxl-gc` exists, and inject the crontab line idempotently via the `# pxl-gc` marker (detect/remove/replace). Reports exactly what changed: script written/updated/unchanged with its checksum, crontab block added/replaced/unchanged.
-- **status** (ungated, read-only): script presence at `/usr/local/sbin/pxl-gc` + checksum against the bundled copy, `# pxl-gc` block present in root's crontab, the last N lines of `/var/log/pxl-gc.log`, and a remote `pxl-gc --dry-run` showing what would be destroyed plus the power-off verdict. Nothing is modified.
+- **status** (ungated, read-only): script presence at `/usr/local/sbin/pxl-gc` + checksum against the bundled copy, the `# pxl-gc` block present in root's crontab, and the tail of `/var/log/pxl-gc.log`. Deliberately **no remote `pxl-gc --dry-run`** — it is kept out of scope (the log tail plus `doctor`'s drift view answer "what would be destroyed" without executing remote tooling). Nothing is modified.
 - **uninstall** (gated `--host-change-authorized`): remove the `# pxl-gc` crontab block and `/usr/local/sbin/pxl-gc`, report the changes, and **never touch guests** — no guest state is read or written on the way out.
 
-Install/uninstall belong to the host-changing command subset (`shutdown`, `crontab`, `install`) and are refused without `--host-change-authorized`; `status` needs no flag. The script itself is exercised against the pinned test harness (`tests/support/fakeqm.py` stub `qm`/`pct` executables on `PATH`).
+Install/uninstall belong to the host-changing command subset (`shutdown`, `crontab`, `install`, `ethtool`, `tee`, `rm`) and are refused without `--host-change-authorized`; `status` needs no flag (its crontab read is exactly `crontab -l`, the one ungated host-change invocation). The script itself is exercised against the pinned test harness (`tests/support/fakeqm.py` stub `qm`/`pct` executables on `PATH`).
 ## G. Config schema and doctor checklist
 
 ### Config file
@@ -1004,7 +1010,7 @@ gates green.
 ### 8. Docs pass
 
 Root `SKILL.md` + `.agents/skills/proxmox-agent-lab/SKILL.md` (currently 0 bytes)
-carrying the kept surface (CLI, the 24 MCP tools, guest metadata contract,
+carrying the kept surface (CLI, the 23 MCP tools, guest metadata contract,
 safety invariants), `README.md`, `docs/` trimmed to the REWRITE set, a
 `CHANGELOG.md` entry for the rework, and a `docs/VERIFICATION.md` note honest
 per AGENTS.md: what the unit suite proves, with no live-hypervisor run claimed.

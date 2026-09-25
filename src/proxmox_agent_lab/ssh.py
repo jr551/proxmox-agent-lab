@@ -78,11 +78,20 @@ ALLOWED_COMMANDS: frozenset[str] = frozenset(
 
 #: The subset that changes the host itself. Runnable, but only with
 #: ``host_change=True`` (plumbed from the CLI authorization flags) on top of
-#: the allowlist membership.
-HOST_CHANGE_COMMANDS: frozenset[str] = frozenset({"shutdown", "crontab", "install"})
+#: the allowlist membership. ``tee`` and ``rm`` write and remove host files
+#: and are path-confined by ``check_allowed`` (``tee`` to the pxl temp
+#: namespace, ``rm`` to it or to the ``/usr/local/sbin/pxl-*`` install
+#: namespace) -- the GC install/uninstall flow needs them because the seam's
+#: quoting leaves no shell redirect to stage the script.
+HOST_CHANGE_COMMANDS: frozenset[str] = frozenset(
+    {"shutdown", "crontab", "install", "tee", "rm"}
+)
 
 #: The only host paths ``cat`` may read (host temp hygiene).
 _PXL_TEMP_PREFIX = "/tmp/pxl-"
+
+#: The install namespace ``rm`` may delete from (currently the GC script).
+_PXL_INSTALL_PREFIX = "/usr/local/sbin/pxl-"
 
 
 def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
@@ -90,9 +99,15 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
 
     The rules, in order: ``argv`` must be non-empty and ``argv[0]`` must be
     allowed (``ALLOWED_COMMANDS`` or ``HOST_CHANGE_COMMANDS``); a command in
-    ``HOST_CHANGE_COMMANDS`` additionally requires ``host_change=True``; and
-    for ``argv[0] == "cat"`` every argument must start with ``/tmp/pxl-`` so
-    the seam cannot read host files outside its own temp namespace.
+    ``HOST_CHANGE_COMMANDS`` additionally requires ``host_change=True`` --
+    except exactly ``crontab -l``, which only reads the crontab and changes
+    nothing, so a status report needs no authorization while ``crontab -``
+    and every other invocation stay gated; for ``argv[0] == "cat"`` every
+    argument must start with ``/tmp/pxl-`` so the seam cannot read host files
+    outside its own temp namespace; for ``"tee"`` every destination must
+    start with ``/tmp/pxl-``; and for ``"rm"`` every path argument must start
+    with ``/tmp/pxl-`` or ``/usr/local/sbin/pxl-``, so the seam can only
+    stage, install and remove pxl's own files.
 
     This replaces the old API-path policy gate (``host_policy.check_api``):
     the gate moved from URL parsing to argv policy. What the gate never did --
@@ -108,14 +123,36 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
     if command not in ALLOWED_COMMANDS and command not in HOST_CHANGE_COMMANDS:
         raise PolicyError(f"refused: {command!r} is not on the command allowlist")
     if command in HOST_CHANGE_COMMANDS and not host_change:
-        raise PolicyError(
-            f"refused: {command!r} changes the host and needs host_change=True"
-        )
+        if not (command == "crontab" and list(argv[1:]) == ["-l"]):
+            raise PolicyError(
+                f"refused: {command!r} changes the host and needs host_change=True"
+            )
     if command == "cat":
         for argument in argv[1:]:
             if not argument.startswith(_PXL_TEMP_PREFIX):
                 raise PolicyError(
                     f"refused: cat reads only {_PXL_TEMP_PREFIX}* files, not {argument!r}"
+                )
+    if command == "tee":
+        for argument in argv[1:]:
+            if argument.startswith("-"):
+                continue
+            if not argument.startswith(_PXL_TEMP_PREFIX):
+                raise PolicyError(
+                    f"refused: tee writes only {_PXL_TEMP_PREFIX}* files, "
+                    f"not {argument!r}"
+                )
+    if command == "rm":
+        for argument in argv[1:]:
+            if argument.startswith("-"):
+                continue
+            if not (
+                argument.startswith(_PXL_TEMP_PREFIX)
+                or argument.startswith(_PXL_INSTALL_PREFIX)
+            ):
+                raise PolicyError(
+                    f"refused: rm removes only {_PXL_TEMP_PREFIX}* or "
+                    f"{_PXL_INSTALL_PREFIX}*, not {argument!r}"
                 )
 
 

@@ -1,16 +1,41 @@
 # Deterministic configuration for the test suite. Tests must never depend on
 # whatever the developer happens to have installed locally.
+#
+# The canonical schema is docs/rework-plan.md §G; the sections below the
+# divider are transitional keys kept only so the modules that die in a later
+# wave (and their tests) keep resolving. Nothing new reads them.
+
+[ssh]
+target = "fixture-host"
+
+[pve]
+node = "pve"
+template_vmid = 9025
+
+[power]
+mac = "aa:bb:cc:dd:ee:ff"
+broadcast = "192.0.2.255"
+port = 9
+# transitional: read by the dying power-mode code
+mode = "wake-on-lan"
+
+[state]
+# Placeholder only: tests/support/bootstrap.py points PROXMOX_AGENT_LAB_STATE
+# at a fresh per-process temp directory, which takes precedence.
+dir = "/tmp/proxmox-agent-lab-test-state"
+
+[lease]
+ttl_seconds = 7200
+idle_shutdown_seconds = 28800
+
+# --- transitional keys: read only by the modules that die in a later wave
+# and by the tests still covering them. Nothing new reads these. -----------
 
 [proxmox]
 host = "192.0.2.10"
 node = "testnode"
 token_user = "tester@pve"
 token_name = "test"
-
-[power]
-mode = "wake-on-lan"
-mac = "aa:bb:cc:dd:ee:ff"
-broadcast = "192.0.2.255"
 
 [storage]
 upload_storages = ["local", "bulk"]

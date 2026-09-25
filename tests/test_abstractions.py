@@ -1,5 +1,12 @@
-"""Tests for the layers that hide platform and guest differences:
-config, secrets, power, the audit ledger, and guest channel selection."""
+"""Tests for the layers that hide platform differences: config and audit.
+
+Rewritten for the SQLite/SSH rework. The credential-store, ledger-queue,
+guest-channel and inventory-registry layers this file used to cover are cut
+or rewritten elsewhere; what survives here is the config surface
+(docs/rework-plan.md §G plus the transitional namespaces the dying modules
+still read) and the audit facade over store.py (redaction, one event per
+action, never fails the action).
+"""
 
 from __future__ import annotations
 
@@ -12,9 +19,6 @@ import sys  # noqa: E402
 # applied before any proxmox_agent_lab import. `support` sits beside this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from support import bootstrap  # noqa: E402,F401
-import shutil
-import tempfile
-import sys  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import unittest  # noqa: E402
@@ -22,15 +26,9 @@ from unittest import mock  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-import json  # noqa: E402
-import sqlite3  # noqa: E402
-
+from proxmox_agent_lab import audit as audit_module  # noqa: E402
 from proxmox_agent_lab import config as config_module  # noqa: E402
-from proxmox_agent_lab import guest as guest_module  # noqa: E402
-from proxmox_agent_lab import inventory as inventory_module  # noqa: E402
-from proxmox_agent_lab import journal as journal_module  # noqa: E402
-from proxmox_agent_lab import power as power_module  # noqa: E402
-from proxmox_agent_lab import secrets_store  # noqa: E402
+from proxmox_agent_lab import store as store_module  # noqa: E402
 
 
 class ConfigTests(unittest.TestCase):
@@ -41,33 +39,35 @@ class ConfigTests(unittest.TestCase):
             config = config_module.load(absent)
         self.assertFalse(config.configured)
         self.assertEqual(config.intended, absent)
-        self.assertEqual(config.power.mode, "wake-on-lan")
+        self.assertEqual(config.ssh.target, "")
+        self.assertEqual(config.lease.ttl_seconds, 7200)
 
     def test_a_misspelled_section_is_reported_but_not_fatal(self) -> None:
         """It is surfaced by `doctor` rather than discarding the config."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.toml"
-            path.write_text('[proxmoxx]\nhost = "x"\n\n[proxmox]\nnode = "n"\n')
+            path.write_text('[proxmoxx]\nhost = "x"\n\n[pve]\nnode = "n"\n')
             config = config_module.load(path)
         self.assertEqual(config.unknown_sections, ["proxmoxx"])
-        self.assertEqual(config.proxmox.node, "n")
+        self.assertEqual(config.pve.node, "n")
 
     def test_require_names_the_setting_and_the_file(self) -> None:
         config = config_module.defaults()
         with self.assertRaises(config_module.ConfigError) as caught:
-            config.require("proxmox.host", "the Proxmox address")
+            config.require("ssh.target", "the ssh target")
         message = str(caught.exception)
-        self.assertIn("[proxmox] host", message)
-        self.assertIn("the Proxmox address", message)
+        self.assertIn("[ssh] target", message)
+        self.assertIn("the ssh target", message)
 
     def test_partial_config_keeps_defaults_for_everything_else(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.toml"
-            path.write_text('[proxmox]\nhost = "10.0.0.1"\n')
+            path.write_text('[pve]\nnode = "n"\n')
             config = config_module.load(path)
-        self.assertEqual(config.proxmox.host, "10.0.0.1")
-        self.assertEqual(config.proxmox.port, 8006)
-        self.assertEqual(config.lease.default_ttl_seconds, 7200)
+        self.assertEqual(config.pve.node, "n")
+        self.assertEqual(config.pve.template_vmid, 0)
+        self.assertEqual(config.power.port, 9)
+        self.assertEqual(config.lease.idle_shutdown_seconds, 28800)
 
     def test_every_module_shares_one_instance(self) -> None:
         self.assertIs(config_module.get(), config_module.get())
@@ -78,581 +78,242 @@ class ConfigTests(unittest.TestCase):
             path.write_text(config_module.TEMPLATE)
             config = config_module.load(path)   # must not raise
         self.assertTrue(config.configured)
+        self.assertEqual(config.unknown_sections, [], "template uses only known keys")
+        self.assertEqual(config.ssh.target, "proxmox")
+        self.assertEqual(config.pve.node, "pve")
+        self.assertEqual(config.pve.template_vmid, 100)
+        self.assertEqual(config.power.port, 9)
+        self.assertEqual(config.state.dir, "~/.local/share/proxmox-agent-lab")
+        self.assertEqual(config.lease.ttl_seconds, 7200)
+        self.assertEqual(config.lease.idle_shutdown_seconds, 28800)
 
-
-class PowerTests(unittest.TestCase):
-    def test_magic_packet_shape(self) -> None:
-        packet = power_module.magic_packet("aa:bb:cc:dd:ee:ff")
-        self.assertEqual(len(packet), 102)          # 6 + 16 * 6
-        self.assertEqual(packet[:6], b"\xff" * 6)
-        self.assertEqual(packet[6:12], bytes.fromhex("aabbccddeeff"))
-        self.assertEqual(packet[-6:], bytes.fromhex("aabbccddeeff"))
-
-    def test_mac_separators_are_all_accepted(self) -> None:
-        expected = power_module.magic_packet("aa:bb:cc:dd:ee:ff")
-        for spelling in ("AA-BB-CC-DD-EE-FF", "aabb.ccdd.eeff", "AABBCCDDEEFF"):
-            self.assertEqual(power_module.magic_packet(spelling), expected)
-
-    def test_a_bad_mac_is_rejected(self) -> None:
-        for bad in ("", "not-a-mac", "aa:bb:cc:dd:ee", "zz:bb:cc:dd:ee:ff"):
-            with self.assertRaises(power_module.PowerError):
-                power_module.magic_packet(bad)
-
-    def test_wake_on_lan_cannot_force_off(self) -> None:
-        """Silently pretending would be worse than admitting it."""
-        config = config_module.defaults()
-        self.assertFalse(power_module.can_force_off(config))
-        with self.assertRaises(power_module.PowerError) as caught:
-            power_module.force_off(config)
-        self.assertIn("cannot force", str(caught.exception))
-
-    def test_force_off_available_only_when_configured(self) -> None:
+    def test_the_nine_key_schema_resolves_from_a_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.toml"
             path.write_text(
-                '[power]\nmode = "command"\n'
-                'on_command = "true"\noff_command = "true"\n'
+                '[ssh]\ntarget = "box"\n'
+                '[pve]\nnode = "alpha"\ntemplate_vmid = 9025\n'
+                '[power]\nmac = "aa:bb:cc:dd:ee:ff"\n'
+                'broadcast = "192.0.2.255"\nport = 7\n'
+                '[state]\ndir = "/tmp/pxl-state"\n'
+                '[lease]\nttl_seconds = 3600\nidle_shutdown_seconds = 100\n'
             )
             config = config_module.load(path)
-        self.assertTrue(power_module.can_force_off(config))
+        self.assertEqual(config.ssh.target, "box")
+        self.assertEqual(config.pve.node, "alpha")
+        self.assertEqual(config.pve.template_vmid, 9025)
+        self.assertEqual(config.power.mac, "aa:bb:cc:dd:ee:ff")
+        self.assertEqual(config.power.broadcast, "192.0.2.255")
+        self.assertEqual(config.power.port, 7)
+        self.assertEqual(config.state.dir, "/tmp/pxl-state")
+        self.assertEqual(config.lease.ttl_seconds, 3600)
+        self.assertEqual(config.lease.idle_shutdown_seconds, 100)
 
-    def test_power_mode_none_explains_itself(self) -> None:
+    def test_the_fixture_loads_through_the_new_loader(self) -> None:
+        config = config_module.get()   # the fixture tests/support/bootstrap pinned
+        self.assertTrue(config.configured)
+        self.assertEqual(config.unknown_sections, [], "fixture uses only known keys")
+        self.assertEqual(config.ssh.target, "fixture-host")
+        self.assertEqual(config.pve.node, "pve")
+        self.assertEqual(config.pve.template_vmid, 9025)
+        self.assertEqual(config.power.mac, "aa:bb:cc:dd:ee:ff")
+        self.assertEqual(config.lease.ttl_seconds, 7200)
+        self.assertEqual(config.lease.idle_shutdown_seconds, 28800)
+
+    def test_legacy_namespaces_still_resolve_for_dying_readers(self) -> None:
+        """TRANSITIONAL: the modules that die in a later wave read these at
+        import time. They must never crash; they are deleted with them."""
+        config = config_module.get()
+        self.assertEqual(config.proxmox.host, "192.0.2.10")
+        self.assertEqual(config.proxmox.node, "testnode")
+        self.assertEqual(config.proxmox.token_user, "tester@pve")
+        self.assertIs(config.proxmox.verify_tls, False)
+        self.assertEqual(config.proxmox.get("ca_file"), "")
+        self.assertEqual(config.proxmox.get("guest_mode", "all"), "all")
+        self.assertEqual(config.storage.upload_storages, ["local", "bulk"])
+        self.assertEqual(config.storage.bulk_storage, "bulk")
+        self.assertEqual(config.audit.get("database"), "proxmox_lab")
+        # [ssh] target is the ssh gate now; [memflow] ssh_host is not.
+        self.assertEqual(config_module.defaults().memflow.ssh_host, "")
+
+    def test_default_ttl_seconds_is_an_alias_of_ttl_seconds(self) -> None:
+        config = config_module.get()
+        self.assertEqual(config.lease.default_ttl_seconds,
+                         config.lease.ttl_seconds)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.toml"
-            path.write_text('[power]\nmode = "none"\n')
-            config = config_module.load(path)
-        with self.assertRaises(power_module.PowerError) as caught:
-            power_module.power_on(config)
-        self.assertIn("switch the machine on yourself", str(caught.exception))
+            path.write_text("[lease]\nttl_seconds = 5400\n")
+            canonical = config_module.load(path)
+            path.write_text("[lease]\ndefault_ttl_seconds = 3600\n")
+            legacy = config_module.load(path)
+        self.assertEqual(canonical.lease.default_ttl_seconds, 5400)
+        self.assertEqual(legacy.lease.ttl_seconds, 3600)
+        self.assertEqual(legacy.lease.default_ttl_seconds, 3600)
 
-    def _composite_config(self, tmp: str) -> "config_module.Config":
-        path = Path(tmp) / "c.toml"
-        path.write_text(
-            '[power]\nmode = "wake-on-lan+home-assistant"\n'
-            'mac = "aa:bb:cc:dd:ee:ff"\nbroadcast = "192.168.1.255"\n'
-            'home_assistant_url = "https://ha.example"\n'
-            'entity_on = "script.lab_power_on"\n'
-            'entity_off = "script.lab_force_off"\n'
+    def test_state_dir_expands_the_state_dir_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text('[state]\ndir = "~/pxl-state-under-test"\n')
+            with mock.patch.dict(os.environ,
+                                 {config_module.ENV_CONFIG: str(path),
+                                  config_module.ENV_STATE: ""}):
+                config_module.reset_cache()
+                try:
+                    self.assertEqual(config_module.state_dir(),
+                                     Path.home() / "pxl-state-under-test")
+                finally:
+                    config_module.reset_cache()
+
+    def test_the_state_env_override_still_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, {config_module.ENV_STATE: tmp}):
+            self.assertEqual(config_module.state_dir(), Path(tmp))
+
+    def test_a_broken_file_is_an_error_only_when_loaded_explicitly(self) -> None:
+        """The split `doctor` relies on: `load()` reports the broken file,
+        while every import-time reader (`get()`) survives it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "c.toml"
+            broken.write_text("[ssh\ntarget = ")
+            with self.assertRaises(config_module.ConfigError) as caught:
+                config_module.load(broken)
+            self.assertIn(str(broken), str(caught.exception))
+            with mock.patch.dict(os.environ, {config_module.ENV_CONFIG: str(broken)}):
+                config_module.reset_cache()
+                try:
+                    config = config_module.get()   # the import-time path
+                    self.assertFalse(config.configured)
+                    self.assertEqual(config.ssh.target, "")
+                    self.assertIn(str(broken), config_module.CONFIG_ERROR or "")
+                finally:
+                    config_module.reset_cache()
+
+    def test_a_fresh_interpreter_imports_with_missing_and_broken_config(self) -> None:
+        program = (
+            "import proxmox_agent_lab.config as c;"
+            "c.get();"
+            "print(c.CONFIG_ERROR or '')"
         )
-        return config_module.load(path)
-
-    def test_composite_mode_sends_both_wol_and_home_assistant(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._composite_config(tmp)
-        with mock.patch.object(power_module, "wake_on_lan") as wol, \
-             mock.patch.object(power_module, "_home_assistant") as ha:
-            result = power_module.power_on(config)
-        wol.assert_called_once_with("aa:bb:cc:dd:ee:ff", "192.168.1.255", 9)
-        ha.assert_called_once_with(config, "script.lab_power_on")
-        self.assertEqual(result["mode"], "wake-on-lan+home-assistant")
-        self.assertIsNone(result["errors"])
-
-    def test_composite_mode_survives_one_path_failing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._composite_config(tmp)
-        with mock.patch.object(power_module, "wake_on_lan",
-                                side_effect=power_module.PowerError("boom")), \
-             mock.patch.object(power_module, "_home_assistant") as ha:
-            result = power_module.power_on(config)
-        ha.assert_called_once()
-        self.assertEqual(len(result["errors"]), 1)
-        self.assertIn("wake-on-lan: boom", result["errors"][0])
-
-    def test_composite_mode_raises_only_if_both_paths_fail(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._composite_config(tmp)
-        with mock.patch.object(power_module, "wake_on_lan",
-                                side_effect=power_module.PowerError("wol down")), \
-             mock.patch.object(power_module, "_home_assistant",
-                                side_effect=power_module.PowerError("ha down")):
-            with self.assertRaises(power_module.PowerError) as caught:
-                power_module.power_on(config)
-        self.assertIn("wol down", str(caught.exception))
-        self.assertIn("ha down", str(caught.exception))
-
-    def test_composite_mode_wowlan_is_silent_on_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._composite_config(tmp)
-            config.power._values["wowlan_mac"] = "e4:42:a6:e7:65:da"
-        calls = []
-        def wol(mac, broadcast, port):
-            calls.append(mac)
-            if mac == "e4:42:a6:e7:65:da":
-                raise power_module.PowerError("wlan unreachable")
-        with mock.patch.object(power_module, "wake_on_lan", side_effect=wol), \
-             mock.patch.object(power_module, "_home_assistant"):
-            result = power_module.power_on(config)
-        self.assertIsNone(result["errors"])
-        self.assertEqual(result["wowlan"], "wlan unreachable")
-        self.assertIn("e4:42:a6:e7:65:da", calls)
-
-    def test_composite_mode_wowlan_not_configured(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._composite_config(tmp)
-        with mock.patch.object(power_module, "wake_on_lan"), \
-             mock.patch.object(power_module, "_home_assistant"):
-            result = power_module.power_on(config)
-        self.assertEqual(result["wowlan"], "not configured")
-        self.assertIsNone(result["wowlan_mac"])
-
-    def test_composite_mode_force_off_goes_through_home_assistant(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._composite_config(tmp)
-        self.assertTrue(power_module.can_force_off(config))
-        with mock.patch.object(power_module, "_home_assistant") as ha:
-            result = power_module.force_off(config)
-        ha.assert_called_once_with(config, "script.lab_force_off")
-        self.assertEqual(result["mode"], "wake-on-lan+home-assistant")
-
-
-class SecretsTests(unittest.TestCase):
-    def test_env_backend_reads_the_namespaced_variable(self) -> None:
-        config = config_module.defaults()
-        config._values["secrets"]["backend"] = "env"
-        with mock.patch.dict(
-            os.environ, {"PROXMOX_AGENT_LAB_PROXMOX_TOKEN": "abc123"}
-        ):
-            self.assertEqual(secrets_store.get(config, "proxmox-token"), "abc123")
-
-    def test_a_missing_secret_says_how_to_store_it(self) -> None:
-        config = config_module.defaults()
-        config._values["secrets"]["backend"] = "env"
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(secrets_store.SecretError) as caught:
-                secrets_store.get(config, "proxmox-token")
-        self.assertIn("proxmox-lab secrets set proxmox-token",
-                      str(caught.exception))
-
-    def test_optional_secrets_return_empty_rather_than_raising(self) -> None:
-        config = config_module.defaults()
-        config._values["secrets"]["backend"] = "env"
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(
-                secrets_store.get(config, "s3-key-id", required=False), ""
-            )
-
-    def test_env_backend_refuses_to_pretend_it_can_store(self) -> None:
-        config = config_module.defaults()
-        config._values["secrets"]["backend"] = "env"
-        with self.assertRaises(secrets_store.SecretError):
-            secrets_store.store(config, "proxmox-token", "x")
-
-    def test_a_keychain_config_survives_a_missing_security_binary(self) -> None:
-        """Issue #98: naming backend = "keychain" on a machine without the
-        macOS `security` binary -- any Windows box -- used to raise
-        FileNotFoundError before the env fallback could run. A missing
-        keystore must read as "not stored", like any other miss."""
-        config = config_module.defaults()
-        config._values["secrets"]["backend"] = "keychain"
-        with mock.patch.dict(
-            os.environ, {"PROXMOX_AGENT_LAB_PROXMOX_TOKEN": "from-env"}
-        ):
-            with mock.patch.object(
-                secrets_store.subprocess, "run",
-                side_effect=FileNotFoundError(2, "no such file", "security"),
-            ):
-                self.assertEqual(
-                    secrets_store.get(config, "proxmox-token"), "from-env"
+        env_base = {
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        }
+        for label, contents in (("missing", None),
+                                ("malformed", "[ssh\ntarget = ")):
+            with self.subTest(config=label), tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "c.toml"
+                if contents is not None:
+                    target.write_text(contents)
+                env = {
+                    **env_base,
+                    config_module.ENV_CONFIG: str(target),
+                    config_module.ENV_STATE: str(Path(tmp) / "state"),
+                }
+                result = subprocess.run(
+                    [sys.executable, "-c", program],
+                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True,
                 )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if contents is None:
+                    self.assertEqual(result.stdout.strip(), "")
+                else:
+                    self.assertIn("not valid TOML", result.stdout)
 
-    def test_storing_to_a_missing_keystore_says_what_to_do(self) -> None:
-        """The store path cannot degrade -- there is nothing to degrade to --
-        so it must raise the user-facing error, not a raw FileNotFoundError."""
-        config = config_module.defaults()
-        config._values["secrets"]["backend"] = "keychain"
-        with mock.patch.object(
-            secrets_store.subprocess, "run",
-            side_effect=FileNotFoundError(2, "no such file", "security"),
-        ):
-            with self.assertRaises(secrets_store.SecretError) as caught:
-                secrets_store.store(config, "proxmox-token", "x")
-        self.assertIn('"env" or "file"', str(caught.exception))
 
-    def test_file_backend_refuses_world_readable_files(self) -> None:
-        """Pinned to the POSIX branch: on Windows the mode bits are skipped
-        by design (NTFS ACLs are the equivalent), and test_windows_host pins
-        that side of the split."""
+class ConfigDiscoveryTests(unittest.TestCase):
+    def test_the_env_variable_is_the_first_choice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "secrets.toml"
-            path.write_text('proxmox-token = "abc"\n')
-            path.chmod(0o644)
-            config = config_module.defaults()
-            config._values["secrets"].update(
-                {"backend": "file", "file_path": str(path)}
-            )
-            with mock.patch.dict(os.environ, {}, clear=True), \
-                 mock.patch.object(secrets_store, "_is_windows",
-                                   return_value=False):
-                with self.assertRaises(secrets_store.SecretError) as caught:
-                    secrets_store.get(config, "proxmox-token")
-        self.assertIn("chmod 600", str(caught.exception))
+            chosen = Path(tmp) / "chosen.toml"
+            with mock.patch.dict(os.environ, {config_module.ENV_CONFIG: str(chosen)}), \
+                 mock.patch.object(config_module.Path, "cwd",
+                                   return_value=Path(tmp)):
+                self.assertEqual(config_module.config_path(), chosen)
 
-    def test_file_backend_round_trip(self) -> None:
+    def test_a_checkout_config_is_the_next_choice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "secrets.toml"
-            config = config_module.defaults()
-            config._values["secrets"].update(
-                {"backend": "file", "file_path": str(path)}
-            )
-            secrets_store.store(config, "proxmox-token", "sekrit")
-            # Windows cannot express 0o600 (chmod there only toggles the
-            # read-only attribute), so the mode contract is POSIX-only; the
-            # read-back below is the part that must work everywhere.
-            if not secrets_store._is_windows():
-                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            with mock.patch.dict(os.environ, {}, clear=True):
+            local = Path(tmp) / f"{config_module.APP_NAME}.toml"
+            local.write_text("")
+            with mock.patch.dict(os.environ, {config_module.ENV_CONFIG: ""}), \
+                 mock.patch.object(config_module.Path, "cwd",
+                                   return_value=Path(tmp)):
+                self.assertEqual(config_module.config_path(), local)
+
+    def test_xdg_then_the_user_path_come_last(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {config_module.ENV_CONFIG: "",
+                                              "XDG_CONFIG_HOME": tmp}):
                 self.assertEqual(
-                    secrets_store.get(config, "proxmox-token"), "sekrit"
+                    config_module.config_path(),
+                    Path(tmp) / config_module.APP_NAME / "config.toml",
                 )
-
-
-journal = journal_module
-config = config_module
-
-
-class JournalTests(unittest.TestCase):
-    """The ledger layer: spooling, deterministic ids, and legacy migration.
-
-    The MariaDB side itself is covered against a real server in
-    test_mariadb.py; these cover the logic that must hold with the ledger
-    unreachable, which is most of the time.
-    """
-
-    def _event(self, name: str, **fields: object) -> dict[str, object]:
-        return {"timestamp": "2026-01-01T00:00:00Z", "event": name, **fields}
-
-    def test_an_unreachable_ledger_spools_instead_of_failing(self) -> None:
-        """The lab host is off between leases; an action must not fail for it."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            outcome = journal.record(None, root, self._event("lease-begin"))
-            self.assertEqual(outcome, "spooled")
-            self.assertEqual(len(journal.read_spool(root)), 1)
-
-    def test_a_spooled_event_keeps_its_controller_and_id(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            journal.record(None, root, self._event("x"), controller="pc-1")
-            entry = journal.read_spool(root)[0]
-            self.assertEqual(entry["controller"], "pc-1")
-            self.assertTrue(entry["event_id"])
-
-    def test_event_ids_are_derived_from_content(self) -> None:
-        """Deterministic, so replaying a spool or re-running a migration is a
-        no-op against the unique index rather than duplicated history."""
-        a = self._event("guest-run", vmid=1)
-        b = self._event("guest-run", vmid=1)
-        c = self._event("guest-run", vmid=2)
-        self.assertEqual(journal.event_id_for(a), journal.event_id_for(b))
-        self.assertNotEqual(journal.event_id_for(a), journal.event_id_for(c))
-
-    def test_an_explicit_event_id_is_kept(self) -> None:
-        given = self._event("x", event_id="abc123")
-        self.assertEqual(journal.event_id_for(given), "abc123")
-
-    def test_legacy_sqlite_and_jsonl_are_found_for_migration(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            root.mkdir(exist_ok=True)
-            connection = sqlite3.connect(journal.legacy_database_path(root))
-            connection.execute(
-                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "timestamp TEXT, event TEXT, lease TEXT, vmid INTEGER, data TEXT)"
-            )
-            connection.execute(
-                "INSERT INTO events (timestamp, event, data) VALUES (?, ?, ?)",
-                ("2026-01-01T00:00:00Z", "old",
-                 json.dumps(self._event("old"), sort_keys=True)),
-            )
-            connection.commit()
-            connection.close()
-            (root / "2026-01-02.jsonl").write_text(
-                json.dumps(self._event("older"), sort_keys=True) + "\n"
-            )
-            self.assertEqual(
-                journal.legacy_counts(root), {"sqlite": 1, "jsonl": 1}
-            )
-
-    def test_the_spool_is_not_mistaken_for_a_legacy_jsonl_ledger(self) -> None:
-        """The spool is also .jsonl; importing it as history would double it."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            journal.record(None, root, self._event("pending"))
-            self.assertEqual(journal.legacy_counts(root)["jsonl"], 0)
-
-    def test_migration_marker_stops_it_running_twice(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.assertFalse(journal.migration_done(root))
-            journal.mark_migrated(root, {"legacy_events": 0})
-            self.assertTrue(journal.migration_done(root))
-            self.assertIsNone(journal.auto_migrate(None, root))
-
-    def test_settings_fall_back_to_the_proxmox_host(self) -> None:
-        """The ledger runs on the lab host, so that is the sensible default."""
-        cfg = config.Config({
-            "proxmox": {"host": "192.0.2.10"},
-            "audit": {},
-        }, None, Path("/nonexistent"))
-        settings = journal.settings_from_config(cfg, "pw")
-        self.assertEqual(settings.host, "192.0.2.10")
-        self.assertEqual(settings.port, 3306)
-
-    def test_no_host_anywhere_means_no_ledger(self) -> None:
-        cfg = config.Config({"proxmox": {}, "audit": {}}, None,
-                            Path("/nonexistent"))
-        self.assertIsNone(journal.settings_from_config(cfg, "pw"))
-
-
-class GuestChannelTests(unittest.TestCase):
-    """Channel selection is the whole point: callers should not have to know
-    whether a guest has an agent."""
-
-    def _lab(self, config: dict[str, object], agent: bool):
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "testnode"
-        api = mock.Mock()
-        api.call.return_value = config
-        return lab, api, mock.patch.multiple(
-            guest_module.console,
-            agent_ready=mock.Mock(return_value=agent),
-            agent_exec=mock.Mock(return_value={"exitcode": 0}),
-        )
-
-    def test_agent_is_preferred_when_available(self) -> None:
-        lab, api, patched = self._lab({"serial0": "socket", "vga": "std"}, True)
-        with patched:
-            session = guest_module.GuestSession(lab, api, 100, password="pw")
-        self.assertEqual(session.channel, "agent")
-
-    def test_falls_back_to_serial_without_an_agent(self) -> None:
-        lab, api, patched = self._lab({"serial0": "socket"}, False)
-        with patched:
-            session = guest_module.GuestSession(lab, api, 100, password="pw")
-        self.assertEqual(session.channel, "serial")
-
-    def test_agent_that_only_pings_is_not_a_command_channel(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "testnode"
-        api = mock.Mock()
-        api.call.return_value = {"serial0": "socket", "agent": "enabled=1"}
-        with mock.patch.object(
-            guest_module.console, "agent_ready", return_value=True
-        ), mock.patch.object(
-            guest_module.console,
-            "agent_exec",
-            side_effect=RuntimeError("Proxmox HTTP 596 for POST agent/exec"),
-        ) as execute:
-            caps = guest_module.probe(lab, api, 100)
-
-        self.assertFalse(caps.agent)
-        self.assertTrue(any(
-            "agent pings but cannot complete a command" in note
-            for note in caps.notes
-        ))
-        execute.assert_called_once_with(
-            lab, api, 100, ["/bin/true"], timeout=5,
-        )
-
-    def test_serial_needs_a_password_and_says_so(self) -> None:
-        lab, api, patched = self._lab({"serial0": "socket"}, False)
-        with patched:
-            with self.assertRaises(guest_module.GuestError) as caught:
-                guest_module.GuestSession(lab, api, 100)
-        self.assertIn("console password", str(caught.exception))
-
-    def test_no_channel_at_all_explains_both_remedies(self) -> None:
-        lab, api, patched = self._lab({"vga": "std"}, False)
-        with patched:
-            with self.assertRaises(guest_module.GuestError) as caught:
-                guest_module.GuestSession(lab, api, 100, password="pw")
-        message = str(caught.exception)
-        self.assertIn("serial0: socket", message)
-        self.assertIn("qemu-guest-agent", message)
-
-    def test_serial_display_is_flagged_as_unable_to_take_keystrokes(self) -> None:
-        """The failure that wasted an hour: a picture, but typing goes nowhere."""
-        lab, api, patched = self._lab({"serial0": "socket", "vga": "serial0"},
-                                      True)
-        with patched:
-            caps = guest_module.probe(lab, api, 100)
-        self.assertFalse(caps.keyboard_input)
-        self.assertTrue(caps.graphical_console is False)
-        self.assertTrue(any("keyboard input does not" in n for n in caps.notes))
-
-    def test_graphical_display_accepts_keystrokes(self) -> None:
-        lab, api, patched = self._lab({"vga": "std", "serial0": "socket"}, True)
-        with patched:
-            caps = guest_module.probe(lab, api, 100)
-        self.assertTrue(caps.keyboard_input)
-
-    def test_command_result_treats_absent_exit_code_as_not_failed(self) -> None:
-        self.assertTrue(
-            guest_module.CommandResult("out", None, "serial").ok
-        )
-        self.assertFalse(guest_module.CommandResult("out", 1, "agent").ok)
-
-
-if __name__ == "__main__":
-    unittest.main()
+            home = Path(tmp) / "home"
+            with mock.patch.dict(os.environ, {config_module.ENV_CONFIG: "",
+                                              "XDG_CONFIG_HOME": "",
+                                              "HOME": str(home)}):
+                self.assertEqual(
+                    config_module.config_path(),
+                    home / ".config" / config_module.APP_NAME / "config.toml",
+                )
 
 
 class ConfigForwardCompatibilityTests(unittest.TestCase):
     def test_an_unknown_section_is_ignored_not_fatal(self) -> None:
         """A leftover section from another version must not discard the whole
-        config; that presents as 'host is not set' and misdirects entirely."""
+        config; that presents as 'target is not set' and misdirects entirely."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.toml"
-            path.write_text(
-                '[proxmox]\nhost = "10.0.0.1"\n\n[frombuture]\nx = 1\n'
-            )
+            path.write_text('[ssh]\ntarget = "x"\n\n[frombuture]\nx = 1\n')
             config = config_module.load(path)
         self.assertTrue(config.configured)
-        self.assertEqual(config.proxmox.host, "10.0.0.1")
+        self.assertEqual(config.ssh.target, "x")
         self.assertEqual(config.unknown_sections, ["frombuture"])
 
-    def test_malformed_toml_is_still_an_error(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "c.toml"
-            path.write_text("[proxmox\nhost = ")
-            with self.assertRaises(config_module.ConfigError):
-                config_module.load(path)
+
+class AuditTests(unittest.TestCase):
+    """The audit facade over store.py: every action appends one redacted
+    event, and an unrecordable event is reported, never raised into the
+    action."""
+
+    def test_redaction_masks_secrets_at_any_depth(self) -> None:
+        masked = audit_module.redact({
+            "password": "a",
+            "API_Token": "b",
+            "ssh_key": "c",
+            "nested": {"private-key": "d", "keep": "visible"},
+            "items": [{"secret": "e"}],
+            "auth": "Bearer xyz",
+            "ticket": "PVEAPI" + "Token=user-at-pve-name-zzz",
+        })
+        self.assertEqual(masked["password"], "[REDACTED]")
+        self.assertEqual(masked["API_Token"], "[REDACTED]")
+        self.assertEqual(masked["ssh_key"], "[REDACTED]")
+        self.assertEqual(masked["nested"]["private-key"], "[REDACTED]")
+        self.assertEqual(masked["nested"]["keep"], "visible")
+        self.assertEqual(masked["items"][0]["secret"], "[REDACTED]")
+        self.assertEqual(masked["auth"], "[REDACTED]")
+        self.assertEqual(masked["ticket"], "[REDACTED]")
+
+    def test_redaction_truncates_long_strings(self) -> None:
+        self.assertEqual(audit_module.redact("x" * 5000), "x" * 1000)
+
+    def test_one_action_writes_one_redacted_event(self) -> None:
+        audit_module.audit("guest-run", lease="abs-audit-row", vmid=9246,
+                           note={"token": "sekrit"})
+        with store_module.Store(config_module.state_dir() / "lab.db") as db:
+            rows = db.query_events(lease="abs-audit-row")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["event"], "guest-run")
+        self.assertEqual(row["vmid"], 9246)
+        self.assertNotIn("sekrit", row["data"] or "")
+        self.assertIn("[REDACTED]", row["data"] or "")
+
+    def test_a_broken_store_never_fails_the_action(self) -> None:
+        with mock.patch.object(store_module.Store, "record",
+                               side_effect=RuntimeError("disk full")):
+            audit_module.audit("guest-run", lease="abs-audit-broken")
 
 
-class RetainedRegistryTests(unittest.TestCase):
-    """A node tag lives for ever and a lease record does not, so the registry
-    is the only durable owner a keep-forever guest has."""
-
-    def test_record_is_idempotent_and_keeps_the_first_owner(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            inventory_module.record(
-                root, kind="qemu", vmid=9231, lease="L1",
-                now="2026-08-01T00:00:00Z", purpose="template", name="tpl",
-            )
-            inventory_module.record(
-                root, kind="qemu", vmid=9231, lease="L2",
-                now="2026-08-02T00:00:00Z", purpose="reused",
-            )
-            entries = inventory_module.entries(root)
-            self.assertEqual(list(entries), ["qemu/9231"])
-            item = entries["qemu/9231"]
-            self.assertEqual(item["created_by_lease"], "L1", "provenance kept")
-            self.assertEqual(item["last_lease"], "L2")
-            self.assertEqual(item["name"], "tpl")
-            self.assertEqual(item["purpose"], "reused")
-
-    def test_forget_removes_only_the_named_guest(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for vmid in (9231, 9232):
-                inventory_module.record(root, kind="qemu", vmid=vmid,
-                                        lease="L1", now="2026-08-01T00:00:00Z")
-            self.assertTrue(inventory_module.forget(root, "qemu", 9231))
-            self.assertFalse(inventory_module.forget(root, "qemu", 9231))
-            self.assertEqual(list(inventory_module.entries(root)), ["qemu/9232"])
-
-    def test_backup_time_is_recorded_for_coverage_tracking(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            inventory_module.record(root, kind="qemu", vmid=9231, lease="L1",
-                                    now="2026-08-01T00:00:00Z")
-            self.assertIsNone(
-                inventory_module.entries(root)["qemu/9231"]["last_backup_at"]
-            )
-            inventory_module.mark_backup(root, "qemu", 9231,
-                                         "2026-08-20T00:00:00Z")
-            self.assertEqual(
-                inventory_module.entries(root)["qemu/9231"]["last_backup_at"],
-                "2026-08-20T00:00:00Z",
-            )
-
-    def test_a_damaged_registry_never_breaks_a_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            inventory_module.registry_path(root).write_text("{not json")
-            self.assertEqual(inventory_module.entries(root), {})
-            inventory_module.record(root, kind="qemu", vmid=1, lease="L",
-                                    now="2026-08-01T00:00:00Z")
-            self.assertIn("qemu/1", inventory_module.entries(root))
-
-    def test_the_registry_is_written_atomically(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            inventory_module.record(root, kind="qemu", vmid=1, lease="L",
-                                    now="2026-08-01T00:00:00Z")
-            leftovers = [p.name for p in root.iterdir()
-                         if p.name.startswith(".retained-")]
-            self.assertEqual(leftovers, [], "no temp file left behind")
-            self.assertTrue(inventory_module.registry_path(root).is_file())
-
-    def test_lease_tag_parsing(self) -> None:
-        self.assertEqual(
-            inventory_module.lease_of_tags("codex-lab;lease-20260816-abc;windows"),
-            "20260816-abc",
-        )
-        self.assertIsNone(inventory_module.lease_of_tags("codex-lab;windows"))
-        self.assertIsNone(inventory_module.lease_of_tags(None))
-        self.assertTrue(inventory_module.is_lab_guest("codex-lab;lease-x"))
-        self.assertFalse(inventory_module.is_lab_guest("production"))
-
-
-class GuestOwnershipTests(unittest.TestCase):
-    """Found live: ~20 guests carried tags whose lease records were gone, so
-    resolving tag -> lease file called nearly every retained guest unowned."""
-
-    GUESTS = [
-        {"vmid": 9001, "type": "qemu", "status": "running",
-         "tags": "codex-lab;lease-live", "name": "current"},
-        {"vmid": 9002, "type": "qemu", "status": "running",
-         "tags": "codex-lab;lease-pruned", "name": "abandoned"},
-        {"vmid": 9003, "type": "qemu", "status": "stopped",
-         "tags": "codex-lab;lease-pruned", "name": "kept", "template": 1},
-        {"vmid": 9004, "type": "qemu", "status": "running", "name": "untagged"},
-    ]
-
-    def _classify(self, retained: dict) -> dict:
-        described = inventory_module.classify(
-            self.GUESTS, known_leases={"live"}, retained=retained
-        )
-        return {item["vmid"]: item for item in described}
-
-    def test_a_tag_with_no_local_record_is_an_orphan(self) -> None:
-        by_vmid = self._classify({})
-        self.assertFalse(by_vmid[9001]["orphaned"], "its lease still exists")
-        self.assertTrue(by_vmid[9001]["lease_known"])
-        self.assertTrue(by_vmid[9002]["orphaned"])
-        self.assertTrue(by_vmid[9003]["orphaned"])
-
-    def test_the_registry_rescues_a_guest_whose_lease_is_gone(self) -> None:
-        by_vmid = self._classify(
-            {"qemu/9003": {"vmid": 9003, "purpose": "haiku template",
-                           "last_backup_at": None}}
-        )
-        self.assertTrue(by_vmid[9003]["retained"])
-        self.assertFalse(by_vmid[9003]["orphaned"],
-                         "the registry vouches for it")
-        self.assertEqual(by_vmid[9003]["retained_purpose"], "haiku template")
-
-    def test_a_guest_this_tool_never_made_is_not_an_orphan(self) -> None:
-        by_vmid = self._classify({})
-        self.assertFalse(by_vmid[9004]["orphaned"])
-        self.assertFalse(by_vmid[9004]["lab_guest"])
-
-    def test_orphans_filters_to_the_unowned(self) -> None:
-        described = inventory_module.classify(
-            self.GUESTS, known_leases={"live"}, retained={}
-        )
-        self.assertEqual(
-            [x["vmid"] for x in inventory_module.orphans(described)],
-            [9002, 9003],
-        )
-
-    def test_malformed_guest_entries_are_skipped(self) -> None:
-        described = inventory_module.classify(
-            [{"no": "vmid"}, {"vmid": "not-a-number"}, {"vmid": 5, "type": "lxc"}],
-            known_leases=set(), retained={},
-        )
-        self.assertEqual([x["vmid"] for x in described], [5])
+if __name__ == "__main__":
+    unittest.main()

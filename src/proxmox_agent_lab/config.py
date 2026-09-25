@@ -6,12 +6,36 @@ module raises on import: an unconfigured install must still be able to run
 `proxmox-lab init` and `--help`. Features complain only when actually used,
 through `require()`.
 
+The canonical schema is the small one (docs/rework-plan.md §G)::
+
+    [ssh]    target                      ssh alias/host reached as root
+    [pve]    node, template_vmid
+    [power]  mac, broadcast, port
+    [state]  dir                         lab.db lives here
+    [lease]  ttl_seconds, idle_shutdown_seconds
+
+Note: ``[ssh] target`` replaces the old ``[memflow] ssh_host`` as the ssh
+gate. The ssh transport is the whole control plane and is gated on
+``[ssh] target`` alone; nothing gates on ``[memflow]`` any more.
+
+TRANSITIONAL: the old attribute namespaces (``proxmox``, ``audit``,
+``memflow``, ``storage``, ``lease.default_ttl_seconds``, ...) still resolve --
+from defaults, and from the file when present -- so the modules that die in a
+later wave keep importing. They are deleted with those modules; nothing new
+should read them. ``lease.default_ttl_seconds`` is kept equal to the canonical
+``lease.ttl_seconds``.
+
 Search order for the config file:
 
 1. `$PROXMOX_AGENT_LAB_CONFIG`
 2. `./proxmox-agent-lab.toml` (handy for a checkout)
 3. `$XDG_CONFIG_HOME/proxmox-agent-lab/config.toml`
 4. `~/.config/proxmox-agent-lab/config.toml`
+
+A missing or unparseable config never raises at import: `get()` records
+`CONFIG_ERROR` and returns a defaulted config, while `load()` raises
+`ConfigError` only when called explicitly -- so `doctor` can report the
+broken file on an install that must first survive it.
 """
 
 from __future__ import annotations
@@ -30,6 +54,54 @@ ENV_CONFIG = "PROXMOX_AGENT_LAB_CONFIG"
 ENV_STATE = "PROXMOX_AGENT_LAB_STATE"
 
 DEFAULTS: dict[str, Any] = {
+    # -- canonical schema (docs/rework-plan.md §G) --------------------------
+    "ssh": {
+        # The ssh transport is the whole control plane; this one setting is
+        # the gate. Replaces the old [memflow] ssh_host.
+        "target": "",
+    },
+    "pve": {
+        "node": "pve",
+        "template_vmid": 0,
+    },
+    "power": {
+        "mac": "",
+        "broadcast": "255.255.255.255",
+        "port": 9,
+        # Transitional power-mode knobs, read only by the dying power/doctor
+        # code. Nothing new reads them.
+        "mode": "wake-on-lan",
+        "wowlan_mac": "",
+        "wol_port": 9,
+        "boot_timeout_seconds": 300,
+        "home_assistant_url": "",
+        "entity_on": "",
+        "entity_off": "",
+        "on_command": "",
+        "off_command": "",
+    },
+    "state": {
+        # lab.db lives here.
+        "dir": "~/.local/share/proxmox-agent-lab",
+    },
+    "lease": {
+        "ttl_seconds": 2 * 60 * 60,
+        "idle_shutdown_seconds": 8 * 60 * 60,
+        # Transitional: an alias of ttl_seconds, kept equal by _reconcile so
+        # the old readers keep working. Deleted with them.
+        "default_ttl_seconds": 2 * 60 * 60,
+        # Transitional backup knobs for the dying backup code.
+        # Long-term leases keep the machine on and their guests alive.
+        "long_term_backup": True,
+        "long_term_backup_storage": "",   # defaults to storage.bulk_storage
+        "long_term_backup_keep": 2,
+        "retained_backup": False,
+        "retained_backup_interval_days": 7,
+    },
+    # -- transitional namespaces --------------------------------------------
+    # Read only by modules that die in a later wave; resolved here (defaults,
+    # plus whatever the file supplies) so those imports cannot crash. Deleted
+    # with those modules.
     "proxmox": {
         "host": "",
         "port": 8006,
@@ -39,37 +111,6 @@ DEFAULTS: dict[str, Any] = {
         "verify_tls": False,
         "ca_file": "",
         "guest_mode": "all",  # all | lxc-only (VPS, no host power-off)
-    },
-    "lease": {
-        "default_ttl_seconds": 2 * 60 * 60,
-        "idle_shutdown_seconds": 8 * 60 * 60,
-        # Long-term leases keep the machine on and their guests alive.
-        "long_term_backup": True,
-        "long_term_backup_storage": "",   # defaults to storage.bulk_storage
-        "long_term_backup_keep": 2,
-        # Guests that outlive their lease (templates, persistent workers) have
-        # no lease to drive a backup. Off by default: turning it on starts
-        # writing gigabytes to the bulk store on a schedule, which is the
-        # operator's call. `doctor` reports the coverage gap either way.
-        "retained_backup": False,
-        "retained_backup_interval_days": 7,
-    },
-    "power": {
-        # how to switch the lab machine on: wake-on-lan | home-assistant
-        # | wake-on-lan+home-assistant | command | none
-        "mode": "wake-on-lan",
-        "mac": "",
-        "wowlan_mac": "",
-        "broadcast": "255.255.255.255",
-        "wol_port": 9,
-        "boot_timeout_seconds": 300,
-        # home-assistant mode
-        "home_assistant_url": "",
-        "entity_on": "",
-        "entity_off": "",
-        # command mode
-        "on_command": "",
-        "off_command": "",
     },
     "storage": {
         "upload_storages": ["local"],
@@ -97,7 +138,6 @@ DEFAULTS: dict[str, Any] = {
         "region": "us-east-1",
     },
     "share": {
-        # Disposable, pre-authenticated links to a guest console.
         "enabled": False,
         "worker_vmid": 0,
         "port": 8900,
@@ -108,11 +148,8 @@ DEFAULTS: dict[str, Any] = {
         "ngrok_region": "",
     },
     "memflow": {
-        # Advanced, opt-in: agentless guest introspection with memflow. Reads
-        # a running guest's memory from the hypervisor over SSH (not the API
-        # token), so it is a separate trust boundary and stays off until both
-        # enabled and ssh_host are set. Needs no patched kernel. See
-        # docs/memflow.md.
+        # Transitionally still resolvable. ssh_host defaults to "" and is no
+        # longer the ssh gate -- [ssh] target is.
         "enabled": False,
         "ssh_host": "",
         "ssh_user": "root",
@@ -123,20 +160,14 @@ DEFAULTS: dict[str, Any] = {
         "connect_timeout": 10,
     },
     "android": {
-        # Emulated phones. x86_64 uses nested KVM and is usable; arm64-v8a is
-        # real ARM but fully emulated and very slow on an x86 host.
         "api_level": 33,
         "abi": "x86_64",
     },
     "windows": {
-        # Retained installer templates are site inventory, never universal
-        # constants. A command-line override is also available for one-off
-        # runs against a different template.
         "template_2025_vmid": 0,
         "template_2022_vmid": 0,
     },
     "secrets": {
-        # keychain (macOS) | secret-tool (Linux) | env | file
         "backend": "auto",
         "file_path": "",
     },
@@ -158,10 +189,15 @@ class ConfigError(RuntimeError):
 
 
 def state_dir() -> Path:
+    """Where runtime state lives; `<state dir>/lab.db` and friends.
+
+    `$PROXMOX_AGENT_LAB_STATE` overrides (the test bootstrap points it at a
+    per-process temp directory); otherwise the expanded `[state] dir` setting.
+    """
     override = os.environ.get(ENV_STATE)
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".local" / "state" / APP_NAME
+    return Path(str(get().state.dir)).expanduser()
 
 
 def default_config_path() -> Path:
@@ -183,8 +219,13 @@ def config_path() -> Path | None:
 
 def defaults() -> "Config":
     """A fully-defaulted config, for when the real one cannot be read."""
-    return Config(_merge(DEFAULTS, {}), None)
+    return Config(_reconcile(_merge(DEFAULTS, {})), None)
 
+
+# The last error hit while reading the config, if any. Recorded, never raised,
+# by `get()` so a broken install can still run `init`/`doctor`; `load()`
+# surfaces the same problem as a `ConfigError` when called explicitly.
+CONFIG_ERROR: str | None = None
 
 _CACHED: "Config | None" = None
 
@@ -194,22 +235,25 @@ def get() -> "Config":
 
     Every module shares one instance. Loading per module would mean several
     reads of the same file and, worse, the possibility of two modules
-    disagreeing about the same setting.
+    disagreeing about the same setting. Never raises: a broken file records
+    `CONFIG_ERROR` and yields the defaults instead.
     """
-    global _CACHED
+    global _CACHED, CONFIG_ERROR
     if _CACHED is None:
         try:
             _CACHED = load()
-        except ConfigError:
+        except ConfigError as exc:
             # Never fail at import; `doctor` reports the problem instead.
+            CONFIG_ERROR = str(exc)
             _CACHED = defaults()
     return _CACHED
 
 
 def reset_cache() -> None:
     """Forget the cached config. For tests, and after `init` writes one."""
-    global _CACHED
+    global _CACHED, CONFIG_ERROR
     _CACHED = None
+    CONFIG_ERROR = None
 
 
 def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -230,6 +274,21 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
         else:
             out[key] = value
     return out
+
+
+def _bridge_legacy(loaded: dict[str, Any]) -> dict[str, Any]:
+    """Accept the pre-§G spelling of the lease ttl. Canonical wins."""
+    lease = loaded.get("lease")
+    if (isinstance(lease, dict) and "ttl_seconds" not in lease
+            and "default_ttl_seconds" in lease):
+        lease["ttl_seconds"] = lease["default_ttl_seconds"]
+    return loaded
+
+
+def _reconcile(values: dict[str, Any]) -> dict[str, Any]:
+    """Keep the transitional aliases equal to their canonical settings."""
+    values["lease"]["default_ttl_seconds"] = values["lease"]["ttl_seconds"]
+    return values
 
 
 class Section:
@@ -295,12 +354,17 @@ class Config:
 
 
 def load(path: Path | None = None) -> Config:
-    """Load configuration, falling back to defaults when absent."""
+    """Load configuration, falling back to defaults when absent.
+
+    Raises `ConfigError` for a file that exists but cannot be read or parsed:
+    this is the explicit-use path (`doctor` reports it); `get()` is the
+    import-time path and swallows the same failure.
+    """
     chosen = path if path is not None else config_path()
     # A config file that does not exist yet is not an error: `init` has to be
     # able to run, and it is the command that creates it.
     if chosen is None or not chosen.is_file():
-        return Config(_merge(DEFAULTS, {}), None, intended=chosen)
+        return Config(_reconcile(_merge(DEFAULTS, {})), None, intended=chosen)
     if tomllib is None:
         raise ConfigError("Python 3.11 or newer is required to read the config")
     try:
@@ -315,10 +379,11 @@ def load(path: Path | None = None) -> Config:
     # not discard the whole config and silently fall back to defaults, which
     # presents as "host is not set" and sends people hunting in the wrong
     # place entirely.
+    loaded = _bridge_legacy(loaded)
     unknown = sorted(set(loaded) - set(DEFAULTS))
     for name in unknown:
         loaded.pop(name, None)
-    config = Config(_merge(DEFAULTS, loaded), chosen)
+    config = Config(_reconcile(_merge(DEFAULTS, loaded)), chosen)
     config.unknown_sections = unknown
     return config
 
@@ -326,117 +391,50 @@ def load(path: Path | None = None) -> Config:
 TEMPLATE = """\
 # proxmox-agent-lab configuration
 #
-# Copy to ~/.config/proxmox-agent-lab/config.toml and edit. Every value here
-# is site-specific; nothing secret belongs in this file. Secrets live in your
-# configured secret backend -- see 'proxmox-lab secrets --help'.
+# Written by 'proxmox-lab init'. Copy to ~/.config/proxmox-agent-lab/config.toml
+# and edit. Every value here is site-specific; nothing secret belongs in this
+# file -- the transport is ssh with your agent/keys only.
 
-[proxmox]
-host = "192.168.1.50"        # address of the Proxmox host
-port = 8006
-node = "pve"                 # node name, as shown in the Proxmox UI
-token_user = "agent@pve"     # API token owner
-token_name = "lab"           # API token id
-verify_tls = false           # true once you trust the host certificate
-ca_file = ""                # optional PEM CA bundle; supplied by onboarding
-guest_mode = "all"          # all | lxc-only (VPS, no host shutdown)
+[ssh]
+target = "proxmox"           # ssh alias/host reached as root
 
-[lease]
-default_ttl_seconds = 7200   # work is cleaned up if a lease is not renewed
-idle_shutdown_seconds = 28800
-# Long-term leases (proxmox-lab lease-begin --long-term) keep their machines
-# alive and the host powered on. These control their weekly backup.
-long_term_backup = true
-long_term_backup_storage = ""   # blank = [storage] bulk_storage
-long_term_backup_keep = 2
+[pve]
+node = "pve"                 # node name used in pvesh paths
+template_vmid = 100          # default template for guest clone/create
 
 [power]
-# How to switch the machine on. Wake-on-LAN needs nothing but the NIC's MAC
-# and works on almost any desktop; enable WoL in its BIOS first.
-mode = "wake-on-lan"         # wake-on-lan | home-assistant
-                             # | wake-on-lan+home-assistant | command | none
-mac = "aa:bb:cc:dd:ee:ff"
-# wowlan_mac = ""  # optional wireless NIC MAC; wake is attempted silently
-broadcast = "192.168.1.255"
-boot_timeout_seconds = 300
+mac = ""                     # wired NIC MAC for WoL (filled by 'proxmox-lab init')
+broadcast = "255.255.255.255"
+port = 9
 
-# mode = "home-assistant"
-# home_assistant_url = "https://homeassistant.example"
-# entity_on = "script.lab_power_on"
-# entity_off = "script.lab_force_off"
+[state]
+dir = "~/.local/share/proxmox-agent-lab"   # lab.db lives here
 
-# mode = "wake-on-lan+home-assistant"  # both together on power-on; force-off
-# home_assistant_url = "https://homeassistant.example"  # still needs Home
-# entity_on = "script.lab_power_on"                     # Assistant, since WoL
-# entity_off = "script.lab_force_off"                   # cannot cut power
+[lease]
+ttl_seconds = 7200           # work is cleaned up if a lease is not renewed
+idle_shutdown_seconds = 28800
 
-# mode = "command"
-# on_command = "/usr/local/bin/lab-power-on"
-# off_command = "/usr/local/bin/lab-force-off"
+# --- transitional: read only by the modules that die in a later wave (and by
+# install.sh's config substitution, which dies with them). Nothing new reads
+# these; they are deleted alongside those modules. --------------------------
 
-[storage]
-upload_storages = ["local"]  # storages this tool may upload into
-bulk_storage = "local"       # where big images and ISOs go
+[proxmox]
+host = ""                    # address of the Proxmox host
+port = 8006
+node = "pve"                 # node name, as shown in the Proxmox UI
+token_user = ""              # API token owner (transitional)
+token_name = ""              # API token id (transitional)
+verify_tls = false
+ca_file = ""
+guest_mode = "all"           # all | lxc-only (VPS, no host shutdown)
 
-[network]
-# Only needed for the forced-VPN gateway.
-lab_bridge = "vmbr1"
-lab_network = "10.66.0.0/24"
-lab_gateway_ip = "10.66.0.1"
-dhcp_start = "10.66.0.50"
-dhcp_end = "10.66.0.200"
-gateway_template_vmid = 0    # VMID of a Debian/Ubuntu cloud-init template
-
-[vpn]
-enabled = false              # true to route all lab egress through WireGuard
-address = ""                 # e.g. "10.100.0.2/32" from your provider
-dns = ""                     # e.g. "10.100.0.1"
-endpoint = ""                # e.g. "vpn.example.com:51820"
-keepalive = 25
+[secrets]
+backend = "auto"             # transitional secret-backend knob (dying)
+file_path = ""
 
 [s3]
-enabled = false              # optional scratch bucket for guest file transfer
+enabled = false
 endpoint = ""
 bucket = ""
 region = "us-east-1"
-
-[share]
-# Optional: send someone a link to one VM's screen. Needs an ngrok authtoken
-# (proxmox-lab secrets set ngrok-authtoken) and a worker built with
-# 'proxmox-lab share setup'.
-enabled = false
-worker_vmid = 0
-tunnel = "cloudflared"       # needs no account; "ngrok" or "none" also work
-default_minutes = 30
-max_minutes = 480
-
-[memflow]
-# Advanced, opt-in: agentless guest introspection with memflow. Reads a
-# running guest's memory from the hypervisor over SSH (a separate trust
-# boundary from the API token); needs no patched kernel. Prepare the host with
-# 'proxmox-lab memflow host-setup'. See docs/memflow.md.
-enabled = false
-# ssh_host = "192.168.1.50"  # the Proxmox host; memflow runs resident there
-# ssh_user = "root"          # needs to read /proc/<qemu-pid>/mem
-# ssh_key = "~/.ssh/pxl_vmi" # path to a key file, never the key itself
-
-[windows]
-# Retained Windows installer templates. Leave at 0 until you have created the
-# corresponding template; `windows install --template-vmid` overrides either.
-template_2025_vmid = 0
-template_2022_vmid = 0
-
-[secrets]
-backend = "auto"             # auto | keychain | secret-tool | env | file
-
-[audit]
-# The shared ledger: MariaDB on the Proxmox host. Provision it once with
-# 'proxmox-lab journal host-setup'. Leave host empty to use the [proxmox]
-# host, which is where that container runs.
-host = ""                    # defaults to the [proxmox] host
-port = 3306
-database = "proxmox_lab"
-user = "proxmox_lab"
-password_secret = "mariadb-password"   # read from the environment
-timeout_seconds = 10
-controller_id = ""           # defaults to the controller hostname
 """

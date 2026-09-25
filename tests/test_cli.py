@@ -5,9 +5,9 @@ A broken HEAD once shipped because no test ever called ``cli.parser()`` after
 file exists so that class of breakage fails the suite instead of the first
 human who runs ``--help``.
 
-The pinned top-level surface (docs/rework-plan.md §A.5) is asserted for the
-commands this phase owns; ``mcp``, ``gc`` and the ``power wake|status|shutdown``
-groups join the assertions when they land (phases 4-6).
+The pinned top-level surface (docs/rework-plan.md §A.5) is asserted in full:
+``power-on`` is gone in favour of the ``power wake|status|shutdown`` group,
+and ``gc``/``mcp`` are registered by their own modules.
 """
 
 from __future__ import annotations
@@ -28,20 +28,23 @@ PINNED_TOP_LEVEL = [
     "init",
     "doctor",
     "journal",
-    "cleanup-expired",
+    "status",
+    "power",
     "lease-begin",
     "lease-heartbeat",
     "lease-end",
     "lease-list",
     "lease-destroy",
     "lease-register",
+    "lease-abandon",
+    "cleanup-expired",
     "guest",
+    "console",
     "push",
     "pull",
-    "console",
-    "power-on",
+    "gc",
+    "mcp",
 ]
-
 
 def _top_level_names(parser: argparse.ArgumentParser) -> list[str]:
     for action in parser._actions:
@@ -71,7 +74,7 @@ class ParserBuildTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, names)
 
-    def test_pinned_console_and_power_subcommands_parse(self) -> None:
+    def test_pinned_subcommands_parse(self) -> None:
         parser = cli.parser()
         for argv in (
             ["console", "screenshot", "--help"],
@@ -87,6 +90,13 @@ class ParserBuildTests(unittest.TestCase):
             ["guest", "run", "--help"],
             ["push", "--help"],
             ["pull", "--help"],
+            ["power", "wake", "--help"],
+            ["power", "status", "--help"],
+            ["power", "shutdown", "--help"],
+            ["gc", "install", "--help"],
+            ["gc", "status", "--help"],
+            ["gc", "uninstall", "--help"],
+            ["mcp", "--help"],
         ):
             with self.subTest(argv=argv):
                 with self.assertRaises(SystemExit) as ctx:

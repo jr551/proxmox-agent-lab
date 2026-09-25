@@ -15,12 +15,24 @@ ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "commands.md"
 
 
-def _collect() -> dict[tuple[str, ...], tuple[str, object]]:
+def _parser() -> object:
+    """Build the real CLI parser, whichever name the current cli exposes."""
     os.environ.setdefault("PROXMOX_AGENT_LAB_CONFIG",
                           str(ROOT / "tests" / "fixtures" / "config.toml"))
     sys.path.insert(0, str(ROOT / "src"))
     from proxmox_agent_lab import cli
 
+    for name in ("parser", "build_parser", "make_parser"):
+        factory = getattr(cli, name, None)
+        if callable(factory):
+            return factory()
+    raise SystemExit(
+        "proxmox_agent_lab.cli exposes no parser factory "
+        "(tried parser, build_parser, make_parser)"
+    )
+
+
+def _collect() -> dict[tuple[str, ...], tuple[str, object]]:
     found: dict[tuple[str, ...], tuple[str, object]] = {}
 
     def walk(parser: object, prefix: tuple[str, ...]) -> None:
@@ -37,7 +49,7 @@ def _collect() -> dict[tuple[str, ...], tuple[str, object]]:
                 if sub is not None:
                     walk(sub, path)
 
-    walk(cli.parser(), ())
+    walk(_parser(), ())
     return found
 
 

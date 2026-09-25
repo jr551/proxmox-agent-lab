@@ -528,7 +528,7 @@ def cmd_lease_begin(lab: Any, args: argparse.Namespace) -> None:
         raise LabError(
             f"the lab host ({config.ssh.target}) is not reachable, so "
             "lease-begin would open a lease that cannot be governed. Wake it "
-            "with 'power-on' (or check the network) and re-run."
+            "with 'power wake' (or check the network) and re-run."
         )
     lease_root = _lease_root(lab)
     long_term = bool(getattr(args, "long_term", False))

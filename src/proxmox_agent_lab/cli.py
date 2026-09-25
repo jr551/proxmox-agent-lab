@@ -3,54 +3,35 @@
 
 Every mutation belongs to a lease, created resources are registered to it,
 and finalising the last lease powers the machine off. Site-specific values
-come from the config file; secrets come from the configured secret
-backend (see secrets_store).
+come from the config file; host access is over SSH keys alone.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import datetime as dt
-import io
 import json
 from pathlib import Path
-import secrets
-import socket
-import uuid
-import ssl
 import sys
-import time
 import types
 from typing import Any
-from urllib import error, parse, request
-
 
 from . import __version__
 from . import config as config_module
-from . import inventory as inventory_module
 from . import power as power_module
 from . import journal as journal_module
-from . import mariadb as mariadb_module
-from . import secrets_store
 from . import audit as audit_module
 from . import cleanup as cleanup_module
 from . import diagnostics as diagnostics_module
 from . import leases as leases_module
-from . import state as state_module
-from . import updates as updates_module
+from . import ssh as ssh_module
 from .config import ConfigError
 from .errors import LabError
-from .state import iso_now, json_dump, utc_now
 from .audit import redact
 from .leases import (
     is_long_term, lease_claims, lease_is_live, lease_requires_cleanup,
     new_expiry, parse_expiry, require_lease_resource,
 )
-
-# Locking lives in state.py; this stays an alias so `lab.fcntl` still
-# answers the platform question (None on Windows).
-fcntl = state_module.fcntl
 
 
 # Importing must never fail, however broken the config is -- otherwise the
@@ -63,47 +44,17 @@ except ConfigError as _exc:
     CONFIG_ERROR = str(_exc)
 CONFIG = config_module.get()      # ...but every module shares this instance
 
-# Site values come from the config file. They stay module-level constants so
-# the rest of the package can keep referring to `lab.NODE` and friends.
-HOST = CONFIG.proxmox.host
-PORT = int(CONFIG.proxmox.port)
-NODE = CONFIG.proxmox.node
-API_ROOT = f"https://{'[' + HOST + ']' if ':' in HOST else HOST}:{PORT}/api2/json"
-TOKEN_USER = CONFIG.proxmox.token_user
-TOKEN_NAME = CONFIG.proxmox.token_name
-VERIFY_TLS = bool(CONFIG.proxmox.verify_tls)
-DEFAULT_TTL_SECONDS = int(CONFIG.lease.default_ttl_seconds)
+DEFAULT_TTL_SECONDS = int(CONFIG.lease.ttl_seconds)
 MCP_IDLE_SHUTDOWN_SECONDS = int(CONFIG.lease.idle_shutdown_seconds)
 MIN_COLD_BOOT_TIMEOUT_SECONDS = 90
 STATE_ROOT = config_module.state_dir()
 LEASE_ROOT = STATE_ROOT / "leases"
-LOCK_PATH = STATE_ROOT / "controller.lock"
-# The journal lives with the rest of the runtime state, never inside the
-# installed package -- site-packages is not writable, and an operator's audit
-# trail is not part of the software.
-JOURNAL_ROOT = Path(CONFIG.audit.get("journal_dir") or (STATE_ROOT / "journal"))
-UPLOAD_STORAGES = tuple(CONFIG.storage.upload_storages)
-# Big images belong on the bulk store, not on the hypervisor's root filesystem.
-# Falls back to whatever is allowed if bulk is not one of the upload targets.
-DEFAULT_UPLOAD_STORAGE = (
-    str(CONFIG.storage.bulk_storage)
-    if str(CONFIG.storage.bulk_storage) in UPLOAD_STORAGES
-    else (UPLOAD_STORAGES[0] if UPLOAD_STORAGES else "local")
-)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+# The single control channel. Feature modules reach the host through
+# `lab.ssh`; constructing it never talks to anything, so `init`/`doctor`
+# still work on an unconfigured install -- probe() simply reports False
+# until a real [ssh] target exists.
+ssh = ssh_module.SSH(str(CONFIG.ssh.target))
 
 
 def _bind(lab: Any, fn: Any) -> Any:
@@ -111,220 +62,17 @@ def _bind(lab: Any, fn: Any) -> Any:
     return lambda args: fn(lab, args)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def _audit_through_boot(event: str, **fields: Any) -> None:
-    """audit(), for the moment right after the lab host wakes.
-
-    The ledger runs on that same host, so it is routinely not answering yet
-    when the Proxmox API already is. `audit` never raises -- it spools -- so
-    this is simply audit() with a name that says why the call site cares.
-    """
-    audit(event, **fields)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Infrastructure this tool runs on the host itself -- currently the audit
-# ledger. It is onboot and outlives every lease on purpose, so counting it as
-# an untracked guest would mean the host could never power itself off again,
-# which is the whole point of the machine.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# How recently a guest must have been touched to count as in use. Tasks that
-# only ever mean "something stopped this guest" are excluded, or our own stop
-# would make every later run think the guest is busy.
-# Work happening *inside* a guest produces no Proxmox task and does not reset
-# its uptime, so a long build in an unmanaged container looks idle to both of
-# the other signals. This floor is set where a guest is unmistakably doing
-# something: an idle Debian guest on the lab node sits near 1% and a genuinely
-# idle container near 0.005%, so 10% is not a judgement call.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
-# Facade: the lifecycle, state, audit and diagnostics implementations
-# now live in leases, cleanup, diagnostics, audit, state and updates.
-# These wrappers keep the same names on this module so feature modules
-# (which receive it as `lab`) and the tests keep working, and so patched
-# configuration values are read at call time rather than captured at import.
-
-
-def controller_lock() -> Any:
-    return state_module.controller_lock(STATE_ROOT, LOCK_PATH)
-
-
-def sweep_lock(name: str) -> Any:
-    return state_module.sweep_lock(STATE_ROOT, name)
-
-
-def _lock_file(handle: Any) -> None:
-    state_module._lock_file(handle)
-
-
-def _try_lock_file(handle: Any) -> bool:
-    return state_module._try_lock_file(handle)
+# Facade: the lifecycle, audit and diagnostics implementations live in
+# leases, cleanup, diagnostics, audit, journal and power. These wrappers
+# keep the same names on this module so feature modules (which receive it
+# as `lab`), the MCP server and the tests keep working, and so patched
+# configuration values are read at call time rather than captured at
+# import.
 
 
 def audit(event: str, **fields: Any) -> None:
     audit_module.audit(event, **fields)
-
-
-def ledger() -> Any:
-    return audit_module.ledger(CONFIG)
-
-
-def _controller_id() -> str:
-    return audit_module.controller_id(CONFIG)
-
-
-def _auto_migrate_once() -> None:
-    audit_module.auto_migrate_once(CONFIG, JOURNAL_ROOT)
-
-
-def check_for_updates(*, now: float | None = None) -> dict[str, Any]:
-    return updates_module.check_for_updates(STATE_ROOT, __version__, now=now)
-
-
-def update_notice() -> None:
-    updates_module.update_notice(STATE_ROOT, __version__)
-
 
 def lease_path(lease_id: str) -> Path:
     return leases_module.lease_path(LEASE_ROOT, lease_id)
@@ -350,11 +98,18 @@ def mcp_idle_elapsed(now: dt.datetime | None = None) -> float:
     return leases_module.mcp_idle_elapsed(STATE_ROOT, now)
 
 
+def mcp_idle_shutdown_due(now: dt.datetime | None = None) -> bool:
+    return leases_module.mcp_idle_shutdown_due(
+        STATE_ROOT, idle_shutdown_seconds=MCP_IDLE_SHUTDOWN_SECONDS, now=now)
+
+
 def idle_shutdown_due(*, reachable: bool, active_lease_count: int,
                       has_failures: bool, idle_seconds: float) -> bool:
     return leases_module.idle_shutdown_due(
-        reachable=reachable, active_lease_count=active_lease_count,
-        has_failures=has_failures, idle_seconds=idle_seconds,
+        reachable=reachable,
+        active_lease_count=active_lease_count,
+        has_failures=has_failures,
+        idle_seconds=idle_seconds,
         threshold_seconds=MCP_IDLE_SHUTDOWN_SECONDS)
 
 
@@ -413,11 +168,11 @@ def running_guest_vmids(api: Any) -> list[int]:
     return cleanup_module.running_guest_vmids(_module(), api)
 
 
-def host_power_policy() -> str:
+def host_power_policy() -> dict[str, Any]:
     return cleanup_module.host_power_policy(_module())
 
 
-def shutdown_host(api: Any) -> dict[str, Any]:
+def shutdown_host(api: Any = None) -> bool:
     return cleanup_module.shutdown_host(_module(), api)
 
 
@@ -433,36 +188,13 @@ def delete_guest(api: Any, kind: str, vmid: int) -> None:
     cleanup_module.delete_guest(_module(), api, kind, vmid)
 
 
-def _delete_guest(api: Any, kind: str, vmid: int, *,
-                  destroy_unreferenced_disks: bool) -> None:
-    cleanup_module._delete_guest(
-        _module(), api, kind, vmid,
-        destroy_unreferenced_disks=destroy_unreferenced_disks)
-
-
-def _forget_retained(kind: str, vmid: int) -> None:
-    cleanup_module._forget_retained(_module(), kind, vmid)
-
-
-def _guest_is_gone(error: Exception) -> bool:
-    return cleanup_module._guest_is_gone(_module(), error)
-
-
-def _storage_io_error(error: Exception) -> bool:
-    return cleanup_module._storage_io_error(_module(), error)
-
-
-def _is_lab_infrastructure(resource: dict[str, Any]) -> bool:
-    return cleanup_module._is_lab_infrastructure(resource)
-
-
-def guest_load(record: dict[str, Any]) -> float | None:
+def guest_load(record: dict[str, Any]) -> dict[str, Any]:
     return cleanup_module.guest_load(record)
 
 
 def recent_guest_activity(api: Any, kind: str, vmid: int, *,
                           within: int = 1800,
-                          record: dict[str, Any] | None = None) -> bool:
+                          record: dict[str, Any] | None = None) -> Any:
     return cleanup_module.recent_guest_activity(
         _module(), api, kind, vmid, within=within, record=record)
 
@@ -485,28 +217,58 @@ def describe_shared_resources(shared: Any) -> str:
     return cleanup_module.describe_shared_resources(shared)
 
 
-def retained_backup_coverage() -> dict[str, Any]:
-    return diagnostics_module.retained_backup_coverage(_module())
+def power_status() -> dict[str, Any]:
+    """The lab host's power posture (the ``power status``/``power_status``
+    report).
 
-
-def host_update_report() -> dict[str, Any]:
-    return diagnostics_module.host_update_report(_module())
-
-
-def _provision_ledger(args: argparse.Namespace) -> dict[str, Any]:
-    return diagnostics_module._provision_ledger(_module(), args)
-
-
-def _seed_shared_secrets(settings: Any) -> list[str]:
-    return diagnostics_module._seed_shared_secrets(_module(), settings)
-
-
-def _guard_install_block(hostguard_module: Any) -> str:
-    return diagnostics_module._guard_install_block(hostguard_module)
+    Reachability over the ssh channel is the honest "is it on" signal; the
+    last power-related audit event, the active lease count and the running
+    guests complete the picture. Guests can only be enumerated while the
+    host answers, so they are ``None`` -- unknown, not zero -- when it does
+    not.
+    """
+    reachable = ssh.probe()
+    last_power_event = None
+    for row in journal_module.query_events(limit=200):
+        event = str(row.get("event") or "")
+        if event.startswith(("lab-power-", "lab-graceful-shutdown-")):
+            last_power_event = {
+                "event": event,
+                "timestamp": row.get("timestamp"),
+            }
+            break
+    return {
+        "reachable": reachable,
+        "powered_on": reachable,
+        "last_power_event": last_power_event,
+        "active_leases": len(active_leases()),
+        "running_guests": running_guest_vmids(None) if reachable else None,
+    }
 
 
 def cmd_power_on(args: argparse.Namespace) -> None:
     leases_module.cmd_power_on(_module(), args)
+
+
+def cmd_power_status(args: argparse.Namespace) -> None:
+    print(json.dumps(power_status(), indent=2, sort_keys=True))
+
+
+def cmd_power_shutdown(args: argparse.Namespace) -> None:
+    if not args.standalone_authorized:
+        raise LabError(
+            "Standalone power-off is refused by default: with no lease left "
+            "there is no finalizer to verify the host actually went off. "
+            "Lease-end shuts the host down as part of normal work; pass "
+            "--standalone-authorized only when a person owns the host."
+        )
+    if not shutdown_host(None):
+        raise LabError(
+            "the host did not power off: it may still be reachable, guests "
+            "may still be running, or the shutdown could not be verified. "
+            "See the journal for the recorded reason."
+        )
+    print(json.dumps({"host_powered_off": True}, indent=2, sort_keys=True))
 
 
 def cmd_lease_begin(args: argparse.Namespace) -> None:
@@ -541,10 +303,6 @@ def cmd_init(args: argparse.Namespace) -> None:
     diagnostics_module.cmd_init(_module(), args)
 
 
-def cmd_secrets(args: argparse.Namespace) -> None:
-    diagnostics_module.cmd_secrets(_module(), args)
-
-
 def cmd_doctor(args: argparse.Namespace) -> None:
     diagnostics_module.cmd_doctor(_module(), args)
 
@@ -557,10 +315,8 @@ def cmd_status(args: argparse.Namespace) -> None:
     diagnostics_module.cmd_status(_module(), args)
 
 
-SENSITIVE_KEY = audit_module.SENSITIVE_KEY
-UPDATE_CHECK_URL = updates_module.UPDATE_CHECK_URL
-UPDATE_CHECK_INTERVAL_SECONDS = updates_module.UPDATE_CHECK_INTERVAL_SECONDS
 INFRA_TAG = cleanup_module.INFRA_TAG
+
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
@@ -576,78 +332,53 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--force", action="store_true")
     init.set_defaults(func=cmd_init)
 
-    doctor = sub.add_parser("doctor", help="check config, secrets and access")
-    doctor.add_argument(
-        "--host-checks", action="store_true",
-        help="also report the node's pending package updates and whether it "
-             "needs a reboot (advisory; needs the opt-in [memflow] host SSH "
-             "channel and adds a few seconds)",
-    )
+    doctor = sub.add_parser("doctor", help="check config, ssh access and store")
     doctor.set_defaults(func=cmd_doctor)
 
-    store = sub.add_parser("secrets", help="store and inspect secrets")
-    store_sub = store.add_subparsers(dest="secrets_command", required=True)
-    store_sub.add_parser("list", help="which secrets are stored").set_defaults(
-        func=cmd_secrets
-    )
-    setter = store_sub.add_parser("set", help="store one secret")
-    setter.add_argument("name")
-    setter.add_argument("--stdin", action="store_true",
-                        help="read the value from stdin instead of prompting")
-    setter.add_argument("--allow-unknown", action="store_true")
-    setter.set_defaults(func=cmd_secrets)
+    journal = sub.add_parser("journal", help="read the local event journal")
+    journal.add_argument("--limit", type=int, default=50)
+    journal.add_argument("--lease")
+    journal.add_argument("--since", help="ISO timestamp lower bound")
+    journal.set_defaults(func=cmd_journal)
 
     status = sub.add_parser("status", help="host and lease overview")
     status.set_defaults(func=cmd_status)
 
-    ledger = sub.add_parser("journal", help="read the audit ledger")
-    ledger.add_argument("--limit", type=int, default=50)
-    ledger.add_argument("--lease")
-    ledger.add_argument("--event", help="exact name, or a * wildcard")
-    ledger.add_argument("--since", help="ISO timestamp lower bound")
-    ledger.add_argument("--summary", action="store_true")
-    ledger.add_argument("--controller", help="only this controller's events")
-    ledger.add_argument(
-        "--flush-spool",
-        action="store_true",
-        help="upload audit events spooled locally while the ledger was down",
-    )
-    ledger.add_argument(
-        "--migrate",
-        action="store_true",
-        help="carry this controller's pre-MariaDB ledger into the shared one "
-             "(runs automatically on upgrade; safe to re-run)",
-    )
-    ledger.add_argument(
-        "--migrations",
-        action="store_true",
-        help="which controllers have already migrated their old ledger",
-    )
-    ledger.add_argument(
-        "--host-setup",
-        action="store_true",
-        help="provision MariaDB on the Proxmox host (host change)",
-    )
-    ledger.add_argument("--host-change-authorized", action="store_true")
-    ledger.add_argument("--ctid", type=int, help="container ID for the ledger")
-    ledger.add_argument("--storage", help="storage for the ledger container")
-    ledger.add_argument("--bridge", default="vmbr0")
-    ledger.add_argument("--timeout", type=int, default=1800)
-    ledger.set_defaults(func=cmd_journal)
-
     power = sub.add_parser(
-        "power-on",
-        help="wake without a lease (manual operations only; authorization required)",
+        "power",
+        help="host power: wake it, check it, or verify a shutdown",
     )
-    power.add_argument(
+    power_sub = power.add_subparsers(dest="power_command", required=True)
+
+    wake = power_sub.add_parser(
+        "wake",
+        help="wake without a lease (manual operations only; authorization "
+             "required)",
+    )
+    wake.add_argument(
         "--timeout", type=int,
-        help="cold-boot wait (default: power.boot_timeout_seconds; minimum: 90)",
+        help="cold-boot wait in seconds (default: 300; minimum: 90)",
     )
-    power.add_argument(
+    wake.add_argument(
         "--standalone-authorized", action="store_true",
         help="confirm that a person, not the lease finalizer, owns shutdown",
     )
-    power.set_defaults(func=cmd_power_on)
+    wake.set_defaults(func=cmd_power_on)
+
+    pstatus = power_sub.add_parser(
+        "status", help="whether the host is answering and what pins it on")
+    pstatus.set_defaults(func=cmd_power_status)
+
+    poff = power_sub.add_parser(
+        "shutdown",
+        help="power the host off, verified by repeated probe failure "
+             "(authorization required)",
+    )
+    poff.add_argument(
+        "--standalone-authorized", action="store_true",
+        help="confirm that a person, not the lease finalizer, owns shutdown",
+    )
+    poff.set_defaults(func=cmd_power_shutdown)
 
     begin = sub.add_parser("lease-begin")
     begin.add_argument("--purpose", required=True)
@@ -656,10 +387,6 @@ def parser() -> argparse.ArgumentParser:
         help="keep these machines (and the host powered on) until destroyed",
     )
     begin.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
-    begin.add_argument(
-        "--timeout", type=int,
-        help="cold-boot wait (default: power.boot_timeout_seconds; minimum: 90)",
-    )
     begin.set_defaults(func=cmd_lease_begin)
 
     heartbeat = sub.add_parser("lease-heartbeat")
@@ -673,7 +400,6 @@ def parser() -> argparse.ArgumentParser:
     register.add_argument("--vmid", type=int, required=True)
     register.add_argument("--policy", choices=("delete", "retain"), default="delete")
     register.add_argument("--name")
-    register.add_argument("--allow-existing", action="store_true")
     register.set_defaults(func=cmd_lease_register)
 
     end = sub.add_parser("lease-end")
@@ -711,8 +437,6 @@ def parser() -> argparse.ArgumentParser:
 
     cleanup = sub.add_parser("cleanup-expired")
     cleanup.add_argument("--all", action="store_true")
-    cleanup.add_argument("--no-backup", action="store_true",
-                         help="skip the long-term backup sweep")
     cleanup.add_argument(
         "--reclaim-orphans", action="store_true",
         help="stop (never delete) guests tagged with a lease this controller "
@@ -722,51 +446,32 @@ def parser() -> argparse.ArgumentParser:
     )
     cleanup.add_argument(
         "--orphans-only", action="store_true",
-        help="reclaim orphaned guests and nothing else: no lease is finalized, "
-             "no backup runs, and the host is left on. Requires "
+        help="reclaim orphaned guests and nothing else: no lease is "
+             "finalized and the host is left on. Requires "
              "--host-change-authorized",
     )
     cleanup.add_argument(
         "--include-active", action="store_true",
         help="also stop an orphaned guest that was touched in the last 30 "
-             "minutes. Skipped by default: another controller drives guests "
-             "through the same token, and its lease records are not here",
+             "minutes. Skipped by default: another controller may be driving "
+             "guests over the same ssh channel, and its lease records are "
+             "not here",
     )
     cleanup.add_argument("--host-change-authorized", action="store_true",
                          help="required by --reclaim-orphans")
     cleanup.set_defaults(func=cmd_cleanup_expired)
 
     from . import console
-    from . import connection
-    from . import crash
-    from . import disk
+    from . import gc
     from . import guest
-    from . import hostinfo
-    from . import ioworkload
-    from . import isoinspect
-    from . import oci
-    from . import onboarding
-    from . import recipes
-    from . import storage
+    from . import mcp
     from . import transfer
-    from . import usb
-    from . import virtio
 
     console.register(sub, _module())
-    connection.register(sub, _module())
-    crash.register(sub, _module())
-    disk.register(sub, _module())
+    gc.register(sub, _module())
     guest.register(sub, _module())
-    hostinfo.register(sub, _module())
-    ioworkload.register(sub, _module())
-    isoinspect.register(sub, _module())
-    oci.register(sub, _module())
-    onboarding.register(sub, _module())
-    recipes.register(sub, _module())
-    storage.register(sub, _module())
+    mcp.register(sub, _module())
     transfer.register(sub, _module())
-    usb.register(sub, _module())
-    virtio.register(sub, _module())
     return root
 
 
@@ -794,16 +499,15 @@ def _expected_errors() -> tuple[type[BaseException], ...]:
     """Every error the package raises on purpose.
 
     Collected once, from the modules themselves, so adding a new subsystem
-    cannot reintroduce a raw traceback for a routine failure like a missing
-    secret or an unreachable worker.
+    cannot reintroduce a raw traceback for a routine failure like an
+    unreachable host.
     """
     errors: list[type[BaseException]] = [
-        LabError, ConfigError, secrets_store.SecretError,
-        mariadb_module.MariaDBError, power_module.PowerError, ValueError,
+        LabError, ConfigError, power_module.PowerError, ValueError,
         json.JSONDecodeError,
     ]
     for name in (
-        "console", "guest", "s3",
+        "console", "guest", "mcp",
     ):
         try:
             module = __import__(f"{__package__}.{name}", fromlist=[name])
@@ -823,9 +527,6 @@ _EXPECTED_ERRORS = _expected_errors()
 def main() -> int:
     try:
         args = parser().parse_args()
-        from .host_policy import check_command
-        check_command(CONFIG, args.command)
-        update_notice()
         args.func(args)
         return 0
     except _EXPECTED_ERRORS as exc:

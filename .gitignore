@@ -12,7 +12,5 @@ runtime/
 *.token
 
 # Runtime state and anything describing a specific site
-journal/
 docs/site-notes.md
 proxmox-agent-lab.toml
-secrets.toml

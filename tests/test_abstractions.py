@@ -120,36 +120,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.lease.ttl_seconds, 7200)
         self.assertEqual(config.lease.idle_shutdown_seconds, 28800)
 
-    def test_legacy_namespaces_still_resolve_for_dying_readers(self) -> None:
-        """TRANSITIONAL: the modules that die in a later wave read these at
-        import time. They must never crash; they are deleted with them."""
-        config = config_module.get()
-        self.assertEqual(config.proxmox.host, "192.0.2.10")
-        self.assertEqual(config.proxmox.node, "testnode")
-        self.assertEqual(config.proxmox.token_user, "tester@pve")
-        self.assertIs(config.proxmox.verify_tls, False)
-        self.assertEqual(config.proxmox.get("ca_file"), "")
-        self.assertEqual(config.proxmox.get("guest_mode", "all"), "all")
-        self.assertEqual(config.storage.upload_storages, ["local", "bulk"])
-        self.assertEqual(config.storage.bulk_storage, "bulk")
-        self.assertEqual(config.audit.get("database"), "proxmox_lab")
-        # [ssh] target is the ssh gate now; [memflow] ssh_host is not.
-        self.assertEqual(config_module.defaults().memflow.ssh_host, "")
-
-    def test_default_ttl_seconds_is_an_alias_of_ttl_seconds(self) -> None:
-        config = config_module.get()
-        self.assertEqual(config.lease.default_ttl_seconds,
-                         config.lease.ttl_seconds)
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "c.toml"
-            path.write_text("[lease]\nttl_seconds = 5400\n")
-            canonical = config_module.load(path)
-            path.write_text("[lease]\ndefault_ttl_seconds = 3600\n")
-            legacy = config_module.load(path)
-        self.assertEqual(canonical.lease.default_ttl_seconds, 5400)
-        self.assertEqual(legacy.lease.ttl_seconds, 3600)
-        self.assertEqual(legacy.lease.default_ttl_seconds, 3600)
-
     def test_state_dir_expands_the_state_dir_setting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.toml"

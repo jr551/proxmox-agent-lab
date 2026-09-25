@@ -6,7 +6,7 @@ module raises on import: an unconfigured install must still be able to run
 `proxmox-lab init` and `--help`. Features complain only when actually used,
 through `require()`.
 
-The canonical schema is the small one (docs/rework-plan.md §G)::
+The canonical schema is the whole schema (docs/rework-plan.md §G)::
 
     [ssh]    target                      ssh alias/host reached as root
     [pve]    node, template_vmid
@@ -14,16 +14,13 @@ The canonical schema is the small one (docs/rework-plan.md §G)::
     [state]  dir                         lab.db lives here
     [lease]  ttl_seconds, idle_shutdown_seconds
 
-Note: ``[ssh] target`` replaces the old ``[memflow] ssh_host`` as the ssh
+``[ssh] target`` replaces the old ``[memflow] ssh_host`` as the ssh
 gate. The ssh transport is the whole control plane and is gated on
-``[ssh] target`` alone; nothing gates on ``[memflow]`` any more.
+``[ssh] target`` alone.
 
-TRANSITIONAL: the old attribute namespaces (``proxmox``, ``audit``,
-``memflow``, ``storage``, ``lease.default_ttl_seconds``, ...) still resolve --
-from defaults, and from the file when present -- so the modules that die in a
-later wave keep importing. They are deleted with those modules; nothing new
-should read them. ``lease.default_ttl_seconds`` is kept equal to the canonical
-``lease.ttl_seconds``.
+Sections a file carries that are not in the schema are reported as
+``unknown_sections`` and ignored -- a leftover section from an older
+version never silently discards the config.
 
 Search order for the config file:
 
@@ -54,7 +51,6 @@ ENV_CONFIG = "PROXMOX_AGENT_LAB_CONFIG"
 ENV_STATE = "PROXMOX_AGENT_LAB_STATE"
 
 DEFAULTS: dict[str, Any] = {
-    # -- canonical schema (docs/rework-plan.md §G) --------------------------
     "ssh": {
         # The ssh transport is the whole control plane; this one setting is
         # the gate. Replaces the old [memflow] ssh_host.
@@ -68,17 +64,6 @@ DEFAULTS: dict[str, Any] = {
         "mac": "",
         "broadcast": "255.255.255.255",
         "port": 9,
-        # Transitional power-mode knobs, read only by the dying power/doctor
-        # code. Nothing new reads them.
-        "mode": "wake-on-lan",
-        "wowlan_mac": "",
-        "wol_port": 9,
-        "boot_timeout_seconds": 300,
-        "home_assistant_url": "",
-        "entity_on": "",
-        "entity_off": "",
-        "on_command": "",
-        "off_command": "",
     },
     "state": {
         # lab.db lives here.
@@ -87,99 +72,6 @@ DEFAULTS: dict[str, Any] = {
     "lease": {
         "ttl_seconds": 2 * 60 * 60,
         "idle_shutdown_seconds": 8 * 60 * 60,
-        # Transitional: an alias of ttl_seconds, kept equal by _reconcile so
-        # the old readers keep working. Deleted with them.
-        "default_ttl_seconds": 2 * 60 * 60,
-        # Transitional backup knobs for the dying backup code.
-        # Long-term leases keep the machine on and their guests alive.
-        "long_term_backup": True,
-        "long_term_backup_storage": "",   # defaults to storage.bulk_storage
-        "long_term_backup_keep": 2,
-        "retained_backup": False,
-        "retained_backup_interval_days": 7,
-    },
-    # -- transitional namespaces --------------------------------------------
-    # Read only by modules that die in a later wave; resolved here (defaults,
-    # plus whatever the file supplies) so those imports cannot crash. Deleted
-    # with those modules.
-    "proxmox": {
-        "host": "",
-        "port": 8006,
-        "node": "",
-        "token_user": "",
-        "token_name": "",
-        "verify_tls": False,
-        "ca_file": "",
-        "guest_mode": "all",  # all | lxc-only (VPS, no host power-off)
-    },
-    "storage": {
-        "upload_storages": ["local"],
-        "bulk_storage": "local",
-    },
-    "network": {
-        "lab_bridge": "vmbr1",
-        "lab_network": "10.66.0.0/24",
-        "lab_gateway_ip": "10.66.0.1",
-        "dhcp_start": "10.66.0.50",
-        "dhcp_end": "10.66.0.200",
-        "gateway_template_vmid": 0,
-    },
-    "vpn": {
-        "enabled": False,
-        "address": "",
-        "dns": "",
-        "endpoint": "",
-        "keepalive": 25,
-    },
-    "s3": {
-        "enabled": False,
-        "endpoint": "",
-        "bucket": "",
-        "region": "us-east-1",
-    },
-    "share": {
-        "enabled": False,
-        "worker_vmid": 0,
-        "port": 8900,
-        "default_minutes": 30,
-        "max_minutes": 480,
-        "tunnel": "cloudflared",   # cloudflared | ngrok | none
-        "novnc_version": "1.6.0",
-        "ngrok_region": "",
-    },
-    "memflow": {
-        # Transitionally still resolvable. ssh_host defaults to "" and is no
-        # longer the ssh gate -- [ssh] target is.
-        "enabled": False,
-        "ssh_host": "",
-        "ssh_user": "root",
-        "ssh_port": 22,
-        "ssh_key": "",
-        "ssh_options": "",
-        "helper": "pxl-memflow-run",
-        "connect_timeout": 10,
-    },
-    "android": {
-        "api_level": 33,
-        "abi": "x86_64",
-    },
-    "windows": {
-        "template_2025_vmid": 0,
-        "template_2022_vmid": 0,
-    },
-    "secrets": {
-        "backend": "auto",
-        "file_path": "",
-    },
-    "audit": {
-        "host": "",            # defaults to the [proxmox] host
-        "port": 3306,
-        "database": "proxmox_lab",
-        "user": "proxmox_lab",
-        "password_secret": "mariadb-password",
-        "timeout_seconds": 10,
-        "journal_dir": "",     # local spool only
-        "controller_id": "",
     },
 }
 
@@ -414,27 +306,4 @@ dir = "~/.local/share/proxmox-agent-lab"   # lab.db lives here
 ttl_seconds = 7200           # work is cleaned up if a lease is not renewed
 idle_shutdown_seconds = 28800
 
-# --- transitional: read only by the modules that die in a later wave (and by
-# install.sh's config substitution, which dies with them). Nothing new reads
-# these; they are deleted alongside those modules. --------------------------
-
-[proxmox]
-host = ""                    # address of the Proxmox host
-port = 8006
-node = "pve"                 # node name, as shown in the Proxmox UI
-token_user = ""              # API token owner (transitional)
-token_name = ""              # API token id (transitional)
-verify_tls = false
-ca_file = ""
-guest_mode = "all"           # all | lxc-only (VPS, no host shutdown)
-
-[secrets]
-backend = "auto"             # transitional secret-backend knob (dying)
-file_path = ""
-
-[s3]
-enabled = false
-endpoint = ""
-bucket = ""
-region = "us-east-1"
 """

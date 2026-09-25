@@ -29,7 +29,7 @@ trap 'proxmox-lab lease-end --lease "$L"' EXIT
 - **[commands.md](commands.md)** — map of every `proxmox-lab` subcommand
   (generated from the parser with `scripts/gen-commands.py`).
 - **[long-term-leases.md](long-term-leases.md)** — machines that stay on:
-  `pxl-expiry=0` semantics, protection, `lease-destroy` and `lease-release`.
+  `pxl-expiry=0` semantics, the GC exemption, and `lease-destroy`.
 - **[troubleshooting.md](troubleshooting.md)** — symptom → diagnostic command →
   next decision. Start here before blaming the tool.
 - **[VERIFICATION.md](VERIFICATION.md)** — what has been run on real hardware

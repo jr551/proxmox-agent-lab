@@ -27,8 +27,13 @@ FORBIDDEN_PREFIXES = ("journal/", "runtime/")
 HOME_PATH = re.compile(r"/(?:Users|home)/[^/\s]+/")
 LOW_SPECIFICITY_NODE = re.compile(r"[a-z]+")
 SITE_FIELDS = {
+    # Current schema (docs/rework-plan.md section G).
+    "ssh": ("target",),
+    "pve": ("node",),
+    "power": ("mac",),
+    # Legacy sections, still worth guarding: a stale config file is exactly
+    # the config a long-lived checkout is likely to sit next to.
     "proxmox": ("host", "node"),
-    "power": ("mac", "home_assistant_url"),
     "vpn": ("endpoint",),
     "s3": ("endpoint", "bucket"),
     "memflow": ("ssh_host",),
@@ -58,10 +63,14 @@ def config_candidates(root: Path) -> list[Path]:
 
 
 def is_low_specificity_node(section: str, key: str, value: str) -> bool:
-    """Return whether a node value is too generic to identify a local site."""
+    """Return whether a value is too generic to identify a local site.
+
+    Node names and ssh aliases are commonly a single lowercase word
+    ("pve", "proxmox"), which would flag the word everywhere it appears.
+    """
     return (
-        section == "proxmox"
-        and key == "node"
+        (section, key) in (("pve", "node"), ("proxmox", "node"),
+                           ("ssh", "target"))
         and LOW_SPECIFICITY_NODE.fullmatch(value) is not None
     )
 

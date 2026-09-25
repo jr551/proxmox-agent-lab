@@ -18,11 +18,8 @@ python3 scripts/check-release.py
 python3 scripts/check-docs.py
 python3 scripts/gen-commands.py --check
 
-for file in \
-  bootstrap.sh install.sh proxmox-host-setup.sh \
-  scripts/proxmox-lab scripts/install-watchdog scripts/check \
-  src/proxmox_agent_lab/resources/*.sh
-do
+# Every surviving shell script in the tree.
+for file in scripts/proxmox-lab scripts/check; do
   bash -n "$file"
 done
 

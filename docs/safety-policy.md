@@ -2,177 +2,220 @@
 
 ## Purpose
 
-Every write belongs to a lease, every guest is tagged and registered, and shutdown is verified — so abandoned work cannot linger, unowned guests cannot silently keep the host up, and destructive actions need explicit, narrowly-scoped authorization.
+Every mutation belongs to a lease, every lab guest carries `pxl` metadata the
+host-side garbage collector can trust, and host power-off is verified by
+repeated probe failure — so abandoned work cannot linger, unowned guests are
+never touched, and destructive or host-changing actions need explicit,
+narrowly-scoped authorization.
 
 ## Commands
 
-Authoritative flags verified against `src/proxmox_agent_lab/cli.py`, `disk.py`, `memflow.py`, `netgw.py`, `storage.py`, `usb.py`, `longterm.py`.
+Authoritative flags verified against `src/proxmox_agent_lab/cli.py` and the
+`guest`, `console`, `gc`, `cleanup` and `power` registrations.
 
-| Command | Authorisation flag (verified) | Scope |
+| Command | Authorization flag | Scope |
 |---|---|---|
-| `storage add-disk --host-change-authorized` / `storage set-content --host-change-authorized` / `storage gc --delete --host-change-authorized` | `--host-change-authorized` | host storage — format, content types, delete images |
-| `disk host-setup --host-change-authorized` | `--host-change-authorized` (`--print` previews) | host libguestfs install |
-| `net host-bridge --host-change-authorized` | `--host-change-authorized` | host networking bridge |
-| `memflow host-setup --host-change-authorized` | `--host-change-authorized` (`--print` previews) | host Rust/memflow toolchain |
-| `usb attach/detach --host-change-authorized` | `--host-change-authorized` | device passthrough |
-| `api --host-change-authorized --slow-storage-accepted` | `--host-change-authorized` (category), `--slow-storage-accepted` (bulk disk) | generic API host changes; bulk-disk guest creation |
-| `disk write --i-understand` | `--i-understand` | mutate stopped guest filesystem |
-| `memflow write --i-understand` / `memflow phys-write --i-understand` | `--i-understand` | mutate live guest memory (kernel-VA vs physical/RAM injection) |
-| `lease-end --shared-guests-authorized` | `--shared-guests-authorized` | destroy a guest also registered to another `active` lease (expired claimant only; live claimant still leaves it) |
-| `cleanup-expired --reclaim-orphans --host-change-authorized` / `--orphans-only --host-change-authorized` | `--host-change-authorized` + `--reclaim-orphans` or `--orphans-only` | stop (never delete) orphaned guests |
-| `cleanup-expired --include-active` | `--include-active` | also stop an orphan touched in last 30 min (overrides 3 signals) |
-| `lease-abandon --confirm` / `lease-destroy --confirm` / `lease-release --confirm` | `--confirm` | close/abandon/destroy lease, with preview without flag |
+| `proxmox-lab guest destroy --lease <id> --vmid <n> --confirm` | `--confirm` | irreversible delete of one lease-owned guest |
+| `proxmox-lab lease-destroy --lease <id> --confirm` | `--confirm` | destroy a lease and its machines; the only exit for a long-term lease |
+| `proxmox-lab lease-abandon --lease <id> --confirm` | `--confirm` | close a stopped lease record; guests and host untouched |
+| `proxmox-lab lease-end --lease <id> --shared-guests-authorized` | `--shared-guests-authorized` | destroy a guest another non-terminal lease also registers |
+| `proxmox-lab cleanup-expired --reclaim-orphans --host-change-authorized` | both flags | stop (never delete) `pxl` guests this controller has no record of |
+| `proxmox-lab cleanup-expired --orphans-only --host-change-authorized` | both flags | reclaim orphans and nothing else — no lease finalized, host left as found |
+| `proxmox-lab cleanup-expired --reclaim-orphans --host-change-authorized --include-active` | `--include-active` on top | also stop an orphan whose 30-minute task/uptime/CPU signals say it is in use |
+| `proxmox-lab gc install` / `proxmox-lab gc uninstall` | `--host-change-authorized` | write or remove the root GC script, its state dir and one crontab line on the host |
+| `proxmox-lab power wake` / `proxmox-lab power shutdown` | `--standalone-authorized` | bare host power outside any lease — a person, not the lease finalizer, owns shutdown |
 
-Quick examples:
-
-```bash
-proxmox-lab storage add-disk --lease "$L" --device /dev/sdb --name bulk \
-  --expect-serial <serial> --expect-size-gb 1000 --host-change-authorized
-proxmox-lab disk write --lease "$L" --vmid 9001 --mount /dev/sda1 \
-  --src ./fixed.cfg --dest /boot/grub/grub.cfg --i-understand
-proxmox-lab memflow write --lease "$L" --vmid 9040 --addr 0x... --hex 9090 --i-understand
-proxmox-lab cleanup-expired --orphans-only --host-change-authorized
-proxmox-lab lease-destroy --lease <id> --confirm
-```
-
-## Initial onboarding and VPS policy
-
-`onboard prepare --mode iso` requires an exact disk serial, a root password
-hash file and `--wipe-confirmed`. This generates media; booting that media is
-what installs onto and erases the selected target disk. The embedded first-boot
-script configures the dedicated API principal, isolated bridge and requested
-Wi-Fi/SSH settings. It is an initial host setup operation before leases exist.
-The generated VPS script requires `--host-change-authorized` and
-`--reboot-authorized` on its first run, before host changes.
-
-An enrolled VPS uses `[proxmox] guest_mode = "lxc-only"`. This explicitly
-suspends automatic host shutdown, including the watchdog, while guest cleanup
-and ownership checks continue. QEMU, privileged LXC creation, cloning, host
-power writes and VM/device command families are blocked by the controller.
-The VPS API token has no host power permission. This is a controller capability
-policy, not a server-side separation between Proxmox's VM and LXC privileges.
-See [onboarding](onboarding.md) for the experimental limits and recovery steps.
+The same gates exist on the MCP surface as data, not flags: `lease_destroy`,
+`guest_destroy` and `cleanup_expired` must carry `"confirm": true`; a missing
+or false value fails `-32602` before anything runs. The server exposes no `gc`
+and no standalone `power wake`/`shutdown` tool at all — host maintenance and
+bare power levers stay CLI-only.
 
 ## Invariants
 
-1. Every write belongs to one active lease.
-2. Every created guest carries `codex-lab` and `lease-<id>` tags.
-3. Cleanup deletes only guests registered to that lease.
-4. Durable templates use `codex-template` and policy `retain`.
-5. Lease expiry is two hours by default and is extended by heartbeats.
-6. Ending or expiring the last lease powers off `pve`.
-7. Completion requires the Proxmox API to remain unreachable for two consecutive checks.
-8. Every operation writes a redacted audit event to the shared MariaDB ledger. The lab host is powered off between leases, so an unreachable ledger spools the event locally rather than failing the action; `journal --flush-spool` uploads the backlog. An `api` write may already have reached Proxmox before its audit event fails; it reports that write as succeeded but unrecorded rather than claiming an unrelated Proxmox permission failure.
-9. Every MCP tool call records only its tool name and refreshes the idle clock.
-10. A reachable host with no active leases is shut down after eight hours without an MCP tool call.
-11. Console input (keys, typing, clicks), guest execution and file transfer require an active lease. Screenshots and terminal reads do not.
-12. Typed text and generated passwords are never audited; only counts, exit codes and object keys are.
-13. A no-op watchdog sweep writes nothing. The journal and the Forgejo history record events, not heartbeats.
-14. Lab guests that reach the internet do so through the VPN gateway. The gateway forwards only `eth1 -> wg0` and drops everything else, so a dropped tunnel stops egress rather than leaking to the home WAN.
-15. `net verify` must pass before a guest behind the gateway is used for real work, and after any change to the gateway ruleset.
-16. A long-term lease suspends invariant 6: while one is active the host stays powered on, and every command that would otherwise shut it down reports that it did not, and why.
-17. Long-term guests carry Proxmox `protection` and policy `retain`. They are removed only by `lease-destroy --confirm`, which lifts protection first.
-18. A long-term backup marks success only when every guest in the lease succeeded, so a partial failure retries instead of waiting a week.
+1. Every mutation belongs to one lease in a non-terminal state (`active`,
+   `ending`, `cleanup_failed`). `store.resources` is the registry; the
+   ownership gate refuses before any host call and names the `lease-register`
+   command that would authorize the guest.
+2. Every lease-owned guest is stamped at create/register time: tags
+   `pxl;lease-<id>` and a `pxl-lease=<id> pxl-expiry=<unix epoch>` line in its
+   description. `lease-heartbeat` rewrites the expiry on every registered
+   guest; `pxl-expiry=0` means long-term, never swept.
+3. Cleanup destroys only `disposable` resources registered to that lease, in
+   reverse registration order. It is idempotent — an already-gone guest is
+   success — and any failure lands the lease in `cleanup_failed`, which every
+   later `cleanup-expired` sweep retries.
+4. `retain`-policy resources and templates (`template: 1`) are never stopped
+   or destroyed: they are clone sources and read-only surface. `guest destroy`
+   additionally refuses a readable guest config that carries no `pxl` tag —
+   a machine somebody else owns can never be mistaken for ours.
+5. Host power-off is verified, never assumed. After `shutdown -h now` the host
+   is probed alternately over ssh and TCP :22; `host_powered_off` is `true`
+   only after at least six consecutive all-fail rounds spanning at least 30
+   seconds. A timeout reports `host_powered_off: false` and exits non-zero.
+   There is no force-off path: a host that refuses to die is reported, not
+   killed.
+6. The host is never powered off while any guest is running (guests tagged
+   `codex-lab-infra` are the documented exception), nor while any lease is
+   still non-terminal, nor while a long-term lease exists.
+7. Destructive and host-changing operations need the explicit flag in the
+   table above. There is no interactive prompt anywhere.
+8. Audit redacts before insert and never fails the action: an unrecordable
+   event is a stderr warning, not a raised error.
+9. Every MCP `tools/call` — read-only or mutating, success or failure —
+   refreshes the idle clock and records only tool name, `ok` and target
+   (vmid/lease). No argument value is ever recorded by that path.
+10. The MCP server is a second power-off net: `idle_shutdown_seconds` with no
+    active lease triggers the same verified shutdown `cleanup-expired` uses,
+    via a self-wake that fires even when the client has gone silent.
+11. `console type` audits the character count only; `console keys` audits the
+    key count only (key names can spell typed content); `guest run` audits
+    argv0 and the exit code, never the full command or its output; `push` and
+    `pull` record the remote path, byte count and digest, never the payload.
+12. The host-side GC fails closed: unreadable config, unparseable metadata or
+    an internal error on one guest is logged and skipped, never deleted.
+13. Least privilege is a command allowlist, not a credential scope (§below).
+    Root ssh is the trust boundary; the allowlist is the policy inside it.
 
-## Graceful finalization
+## The ssh allowlist — the least-privilege boundary
 
-For each disposable registered guest:
+Every byte to and from the host crosses `ssh.py`, the only module that spawns
+`ssh`. The rules, enforced before any process is spawned:
 
-1. request ACPI shutdown for QEMU or shutdown for LXC;
-2. wait up to 120 seconds for `stopped`;
-3. issue a hard guest stop only if graceful guest shutdown timed out;
-4. delete the stopped guest;
-5. preserve the Proxmox task ID and result.
+- `argv[0]` must be in the allowlist: `qm`, `pct`, `pvesh`, `pveversion`,
+  `hostname`, `ip`, `cat`, `base64`, `true` for ordinary calls; `shutdown`,
+  `crontab`, `install`, `ethtool`, `tee`, `rm` additionally need
+  `host_change=True`, plumbed from the CLI authorization flags — with the one
+  read-only exception `crontab -l`. Anything else, an arbitrary root shell
+  included, is refused as a `PolicyError` before spawn.
+- The remote argv is `shlex.quote`d word-by-word and joined; `;`, `$(...)` and
+  spaces arrive as literal argument text, never as shell syntax.
+- `cat` and `tee` are confined to `/tmp/pxl-*`; `rm` to `/tmp/pxl-*` and
+  `/usr/local/sbin/pxl-*`; `base64` may read `/tmp/pxl-*`,
+  `/usr/local/sbin/pxl-*` and `/var/log/pxl-*`. A path containing `..`
+  anywhere is refused outright, and the path is normalized before the prefix
+  test, so the seam cannot read, write or remove host files outside the pxl
+  namespaces however the path is spelled.
+- `BatchMode=yes` and `ConnectTimeout=5` are always set: the transport can
+  never hang on a prompt, and every call is timeout-bounded.
+- The spawn happens as `ssh <target> '<quoted argv>'` — your ssh config, keys
+  and agent decide what `<target>` means. No credential of any kind is handled
+  by this tool.
 
-After all leases are closed:
+## Audit and redaction
 
-1. request `command=shutdown` on `/nodes/pve/status`;
-2. wait up to 240 seconds for the API to disappear;
-3. retry one reachability check;
-4. invoke `script.nanokvm_pc2_force_off` only if the API remains reachable;
-5. wait up to 60 seconds and verify the API is down.
+Every action appends one event row to `lab.db`'s `events` table (the legacy
+DDL, reused verbatim). The `data` column carries `{actor, tool, ok, target,
+…fields}` with every value redacted *before* insert: keys that smell like
+credentials (passwords, keys, auth material) become `[REDACTED]`, strings are
+capped at 1000 characters. A failure to record warns on stderr and the action
+proceeds — auditing must never break the work it observes. `journal` reads
+this table (`--limit`, `--lease`, `--since`); there is no upload step because
+there is no central ledger — the store is local.
 
-## Safety gate — refuse or stop
+## What `pxl` metadata proves, and what owns a guest
 
-- Refuse a write with no active lease.
-- Refuse deletion of an unregistered VMID.
-- Refuse host storage, network, access-control, cluster, SDN, firewall-default, or device-passthrough changes unless the user's current request explicitly authorizes that category — the CLI gate is `--host-change-authorized`.
-- Stop and report if an untagged or pre-existing guest would be deleted.
-- Treat the `[memflow]` SSH connection as a distinct trust boundary: it reaches the host as root outside the API token, so it stays off unless the user has configured it, and `memflow host-setup` / `usb attach` are host changes gated behind `--host-change-authorized`. `netcap` (capture, SSL inspection, MITM) rides the same connection and is subject to the same boundary.
-- Refuse a `memflow write` or `memflow phys-write` (both mutate live guest memory -- kernel-virtual and physical/RAM-injection respectively) unless the user's current request explicitly authorizes it, then pass `--i-understand`. Never pass a USB device backing active storage through to a guest.
-- Capture and decrypt only a guest's own traffic, within a lease. `netcap intercept` is an active MITM: install its CA only in guests the user controls, for work the user has authorized, and never rewrite traffic the user did not ask to rewrite.
-- Do not log cloud-init passwords, tokens, authorization headers, SSH private keys, presigned S3 URLs, or full environment files. Guest memory, USB and network captures — and decrypted MITM flows — are never written to the ledger; only the fact of the capture is.
-- Refuse to write any credential into this repository. The S3 key ID and secret belong in the configured secret backend; `scripts/check-secrets.py` blocks the common shapes at commit time.
+A guest this tool created is tagged `pxl;lease-<id>` and carries
+`pxl-lease=<id> pxl-expiry=<epoch>` in its description. The stamp outlives the
+lease record that explains it — lease rows end; guest metadata does not — so
+it is evidence that *some* lease on *some* controller created the guest, and
+nothing more. Ownership comes from `lab.db`, the only registry: a
+`(kind, vmid)` must be registered to the supplied lease, live, before any
+mutating call. A `pxl`-tagged guest whose lease id no local lease row owns is
+an **orphan**.
 
-## What a tag proves, and what owns a guest
-
-Every guest this tool creates is tagged `codex-lab;lease-<id>`. Those tags stay on the node for ever; the lease records that explain them do not — they are pruned, and on a rebuilt controller they were never there. So a tag is evidence that *some* lease created a guest and nothing more. **Ownership checks must not resolve `tag → lease file`**: on a fresh controller almost nothing resolves, and nearly every deliberately-kept guest would be called unowned.
-
-Ownership comes from the two things the controller actually keeps:
-
-1. **The lease record**, for the life of the lease. This is what `require_lease_resource` checks before any mutation. It refuses before the request is sent and names the `lease-register` command that would authorize the guest. A guest write whose path does not resolve to a `(kind, vmid)` — `/nodes/<node>/qemu//9246/sendkey`, say — is refused for the same reason: a path the check cannot read is a check that did not happen.
-2. **The retained registry** (`retained.json` under the state root), for guests that outlive their lease on purpose. Written at register time for any `policy = retain` resource, never pruned automatically, and cleared when the guest is actually deleted.
-
-`guest inventory` prints both for every guest on the node: its tag, whether anything local resolves it, and whether the registry vouches for it. A guest this tool created that neither vouches for is **orphaned**.
-
-An orphan matters because of a deliberate interaction between two safety rules: cleanup only ever finalizes resources listed in a lease, and `shutdown_host()` refuses to power off while *any* guest is running. So one running orphan is invisible to every sweep and keeps the machine on indefinitely — five days, in the run that prompted this. `doctor` therefore fails when a running orphan exists, and reclamation is explicit:
+An orphan matters because two rules interact deliberately: cleanup only
+finalizes resources a lease registered, and host power-off refuses while
+*any* guest runs — so one running orphan is invisible to every sweep and pins
+the machine on indefinitely. Reclamation is explicit and stops, never
+deletes:
 
 ```bash
-proxmox-lab guest inventory --orphaned-only
+proxmox-lab status            # every vmid on the node vs. `guest list` (registered)
 proxmox-lab cleanup-expired --orphans-only --host-change-authorized
 ```
 
-`--orphans-only` does exactly that and nothing else. Plain `--reclaim-orphans` folds reclamation into a full expiry sweep, which in the same run finalizes every expired lease — deleting their guests — and then decides whether to power the host off. Those are much larger intentions, so they have separate flags.
+`--orphans-only` does exactly that and nothing else. `--reclaim-orphans`
+folds reclamation into a full expiry sweep — finalizing every expired lease
+and possibly powering the host off — a much larger intention, so a separate
+flag.
 
 ### "Orphaned" does not mean "abandoned"
 
-It means *this* controller has no record of the guest. A second controller — or one whose state directory lives elsewhere — drives guests through the same API token, and its lease records are not here. So a running orphan may be somebody else's live work.
+It means *this* `lab.db` has no record. Another controller drives guests
+through the same root ssh channel, and its lease records are not here — a
+running orphan may be somebody else's live work. Reclamation leaves a guest
+alone if **any** of three signals says it is in use: a non-stop task for it
+in the last 30 minutes (stop tasks excluded, or our own stop would veto every
+later run); uptime under 30 minutes; CPU at or above 10%. An unreadable task
+list counts as in use — not knowing must not resolve to stopping someone's
+work. `--include-active` overrides all three; pass it only when you have
+proven the orphan is not live work elsewhere. The measured load is reported
+either way, so disagree with the floor using numbers, not trust.
 
-Reclamation therefore leaves a guest alone if **any** of three signals says it is in use:
+## Graceful finalization
 
-1. a non-stop task for it in the last 30 minutes — console, start, agent: some thing driving it from outside;
-2. an uptime shorter than that — started recently, even if the task log rolled;
-3. CPU at or above 10% — work happening *inside* it, which neither of the others can see at all. A three-hour build in an unmanaged container produces no Proxmox task and does not reset the uptime.
+Per disposable resource, in reverse registration order:
 
-Stop tasks are excluded from signal 1, or our own stop would make every later run refuse. An unreadable task log counts as in use, because not knowing must not resolve to stopping someone's work. `--include-active` overrides all three. `doctor` reports such guests as `orphaned_but_active` rather than as a problem — they keep the host on, which is correct while they are in use.
+1. skip it if already stamped `destroyed_at` (idempotency);
+2. leave it, reported `left_to_another_lease`, if another *live* lease
+   registers the same guest — an expired claim shields nothing;
+3. graceful shutdown (`qm shutdown`/`pct shutdown`), then a hard stop only if
+   the grace period expires;
+4. destroy the stopped guest; QEMU destroys purge the disks;
+5. a failure lands the lease in `cleanup_failed` with `last_error`, retried
+   by every later sweep.
 
-The 10% floor has to sit well above background noise: measured on the lab node, a genuinely idle container runs at 0.005% and a mostly-idle Debian guest at about 1%, so a lower floor would make nothing ever reclaimable. Below the floor a guest is not *proven* idle, only not proven busy — so the measured CPU, memory and disk/network counters are reported for every orphan either way, in the reclamation result and in `doctor`'s `orphaned_idle_load`. Disagree with the threshold using the numbers rather than trusting it.
+`lease-end` refuses *before* touching anything when a guest it would destroy
+is registered to another non-terminal lease (recorded as
+`lease-end-refused-shared-guest`): end or abandon the other lease first, or
+re-run with `--shared-guests-authorized` only when the user has said that
+guest is theirs to delete. `lease-destroy` on a long-term lease first rewrites
+each guest's `pxl-expiry` to the past, so a half-failed teardown is reaped by
+the GC instead of pinning the machine on for ever. `lease-abandon` verifies
+every registered guest is stopped (or already gone), then closes only the
+record: no guest mutation, no host mutation.
 
-This was learned the direct way: a reclamation run stopped a ReactOS benchmark that another session had been screenshotting every 45 seconds, and that session restarted the guest 90 seconds later.
+## The host-side GC — fail closed by construction
 
-Reclamation **stops, and never deletes.** Stopping is reversible and is all that is needed to unblock power-off; a controller that has lost the record of a guest cannot vouch for what is on its disk, so deleting it stays a human decision. Adopting one instead is the other half:
+`proxmox-lab gc install --host-change-authorized` puts exactly one thing on
+the host: `/usr/local/sbin/pxl-gc` (mode 0755, sha256-checked against the
+bundled copy), a `/var/lib/pxl-gc` state dir, and one root crontab line
+running it every ten minutes. The script is standalone — stdlib only, no
+controller database — the net for agents that walked away:
 
-```bash
-proxmox-lab guest retain --vmid 101 --purpose "Ubuntu cloud-init template"
-```
+- a guest without the `pxl` tag is skipped; so is a template, an unreadable
+  config, and metadata that does not parse — a warning, never a delete;
+- `pxl-expiry=0` (long-term) and unexpired guests pin the host on;
+- an expired guest gets graceful shutdown, then a hard stop, then destroy
+  (`--purge` for QEMU), under a per-vmid flock so overlapping runs never race;
+- power-off needs two *consecutive* clear runs ≥600 s apart — zero running
+  and zero pinned; anything running or pinned removes the clear stamp at once.
 
-That records the guest as deliberately kept — it stops being reported as an orphan and becomes eligible for retained backups. It changes controller state only; the guest is never touched.
+`gc status` reports script presence, checksum, crontab line and the log tail
+(read-only, no authorization). `gc uninstall --host-change-authorized` removes
+the crontab line first, then the script; guests are never touched on the way
+out.
 
-## Failure mode
+## Credentials
 
-- A lease left in `cleanup_failed` (e.g. QEMU lock timed out while stopping one guest) is picked up by every later sweep until it succeeds — finalizing is idempotent, so a resource already gone costs nothing. Previously such a lease was skipped for ever and its guests, and the host, stayed up until someone reran `lease-end` by hand.
-- Cleanup never destroys a resource another live lease owns. Before stopping or deleting a registered guest, cleanup checks whether any other lease that is still live (long-term, or not yet expired) also registers that `(kind, vmid)`. If one does, the resource is left alone and reported as `left_to_another_lease`. An expired claim does not shield a guest, so two stale leases cannot leave one running for ever. `lease-register` also refuses outright to take a guest that a live lease already owns.
-- `lease-end` refuses up front when a guest is cross-referenced. The two checks above are per-resource and ask whether the *other* lease is live, and `lease-register` is not the only way a guest gets registered — an idempotent setup command (`memflow ghidra-setup --lxc N`, `netcap mitm-setup --lxc N`) calls `register_resource` directly. So before `lease-end` powers anything on, stops anything, or deletes anything, it cross-references every guest it would *delete* against the resources of every other `active` lease, including long-term ones and ones that are past their expiry. If any match, the command refuses, naming the guest and the other lease id, and records `lease-end-refused-shared-guest` in the audit journal. The check reads lease records only, so it adds no network call inside the controller lock. `--shared-guests-authorized` proceeds anyway. It does not disable the per-resource check inside cleanup, so a guest a still-live lease owns is still left alone and reported as `left_to_another_lease`; what the flag allows through is a guest claimed only by an expired-but-`active` record. Either way the shared guests are named in `shared_with_other_leases`, in the `lease-end` audit event, and on stderr. A `retain` resource is out of scope: `lease-end` never deletes one, so its behaviour is unchanged.
-- Orphan reclamation is intentionally conservative: a 30-minute task/uptime/CPU signal keeps the guest alone. Pass `--include-active` only when you have proven the orphan is not someone else's live work.
-- If an ordinary lease is stale but every registered guest is already stopped, use `proxmox-lab lease-abandon --lease <id> --confirm`. It verifies those guest states, then closes only the local lease record: it does not start, stop, delete, or otherwise mutate a guest, and it does not shut down the host. It refuses long-term leases, unreachable Proxmox, or any guest that is not verifiably stopped. It attempts an audit event and reports explicitly if the record could not be written.
+SSH keys are the whole story. There is no credential store in this tool at
+all — no backend to configure, nothing to fetch or rotate. `[ssh] target` is
+an ssh alias or host you control as root, trusted once with `ssh-copy-id`;
+BatchMode means the transport physically cannot prompt. The config file holds
+no secret material, and none should ever be written there.
 
-## Recovery
+## Safety gate — refuse or stop
 
-The macOS LaunchAgent runs `cleanup-expired` every five minutes. It makes abandoned work eventually safe even if the calling agent crashes or loses its thread, and enforces the eight-hour MCP-idle shutdown threshold. A lease heartbeat prevents cleanup and idle shutdown during legitimate long-running work.
-
-Three properties of the cleanup path matter enough to state:
-
-- **It retries a failed cleanup.** A lease left in `cleanup_failed` — say a QEMU lock timed out while stopping one guest — is picked up by every later sweep until it succeeds. Finalizing is idempotent, so a resource that is already gone costs nothing. Previously such a lease was skipped for ever and its guests, and the host, stayed up until someone reran `lease-end` by hand.
-- **It never destroys a resource another live lease owns.** Before stopping or deleting a registered guest, cleanup checks whether any other lease that is still live (long-term, or not yet expired) also registers that `(kind, vmid)`. If one does, the resource is left alone and reported as `left_to_another_lease`. An expired claim does not shield a guest, so two stale leases cannot leave one running for ever. `lease-register` also refuses outright to take a guest that a live lease already owns.
-- **`lease-end` refuses up front when a guest is cross-referenced.** The two checks above are per-resource and ask whether the *other* lease is live, and `lease-register` is not the only way a guest gets registered — an idempotent setup command (`memflow ghidra-setup --lxc N`, `netcap mitm-setup --lxc N`) calls `register_resource` directly. So before `lease-end` powers anything on, stops anything, or deletes anything, it cross-references every guest it would *delete* against the resources of every other `active` lease, including long-term ones and ones that are past their expiry. If any match, the command refuses, naming the guest and the other lease id, and records `lease-end-refused-shared-guest` in the audit journal. The check reads lease records only, so it adds no network call inside the controller lock. `--shared-guests-authorized` proceeds anyway. It does not disable the per-resource check inside cleanup, so a guest a still-live lease owns is still left alone and reported as `left_to_another_lease`; what the flag allows through is a guest claimed only by an expired-but-`active` record. Either way the shared guests are named in `shared_with_other_leases`, in the `lease-end` audit event, and on stderr. A `retain` resource is out of scope: `lease-end` never deletes one, so its behaviour is unchanged.
-
-If an ordinary lease is stale but every registered guest is already stopped, use `proxmox-lab lease-abandon --lease <id> --confirm`. It verifies those guest states, then closes only the local lease record: it does not start, stop, delete, or otherwise mutate a guest, and it does not shut down the host. It refuses long-term leases, unreachable Proxmox, or any guest that is not verifiably stopped. It attempts an audit event and reports explicitly if the record could not be written.
+Every gate above resolves the same way: refuse before the host call, name the
+authorizing flag or `lease-register` in the error, and record the refusal.
+`host_powered_off: false` is reported loudly and never rounded up to success;
+an inconclusive probe is unproven, never a pass.
 
 ## See also
 
-- [CONFIGURATION.md](CONFIGURATION.md#lease) — `[lease]` TTL, idle shutdown, backup intervals
-- [long-term-leases.md](long-term-leases.md) — long-term leases and `lease-destroy`/`lease-release` (`--confirm`)
-- [storage.md](storage.md) — bulk/fast storage and trusted-LAN canonical warning
-- [disk.md](disk.md) / [memflow.md](memflow.md) / [usb.md](usb.md) / [netcap.md](netcap.md) / [network.md](network.md) — subsystem-specific gates
-- [VERIFICATION.md](VERIFICATION.md) — hardware verification of power-off and cleanup
-
+- [AGENTS.md](AGENTS.md) — how an agent should drive this surface
+- [troubleshooting.md](troubleshooting.md) — symptom-to-command guide
+- [CONFIGURATION.md](CONFIGURATION.md) — the config file keys
+- [commands.md](commands.md) — generated command reference
+- [VERIFICATION.md](VERIFICATION.md) — what has been exercised on hardware

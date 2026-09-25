@@ -1,196 +1,193 @@
 # 🤖 Driving this lab as an agent
 
 > **Audience:** AI agents that already know the lease shape from `SKILL.md`.
-> **Scope:** Deep operational guidance — probe decision table, screen ladder, permissions, worked example, and builders. For quick-ref copy-paste, read `SKILL.md`; for enforced invariants, read `safety-policy.md`.
+> **Scope:** deep operational guidance — the MCP surface, the channel decision,
+> console input, hygiene, and honest reporting. For quick-ref copy-paste read
+> [`SKILL.md`](../SKILL.md); for the rules enforced in code read
+> [safety-policy.md](safety-policy.md).
 
-Guidance for an AI agent using `proxmox-lab`. Read [safety-policy.md](safety-policy.md) for the rules enforced in code; this is about doing the job well. Copy-paste starting points for common jobs are in [RECIPES.md](RECIPES.md). Subsystem hardware coverage is tracked in [VERIFICATION.md](VERIFICATION.md).
+The lab is one Proxmox host driven over **root SSH** from this controller;
+every byte crosses one `ssh` subprocess with a command allowlist. All state —
+leases, resource registry, journal — lives in one local SQLite file, `lab.db`
+under `[state] dir`. Nothing runs on the host except `qm`/`pct`/`pvesh` and,
+optionally, one GC cron line.
+
 ## 🔑 The one rule
 
-**Every run is a lease, and every lease ends.** Canonical copy-paste block (trap, timing, takeover) lives in [`SKILL.md`](../SKILL.md) § Every task follows this shape — use it verbatim. Host-setup one-liners live in [INSTALL.md](INSTALL.md).
+**Every run is a lease, and every lease ends.** The canonical copy-paste
+block — `lease-begin`, `trap ... lease-end` on EXIT — lives in
+[`SKILL.md`](../SKILL.md#every-task-is-a-lease). Use it verbatim.
 
 Deep notes beyond the quick-ref:
 
-Put `lease-end` in a trap, a `finally`, or the equivalent, so it runs even when
-the work fails. It must print `"host_powered_off": true`; if it does not, say
-so plainly rather than reporting success.
+- `lease-begin` **does not wake the host**. It refuses outright when the host
+  does not answer ssh, with a message pointing at `power wake`. A dark host is
+  therefore an operator step, not an agent one: ask the user to run
+  `proxmox-lab power wake --standalone-authorized` (the flag exists precisely
+  because bare power has no lease finalizer behind it), then retry. Never hold
+  bare power yourself — `power wake`/`power shutdown` are gated for a reason.
+- Put `lease-end` in a trap/finally so it runs even when the work fails. It
+  must print `"host_powered_off": true` when it closed the last lease; if it
+  does not, say so plainly rather than reporting success.
+- `lease-end` refuses before it touches anything if a guest it would destroy
+  is still registered to another non-terminal lease, naming the guest and that
+  lease. Do not reach for `--shared-guests-authorized` to get past it: end or
+  abandon the other lease, unless the user said that guest is theirs.
+- Work lasting more than ~30 minutes needs
+  `proxmox-lab lease-heartbeat --lease "$L"` — a heartbeat extends the lease
+  *and* rewrites `pxl-expiry` on every registered guest, so neither
+  `cleanup-expired` nor the host GC reaps live work.
+- One lease per session. Each begin/end cycle can cost a host boot and a
+  verified power-off; reuse the lease, don't churn it.
 
-`lease-end` refuses before it touches anything if a guest it would destroy is
-still registered to another active lease, naming the guest and that lease. Do
-not reach for `--shared-guests-authorized` to get past it: end or abandon the
-other lease instead, unless the user has said that guest is theirs to delete.
+## 🧰 The MCP surface
 
-`lease-begin` powers the machine on. Expect it to take a minute or two. Omit
-`--timeout` so the configured boot budget is used. A cold-start override below
-90 seconds is rejected; a short timeout creates duplicate leases and false
-failure reports rather than making the host boot faster.
+If your client speaks MCP, point it at `proxmox-lab mcp` (stdio JSON-RPC 2.0).
+All 23 tools call the same handlers the CLI binds — same behavior, same gates:
 
-Work lasting more than 30 minutes needs `lease-heartbeat --lease "$L"`, or the
-watchdog will clean up underneath you.
+| Group | Tools |
+|---|---|
+| leases | `lease_begin`, `lease_heartbeat`, `lease_end`, `lease_list`, `lease_destroy`, `lease_register` |
+| guests | `guest_create`, `guest_clone`, `guest_start`, `guest_stop`, `guest_destroy`, `guest_probe`, `guest_list`, `guest_run` |
+| files | `push_file`, `pull_file` |
+| console | `console_screenshot`, `console_type`, `console_keys` |
+| hygiene & health | `cleanup_expired`, `journal_query`, `doctor`, `power_status` |
+
+Notes that matter:
+
+- `lease_destroy`, `guest_destroy` and `cleanup_expired` require
+  `"confirm": true` — missing or false fails `-32602` before anything runs.
+  Pass it only when the user asked for the destruction.
+- Guest-scoped tools take `lease_id` + `vmid`; read-only tools (`guest_probe`,
+  `guest_list`, `journal_query`, `doctor`, `power_status`) need no lease.
+- Results arrive as `content[0].text` carrying the same JSON the CLI prints;
+  `console_screenshot` returns the PNG inline as `png_base64`.
+- Every call refreshes the idle clock and records name + ok + target only —
+  after `idle_shutdown_seconds` (default 8h) with no active lease the server
+  powers the host off itself. Going silent is not a way to keep the host up.
+- No `gc` and no standalone `power wake`/`shutdown` tools exist. Host
+  maintenance and bare power are operator work.
 
 ## 👀 Choosing how to talk to a guest
 
-This is the decision agents most often get wrong. **Ask first:**
+Ask first:
 
 ```bash
 proxmox-lab guest probe --vmid 9001
 ```
 
-It reports whether the guest agent answers, whether a serial console exists,
-whether VNC keystrokes will land, and what to do about it. Then:
+Probe reports `exists`, `running`, `kind`, `agent_ok`, `ip` and `channel`
+(`"agent"` | `"pct"` | `"ssh"`). Then:
 
-| The guest can... | Use | Why |
+| The guest is... | Use | Why |
 |---|---|---|
-| run qemu-guest-agent | `guest run` | Real exit codes and separated streams |
-| offer a serial console | `guest run --password-stdin` | No agent needed |
-| only show a screen | `console screenshot` | You are multimodal — look at it |
+| qemu with guest agent answering | `guest run` | real exit code, separated stdout/stderr |
+| lxc (running) | `guest run` | `pct exec` is native — no agent needed |
+| qemu without agent | `console type`/`keys` + `console screenshot` | you drive the emulated keyboard, then *look* |
 
-`guest run` picks between the first two automatically. Prefer it over calling
-`console exec` or `console text` directly unless you need something specific.
+`guest run` picks `qm guest exec` or `pct exec` by kind automatically and
+times out at 300s unless `--timeout` says otherwise. Only argv0 and the exit
+code are audited — the command text never is.
 
-A guest with **no password at all** — a stock installer, a rescue shell, a
-blank-root appliance — still uses the serial channel: pass `--password-stdin`
-and feed it an empty line (`</dev/null`, or `<<< ''`). What is refused is
-*forgetting* the flag, which is not the same statement.
+**Prefer text over pixels.** Output you can grep beats a screenshot of a
+terminal. **But do look when a screen is the truth** — a stuck boot, a GUI
+installer, a login prompt. `console screenshot --vmid <id> --out ./shot.png`
+writes a PNG (QEMU only — LXC guests have no `qm monitor` and report
+`supported: false`).
 
-**Prefer text over pixels.** If a guest can hand you real characters, take
-them. A screenshot of a terminal is strictly worse than its output: you cannot
-grep it, and you might misread it.
+`keys_sent`/`sent` counts what the controller transmitted, not what the guest
+received. `console keys --screenshot-after 3` bundles proof: it waits, then
+returns a capture. If the screen did not change, stop and re-read instead of
+sending more input — that is how a guest gets driven blind for an hour.
 
-**But do look at screens when a screen is the truth.** A stuck boot, a GUI
-installer, a kernel panic, a BIOS menu — read the PNG. That is what it is for.
+Input to a guest the lease does not own is refused *before* anything is sent;
+the error names the `lease-register` command that fixes it. Read it rather
+than retrying.
 
-### ⚠️ The trap that costs an hour
+## 📦 Creating and feeding guests
 
-A VM whose display is the serial console (`vga: serial0`, which most Linux
-cloud templates use) will happily give you a *screenshot*, and silently
-discard every keystroke you send over VNC. RFB key events go to the emulated
-PS/2 keyboard, which that VM does not present.
+```bash
+proxmox-lab guest create --lease "$L" --vmid 9001 --name probe --start
+proxmox-lab guest clone --lease "$L" --vmid 9002 --source 100
+```
 
-`guest probe` reports this as `"keyboard_input": false`. If you are typing at a
-guest and nothing happens, that is why. Use the serial channel instead.
+`guest create` clones the configured `[pve] template_vmid` (or builds fresh
+with `--fresh`; LXC fresh needs `--ostemplate`). `guest clone` accepts any
+*vouched* source — a config template (`template: 1`) or a `policy=retain`
+registry row. Either way the guest is registered to your lease and stamped
+`pxl` metadata **before** it can ever be started.
 
-### ⌨️ `keys_sent` is not "the guest got it"
+Adopt a pre-existing guest — e.g. one created in the Proxmox UI — with
+`proxmox-lab lease-register --lease "$L" --kind qemu --vmid <id>`; without that
+row every mutating command refuses it. Use `--policy retain` for a guest that
+should outlive the lease (it becomes a clone source, never driven or
+destroyed by lease teardown).
 
-`console keys` answers `keys_sent`, and `console type` answers
-`characters_sent`. Both count what the controller transmitted. Add
-`--screenshot-after SECONDS` and they also report `screen_changed`, compared
-against the previous capture of that guest:
+Files move with `push`/`pull`, chunked base64 through the same guest-exec
+channel as `guest run` — so they need the agent on qemu or a running lxc.
+`--sha256` verifies end to end; a mismatched `pull` leaves no file behind.
 
-- `screen_changed: true` — the screen moved; carry on.
-- `screen_changed: false` — pixel-identical, and the `agent_hint` says what to
-  check. Stop and re-read the screen instead of sending more input.
-- `screen_changed: null` — nothing to compare against yet; capture again.
+## 🧹 Hygiene and your own audit trail
 
-It is evidence, not proof, and it never blocks the command. Without
-`--screenshot-after` there is no evidence at all, which is how a guest gets
-driven blind for an hour.
-
-Input to a guest the lease does not own is refused outright, before anything
-is transmitted; the error names the `lease-register` command that fixes it.
-Read it rather than retrying.
-
-### ISOs that ignore the keyboard at the boot menu
-
-Some legacy install ISOs ignore Tab and typed characters at their boot menu
-while Enter and arrow keys still work (observed: Ubuntu 14.10 server,
-isolinux/vesamenu). The "append `console=ttyS0` via Tab" shortcut is unusable
-on that media, so the installer boots onto VGA; drive it with the bounded
-screenshot/keyboard loop instead (see
-[gui-installers.md](gui-installers.md)). Serial access can still be enabled
-after install — for example an upstart getty plus `console=ttyS0` on the
-kernel line — for later text access.
-
-## 👁️ Reading a screen
-
-A screen is read by a model. Work down this list:
-
-1. **Guest is a terminal** — `console text`. Proxmox hands over the guest's
-   real character stream; exact beats any look at pixels.
-2. **You can see images** — `console screenshot`, then read the PNG it wrote.
-3. **You cannot see images** — `console inspect` when a vision key is stored,
-   otherwise `console screenshot --for-model`, which returns the screen inline
-   as a bounded base64 PNG for you to decode and look at. `console inspect`
-   attaches the same base64 copy automatically when every provider fails, so a
-   vision outage never leaves you with nothing to read.
-
-There is no OCR. Glyph matching only worked on a guest whose console font the
-controller already had; `--ocr` and `console import-font` still exist as
-deprecated signposts that error with a pointer here. They will be removed only
-when the release notes announce a deliberate removal. Never substitute Tesseract,
-crops, or image filters for actually looking at the screen.
+- `proxmox-lab journal --limit 20` — what you just did, as recorded. The audit
+  is redacted by construction: typed text and command strings never appear.
+- `proxmox-lab cleanup-expired` — sweep any expired leases (yours or a dead
+  session's). A no-op sweep writes no event, so the journal stays signal.
+- `proxmox-lab gc install --host-change-authorized` — the host-side net:
+  root cron every 10 minutes reaps guests whose `pxl-expiry` passed and powers
+  the host off after two consecutive clear runs. Install it once when the
+  user asks; `proxmox-lab gc status` verifies script, checksum and crontab.
+- Long-term work: `lease-begin --long-term` pins the host on and stamps
+  `pxl-expiry=0` — never swept. Exit is `lease-destroy --confirm`. Use only
+  when the user asked for persistence.
 
 ## 🩺 When something fails
 
-See [troubleshooting.md](troubleshooting.md) for a symptom-to-command guide.
-Work down this list before concluding the tool is broken.
+[troubleshooting.md](troubleshooting.md) is the symptom-to-command guide.
+Work down this list before concluding the tool is broken:
 
 ```bash
-proxmox-lab doctor          # config, secrets, reachability, privileges
+proxmox-lab doctor        # config, ssh answer, host tooling, lab.db, GC cron
+proxmox-lab status        # host reachable? leases? vmids on the node?
 proxmox-lab guest probe --vmid <id>
-proxmox-lab console screenshot --vmid <id>   # what is it actually doing?
-proxmox-lab journal --limit 20               # what did I just do?
+proxmox-lab journal --limit 20
 ```
-
-**HTTP 403 on something that should work.** The API token almost certainly
-lacks a privilege. Proxmox tokens with privilege separation inherit *nothing*
-from their user, so a role granted to the user does not apply to the token.
-`doctor` lists what is missing.
-
-**A guest command hangs.** Take a screenshot. The guest is usually sitting at a
-prompt — a bootloader menu, a login, a package manager asking a question.
-
-**"No egress" from a guest behind the VPN gateway.** Check with ICMP before
-concluding the network is broken; a minimal image often has no `curl` at all.
-`net leak-test` does this correctly.
 
 ## 📢 Reporting honestly
 
-- If `lease-end` does not confirm power-off, **say so**. Do not report success.
-- Distinguish *inconclusive* from *negative*. A probe that returned nothing is
-  not proof of safety. The leak test models this deliberately: a broken probe
-  is reported as unproven, never as a pass.
-- Quote the command output that supports your claim. "The tunnel works" is
-  weaker than an egress IP that differs from the home WAN.
+- If `lease-end` does not confirm power-off, **say so**. Do not report
+  success. Same for a `cleanup_failed` lease or a `lease-end`/`power shutdown`
+  that exits non-zero.
+- Distinguish *inconclusive* from *negative*. `agent_ok: false` from probe is
+  a fact; a screenshot you never took is not. `doctor` marks unreachable-host
+  checks `skipped`, and skips never count as failures.
+- Quote the output that supports your claim — `"host_powered_off": true`, an
+  exit code, a `sha256` that matched.
 - If you skipped part of the task, name the part.
 
 ## 🛑 Things that need explicit permission
 
-The tool refuses these unless you pass a flag, and you should not pass the flag
-unless the user asked for that specific change. Canonical command+flag pairs and scopes live in [safety-policy.md](safety-policy.md#commands) — do not invent flags not listed there.
+The tool refuses these unless you pass a flag (or `confirm: true` over MCP),
+and you should not pass it unless the user asked for that specific change.
+Canonical command+flag pairs live in [safety-policy.md](safety-policy.md) —
+do not invent flags not listed there.
 
-Summary of gated categories (see safety-policy for exact commands):
+- `guest destroy`, `lease-destroy`, `lease-abandon` → `--confirm`
+- ending a lease that shares a guest with another live lease →
+  `--shared-guests-authorized` (prefer ending the other lease)
+- `cleanup-expired --reclaim-orphans` / `--orphans-only` →
+  `--host-change-authorized` (`--include-active` overrides the in-use signals)
+- `gc install`/`uninstall` → `--host-change-authorized`
+- `power wake`/`power shutdown` → `--standalone-authorized`, and these are
+  *operator* levers: agents work through leases.
+- deleting a guest the lease does not own → not possible, refused outright.
 
-- Host networking, storage, permissions, USB passthrough, memflow host-setup → `--host-change-authorized` (persistent host changes; see also `--slow-storage-accepted` for bulk-disk API writes)
-- Formatting a disk → `--wipe-confirmed` plus `--expect-serial` (and `--expect-size-gb` — irreversible, device names move)
-- Preparing a host for memflow or handing USB hardware to a guest → `--host-change-authorized`
-- Writing live guest memory (`memflow write`, `memflow phys-write`) or offline guest filesystem (`disk write`) → `--i-understand`
-- Ending a lease that shares a guest with another active lease → `--shared-guests-authorized`
-- Deleting a guest the lease did not create → *not possible* — refused outright
-
-Before anything destructive, **look at the target**. A disk that "should be
-empty" may not be — check before you wipe, and report what you found.
-
-## ⚡ Working efficiently
-
-- **Do not poll a build in a tight loop.** Cloning and provisioning take
-  minutes. Start it, then do something useful, then check.
-- **Reuse one lease** for a session's work instead of opening and closing
-  repeatedly; each cycle costs a boot.
-- **Templates beat installs.** Clone a cloud-init template in seconds rather
-  than installing an OS.
-- **Keep guest disks on fast storage.** A bulk USB disk is fine for ISOs and
-  images, painful to boot from.
-- **For GUI installers, use the bounded checkpoint loop.** One action can
-  return its settled screenshot with `--screenshot-after 3`; do not create
-  external crop-and-filter loops. Use `console inspect` first when an optional
-  cloud vision key is configured. Otherwise, if the current model has no
-  vision, get the screen inline with `console screenshot --for-model`, or
-  delegate the single-screen decision to a model that can see. See
-  [gui-installers.md](gui-installers.md).
+Before anything destructive, **look at the target**: `guest list`, `status`,
+a screenshot. Report what you found.
 
 ## 📝 A worked example
 
-Bring up a Debian VM, check something, tear it down:
+Bring up a VM, check something, tear it down:
 
 ```bash
 set -e
@@ -198,86 +195,10 @@ L=$(proxmox-lab lease-begin --purpose "check systemd unit ordering" \
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 trap 'proxmox-lab lease-end --lease "$L"' EXIT
 
-proxmox-lab api --lease "$L" --method POST \
-  --path /nodes/$NODE/qemu/102/clone \
-  --data newid=9001 --data name=probe --wait-task
-proxmox-lab lease-register --lease "$L" --kind qemu --vmid 9001 --name probe
-proxmox-lab api --lease "$L" --method POST \
-  --path /nodes/$NODE/qemu/9001/status/start --wait-task
-
+proxmox-lab guest clone --lease "$L" --vmid 9001 --source 100 --name probe
+proxmox-lab guest start --lease "$L" --vmid 9001
 proxmox-lab guest probe --vmid 9001
-proxmox-lab guest run --lease "$L" --vmid 9001 systemd-analyze critical-chain
+proxmox-lab guest run --lease "$L" --vmid 9001 -- systemd-analyze critical-chain
 ```
 
 The `trap` is the important line. Everything else is detail.
-
-## ⚡ Builders, templates, and long jobs
-
-For repeated compile/test loops against a disposable builder, do not end a
-lease between attempts — each `lease-begin`/`lease-end` cycle costs a host
-boot and provisioning. Begin once, keep it alive with
-`lease-heartbeat --lease "$L"` (every ≤20 min), and reuse it:
-
-- **Promote a provisioned builder to a template** once it has your toolchain
-  and caches (`guest template --lease "$L" --vmid <id>`, guest must be
-  stopped). Later iterations clone it in seconds
-  (`guest clone --lease "$L" --template <id> --newid <id>`), and the clone is
-  registered to the lease automatically.
-- **Long builds** should not block on an agent exec timeout. Start them
-  detached: `guest run --lease "$L" --vmid <id> --detach <command…>` returns a
-  pid immediately; stream output with
-  `guest log --lease "$L" --vmid <id> --pid <pid> --follow` and block on
-  completion with `guest wait --lease "$L" --vmid <id> --pid <pid>`. The exit
-  code is recorded as a `grun-exit:N` marker in the log.
-- **Large artifacts** (ISOs, qcow2 overlays) transfer in chunks with
-  end-to-end SHA-256 verification: `push`/`pull` automatically chunk files
-  above 32 MiB on Linux guests (`--chunk-size MB` to tune). A `pull` with
-  `--sha256` skips the transfer entirely when the local copy already matches,
-  so retries are cheap and idempotent.
-- **Optional network services**: spawn a lease-owned DHCP server
-  (`net dhcp-create`, optional PXE via `--bootfile` + `--next-server`), a TFTP
-  server for boot files (`net tftp-create`, stage files with `net tftp-push`),
-  or see who got an address (`net dhcp-leases`). Together they form a minimal
-  PXE stack on the lab bridge for netbooting installers. They are optional:
-  nothing spawns them unless you ask.
-- **Kernel debugging**: when a guest waits on a serial debugger
-  (e.g. ReactOS KDBG `connect a debugger on port COM1`), attach through the
-  serial bridge instead of treating it as a wall:
-  `console bridge --lease "$L" --vmid <id> --port 4000`, then connect a KD
-  protocol client (ReactOS KDBG speaks the WinDbg KD protocol — attach
-  WinDbg from a Windows host via a TCP-to-COM shim, or gdb/`nc` for raw
-  serial) to that port.
-
-## 🧠 Kernel debugging playbook
-
-When a guest kernel misbehaves, pick the right tool for the layer:
-
-- **Boot logs / panic traces** — capture the serial stream continuously:
-  `console text --vmid <id> --follow --timeout 300` (serial must exist;
-  `console screenshot` if the panic is on the display).
-- **Attach a kernel debugger** — ReactOS KDBG and Windows KD speak the WinDbg
-  KD protocol over serial. `console bridge --lease "$L" --vmid <id> --port 4000`
-  then attach WinDbg (from a Windows host, via a TCP-to-COM shim) or gdb/`nc`
-  for raw serial.
-- **Live memory introspection** (no guest agent, no patched kernel) —
-  `memflow processes|scan|read|phys-write` against the running guest; vCPU
-  state via `memflow registers`.
-- **Live CPU stepping** — `memflow trace --steps N` / `memflow break --addr`
-  drive QEMU's built-in gdbstub (RSP) for single-step and breakpoints.
-- **Diagnose a stuck boot** — `memflow boot-diagnose --lease "$L" --vmid <id>`
-  classifies the CPU as wedged vs executing and scans RAM for boot-failure
-  text (kernel panic, GRUB rescue, BIOS/Windows boot errors) when no console
-  is usable.
-- **Port or debug virtio drivers** — `virtio inspect --vmid <id>` reports the
-  configured virtio devices and their live negotiated feature bits (via the
-  read-only QEMU monitor); `virtio decode --value 0x… --device net|blk|scsi`
-  names every bit in a feature word offline, for checking a driver's
-  negotiation against what the device offers.
-- **Iterate without reinstalling** — before testing a new kernel build,
-  `guest snapshot --lease "$L" --vmid <id> --mode create --name before-kernel`;
-  after a bugcheck, stop the guest and
-  `guest snapshot --mode rollback --name before-kernel` to return to the known
-  good state. List/delete with `--mode list|delete`.
-- **Collect the dump** — after a crash, `pull` the guest's dump file
-  (Windows `C:\Windows\MEMORY.DMP`, ReactOS/BSD equivalent) for offline
-  analysis with the Ghidra LXC (`memflow analyze` for live buffers).

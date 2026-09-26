@@ -288,7 +288,6 @@ TOOLS: tuple[dict[str, Any], ...] = (
             lease_id=_STR,
             confirm=_BOOL,
             all=_BOOL,
-            no_backup=_BOOL,
         ),
     },
     {

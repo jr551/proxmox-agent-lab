@@ -13,6 +13,31 @@ is verified powered off when the last lease ends. **Nothing runs on the
 Proxmox host** except `qm`/`pct`/`pvesh` — plus one optional garbage-collector
 cron line (`gc install`). Zero third-party dependencies.
 
+## The host may be in use
+
+The Proxmox host is often **someone's live machine** — the lab is a guest on
+it, not a replacement for it. Everything the lab creates is labelled:
+
+```
+tags:        pxl;lease-<id>
+description: pxl-lease=<id> pxl-expiry=<epoch>
+```
+
+Rules that follow from that, and they are not negotiable:
+
+- **Never touch a guest without a `pxl` tag.** Do not destroy, stop, resize
+  or reconfigure it, and do not `lease-register` one you were not asked to
+  adopt. A refusal here is the design working, not an obstacle.
+- **Check VMID and storage before creating.** Use an unused VMID and a pool
+  that exists on this host: `guest create --vmid <free> --storage <pool>
+  --disk-gb <n>`. A collision destroys a real machine.
+- **Do not force a power-off.** `lease-end` powers the host down only when
+  nothing is running and two clear checks agree. If it leaves the host up,
+  read the `reason` it prints — usually the operator's own guests. Report it;
+  do not override it.
+- Lab guests are visible in the normal Proxmox web UI under the `pxl` tag.
+  Their presence is expected, not a problem to hide.
+
 ## Setup (operator, once)
 
 1. `python3 -m pip install proxmox-agent-lab` (Python ≥ 3.11).

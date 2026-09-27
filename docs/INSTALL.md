@@ -1,37 +1,75 @@
 # Installation
 
 Two machines are involved: the **controller** (this tool, on your laptop or
-any always-on box) and the **lab host** (a spare PC running Proxmox).
-Everything the controller does travels over one ssh connection as root —
-there is no other credential, service, or listener to set up.
+any always-on box) and the **Proxmox host** it drives. Everything the
+controller does travels over one ssh connection as root — there is no other
+credential, service, or listener to set up.
 
 **Prerequisites:**
 
 - **Controller:** Python 3.11+ and `pip`.
-- **Lab host:** Proxmox VE 8 or 9 on a wired connection with Wake-on-LAN
-  (Wi-Fi cannot wake a machine — use the wired port).
+- **Proxmox host:** VE 8 or 9. It may be a spare machine or a host you
+  already run other workloads on; see
+  [the coexistence notes](#running-alongside-an-existing-install) before
+  choosing one.
 - **You:** root ssh access to the host, which you are about to set up.
-
-Budget about an hour, most of it waiting for the Proxmox installer.
 
 ---
 
-## 1. Install Proxmox on the spare PC
+## 1. Trust your controller on the host
 
-Download **Proxmox VE 8 or 9** from
-[proxmox.com/downloads](https://www.proxmox.com/en/downloads), write it to a
-USB stick, and install. Two choices matter:
+This is the only host-side setup. On the controller:
 
-- **Hostname.** Whatever you pick becomes the *node name* you put in the
-  config. `pve` is the default; the short name is what you want, not the FQDN.
-- **Network.** Give the machine a **static IP**, or a DHCP reservation. If its
-  address moves, nothing here can find it.
+```sh
+ssh-copy-id root@your-proxmox-host
+```
 
-## 2. Prepare the machine to be woken and shut down
+Confirm it works without a password prompt:
 
-**Enable Wake-on-LAN in the BIOS.** Reboot into firmware setup and look for
-*Wake on LAN*, *Power On By PCI-E*, or *Resume by LAN* — usually under Power
-Management. Turn it on.
+```sh
+ssh root@your-proxmox-host 'pveversion'
+```
+
+Nothing is installed on the host by that: the tool drives `qm`, `pct` and
+`pvesh` over that one channel.
+
+`your-proxmox-host` is just a name — use an ssh alias, hostname, or IP. If
+you prefer an alias, put it in `~/.ssh/config` first:
+
+```
+Host proxmox
+    HostName 192.0.2.10
+    User root
+```
+
+Prove it works with no prompts (this is exactly how the tool connects):
+
+```sh
+ssh -o BatchMode=yes root@proxmox true && echo ok
+```
+
+## 2. Install the controller
+
+```sh
+python -m pip install proxmox-agent-lab
+proxmox-lab init        # writes the starter config
+$EDITOR ~/.config/proxmox-agent-lab/config.toml
+proxmox-lab doctor      # checks the whole path; non-zero if anything fails
+```
+
+From a checkout, `scripts/proxmox-lab` runs the same commands uninstalled.
+
+Set `[ssh] target` to the host, and `[pve] node` to its node name (the short
+name — `pve` by default, not the FQDN). Every setting and its default is in
+[CONFIGURATION.md](CONFIGURATION.md).
+
+## 3. Optional: Wake-on-LAN
+
+Only needed if you want the tool to power the host on and off. A host that
+is always on can skip this section entirely.
+
+**Enable Wake-on-LAN in the BIOS** — look for *Wake on LAN*, *Power On By
+PCI-E*, or *Resume by LAN*, usually under Power Management.
 
 **Note the MAC address** of the wired NIC. On the Proxmox console:
 
@@ -57,51 +95,43 @@ printf '#!/bin/sh\nethtool -s %s wol g\n' <interface> > /etc/network/if-up.d/wol
 chmod +x /etc/network/if-up.d/wol
 ```
 
-## 3. Trust your controller on the host
+Record the MAC in the config under `[power] mac` (the `power wake` commands
+refuse without it).
 
-Copy your public key to the host once, as root:
+---
 
-```sh
-ssh-copy-id root@proxmox
-```
+## Running alongside an existing install
 
-`proxmox` is just a name — use your ssh alias, hostname, or IP. If you want an
-alias, put it in `~/.ssh/config` first:
+The tool creates ordinary, labelled guests and only ever touches those:
 
 ```
-Host proxmox
-    HostName 192.0.2.10
-    User root
+tags:        pxl;lease-<id>
+description: pxl-lease=<id> pxl-expiry=<epoch>
 ```
 
-Prove it works with no prompts (this is exactly how the tool will connect):
+- A guest **without** a `pxl` tag is never destroyed, stopped or reclaimed.
+- Lab guests are visible in the normal web UI; filter by the `pxl` tag.
+- The host is powered off only when nothing is running — including your own
+  unlabelled guests — and only after two clear checks minutes apart.
+- Pick storage and VMIDs that do not collide with your own:
+  `guest create --storage <name> --disk-gb <n> --vmid <id>`.
 
-```sh
-ssh -o BatchMode=yes root@proxmox true && echo ok
-```
+## 4. Set the config
 
-## 4. Install the controller and create the config
-
-```sh
-python -m pip install proxmox-agent-lab
-proxmox-lab init
-```
-
-`init` writes a starter file to
-`~/.config/proxmox-agent-lab/config.toml` (use `--path` to choose another
-location, `--force` to overwrite). Edit it and set the four values that are
-site-specific:
+`init` wrote a starter file to `~/.config/proxmox-agent-lab/config.toml`
+(use `--path` to choose another location, `--force` to overwrite). Edit it
+and set the values that are site-specific:
 
 ```toml
 [ssh]
-target = "proxmox"           # the alias/host from step 3
+target = "proxmox"           # the alias/host from step 1
 
 [pve]
-node = "pve"                 # the hostname you chose in step 1
+node = "pve"                 # the host's short hostname
 template_vmid = 100          # a template to clone guests from
 
 [power]
-mac = "aa:bb:cc:dd:ee:ff"    # the MAC you noted in step 2
+mac = "aa:bb:cc:dd:ee:ff"    # the MAC you noted in step 3 (optional)
 ```
 
 Every key, default and search order is documented in
@@ -198,3 +228,19 @@ proxmox-lab journal --limit 20
 When something misbehaves: [troubleshooting.md](troubleshooting.md) first,
 then [safety-policy.md](safety-policy.md) for the rules the code enforces and
 [VERIFICATION.md](VERIFICATION.md) for what has actually been tested.
+
+---
+
+## Appendix: installing on a brand-new host
+
+If the machine has no Proxmox yet, download **Proxmox VE 8 or 9** from
+[proxmox.com/downloads](https://www.proxmox.com/en/downloads) and install
+it before any of the above. Two choices matter:
+
+- **Hostname.** Whatever you pick becomes the *node name* you put in the
+  config (`[pve] node`). `pve` is the default; use the short name, not the
+  FQDN.
+- **Network.** Give the machine a **static IP**, or a DHCP reservation. If
+  its address moves, nothing here can find it.
+
+Then return to step 1.

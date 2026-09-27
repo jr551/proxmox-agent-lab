@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "proxmox-agent-lab"
 version = "0.18.0"
-description = "Turn an old computer into a disposable AI research lab that cleans up and powers itself off."
+description = "A skill that gives an AI agent disposable Proxmox guests that clean up after themselves."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

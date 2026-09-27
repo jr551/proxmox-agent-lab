@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping turn spare hardware into safer research infrastructure.
+Thanks for helping make automated lab work safer and more repeatable.
 
 ## Ground rules
 

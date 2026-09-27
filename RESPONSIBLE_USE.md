@@ -1,20 +1,25 @@
 # Responsible use
 
-Old Computer → AI Lab exists to make legitimate systems research safer and more
+proxmox-agent-lab exists to make legitimate systems research safer and more
 repeatable. Intended uses include authorized reverse engineering, defensive
 malware analysis, incident response, digital forensics, vulnerability
 reproduction, interoperability, driver and firmware development, debugging,
 and education.
 
+It drives real hypervisors and real guests as root over ssh. It is built for
+hosts you own, and the safest deployment is a host dedicated to the lab; a
+shared production host works, because lab guests are labelled and cleanup
+refuses anything unlabelled, but you are one bug away from someone's
+workload.
+
 Use it only with systems, software, devices, accounts, and network traffic that
 you own or are explicitly authorized to test. Follow applicable law, licenses,
 organizational policy, and coordinated-disclosure expectations.
 
-Some optional features can inspect or mutate live guest memory, pass physical
-USB devices into guests, capture traffic, or intercept TLS in a guest you
-control. Those capabilities have legitimate research value and carry real
-risk. Keep them scoped to disposable guests, enable them deliberately, retain
-the audit trail, and never install an interception CA outside a lab you control.
+Guest memory inspection, USB passthrough, traffic capture and TLS
+interception were part of earlier versions and are **not** in this release.
+The current surface is guest lifecycle, console access and file transfer —
+keep work inside disposable, lease-owned guests, and retain the journal.
 
 The project intentionally enforces leases, resource ownership, explicit
 host-change gates, opt-in host access, redacted auditing, and verified cleanup.

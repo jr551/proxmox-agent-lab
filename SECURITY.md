@@ -1,9 +1,8 @@
 # Security policy
 
-Old Computer AI Lab controls hypervisors, guest machines, networks, storage,
-and optional host-side debugging tools. Please treat vulnerabilities in its
-authorization, isolation, secret handling, cleanup, or console-sharing paths
-as sensitive.
+proxmox-agent-lab controls hypervisors, guest machines, networks and storage
+over a root ssh channel. Please treat vulnerabilities in its authorization,
+isolation, secret handling, cleanup, or guest-destruction paths as sensitive.
 
 ## Supported versions
 

@@ -1,4 +1,4 @@
 interface:
-  display_name: "Old Computer AI Lab"
-  short_description: "Turn spare hardware into a disposable AI research lab"
-  default_prompt: "Use $proxmox-agent-lab to create a temporary research machine, run the requested authorized work, and verify cleanup and lab-host shutdown."
+  display_name: "Proxmox Agent Lab"
+  short_description: "Disposable, self-cleaning Proxmox guests for an AI agent"
+  default_prompt: "Use $proxmox-agent-lab to lease a lab, create the guests the task needs, do the authorized work, and clean up — destroying only the guests it created and leaving the rest of the host untouched."

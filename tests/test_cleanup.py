@@ -343,6 +343,53 @@ class CleanupTests(unittest.TestCase):
         kinds = [call[0] for call in self.seam.destructive()]
         self.assertEqual(kinds, ["shutdown", "stop", "destroy"])
 
+    def test_sweep_never_destroys_a_template(self) -> None:
+        # `guest destroy` refuses a template because it is the shared clone
+        # source; the expiry sweep must not do what the operator-facing
+        # command refuses. The registry row says nothing, so the host config
+        # decides.
+        row = self.begin()
+        self.register(row, "qemu", 101)
+        self.seam._ssh.add(
+            r"^qm config 101", stdout=b"template: 1\nname: tpl\n"
+        )
+        self.expire(row)
+        self.seam.calls.clear()
+
+        payload, error = self.sweep()
+        self.assertIsNone(error)
+        self.assertNotIn(
+            ("destroy", "qemu", 101), self.seam.calls,
+            "the sweep destroyed a template",
+        )
+        self.assertIn("qemu/101", payload["left_to_another_lease"].get(
+            row["id"], []
+        ))
+
+    def test_a_destroy_error_naming_a_missing_path_is_not_success(self) -> None:
+        # The stderr "No such file or directory" can describe a disk the
+        # destroy could not remove, not the guest being absent. Trusting that
+        # text stamped the resource destroyed, ended the lease and orphaned a
+        # live VM with no sweep left to retry it.
+        row = self.begin()
+        self.register(row, "qemu", 101)
+
+        def destroy(kind, vmid, *, purge=True):
+            self.seam.calls.append(("destroy", kind, vmid))
+            raise ProxmoxError(
+                f"qm destroy {vmid} failed: unable to remove directory "
+                f"'/var/lib/vz/images/101': No such file or directory"
+            )
+
+        self.seam.destroy = destroy
+        self.expire(row)
+        self.seam.calls.clear()
+
+        payload, error = self.sweep()
+        # the guest still answers a status probe -> it is NOT gone
+        self.assertEqual(self.lease_row(row["id"])["state"], "cleanup_failed")
+        self.assertNotIn(row["id"], payload["cleaned"])
+
     # -- lease-destroy ------------------------------------------------------
 
     def test_destroy_refuses_without_confirm_before_any_side_effect(self):

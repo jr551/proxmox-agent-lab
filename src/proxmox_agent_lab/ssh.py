@@ -98,6 +98,18 @@ _PXL_INSTALL_PREFIX = "/usr/local/sbin/pxl-"
 #: The pxl log namespace ``base64`` may read (the GC's cron log).
 _PXL_LOG_PREFIX = "/var/log/pxl-"
 
+#: ``pvesh`` verbs that only read. ``pvesh get`` is the API read the seam uses
+#: everywhere; ``usage``/``help`` print text and change nothing. Every other
+#: verb (``set``, ``create``, ``delete``, ``start`` …) mutates host state and
+#: is refused unless the caller passes ``host_change=True``.
+_PVESH_READ_VERBS: frozenset[str] = frozenset({"get", "usage", "help"})
+
+#: ``install`` flags that take a separate value operand. Their values are
+#: modes/owners, not paths, so they are never path-confined.
+_INSTALL_VALUE_FLAGS: frozenset[str] = frozenset(
+    {"-m", "-o", "-g", "-t", "--mode", "--owner", "--group", "--target-directory"}
+)
+
 
 def _confine(
     command: str, argument: str, prefixes: tuple[str, ...], verb: str
@@ -144,6 +156,20 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
     ``/var/log/pxl-*``. Flag arguments (``-d``, ``-f`` …) are skipped for
     ``tee``, ``rm`` and ``base64`` (``cat`` checks every argument, as before).
 
+    Three more shapes are gated because the command itself can write the
+    host even though it is not in ``HOST_CHANGE_COMMANDS``. ``pvesh`` is
+    restricted to its read verbs (``get``/``usage``/``help``) and is refused
+    outright for anything else -- ``pvesh set``/``delete``/``create``
+    reconfigure networking, storage and cluster state, and no caller in this
+    tool needs a pvesh write, so the seam offers no way to authorize one.
+    ``ip`` is confined to the read-only ``ip -br link show`` probe doctor
+    needs, refusing ``link set``/``addr add``/``route replace``. ``install``
+    is path-confined like ``tee``: its sources must come from the pxl temp
+    namespace and its destination must land in the pxl install namespace
+    (``install -d`` may create only a pxl temp/log directory), with
+    value-carrying flags (``-m``, ``-o``, ``-g``, ``-t``) skipped so a mode
+    is never mistaken for a path.
+
     This replaces the old API-path policy gate (``host_policy.check_api``):
     the gate moved from URL parsing to argv policy. What the gate never did --
     lease and ownership gating over which guest or host a caller may touch --
@@ -189,6 +215,66 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
                 argument,
                 (_PXL_TEMP_PREFIX, _PXL_INSTALL_PREFIX, _PXL_LOG_PREFIX),
                 "reads",
+            )
+    if command == "pvesh":
+        # `pvesh` reaches every corner of the API -- `pvesh set/delete/create`
+        # reconfigures networking, storage and cluster state. Only the read
+        # verb is on the ungated list; anything that writes needs the
+        # host-change authorization like `shutdown` does.
+        verb = argv[1] if argv[1:2] else ""
+        if verb not in _PVESH_READ_VERBS:
+            allowed = " or ".join(sorted(_PVESH_READ_VERBS))
+            raise PolicyError(
+                f"refused: pvesh {verb!r} is not a read verb; without "
+                f"host_change=True pvesh may only be used as {allowed}"
+            )
+    if command == "ip":
+        # Same shape as pvesh: `ip -br link show` is a read doctor probe,
+        # but `ip link set`/`ip addr add`/`ip route replace` reconfigure the
+        # host's networking. Confine the ungated form to the read-only
+        # `link show` probe doctor needs.
+        if argv[1:2] not in (["-br"], ["-brief"], ["-o"]) or (
+            "show" not in argv
+        ):
+            raise PolicyError(
+                "refused: ungated ip is limited to the read-only "
+                "'ip -br link show' probe"
+            )
+    if command == "install":
+        # `install` writes and chmods: the last unconfined writer. Only the
+        # GC script namespace may be written, from the host temp staging
+        # path, so a host-change-authorized caller cannot copy arbitrary
+        # files to arbitrary destinations.
+        # `install` takes value-carrying flags (`-m 0755`, `-o root`, `-g
+        # root`), so a flag's *value* must be skipped too -- `-m`'s operand
+        # is a mode, not a path, and treating it as one would refuse every
+        # legitimate install.
+        operands: list[str] = []
+        skip_value = False
+        for argument in argv[1:]:
+            if skip_value:
+                skip_value = False
+                continue
+            if argument in _INSTALL_VALUE_FLAGS:
+                skip_value = True
+                continue
+            if argument.startswith("-"):
+                continue
+            operands.append(argument)
+        # `install -d <dir>` creates a single directory; `install src dst`
+        # and `install -t DIR src...` copy sources onto a destination.
+        if "-d" in argv[1:] and len(operands) == 1:
+            _confine(
+                "install", operands[0], (_PXL_TEMP_PREFIX, _PXL_LOG_PREFIX),
+                "creates",
+            )
+        else:
+            if len(operands) < 2:
+                raise PolicyError("refused: install needs a source and a dest")
+            for source in operands[:-1]:
+                _confine("install", source, (_PXL_TEMP_PREFIX,), "reads")
+            _confine(
+                "install", operands[-1], (_PXL_INSTALL_PREFIX,), "writes"
             )
 
 

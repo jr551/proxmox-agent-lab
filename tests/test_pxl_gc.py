@@ -380,24 +380,44 @@ class PxLGcTests(unittest.TestCase):
 
     # -- robustness -------------------------------------------------------
 
-    def test_missing_qm_is_survived(self):
+    def test_missing_qm_is_survived_and_never_powers_off(self):
+        # A failed listing is NOT "no guests exist". The LXC duty still runs
+        # on what `pct list` could enumerate, but the power-off duty must
+        # refuse: a missing/failed `qm` cannot tell us no QEMU guest is
+        # running, and powering the host off under a running untracked guest
+        # is the one outcome §F forbids.
         (self.bin / "qm").unlink()
         self.add_guest("pct", 201, status="stopped",
                        config=pxl_config(EXPIRED))
+        self.state.mkdir(exist_ok=True)
+        self.stamp().write_text(str(NOW - 700) + "\n")
         proc = self.run_gc()
         self.assert_boring(proc)
-        self.assertIn("qm not found on PATH; skipping qemu guests", proc.stdout)
+        self.assertIn("qm not found on PATH; cannot enumerate qemu guests",
+                      proc.stdout)
+        # the LXC duty still reaped what it could see
         self.assertIn("201: destroyed", proc.stdout)
         self.assertFalse((self.stub / "pct" / "201").exists())
+        # but the host stayed up, and the clear stamp is gone
+        self.assertIn("not clear: guest enumeration failed; refusing to power off",
+                      proc.stdout)
+        self.assertNotIn("poweroff", self.calls())
+        self.assertFalse(self.stamp().exists())
 
-    def test_failed_qm_is_survived(self):
+    def test_failed_qm_list_never_powers_off(self):
         self.write_stub("qm", "#!/bin/sh\n"
                               "echo \"qm $*\" >> \"${PXL_GC_STUB_DIR:?}/calls.log\"\n"
                               "echo boom >&2\n"
                               "exit 1\n")
+        self.state.mkdir(exist_ok=True)
+        self.stamp().write_text(str(NOW - 700) + "\n")
         proc = self.run_gc()
         self.assert_boring(proc)
         self.assertIn("qm list failed (1): boom", proc.stdout)
+        self.assertIn("not clear: guest enumeration failed; refusing to power off",
+                      proc.stdout)
+        self.assertNotIn("poweroff", self.calls())
+        self.assertFalse(self.stamp().exists())
 
     def test_unknown_flag_exits_2(self):
         proc = self.run_gc("--bogus")

@@ -87,14 +87,21 @@ def run_command(argv, timeout):
 
 
 def enumerate_guests(binary, kind):
-    """[(vmid, status)] from `qm list` / `pct list`; any failure logs and yields []."""
+    """(guests, ok) from `qm list` / `pct list`.
+
+    `ok` is False when the listing itself failed -- the binary missing from
+    PATH, or the command erroring. Callers must NOT read an empty list as
+    "no guests exist": an unknown state is what keeps the power-off duty
+    from firing (fail closed), while the deletion duty simply has nothing
+    it can safely act on.
+    """
     if shutil.which(binary) is None:
-        log(binary + " not found on PATH; skipping " + kind + " guests")
-        return []
+        log(binary + " not found on PATH; cannot enumerate " + kind + " guests")
+        return [], False
     rc, out, err = capture(binary, ["list"])
     if rc != 0:
-        log(binary + " list failed (" + str(rc) + "): " + err + "; skipping these guests")
-        return []
+        log(binary + " list failed (" + str(rc) + "): " + err + "; cannot enumerate")
+        return [], False
     guests = []
     lines = out.splitlines()
     for line in lines[1:]:  # first line is the column header
@@ -110,7 +117,7 @@ def enumerate_guests(binary, kind):
             log("unparseable status for " + parts[0] + ", treating as running")
             status = "running"
         guests.append((parts[0], status))
-    return guests
+    return guests, True
 
 
 def fetch_config(binary, vmid):
@@ -280,8 +287,24 @@ def run_poweroff():
         log("poweroff command sent: " + " ".join(argv))
 
 
-def power_pass(enumerated, pinned, stopped, now, state_dir, dry):
-    """Second duty: power the host off when idle across two clear runs >=10 min apart."""
+def power_pass(enumerated, pinned, stopped, now, state_dir, dry, known):
+    """Second duty: power the host off when idle across two clear runs >=10 min apart.
+
+    `known` is False when any guest listing failed. "Could not enumerate"
+    is NOT "no guests running" -- a listing failure under a running untracked
+    guest would otherwise power the host off under live work, so the duty
+    refuses to judge and drops any clear stamp (fail closed, §F).
+    """
+    if not known:
+        log("not clear: guest enumeration failed; refusing to power off")
+        try:
+            os.unlink(stamp_path(state_dir))
+            log("clear stamp removed")
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log("warn: cannot remove clear stamp: " + str(exc))
+        return
     running = sum(1 for kind, vmid, status in enumerated
                   if status == "running" and (kind, vmid) not in stopped)
     if running or pinned:
@@ -333,8 +356,12 @@ def main(argv):
     enumerated = []  # (kind, vmid, status)
     pinned = set()   # (kind, vmid): parseable pxl metadata, expiry 0 or future
     stopped = set()  # (kind, vmid): stopped or destroyed by this run
+    known = True     # did every guest listing succeed? (power-off fails closed)
     for kind, binary in (("qemu", "qm"), ("lxc", "pct")):
-        for vmid, status in enumerate_guests(binary, kind):
+        guests, ok = enumerate_guests(binary, kind)
+        if not ok:
+            known = False
+        for vmid, status in guests:
             enumerated.append((kind, vmid, status))
 
     for kind, vmid, status in enumerated:
@@ -369,7 +396,7 @@ def main(argv):
         except Exception as exc:  # one bad guest never fails the run
             log("warn " + vmid + ": internal error (" + str(exc) + "); not deleting")
 
-    power_pass(enumerated, pinned, stopped, now, state_dir, dry)
+    power_pass(enumerated, pinned, stopped, now, state_dir, dry, known)
     return 0
 
 

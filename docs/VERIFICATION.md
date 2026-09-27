@@ -9,16 +9,29 @@ and, just as usefully, what has not.
 The control plane was rebuilt on 2026-09-25: the old HTTP API, central
 ledger, and host daemon were replaced by a single root ssh channel and a
 local SQLite `lab.db` ([architecture.md](architecture.md) has the module
-map). **No run against a real Proxmox node has been recorded since that
-rebuild.** Every claim below is test-suite evidence; nothing on this page
-has been observed end to end on hardware in its current form.
+map).
+Several runs against a real Proxmox node **were** recorded on 2026-09-25 and
+2026-09-27 (PVE 9.2.2, node `pve`), covering `init`, `doctor`, `status`,
+`lease-begin`/`lease-end`, fresh LXC create, `guest probe`/`guest run`,
+`push`/`pull` with a sha256-verified payload, `guest destroy`, `journal`,
+`gc status`, and an MCP `guest_list` over real stdio. Two defects were found
+by those runs and fixed (an LXC `rootfs` with no storage knob, and
+`guest destroy` refusing a running guest). A 2026-09-27 review pass added
+the safety fixes listed below and re-ran the full lease lifecycle on
+hardware: create → run → lease-end destroyed the guest while leaving every
+pre-existing guest (100–103) untouched.
+
+Claims below are still labelled per-section: test-suite evidence unless the
+section says otherwise. What remains unobserved is the host power-off
+duty and the installed `pxl-gc` crontab — see
+"What it cannot prove".
 
 That does not mean the suite is thin — it means the boundary between
-"the code does X" and "Proxmox accepts X" is drawn exactly where it is.
+"the code does X" and "Proxmox accepts X" is drawn explicitly, not assumed.
 
 ## The suite that exists
 
-308 tests, warning-clean (`PYTHONWARNINGS=error`), run with:
+311 tests, warning-clean (`PYTHONWARNINGS=error`), run with:
 
 ```bash
 python3 -m unittest discover -s tests -q
@@ -146,6 +159,52 @@ node over the old HTTP API control plane. Two things changed underneath it:
 
 That history is kept in git, not on this page: it described a system that
 has been replaced.
+
+## Review findings fixed on 2026-09-27
+
+A three-way review of the rework diff (destruction/ownership, remote seam
+and MCP protocol, state/audit/host GC) found these defects. Each is fixed
+and each fix has a regression test; the ones marked *hardware* were
+re-verified on the real node afterwards.
+
+- **Host GC failed open on enumeration failure** (most serious). A failed or
+  missing `qm`/`pct list` returned `[]`, which the power-off duty read as
+  "zero running guests" — so a listing failure (for example cron's PATH
+  lacking `/usr/sbin`) could power the host off under a running untracked
+  guest. Enumeration now reports failure distinctly and the power-off duty
+  refuses to judge, dropping the clear stamp so a later clear run must
+  re-observe. *Unit-tested; the installed-cron path is still unobserved.*
+- **The expiry sweep destroyed templates.** `guest destroy` refuses a
+  template, but `finalize_lease` never read the guest config, so a template
+  registered `disposable` was destroyed — killing the shared clone source.
+  The sweep now consults the host config and skips templates. *Hardware:
+  a real lease-end destroyed only its own guest and left 100–103 intact.*
+- **A teardown error was mistaken for success.** `_guest_is_gone` matched
+  any "no such file or directory" in stderr, so a destroy that failed over a
+  disk path stamped the resource destroyed and ended the lease, orphaning a
+  live guest with no sweep left to retry it. Absence is now confirmed by a
+  fresh status probe. *Unit-tested.*
+- **`guest destroy` ignored cross-lease ownership**, so one lease could
+  destroy a guest another live lease had registered. Now refused.
+- **MCP transfer tools had no path confinement** — a remote client could
+  read any host file (`push_file`) or overwrite any host file with
+  guest-controlled bytes (`pull_file`), running as root. MCP transfer paths
+  are now confined to `<state dir>/transfers`; the CLI operator is
+  unaffected.
+- **The seam allowed host-mutating shapes ungated**: `pvesh` (any verb) and
+  `ip` (any subcommand) could reconfigure networking, storage and cluster
+  state without `host_change=True`, and `install` was not path-confined.
+  `pvesh` is now read-verbs-only, `ip` is limited to the read-only probe,
+  and `install` is confined to the pxl namespaces. *Hardware: `doctor`,
+  which exercises both reads, still passes.*
+- **Unbounded client numbers**: `guest_run`/`guest_stop` `timeout` and
+  `journal_query` `limit` were accepted with no ceiling and flowed into a
+  blocking ssh subprocess. Now capped.
+
+Still unobserved on hardware: the verified host power-off and shutdown
+probes, and an installed `pxl-gc` crontab run (the GC script itself was
+exercised with stubbed `qm`/`pct`, and the enumeration-failure path was
+verified directly against the real script).
 
 ## Reproducing a hardware pass
 

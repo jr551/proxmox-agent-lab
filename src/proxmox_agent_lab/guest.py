@@ -448,6 +448,18 @@ def cmd_destroy(lab: Any, args: Any) -> dict:
         )
     row = require_owned(lab, lease_id, None, vmid)
     kind = str(row["kind"])
+    with _open_store(lab) as store:
+        owner = store.owner_elsewhere(lease_id, kind, vmid)
+    if owner:
+        # `require_owned` only asks whether THIS lease has a live row. A
+        # vmid registered to two live leases (dual registration is reachable:
+        # an expired-but-active lease still counts) would let one lease
+        # destroy a machine the other is using.
+        raise LabError(
+            f"{kind} {vmid} is also registered to lease {owner}, which is "
+            f"still live: a guest another lease owns is never destroyed from "
+            f"under it (end that lease first)"
+        )
     prox = _make_proxmox(lab.CONFIG)
     cfg = _guest_config(prox, kind, vmid)
     if row.get("policy") == "retain" or (cfg is not None and _is_template(cfg)):

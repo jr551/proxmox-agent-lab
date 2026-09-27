@@ -34,12 +34,22 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
+from . import config as config_module
 from . import guest as guest_module
 from . import proxmox as proxmox_module
 from .errors import LabError
 
 DEFAULT_TIMEOUT = 300
 MAX_TIMEOUT = 86400
+
+#: Scratch directory, under the state dir, that an MCP transfer may name. The
+#: CLI operator is trusted with any path; an MCP caller is not (see
+#: :func:`_confined_path`).
+TRANSFER_ROOT = "transfers"
+
+#: While false, transfer paths resolve freely (the trusted CLI). The MCP
+#: dispatch sets it true for the duration of a tool call.
+_CONFINED = False
 
 
 def _make_proxmox(config: Any) -> proxmox_module.Proxmox:
@@ -112,10 +122,46 @@ def _write_private(path: Path, data: bytes) -> None:
         raise LabError(f"cannot write {path}: {exc}") from exc
 
 
+def _confined_path(raw: Any) -> Path:
+    """Resolve a transfer path, confined to the scratch root for MCP callers.
+
+    The CLI is a trusted local operator naming their own ``--file``/``--out``,
+    so nothing there is confined. MCP is not: the caller is a remote
+    JSON-RPC client (typically a model) and the controller runs as root, so
+    ``push_file`` would otherwise read any file root can read (private keys,
+    ``/etc/shadow``) and ``pull_file`` would overwrite any file root can
+    write (``~/.ssh/authorized_keys``) with guest-controlled bytes -- an
+    arbitrary file read/write triggered by a single tool call.
+
+    So while the MCP dispatch is running (:func:`set_unconfined`), the path
+    must resolve inside ``<state dir>/transfers``. The test runs on the fully
+    resolved path, so ``..`` traversal, an absolute path and a symlink
+    pointing outward are all refused, and it happens before any byte is read
+    or written.
+    """
+    path = Path(str(raw)).expanduser()
+    if not _CONFINED:
+        return path.resolve()
+    root = (config_module.state_dir() / TRANSFER_ROOT).resolve()
+    candidate = path.resolve() if path.is_absolute() else (root / path).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise LabError(
+            f"refused: {candidate} is outside the transfer scratch directory "
+            f"{root}; an MCP transfer may only name paths under it"
+        )
+    return candidate
+
+
+def set_unconfined(value: bool) -> None:
+    """Set path confinement for the current call (the MCP dispatch does this)."""
+    global _CONFINED
+    _CONFINED = value
+
+
 def cmd_push(lab: Any, args: Any) -> None:
     """Copy a local file into a guest via chunked base64 guest exec."""
     kind = _require_guest(lab, args)
-    source = Path(args.file).expanduser().resolve()
+    source = _confined_path(args.file)
     if not source.is_file():
         raise LabError(f"not a regular file: {source}")
     data = source.read_bytes()
@@ -164,7 +210,8 @@ def cmd_pull(lab: Any, args: Any) -> None:
         f"pull from {remote}",
     )
     digest = hashlib.sha256(data).hexdigest()
-    out = Path(args.out).expanduser()
+    out = _confined_path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     _write_private(out, data)
     expected = getattr(args, "sha256", None)
     if expected and digest != expected:

@@ -98,6 +98,12 @@ def _schema(*, required: tuple[str, ...] = (), **properties: Any) -> dict:
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
+
+#: Upper bounds for client-supplied numbers that reach a blocking seam call
+#: or a store scan. A tool call must not be able to hold an MCP request open
+#: for years; the same cap `transfer._timeout_seconds` enforces on the CLI.
+_MAX_TIMEOUT = 86400
+_MAX_LIMIT = 1000
 _KEYS = {"type": "array", "items": {"type": "string"}}
 _KIND = {"type": "string", "enum": ["qemu", "lxc"]}
 _STATE = {"type": "string", "enum": ["running", "stopped", "all"]}
@@ -193,7 +199,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             required=("lease_id", "vmid"),
             lease_id=_STR,
             vmid=_INT,
-            timeout=_INT,
+            timeout={**_INT, "maximum": _MAX_TIMEOUT},
             force=_BOOL,
         ),
     },
@@ -226,7 +232,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             lease_id=_STR,
             vmid=_INT,
             command=_STR,
-            timeout=_INT,
+            timeout={**_INT, "maximum": _MAX_TIMEOUT},
             stdin=_STR,
         ),
     },
@@ -294,7 +300,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "name": "journal_query",
         "description": "Read audit events from the local store (read-only).",
         "inputSchema": _schema(
-            lease_id=_STR, since=_STR, limit=_INT
+            lease_id=_STR, since=_STR, limit={**_INT, "maximum": _MAX_LIMIT}
         ),
     },
     {
@@ -351,9 +357,19 @@ def _invoke(
     body always mirrors what the CLI emits. ``redirect_stdout`` confines the
     print to a local buffer -- the protocol stream is never polluted.
     """
+    from . import transfer as transfer_module
+
     buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
-        result = handler(lab, args)
+    # Every tool call comes from a remote caller, so transfer paths are
+    # confined to the scratch root for its duration -- restored even when the
+    # handler raises, so a failure cannot leave confinement off.
+    already_confined = transfer_module._CONFINED
+    transfer_module.set_unconfined(True)
+    try:
+        with contextlib.redirect_stdout(buffer):
+            result = handler(lab, args)
+    finally:
+        transfer_module.set_unconfined(already_confined)
     if isinstance(result, dict):
         return result
     text = buffer.getvalue().strip()
@@ -810,6 +826,13 @@ def _check_params(name: str, arguments: Any) -> dict[str, Any]:
             raise _ParamsError(
                 f"{name}: field '{key}' must be one of "
                 + "/".join(spec["enum"])
+            )
+        if "maximum" in spec and isinstance(value, int) and value > spec["maximum"]:
+            # A client must not be able to block an MCP request for years:
+            # these numbers flow straight into an ssh subprocess timeout or a
+            # store scan. The message names the field, never the value.
+            raise _ParamsError(
+                f"{name}: field '{key}' must be at most {spec['maximum']}"
             )
         if expected == "array":
             item_type = spec.get("items", {}).get("type")

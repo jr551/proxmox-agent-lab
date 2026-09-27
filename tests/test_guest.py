@@ -544,6 +544,27 @@ class DestroyTests(GuestCase):
         self.lab.audit.assert_called_once_with(
             "guest-destroy", lease=LEASE, vmid=101, kind="qemu", purged=True
         )
+
+    def test_destroy_refuses_a_guest_another_live_lease_owns(self) -> None:
+        # require_owned only asks whether THIS lease has a row. Dual
+        # registration is reachable (an expired-but-active lease still
+        # counts), so one lease must not destroy the other's machine.
+        self.open_lease()
+        self.open_lease(OTHER_LEASE)
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.register_guest(OTHER_LEASE, "qemu", 101, name="alpha")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "destroy", "--lease", LEASE, "--vmid", "101",
+                "--confirm",
+            )
+        self.assertIn(OTHER_LEASE, str(caught.exception))
+        self.assertNotIn(
+            ["qm", "destroy", "101", "--purge", "1"], self.argvs()
+        )
+        self.assertEqual(
+            [c for c in self.argvs() if c[0] in ("qm", "pct")], []
+        )
     def test_destroy_stops_a_running_guest_before_destroying(self) -> None:
         # pct/qm destroy refuse a running guest; destroy must stop it first.
         self.open_lease()

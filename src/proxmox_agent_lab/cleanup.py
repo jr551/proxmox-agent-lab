@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import guest as guest_module
 from . import leases as leases_module
 from . import power as power_module
 from . import proxmox as proxmox_module
@@ -282,11 +283,34 @@ def _forget_retained(lab: Any, kind: str, vmid: int) -> None:
     leases_module.forget_resource(_lease_root(lab), kind, int(vmid))
 
 
+def _confirm_absent(lab: Any, kind: str, vmid: int) -> bool:
+    """Ask the host whether the guest is really gone, instead of trusting text.
+
+    ``_guest_is_gone`` matches on message text, and a destroy can fail for
+    an unrelated reason whose stderr merely *contains* "No such file or
+    directory" (a disk path it could not remove, say). Treating that as
+    success stamps the resource destroyed and ends the lease, so no later
+    sweep retries and the live guest is orphaned forever.
+
+    So absence must be *positively claimed* by a fresh probe: a status that
+    comes back is proof the guest lives, and a probe that fails is proof only
+    when the host itself says the guest does not exist. Anything else is no
+    proof, and the record is kept so a later sweep retries.
+    """
+    try:
+        _make_proxmox(lab.CONFIG).status(kind, vmid)
+    except proxmox_module.ProxmoxError as exc:
+        return _guest_is_gone(lab, exc)
+    except Exception:  # noqa: BLE001 - an unreadable status is not proof
+        return False
+    return False  # the host answered with a status: the guest is still there
+
+
 def delete_guest(lab: Any, api: Any, kind: str, vmid: int) -> None:
     try:
         _delete_guest(lab, api, kind, vmid, destroy_unreferenced_disks=True)
     except LabError as exc:
-        if not _guest_is_gone(lab, exc):
+        if not _guest_is_gone(lab, exc) or not _confirm_absent(lab, kind, vmid):
             raise
     _forget_retained(lab, kind, vmid)
 
@@ -436,6 +460,21 @@ def reclaim_orphans(lab: Any, api: Any, *,
     return result
 
 
+
+def _is_template_guest(lab: Any, kind: str, vmid: int) -> bool:
+    """Does the host say this guest is a template? Unreadable config says no.
+
+    Only a *positive* ``template: 1`` from the host counts. If the config
+    cannot be read we have no proof, and skipping a destroy we could have
+    performed is the safe direction: the record stays and a later sweep
+    retries, rather than a template being destroyed on a guess.
+    """
+    try:
+        cfg = guest_module._guest_config(_make_proxmox(lab.CONFIG), kind, vmid)
+    except Exception:  # noqa: BLE001 - an unreadable config is not a template
+        return False
+    return cfg is not None and guest_module._is_template(cfg)
+
 def finalize_lease(lab: Any, api: Any, lease: dict[str, Any]) -> list[str]:
     """Tear down what one lease owned. Returns the failure lines.
 
@@ -475,6 +514,17 @@ def finalize_lease(lab: Any, api: Any, lease: dict[str, Any]) -> list[str]:
             # Retained guests outlive the lease untouched; their metadata is
             # the GC's business, not this teardown's.
             continue
+        if _is_template_guest(lab, kind, vmid):
+            # `guest destroy` refuses a template because destroying one kills
+            # the shared clone source; the sweep must not do what the
+            # operator-facing command refuses. The registry row is a weaker
+            # proof than the host config, so the config decides.
+            transferred.append(f"{kind}/{vmid}")
+            lab.audit(
+                "lease-resource-is-a-template",
+                lease=lease_id, kind=kind, vmid=vmid,
+            )
+            continue
         try:
             stop_guest(lab, api, kind, vmid)
             delete_guest(lab, api, kind, vmid)
@@ -483,7 +533,10 @@ def finalize_lease(lab: Any, api: Any, lease: dict[str, Any]) -> list[str]:
                 lease=lease_id, kind=kind, vmid=vmid, policy="disposable",
             )
         except LabError as exc:
-            if _guest_is_gone(lab, exc):
+            # Only treat a teardown error as "the guest is gone" when the
+            # host confirms it. The stderr text alone can describe a disk
+            # that could not be removed while the guest itself is alive.
+            if _guest_is_gone(lab, exc) and _confirm_absent(lab, kind, vmid):
                 _forget_retained(lab, kind, vmid)
                 continue
             failures.append(f"{kind}/{vmid}: {exc}")

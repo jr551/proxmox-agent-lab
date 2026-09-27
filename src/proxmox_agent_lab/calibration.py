@@ -121,6 +121,17 @@ class Record:
             max(0, min(int(fy), self.height - 1)),
         )
 
+    @property
+    def trustworthy(self) -> bool:
+        """Is this fit good enough to click on?
+
+        A high residual means the client's image scaling changed since this
+        was measured, so the stored transform describes a display that no
+        longer exists. Clicking off it is the wrong-pixel failure this whole
+        module exists to prevent, so a poor fit is refused.
+        """
+        return self.rmse <= ACCEPTABLE_RMSE
+
 
 def normalize_client_id(raw: str) -> str:
     """Fold a client-supplied name into a stable id.

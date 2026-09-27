@@ -13,7 +13,13 @@ detail belongs to `--help` and the feature pages listed in
 
 guest screenshots and keyboard input
 
+- `proxmox-lab console burst` — capture several frames in one call and stitch them
+- `proxmox-lab console calibrate` — measure how this client scales the guest screen, so clicks read off a screenshot land on the right pixel
+- `proxmox-lab console click` — click at a point in the guest (lease-gated)
+- `proxmox-lab console drag` — press, drag and release between two points
+- `proxmox-lab console grid` — screenshot with a labelled coordinate grid burned in
 - `proxmox-lab console keys` — send key names/combinations via qm sendkey
+- `proxmox-lab console move` — move the guest pointer without clicking
 - `proxmox-lab console screenshot` — capture the guest screen as a PNG
 - `proxmox-lab console type` — type text at the guest console (one key per character)
 

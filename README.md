@@ -58,7 +58,7 @@ The full instructions live in [SKILL.md](SKILL.md).
 
 ### Prefer tools over shell commands? Mount the MCP server
 
-That surface exists too — 23 tools over stdio:
+That surface exists too — 29 tools over stdio:
 
 ```json
 {

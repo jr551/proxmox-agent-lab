@@ -124,6 +124,12 @@ asked for persistence. See [docs/long-term-leases.md](docs/long-term-leases.md).
 | `proxmox-lab console screenshot --vmid N` | guest screen to a PNG (`--out`) |
 | `proxmox-lab console type --lease L --vmid N --text-stdin` | keystrokes; text is never audited |
 | `proxmox-lab console keys --lease L --vmid N KEY...` | QEMU key names (`ret`, `f2`, `ctrl-alt-delete`) |
+| `proxmox-lab console move --lease L --vmid N --x X --y Y` | move the pointer, no click — safe for probing a layout |
+| `proxmox-lab console click --lease L --vmid N --x X --y Y` | click (`--button`, `--double`, `--screenshot-after`) |
+| `proxmox-lab console drag --lease L --vmid N --x X --y Y --to-x A --to-y B` | press, drag, release (`--steps` interpolates) |
+| `proxmox-lab console grid --vmid N` | screenshot with a labelled coordinate grid burned in |
+| `proxmox-lab console burst --vmid N --frames 3` | several frames in one call, stitched |
+| `proxmox-lab console calibrate --vmid N --action start` | lay markers to measure this client's image scaling |
 | `proxmox-lab power status` / `wake` / `shutdown` | manual power; wake/shutdown need `--standalone-authorized` |
 | `proxmox-lab gc install` / `status` / `uninstall` | host-side GC cron; install/uninstall need `--host-change-authorized` |
 | `proxmox-lab mcp` | serve the MCP tool surface over stdio |
@@ -131,7 +137,7 @@ asked for persistence. See [docs/long-term-leases.md](docs/long-term-leases.md).
 ## MCP server
 
 Point an MCP client at `proxmox-lab mcp` — a stdlib-only JSON-RPC 2.0 server
-on stdio (newline-delimited messages) exposing these 23 tools. They call the
+on stdio (newline-delimited messages) exposing these 29 tools. They call the
 same functions as the CLI; results are `content[0].text` carrying the CLI JSON
 body (screenshots as `png_base64`). Errors are JSON-RPC errors: `-32602` for
 schema/`confirm`/key-name violations, `-32603` for a failed action (redacted).
@@ -159,10 +165,52 @@ active lease the server performs the verified host shutdown itself.
 | `console_screenshot` | guest screen as PNG (`png_base64` in result) |
 | `console_type` | type at a guest's console (text never audited) |
 | `console_keys` | QEMU key names (`ret`, `f2`, ...) |
+| `console_move` | move the guest pointer without clicking |
+| `console_click` | click a point (`button`, `double`, `space`, `client`) |
+| `console_drag` | press, drag, release between two points |
+| `console_calibrate` | measure this client's image scaling (`action`, `samples`) |
+| `console_grid` | screenshot with a coordinate grid burned in |
+| `console_burst` | capture several frames in one call, stitched |
 | `cleanup_expired` | sweep expired leases for a lease (`confirm`; may power off an idle host) |
+
 | `journal_query` | audit events from lab.db (read-only) |
 | `doctor` | end-to-end health check (read-only) |
 | `power_status` | host reachability and what pins it on (read-only) |
+
+### Clicking: which coordinates are you reading?
+
+This is the one thing to get right, because the failure is silent: a click
+lands *near* the target rather than on it, and the guest does something else
+entirely.
+
+- **Default (`--space framebuffer`)** — the numbers are real guest pixels. Use
+  this when reading coordinates off `console grid`, or a screenshot whose
+  `width`/`height` match the framebuffer the tool reported.
+- **`--space image`** — the numbers came off a *downscaled* image (what your
+  viewer actually shows you). This **requires a saved calibration** and is
+  refused without one. Calibrate first:
+
+  ```bash
+  # 1. lay a numbered marker grid, get the annotated screenshot back
+  proxmox-lab console calibrate --vmid N --action start --client "My IDE"
+  # 2. read where each marker landed IN THE IMAGE YOU WERE SHOWN, then
+  proxmox-lab console calibrate --vmid N --action commit \
+      --client "My IDE" --samples '[{"id":"M1","x":144,"y":81}, ...]'
+  # 3. now --space image works and maps your coordinates for you
+  proxmox-lab console click --lease L --vmid N --x 144 --y 81 \
+      --space image --client "My IDE"
+  ```
+
+  Read the markers off the image, do not guess them — a guessed reading
+  produces a confidently wrong transform. `--action submit` shows the fit and
+  its error without saving, so you can check before committing.
+
+If the guest's resolution changes, the saved calibration reads `STALE` and
+calibrated clicks are refused. Re-calibrate; never fall back to
+`--space framebuffer` carrying image-space numbers.
+
+Pointer input is a mutation like any other: lease-gated, and it drives the
+QEMU HID tablet over the same ssh seam. Nothing is installed in the guest.
 
 `gc` and standalone `power wake`/`shutdown` are CLI-only: host maintenance and
 bare power levers belong to operators, not agents.

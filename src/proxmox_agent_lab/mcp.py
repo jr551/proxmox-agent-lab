@@ -106,6 +106,7 @@ _MAX_TIMEOUT = 86400
 _MAX_LIMIT = 1000
 _KEYS = {"type": "array", "items": {"type": "string"}}
 _KIND = {"type": "string", "enum": ["qemu", "lxc"]}
+_NUMBER = {"type": "number"}
 _STATE = {"type": "string", "enum": ["running", "stopped", "all"]}
 
 TOOLS: tuple[dict[str, Any], ...] = (
@@ -259,6 +260,68 @@ TOOLS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "console_move",
+        "description": "Move the guest pointer without clicking.",
+        "inputSchema": _schema(
+            required=("lease_id", "vmid", "x", "y"),
+            lease_id=_STR, vmid=_INT, x=_INT, y=_INT,
+            space={"type": "string", "enum": ["framebuffer", "image"]},
+            client=_STR,
+        ),
+    },
+    {
+        "name": "console_click",
+        "description": "Click a point in the guest (lease-gated).",
+        "inputSchema": _schema(
+            required=("lease_id", "vmid", "x", "y"),
+            lease_id=_STR, vmid=_INT, x=_INT, y=_INT,
+            button={"type": "string", "enum": ["left", "middle", "right"]},
+            double=_BOOL,
+            space={"type": "string", "enum": ["framebuffer", "image"]},
+            client=_STR,
+        ),
+    },
+    {
+        "name": "console_drag",
+        "description": "Press, drag and release between two guest points.",
+        "inputSchema": _schema(
+            required=("lease_id", "vmid", "x", "y", "to_x", "to_y"),
+            lease_id=_STR, vmid=_INT,
+            x=_INT, y=_INT, to_x=_INT, to_y=_INT,
+            steps={**_INT, "maximum": 200},
+            space={"type": "string", "enum": ["framebuffer", "image"]},
+            client=_STR,
+        ),
+    },
+    {
+        "name": "console_calibrate",
+        "description": "Measure this client's screenshot scaling for a guest.",
+        "inputSchema": _schema(
+            required=("vmid",),
+            vmid=_INT,
+            action={"type": "string",
+                    "enum": ["start", "submit", "commit", "status"]},
+            samples=_STR, client=_STR,
+        ),
+    },
+    {
+        "name": "console_grid",
+        "description": "Screenshot with a labelled coordinate grid burned in.",
+        "inputSchema": _schema(
+            required=("vmid",), vmid=_INT,
+            step={**_INT, "minimum": 20},
+        ),
+    },
+    {
+        "name": "console_burst",
+        "description": "Capture several guest frames in one call, stitched.",
+        "inputSchema": _schema(
+            required=("vmid",), vmid=_INT,
+            frames={**_INT, "minimum": 2, "maximum": 30},
+            interval=_NUMBER,
+        ),
+    },
+    {
         "name": "console_screenshot",
         "description": "Capture a guest's screen as PNG (base64 in result).",
         "inputSchema": _schema(
@@ -324,7 +387,7 @@ _CONFIRM_TOOLS = frozenset({"lease_destroy", "guest_destroy", "cleanup_expired"}
 _JSON_TYPES = {
     "string": str,
     "integer": int,
-    "boolean": bool,
+    "number": (int, float),
     "array": list,
 }
 
@@ -642,6 +705,111 @@ def _dispatch_pull_file(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+
+def _pointer_args(a: dict[str, Any], **extra: Any) -> argparse.Namespace:
+    """Namespace for the pointer handlers, with the coordinate space named.
+
+    ``space`` is passed straight through so the handler's own refusal
+    applies: an uncalibrated image-space click must be a -32603 from the
+    same code path the CLI uses, not a separate MCP-only check.
+    """
+    return _ns(
+        a,
+        lease=a["lease_id"],
+        vmid=int(a["vmid"]),
+        x=int(a["x"]),
+        y=int(a["y"]),
+        space=str(a.get("space") or "framebuffer"),
+        client=a.get("client"),
+        screenshot_after=None,
+        **extra,
+    )
+
+
+def _dispatch_console_move(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import console
+
+    return _invoke(console.cmd_move, lab, _pointer_args(a))
+
+
+def _dispatch_console_click(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import console
+
+    return _invoke(
+        console.cmd_click,
+        lab,
+        _pointer_args(
+            a,
+            button=str(a.get("button") or "left"),
+            double=bool(a.get("double", False)),
+        ),
+    )
+
+
+def _dispatch_console_drag(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import console
+
+    return _invoke(
+        console.cmd_drag,
+        lab,
+        _pointer_args(
+            a,
+            to_x=int(a["to_x"]),
+            to_y=int(a["to_y"]),
+            steps=int(a.get("steps") or 10),
+        ),
+    )
+
+
+def _dispatch_console_calibrate(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import console
+
+    return _invoke(
+        console.cmd_calibrate,
+        lab,
+        _ns(
+            a,
+            vmid=int(a["vmid"]),
+            action=str(a.get("action") or "status"),
+            samples=a.get("samples"),
+            client=a.get("client"),
+        ),
+    )
+
+
+def _dispatch_console_grid(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import console
+
+    payload = _invoke(
+        console.cmd_grid,
+        lab,
+        _ns(a, vmid=int(a["vmid"]), out=None, step=int(a.get("step") or 100)),
+    )
+    result = dict(payload)
+    encoded = Path(str(payload["path"])).read_bytes()
+    result["png_base64"] = base64.b64encode(encoded).decode("ascii")
+    return result
+
+
+def _dispatch_console_burst(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import console
+
+    payload = _invoke(
+        console.cmd_burst,
+        lab,
+        _ns(
+            a,
+            vmid=int(a["vmid"]),
+            out=None,
+            frames=int(a.get("frames") or 3),
+            interval=float(a.get("interval") or 0.5),
+        ),
+    )
+    result = dict(payload)
+    encoded = Path(str(payload["path"])).read_bytes()
+    result["png_base64"] = base64.b64encode(encoded).decode("ascii")
+    return result
+
 def _dispatch_console_screenshot(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
     from . import console
     from . import guest as guest_module
@@ -775,6 +943,12 @@ _DISPATCH: dict[str, Callable[[Any, dict[str, Any]], dict[str, Any]]] = {
     "console_screenshot": _dispatch_console_screenshot,
     "console_type": _dispatch_console_type,
     "console_keys": _dispatch_console_keys,
+    "console_move": _dispatch_console_move,
+    "console_click": _dispatch_console_click,
+    "console_drag": _dispatch_console_drag,
+    "console_calibrate": _dispatch_console_calibrate,
+    "console_grid": _dispatch_console_grid,
+    "console_burst": _dispatch_console_burst,
     "cleanup_expired": _dispatch_cleanup_expired,
     "journal_query": _dispatch_journal_query,
     "doctor": _dispatch_doctor,

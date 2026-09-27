@@ -1,4 +1,4 @@
-"""Tests for the MCP server (``mcp.py``): the 23-tool surface over stdio.
+"""Tests for the MCP server (``mcp.py``): the 29-tool surface over stdio.
 
 Two harnesses, both speaking real newline-delimited JSON-RPC bytes:
 
@@ -39,7 +39,9 @@ from proxmox_agent_lab import proxmox as proxmox_module  # noqa: E402
 from proxmox_agent_lab import store as store_module  # noqa: E402
 from support.fakessh import FakeSSH  # noqa: E402
 
-#: The pinned §E surface: exactly these 23 names, in tools/list order.
+#: The pinned §E surface: exactly these names, in tools/list order. The six
+#: pointer/capture tools are ported from vnc-mcp (BSD 2-Clause, see NOTICE)
+#: and ride the same seam; the server itself stays stdio-only, never a daemon.
 TOOL_NAMES = [
     "lease_begin",
     "lease_heartbeat",
@@ -57,6 +59,12 @@ TOOL_NAMES = [
     "guest_run",
     "push_file",
     "pull_file",
+    "console_move",
+    "console_click",
+    "console_drag",
+    "console_calibrate",
+    "console_grid",
+    "console_burst",
     "console_screenshot",
     "console_type",
     "console_keys",
@@ -384,13 +392,13 @@ class InProcessProtocolTests(McpTestCase):
         self.assertIn("version", result["serverInfo"])
         self.assertEqual(result["capabilities"], {"tools": {}})
 
-    def test_tools_list_is_exactly_the_23_tools_with_schemas(self):
+    def test_tools_list_is_exactly_the_29_tools_with_schemas(self):
         with _InProcessMcp(self.lab) as server:
             listed = server.request({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/list",
             })
         tools = listed["result"]["tools"]
-        self.assertEqual(len(tools), 23)
+        self.assertEqual(len(tools), 29)
         self.assertEqual([t["name"] for t in tools], TOOL_NAMES)
         for tool in tools:
             schema = tool["inputSchema"]

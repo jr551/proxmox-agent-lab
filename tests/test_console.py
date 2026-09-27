@@ -422,7 +422,15 @@ class GateTests(_ConsoleCase):
 
 
 class RegisterTests(unittest.TestCase):
-    """`console` registers exactly screenshot|type|keys."""
+    """`console` registers the capture, keyboard and pointer surface."""
+
+    #: Every console subcommand the surface promises. Pointer input, burst
+    #: capture, grid overlay and calibration are ported from vnc-mcp
+    #: (BSD 2-Clause, see NOTICE) and ride the same seam.
+    EXPECTED = {
+        "screenshot", "type", "keys", "move", "click", "drag",
+        "calibrate", "grid", "burst",
+    }
 
     @staticmethod
     def _subcommand_names(parser: argparse.ArgumentParser) -> set[str]:
@@ -432,28 +440,361 @@ class RegisterTests(unittest.TestCase):
                 names |= set(action.choices)
         return names
 
-    def test_only_the_three_console_subcommands_exist(self) -> None:
+    def test_exactly_the_expected_console_subcommands_exist(self) -> None:
         parser = argparse.ArgumentParser()
         sub = parser.add_subparsers(dest="command", required=True)
         console_module.register(sub, object())
         self.assertEqual(
-            self._subcommand_names(sub.choices["console"]),
-            {"screenshot", "type", "keys"},
+            self._subcommand_names(sub.choices["console"]), self.EXPECTED
         )
         for argv in (
             ["console", "screenshot", "--vmid", "1"],
             ["console", "type", "--lease", "L", "--vmid", "1", "--text", "x"],
             ["console", "keys", "--lease", "L", "--vmid", "1", "ret"],
+            ["console", "move", "--lease", "L", "--vmid", "1",
+             "--x", "5", "--y", "6"],
+            ["console", "click", "--lease", "L", "--vmid", "1",
+             "--x", "5", "--y", "6"],
+            ["console", "drag", "--lease", "L", "--vmid", "1",
+             "--x", "5", "--y", "6", "--to-x", "7", "--to-y", "8"],
+            ["console", "calibrate", "--vmid", "1"],
+            ["console", "grid", "--vmid", "1"],
+            ["console", "burst", "--vmid", "1"],
         ):
             with self.subTest(argv=argv):
                 args = parser.parse_args(argv)
                 self.assertTrue(callable(args.func))
-        for dead in ("click", "inspect", "text", "bridge", "exec",
-                     "screenshot-burst", "preflight"):
+
+    def test_cut_console_subcommands_stay_gone(self) -> None:
+        # Names from the pre-rework console stack. None may come back: each
+        # needs a guest agent or a websocket server this project does not run.
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command", required=True)
+        console_module.register(sub, object())
+        for dead in ("inspect", "text", "bridge", "exec",
+                     "screenshot-burst", "preflight", "share", "vision"):
             with self.subTest(dead=dead):
                 with contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit):
                         parser.parse_args(["console", dead, "--vmid", "1"])
+
+
+def _ppm(width: int, height: int) -> bytes:
+    """A binary P6 framebuffer of exactly this size."""
+    return f"P6\n{width} {height}\n255\n".encode() + bytes(width * height * 3)
+
+
+def calibration_positions() -> list[tuple[str, float, float]]:
+    """The marker grid `console calibrate --action start` lays down."""
+    from proxmox_agent_lab import calibration
+
+    return calibration.marker_positions(640, 480)
+
+
+def cleanup_calibration(client_id: str, endpoint: str,
+                        width: int, height: int) -> None:
+    """Drop a saved calibration so one test cannot leak into the next."""
+    from proxmox_agent_lab import calibration
+
+    calibration.remove(client_id, endpoint, width, height)
+
+
+class PointerTests(_ConsoleCase):
+    """Lease-gated mouse input over HMP, and the coordinate guard.
+
+    The pointer rides `qm monitor` (`mouse_set`/`mouse_move`/`mouse_button`),
+    the only input transport that stays inside the ssh allowlist: QMP would
+    need socat/nc/python3 on the host, and the seam refuses those on purpose.
+    Pinned here: the tablet is selected before every gesture, a click is a
+    press+release pair, a drag interpolates, an out-of-bounds or uncalibrated
+    point is refused before any input, and an HMP rejection is never mistaken
+    for a delivered click.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        _register_lease_guest(self.lab, "lease-a", "qemu", 101)
+        self.fake.add(r"^qm status 101$", stdout=b"status: running\n")
+        self.fake.add(r"^qm monitor 101$", stdout=b"")
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=_ppm(640, 480))
+
+    def monitor_scripts(self) -> list[str]:
+        return [
+            call["stdin"].decode()
+            for call in self.fake.calls
+            if call["argv"][:2] == ["qm", "monitor"]
+        ]
+
+    def input_scripts(self) -> list[str]:
+        """Only the scripts that MOVE or PRESS something.
+
+        Resolving a point legitimately takes one screendump to learn the
+        framebuffer size, so "nothing at all reached the host" is the wrong
+        assertion for a refusal. What must never happen is input.
+        """
+        return [s for s in self.monitor_scripts() if "mouse_" in s]
+
+    def click_args(self, **overrides: object) -> argparse.Namespace:
+        base: dict[str, object] = {
+            "lease": "lease-a", "vmid": 101, "x": 100, "y": 200,
+            "button": "left", "double": False, "space": "framebuffer",
+            "client": None, "screenshot_after": None,
+        }
+        base.update(overrides)
+        return argparse.Namespace(**base)  # type: ignore[arg-type]
+
+    def test_click_selects_the_tablet_then_presses_and_releases(self) -> None:
+        payload = self.capture(console_module.cmd_click, self.click_args())
+        self.assertTrue(payload["clicked"])
+        self.assertEqual((payload["x"], payload["y"]), (100, 200))
+        self.assertEqual(payload["coordinates"], "framebuffer")
+        scripts = self.monitor_scripts()
+        self.assertTrue(any("mouse_set 3" in s for s in scripts))
+        self.assertTrue(any("mouse_move 100 200" in s for s in scripts))
+        self.assertTrue(any("mouse_button 1" in s for s in scripts))
+        self.assertTrue(any("mouse_button 0" in s for s in scripts))
+        # the audit records the pixel, never anything read off the screen
+        self.assertEqual(
+            self.lab.audits[-1],
+            {"event": "console-click", "lease": "lease-a", "vmid": 101,
+             "x": 100, "y": 200, "button": "left", "clicks": 1},
+        )
+
+    def test_double_click_is_two_complete_press_release_pairs(self) -> None:
+        self.capture(console_module.cmd_click, self.click_args(double=True))
+        scripts = self.monitor_scripts()
+        self.assertEqual(sum("mouse_button 1" in s for s in scripts), 2)
+        self.assertEqual(sum("mouse_button 0" in s for s in scripts), 2)
+
+    def test_the_right_button_is_qemus_button_three(self) -> None:
+        self.capture(
+            console_module.cmd_click, self.click_args(button="right")
+        )
+        self.assertTrue(
+            any("mouse_button 3" in s for s in self.monitor_scripts())
+        )
+
+    def test_move_never_clicks(self) -> None:
+        payload = self.capture(
+            console_module.cmd_move,
+            argparse.Namespace(
+                lease="lease-a", vmid=101, x=5, y=6,
+                space="framebuffer", client=None,
+            ),
+        )
+        self.assertFalse(payload["clicked"])
+        self.assertFalse(
+            any("mouse_button" in s for s in self.monitor_scripts())
+        )
+
+    def test_drag_interpolates_between_the_endpoints(self) -> None:
+        self.capture(
+            console_module.cmd_drag,
+            argparse.Namespace(
+                lease="lease-a", vmid=101, x=0, y=0, to_x=100, to_y=0,
+                steps=4, space="framebuffer", client=None,
+                screenshot_after=None,
+            ),
+        )
+        moves = [s for s in self.monitor_scripts() if "mouse_move" in s]
+        # one for the start point, then 4 interpolated hops
+        self.assertEqual(len(moves), 5)
+        self.assertIn("mouse_move 100 0", moves[-1])
+
+    def test_a_point_outside_the_framebuffer_is_refused_before_any_input(
+        self,
+    ) -> None:
+        with self.assertRaises(LabError) as caught:
+            self.capture(console_module.cmd_click, self.click_args(x=9999))
+        self.assertIn("640x480", str(caught.exception))
+        self.assertEqual(self.input_scripts(), [])
+        self.assertEqual(self.lab.audits, [])
+
+    def test_a_monitor_rejection_is_not_a_delivered_click(self) -> None:
+        # HMP is silent on success and prints "unknown command: ..." on
+        # refusal, so exit status alone would report a dropped click as
+        # a delivered one.
+        self.fake._rules.clear()
+        self.fake.add(r"^qm status 101$", stdout=b"status: running\n")
+        self.fake.add(
+            r"^qm monitor 101$",
+            stdout=b"unknown command: 'mouse_button 1'\n",
+        )
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=_ppm(640, 480))
+        with self.assertRaises(LabError) as caught:
+            self.capture(console_module.cmd_click, self.click_args())
+        self.assertIn("rejected", str(caught.exception))
+        self.assertEqual(self.lab.audits, [])
+
+    def test_pointer_input_refuses_an_unowned_guest(self) -> None:
+        with self.assertRaises(LabError):
+            self.capture(console_module.cmd_click, self.click_args(lease="lease-b"))
+        self.assertEqual(self.input_scripts(), [])
+
+    def test_image_space_without_a_calibration_is_refused(self) -> None:
+        # Passing image-space numbers to the tablet as framebuffer pixels is
+        # exactly the wrong-pixel click this guard exists to prevent.
+        with self.assertRaises(LabError) as caught:
+            self.capture(
+                console_module.cmd_click,
+                self.click_args(x=30, y=60, space="image", client="my-ide"),
+            )
+        self.assertIn("calibrat", str(caught.exception).lower())
+        self.assertEqual(self.input_scripts(), [])
+
+    def test_image_space_with_a_saved_calibration_maps_the_point(self) -> None:
+        from proxmox_agent_lab import calibration
+
+        calibration.upsert(
+            calibration.Record(
+                client_id="my-ide", client_name="My IDE", endpoint_id="101",
+                width=640, height=480, x_a=2.0, x_b=0.0, y_a=2.0, y_b=0.0,
+                rmse=0.1, rounds=1, created_at=1, updated_at=1,
+            )
+        )
+        self.addCleanup(cleanup_calibration, "my-ide", "101", 640, 480)
+        payload = self.capture(
+            console_module.cmd_click,
+            self.click_args(x=30, y=60, space="image", client="My IDE"),
+        )
+        self.assertEqual((payload["x"], payload["y"]), (60, 120))
+        self.assertEqual(payload["coordinates"], "image->framebuffer")
+
+    def test_a_poor_fit_still_refuses_the_click(self) -> None:
+        # A saved calibration whose residual is too high means the client's
+        # scaling changed; clicking off it is the failure being prevented.
+        from proxmox_agent_lab import calibration
+
+        calibration.upsert(
+            calibration.Record(
+                client_id="my-ide", client_name="My IDE", endpoint_id="101",
+                width=640, height=480, x_a=2.0, x_b=0.0, y_a=2.0, y_b=0.0,
+                rmse=99.0, rounds=1, created_at=1, updated_at=1,
+            )
+        )
+        self.addCleanup(cleanup_calibration, "my-ide", "101", 640, 480)
+        with self.assertRaises(LabError):
+            self.capture(
+                console_module.cmd_click,
+                self.click_args(x=30, y=60, space="image", client="my-ide"),
+            )
+        self.assertEqual(self.input_scripts(), [])
+
+    def test_drag_steps_are_bounded(self) -> None:
+        with self.assertRaises(LabError):
+            self.capture(
+                console_module.cmd_drag,
+                argparse.Namespace(
+                    lease="lease-a", vmid=101, x=0, y=0, to_x=10, to_y=10,
+                    steps=0, space="framebuffer", client=None,
+                    screenshot_after=None,
+                ),
+            )
+
+
+class CalibrateAndCaptureTests(_ConsoleCase):
+    """`calibrate`, `grid` and `burst` over the same read-only seam."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _register_lease_guest(self.lab, "lease-a", "qemu", 101)
+        self.fake.add(r"^qm status 101$", stdout=b"status: running\n")
+        self.fake.add(r"^qm monitor 101$", stdout=b"")
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=_ppm(640, 480))
+
+    def test_calibrate_start_marks_the_grid_without_touching_the_guest(
+        self,
+    ) -> None:
+        payload = self.capture(
+            console_module.cmd_calibrate,
+            argparse.Namespace(
+                vmid=101, action="start", samples=None, client="My IDE",
+            ),
+        )
+        self.assertEqual(payload["framebuffer"], [640, 480])
+        self.assertEqual(len(payload["markers"]), 9)
+        self.assertTrue(Path(payload["screenshot"]["path"]).exists())
+        # markers are burned into the returned image only: the guest was
+        # never clicked, only screenshotted
+        self.assertEqual(
+            [a["event"] for a in self.lab.audits], ["console-screenshot"]
+        )
+
+    def test_calibrate_refuses_a_generic_client_identity(self) -> None:
+        with self.assertRaises(LabError) as caught:
+            self.capture(
+                console_module.cmd_calibrate,
+                argparse.Namespace(
+                    vmid=101, action="start", samples=None, client="mcp",
+                ),
+            )
+        self.assertIn("generic", str(caught.exception))
+
+    def test_calibrate_refuses_too_few_readings(self) -> None:
+        with self.assertRaises(LabError) as caught:
+            self.capture(
+                console_module.cmd_calibrate,
+                argparse.Namespace(
+                    vmid=101, action="commit",
+                    samples='[{"id":"M1","x":1,"y":1}]', client="My IDE",
+                ),
+            )
+        self.assertIn("at least two", str(caught.exception))
+
+    def test_calibrate_commits_a_real_fit_and_says_it_is_saved(self) -> None:
+        # A 0.5x client: report readings at half the marker's real position.
+        samples = [
+            {"id": mid, "x": round(fx / 2), "y": round(fy / 2)}
+            for mid, fx, fy in calibration_positions()
+        ]
+        payload = self.capture(
+            console_module.cmd_calibrate,
+            argparse.Namespace(
+                vmid=101, action="commit", samples=json.dumps(samples),
+                client="My IDE",
+            ),
+        )
+        self.assertTrue(payload["saved"])
+        self.assertTrue(payload["trustworthy"])
+        self.assertEqual(payload["markers_used"], 9)
+        self.assertAlmostEqual(payload["x"]["a"], 2.0, places=1)
+        self.addCleanup(cleanup_calibration, "my-ide", "101", 640, 480)
+
+    def test_grid_keeps_the_untouched_capture_as_evidence(self) -> None:
+        payload = self.capture(
+            console_module.cmd_grid,
+            argparse.Namespace(vmid=101, out=None, step=100),
+        )
+        self.assertTrue(Path(payload["path"]).exists())
+        # the clean capture survives alongside the annotated one
+        self.assertTrue(Path(payload["original"]).exists())
+        self.assertNotEqual(payload["path"], payload["original"])
+
+    def test_burst_stitches_several_frames_and_keeps_each_one(self) -> None:
+        payload = self.capture(
+            console_module.cmd_burst,
+            argparse.Namespace(vmid=101, out=None, frames=3, interval=0.1),
+        )
+        self.assertEqual(payload["frames"], 3)
+        self.assertEqual(len(payload["frame_paths"]), 3)
+        self.assertTrue(Path(payload["path"]).exists())
+        # frames are never scaled to match, so a stable guest tiles exactly
+        self.assertEqual(payload["width"], 640 * 3 + 4 * 2)
+        self.assertEqual(self.lab.audits[-1]["event"], "console-burst")
+        self.assertEqual(self.sleeps, [0.1, 0.1])
+
+    def test_burst_frame_count_is_bounded(self) -> None:
+        for frames in (1, 31):
+            with self.subTest(frames=frames):
+                with self.assertRaises(LabError):
+                    self.capture(
+                        console_module.cmd_burst,
+                        argparse.Namespace(
+                            vmid=101, out=None, frames=frames, interval=0.5,
+                        ),
+                    )
+
+
 
 
 if __name__ == "__main__":  # pragma: no cover

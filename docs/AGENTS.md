@@ -43,7 +43,7 @@ Deep notes beyond the quick-ref:
 ## 🧰 The MCP surface
 
 If your client speaks MCP, point it at `proxmox-lab mcp` (stdio JSON-RPC 2.0).
-All 23 tools call the same handlers the CLI binds — same behavior, same gates:
+All 29 tools call the same handlers the CLI binds — same behavior, same gates:
 
 | Group | Tools |
 |---|---|

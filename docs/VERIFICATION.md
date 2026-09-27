@@ -31,7 +31,7 @@ That does not mean the suite is thin — it means the boundary between
 
 ## The suite that exists
 
-311 tests, warning-clean (`PYTHONWARNINGS=error`), run with:
+355 tests, warning-clean (`PYTHONWARNINGS=error`), run with:
 
 ```bash
 python3 -m unittest discover -s tests -q
@@ -205,6 +205,53 @@ Still unobserved on hardware: the verified host power-off and shutdown
 probes, and an installed `pxl-gc` crontab run (the GC script itself was
 exercised with stubbed `qm`/`pct`, and the enumeration-failure path was
 verified directly against the real script).
+
+## Pointer input and calibration — observed on hardware 2026-09-27
+
+The mouse and capture tools ported from vnc-mcp (BSD 2-Clause, credited in
+NOTICE) were exercised against a real 512MB QEMU guest on 192.168.69.105
+(PVE 9.2.2), booted from an ISO and driven through `qm monitor` HMP:
+
+- **A real click lands.** `console move` then `console click` at (360,200)
+  on a 720x400 framebuffer were accepted by the guest's HID tablet, and
+  `--screenshot-after` returned a fresh 720x400 frame.
+- **Calibration is correct, not merely present.** Markers were laid on the
+  real 720x400 display, readings submitted as if by a client showing it at
+  50% scale, and the fit came back `x: a=2.0 b=0.0`, `y: a=2.0 b=0.0` with
+  `rmse_px: 0.0`. An image-space click at (180,100) then resolved to
+  framebuffer (360,200) — exactly the true pixel — and was delivered.
+- **The refusals hold on real hardware.** `(5000,200)` was rejected as
+  outside the 720x400 framebuffer, and `--space image` without a calibration
+  was refused before any input was sent.
+- **Drag and burst work.** A calibrated drag (180,100)→(300,150) resolved to
+  (360,200)→(600,300) and interpolated 6 hops; `console burst --frames 3`
+  stitched three real captures into a 2168x400 image.
+- **MCP carries the same behaviour.** `console_move` and `console_click`
+  over real stdio on the running server applied the saved calibration
+  (100,50 → 180,100) and reported `clicked: true`.
+
+Test guest 9196 was destroyed afterwards and the host was verified back to
+its original four guests (100–103). The `/tmp/pxl-shot-9196.ppm` left behind
+is the documented by-design behaviour: the screenshot host temp is never
+removed, so capture stays read-only on the host.
+
+Still unobserved on hardware: the calibration workflow driven by a *real*
+downscaling image viewer (the 50% case above was submitted from measured
+half-scale readings, not from an actual IDE's rendering), and guest
+applications that specifically require intermediate drag motion.
+
+## Not ported, deliberately
+
+The remaining ~30 vnc-mcp tools were not ported because each requires an
+agent listening inside the guest — a VNC server, or the WinMCP tray
+application for registry, services, PowerShell, Marionette browser control
+and UI automation. That is exactly the "runs on the guest" surface this
+project deleted. The QMP socket (`/run/qemu-server/<vmid>.qmp`) does work and
+was proven to accept absolute mouse events, but reaching it needs `socat`,
+`nc`, `python3` or `bash` on the host, all of which the ssh allowlist
+refuses on purpose: admitting them would hand an MCP tool arbitrary code
+execution as root. HMP over the already-allowlisted `qm` is the only input
+transport that keeps that boundary closed.
 
 ## Reproducing a hardware pass
 

@@ -240,6 +240,34 @@ downscaling image viewer (the 50% case above was submitted from measured
 half-scale readings, not from an actual IDE's rendering), and guest
 applications that specifically require intermediate drag motion.
 
+## Ownership labels and host cleanup — observed on hardware 2026-09-27
+
+The guest tag contract was made human-readable at the user's request: guests
+are stamped `proxmoxagentlab;<controller-hostname>;lease-<id>` (e.g.
+`proxmoxagentlab;mac;lease-…` on a Mac), replacing the opaque `pxl` token.
+Verified live on 192.168.69.105:
+
+- `guest create --fresh` produced tags `proxmoxagentlab;omp-box;lease-…` and
+  description `pxl-lease=… pxl-expiry=…`, confirmed by `qm config`, `qm
+  list`, and `pvesh` — the labels are real host state, not local bookkeeping.
+- **Host-side GC reaped an expired guest.** A guest whose `pxl-expiry` was
+  past was graceful-stopped, destroyed and gone within one `pxl-gc` run;
+  guests without the ownership tag (100-103) and the unexpired lab guest
+  were skipped, and power-off was refused while 102/103 ran.
+- **Controller-side expiry swept the lease.** `cleanup-expired` on a lease
+  with a past `expires_at` destroyed its remaining guest and left the host
+  up (operator guests running) — exactly the pin rule.
+- **`gc install` was broken and is now fixed.** The seam's `install -d`
+  allowlist knew `/tmp/pxl-*` and `/var/log/pxl-*` but not `/var/lib/pxl-gc`,
+  so install shipped the script then refused before the crontab. `/var/lib/pxl-*`
+  joined the `install -d` confinement; install now completes script + state
+  dir + crontab, and `gc status` reports `checksum match / crontab present`.
+- `doctor` reports the gc_cron installed and zero metadata drift.
+
+The legacy `pxl` tag is still honoured by every matcher (GC, orphan scan,
+guest destroy, doctor) so a guest stamped before the rename is never
+orphaned by it; new stamps never write it.
+
 ## Not ported, deliberately
 
 The remaining ~30 vnc-mcp tools were not ported because each requires an

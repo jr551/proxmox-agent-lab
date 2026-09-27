@@ -263,7 +263,7 @@ class PxLGcTests(unittest.TestCase):
             config="tags: web;prod\ndescription: my web server\n")
         proc = self.run_gc()
         self.assert_boring(proc)
-        self.assertIn("skip 101: not pxl", proc.stdout)
+        self.assertIn("skip 101: not ours (no ownership tag)", proc.stdout)
         self.assertTrue(guest.exists())
         self.assertNotIn("shutdown", self.calls())
         self.assertNotIn("destroy", self.calls())

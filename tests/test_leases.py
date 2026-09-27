@@ -158,7 +158,9 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual(len(stamps), 1)
         _, kind, vmid, tags, description = stamps[0]
         self.assertEqual((kind, vmid), ("qemu", 101))
-        self.assertEqual(tags, f"pxl;lease-{row['id']}")
+        # Ownership tag, the machine that created it, and the lease id.
+        self.assertTrue(tags.startswith("proxmoxagentlab;"))
+        self.assertTrue(tags.endswith(f";lease-{row['id']}"))
         self.assertEqual(
             description,
             f"pxl-lease={row['id']} pxl-expiry={refreshed['expires_at']}",

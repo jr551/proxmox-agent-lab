@@ -19,15 +19,15 @@ The Proxmox host is often **someone's live machine** — the lab is a guest on
 it, not a replacement for it. Everything the lab creates is labelled:
 
 ```
-tags:        pxl;lease-<id>
+tags:        proxmoxagentlab;<controller-hostname>;lease-<id>
 description: pxl-lease=<id> pxl-expiry=<epoch>
 ```
 
 Rules that follow from that, and they are not negotiable:
 
-- **Never touch a guest without a `pxl` tag.** Do not destroy, stop, resize
-  or reconfigure it, and do not `lease-register` one you were not asked to
-  adopt. A refusal here is the design working, not an obstacle.
+- **Never touch a guest without a `proxmoxagentlab` tag.** Do not destroy,
+  stop, resize or reconfigure it, and do not `lease-register` one you were
+  not asked to adopt. A refusal here is the design working, not an obstacle.
 - **Check VMID and storage before creating.** Use an unused VMID and a pool
   that exists on this host: `guest create --vmid <free> --storage <pool>
   --disk-gb <n>`. A collision destroys a real machine.
@@ -35,7 +35,8 @@ Rules that follow from that, and they are not negotiable:
   nothing is running and two clear checks agree. If it leaves the host up,
   read the `reason` it prints — usually the operator's own guests. Report it;
   do not override it.
-- Lab guests are visible in the normal Proxmox web UI under the `pxl` tag.
+- Lab guests are visible in the normal Proxmox web UI under the
+  `proxmoxagentlab` tag, with the creating machine's hostname beside it.
   Their presence is expected, not a problem to hide.
 
 ## Setup (operator, once)
@@ -219,18 +220,19 @@ bare power levers belong to operators, not agents.
 
 Every lease-owned guest is stamped at create/register time:
 
-- **tags**: `pxl;lease-<lease-id>`
+- **tags**: `proxmoxagentlab;<controller-hostname>;lease-<lease-id>`
+  (e.g. `proxmoxagentlab;mac;lease-2026…` on a Mac)
 - **description**: `pxl-lease=<lease-id> pxl-expiry=<unix epoch>`
   (`pxl-expiry=0` means long-term — never swept)
 
 Heartbeat rewrites `pxl-expiry`. `doctor` cross-checks this metadata against
 `lab.db` and reports drift. The GC cron and `cleanup-expired` trust this
-stamp, so **never edit tags or descriptions on `pxl` guests** and never stamp
+stamp, so **never edit tags or descriptions on `proxmoxagentlab` guests** and never stamp
 them yourself — `lease-register` is the way in.
 
 ## Safety rules (enforced, not advisory)
 
-- **Lease-owned only.** Every mutation names a lease; only `pxl`-tagged,
+- **Lease-owned only.** Every mutation names a lease; only `proxmoxagentlab`-tagged,
   lease-registered guests are ever stopped or destroyed. A guest another
   active lease also registers is refused unless you pass
   `lease-end --shared-guests-authorized` — reach for ending the other lease

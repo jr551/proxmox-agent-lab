@@ -125,7 +125,8 @@ def describe_guests(lab: Any, api: Any) -> list[dict[str, Any]]:
             "name": record.get("name"),
             "status": record.get("status"),
             "tags": record.get("tags"),
-            "pxl": "pxl" in tags,
+            "pxl": (leases_module.OWNERSHIP_TAG in tags
+                    or leases_module.LEGACY_OWNERSHIP_TAG in tags),
             "lease_tag": lease_tag,
             "known_lease": bool(lease_tag and lease_tag in known),
             "load": guest_load(record),

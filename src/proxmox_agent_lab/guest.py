@@ -175,7 +175,9 @@ def _is_template(cfg: dict) -> bool:
 
 
 def _has_pxl_tag(cfg: dict) -> bool:
-    return "pxl" in {token.strip() for token in str(cfg.get("tags", "")).split(";")}
+    tokens = {token.strip() for token in str(cfg.get("tags", "")).split(";")}
+    return (leases_module.OWNERSHIP_TAG in tokens
+            or leases_module.LEGACY_OWNERSHIP_TAG in tokens)
 
 
 def _pxl_expiry(cfg: dict) -> int | None:

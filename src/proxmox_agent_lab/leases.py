@@ -7,7 +7,8 @@ it is ``kind='long_term'`` with ``expires_at=0`` and guest metadata
 ``protection`` flag.
 
 Guest identity for the host-side GC is written when a guest joins the lease:
-tags ``pxl;lease-<id>`` and description ``pxl-lease=<id> pxl-expiry=<epoch>``
+tags ``proxmoxagentlab;<controller-hostname>;lease-<id>`` and description
+``pxl-lease=<id> pxl-expiry=<epoch>``
 (``0`` for long-term). Every heartbeat rewrites that expiry on every
 registered guest, because the GC is metadata-driven and stale metadata would
 reap live work.
@@ -26,6 +27,7 @@ import datetime as dt
 import json
 import re
 import secrets
+import socket
 import time
 from pathlib import Path
 from typing import Any
@@ -185,9 +187,42 @@ def metadata_description(lease_id: str, expiry_epoch: int) -> str:
     return f"pxl-lease={lease_id} pxl-expiry={int(expiry_epoch)}"
 
 
-def metadata_tags(lease_id: str) -> str:
-    """The GC tags for one guest: the ``pxl`` token plus its lease id."""
-    return f"pxl;lease-{lease_id}"
+#: The tag the host-side GC and the controller's own cross-checks key on.
+#: Deliberately readable on the Proxmox GUI: a guest carrying it is ours.
+OWNERSHIP_TAG = "proxmoxagentlab"
+
+#: Pre-rename guests still carry ``pxl``; matchers accept it so a guest
+#: stamped before the rename is never orphaned by it. New stamps never use it.
+LEGACY_OWNERSHIP_TAG = "pxl"
+
+_TAG_SAFE = re.compile(r"[^a-z0-9-]+")
+
+
+def controller_tag() -> str:
+    """This machine's short name as a Proxmox tag (``mac``, ``omp-box``...).
+
+    PVE tag chars are restricted, so fold the hostname to lowercase,
+    collapse anything outside ``[a-z0-9-]`` to ``-``, and trim; an empty or
+    unguessable hostname degrades to ``controller`` rather than failing the
+    stamp.
+    """
+    try:
+        raw = socket.gethostname() or ""
+    except OSError:
+        raw = ""
+    short = raw.split(".", 1)[0]                     # drop any domain part
+    folded = _TAG_SAFE.sub("-", short.strip().lower()).strip("-")
+    return folded or "controller"
+
+
+def metadata_tags(lease_id: str, controller: str | None = None) -> str:
+    """The GC tags for one guest: ownership, the machine that made it, lease.
+
+    ``proxmoxagentlab`` is the sweep key; the controller hostname is human
+    context (which machine created it); ``lease-<id>`` pins the owner.
+    """
+    host = controller if controller is not None else controller_tag()
+    return f"{OWNERSHIP_TAG};{host};lease-{lease_id}"
 
 
 def _stamp_guest(seam: Any, kind: str, vmid: int, lease_id: str,

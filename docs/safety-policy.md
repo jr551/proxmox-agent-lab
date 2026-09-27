@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Every mutation belongs to a lease, every lab guest carries `pxl` metadata the
+Every mutation belongs to a lease, every lab guest carries `proxmoxagentlab` metadata the
 host-side garbage collector can trust, and host power-off is verified by
 repeated probe failure — so abandoned work cannot linger, unowned guests are
 never touched, and destructive or host-changing actions need explicit,
@@ -19,7 +19,7 @@ Authoritative flags verified against `src/proxmox_agent_lab/cli.py` and the
 | `proxmox-lab lease-destroy --lease <id> --confirm` | `--confirm` | destroy a lease and its machines; the only exit for a long-term lease |
 | `proxmox-lab lease-abandon --lease <id> --confirm` | `--confirm` | close a stopped lease record; guests and host untouched |
 | `proxmox-lab lease-end --lease <id> --shared-guests-authorized` | `--shared-guests-authorized` | destroy a guest another non-terminal lease also registers |
-| `proxmox-lab cleanup-expired --reclaim-orphans --host-change-authorized` | both flags | stop (never delete) `pxl` guests this controller has no record of |
+| `proxmox-lab cleanup-expired --reclaim-orphans --host-change-authorized` | both flags | stop (never delete) `proxmoxagentlab` guests this controller has no record of |
 | `proxmox-lab cleanup-expired --orphans-only --host-change-authorized` | both flags | reclaim orphans and nothing else — no lease finalized, host left as found |
 | `proxmox-lab cleanup-expired --reclaim-orphans --host-change-authorized --include-active` | `--include-active` on top | also stop an orphan whose 30-minute task/uptime/CPU signals say it is in use |
 | `proxmox-lab gc install` / `proxmox-lab gc uninstall` | `--host-change-authorized` | write or remove the root GC script, its state dir and one crontab line on the host |
@@ -38,7 +38,7 @@ bare power levers stay CLI-only.
    ownership gate refuses before any host call and names the `lease-register`
    command that would authorize the guest.
 2. Every lease-owned guest is stamped at create/register time: tags
-   `pxl;lease-<id>` and a `pxl-lease=<id> pxl-expiry=<unix epoch>` line in its
+   `proxmoxagentlab;<controller-hostname>;lease-<id>` and a `pxl-lease=<id> pxl-expiry=<unix epoch>` line in its
    description. `lease-heartbeat` rewrites the expiry on every registered
    guest; `pxl-expiry=0` means long-term, never swept.
 3. Cleanup destroys only `disposable` resources registered to that lease, in
@@ -47,7 +47,7 @@ bare power levers stay CLI-only.
    later `cleanup-expired` sweep retries.
 4. `retain`-policy resources and templates (`template: 1`) are never stopped
    or destroyed: they are clone sources and read-only surface. `guest destroy`
-   additionally refuses a readable guest config that carries no `pxl` tag —
+   additionally refuses a readable guest config that carries no `proxmoxagentlab` tag —
    a machine somebody else owns can never be mistaken for ours.
 5. Host power-off is verified, never assumed. After `shutdown -h now` the host
    is probed alternately over ssh and TCP :22; `host_powered_off` is `true`
@@ -113,16 +113,17 @@ proceeds — auditing must never break the work it observes. `journal` reads
 this table (`--limit`, `--lease`, `--since`); there is no upload step because
 there is no central ledger — the store is local.
 
-## What `pxl` metadata proves, and what owns a guest
+## What `proxmoxagentlab` metadata proves, and what owns a guest
 
-A guest this tool created is tagged `pxl;lease-<id>` and carries
-`pxl-lease=<id> pxl-expiry=<epoch>` in its description. The stamp outlives the
+A guest this tool created is tagged `proxmoxagentlab;<controller-hostname>;lease-<id>`
+and carries `pxl-lease=<id> pxl-expiry=<epoch>` in its description. The stamp outlives the
 lease record that explains it — lease rows end; guest metadata does not — so
 it is evidence that *some* lease on *some* controller created the guest, and
 nothing more. Ownership comes from `lab.db`, the only registry: a
 `(kind, vmid)` must be registered to the supplied lease, live, before any
-mutating call. A `pxl`-tagged guest whose lease id no local lease row owns is
-an **orphan**.
+mutating call. A `proxmoxagentlab`-tagged guest whose lease id no local lease row owns
+is an **orphan**. The pre-rename `pxl` tag is still honoured everywhere the
+new one is, so a guest stamped before the rename is never orphaned by it.
 
 An orphan matters because two rules interact deliberately: cleanup only
 finalizes resources a lease registered, and host power-off refuses while
@@ -184,7 +185,7 @@ bundled copy), a `/var/lib/pxl-gc` state dir, and one root crontab line
 running it every ten minutes. The script is standalone — stdlib only, no
 controller database — the net for agents that walked away:
 
-- a guest without the `pxl` tag is skipped; so is a template, an unreadable
+- a guest without the `proxmoxagentlab` tag (or pre-rename `pxl`) is skipped; so is a template, an unreadable
   config, and metadata that does not parse — a warning, never a delete;
 - `pxl-expiry=0` (long-term) and unexpired guests pin the host on;
 - an expired guest gets graceful shutdown, then a hard stop, then destroy

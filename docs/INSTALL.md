@@ -105,12 +105,12 @@ refuse without it).
 The tool creates ordinary, labelled guests and only ever touches those:
 
 ```
-tags:        pxl;lease-<id>
+tags:        proxmoxagentlab;<controller-hostname>;lease-<id>
 description: pxl-lease=<id> pxl-expiry=<epoch>
 ```
 
-- A guest **without** a `pxl` tag is never destroyed, stopped or reclaimed.
-- Lab guests are visible in the normal web UI; filter by the `pxl` tag.
+- A guest **without** a `proxmoxagentlab` tag is never destroyed, stopped or reclaimed.
+- Lab guests are visible in the normal web UI; filter by the `proxmoxagentlab` tag.
 - The host is powered off only when nothing is running — including your own
   unlabelled guests — and only after two clear checks minutes apart.
 - Pick storage and VMIDs that do not collide with your own:
@@ -162,7 +162,7 @@ broken — that is the point. What it checks:
 8. **Wake-on-LAN MAC** — `[power].mac` set; warn if empty.
 9. **GC crontab** — info if the host-side garbage collector is not installed
    (step 6 is optional).
-10. **Drift** — pxl-tagged guests whose description lease/expiry metadata
+10. **Drift** — `proxmoxagentlab`-tagged guests whose description lease/expiry metadata
     disagrees with `lab.db`; warn per drifted guest.
 
 Fix what it flags, re-run until it prints `"ok": true`.
@@ -188,10 +188,10 @@ line, marked for idempotent detection:
 On the host side the script is stateless and reads no controller database:
 every ten minutes it walks the guests and reads only their metadata — the
 `pxl` tag plus the `pxl-lease=` / `pxl-expiry=` line in the description.
-A guest whose lease expired is stopped and destroyed; anything without pxl
+A guest whose lease expired is stopped and destroyed; anything without `proxmoxagentlab`
 metadata, any template, and any long-term guest (`pxl-expiry=0`) is never
 touched, and metadata that does not parse is warned about and skipped, never
-deleted on. When zero guests are running and zero unexpired pxl guests exist
+deleted on. When zero guests are running and zero unexpired `proxmoxagentlab` guests exist
 on two consecutive runs at least ten minutes apart, the host shuts itself
 down. `--host-change-authorized` is required for install and uninstall;
 check what is in place, read-only, with:

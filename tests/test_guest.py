@@ -130,7 +130,10 @@ class MetadataContractTests(GuestCase):
         self.assertEqual(tags, leases_module.metadata_tags(LEASE))
         self.assertEqual(description,
                          leases_module.metadata_description(LEASE, EXPIRY))
-        self.assertEqual(tags, f"pxl;lease-{LEASE}")
+        parts = tags.split(";")
+        self.assertEqual(parts[0], "proxmoxagentlab")
+        self.assertEqual(parts[-1], f"lease-{LEASE}")
+        self.assertNotIn("pxl", parts)
         self.assertEqual(description,
                          f"pxl-lease={LEASE} pxl-expiry={EXPIRY}")
 
@@ -139,7 +142,7 @@ class MetadataContractTests(GuestCase):
         lab_guest.stamp_guest(seam, "lxc", 102, LEASE, EXPIRY)
         seam.set_metadata.assert_called_once_with(
             "lxc", 102,
-            tags=f"pxl;lease-{LEASE}",
+            tags=leases_module.metadata_tags(LEASE),
             description=f"pxl-lease={LEASE} pxl-expiry={EXPIRY}",
         )
         self.assertEqual(seam.mock_calls[0][0], "set_metadata")
@@ -204,7 +207,7 @@ class CreateTests(GuestCase):
             "--name", "alpha", "--template", "9000",
         )
         tags, description = metadata = lab_guest.metadata_for(LEASE, EXPIRY)
-        self.assertEqual(metadata, (f"pxl;lease-{LEASE}",
+        self.assertEqual(metadata, (leases_module.metadata_tags(LEASE),
                                     f"pxl-lease={LEASE} pxl-expiry={EXPIRY}"))
         self.assertEqual(self.argvs()[0],
                          ["qm", "clone", "9000", "101", "--name", "alpha"])

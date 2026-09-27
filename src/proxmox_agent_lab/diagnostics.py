@@ -18,6 +18,7 @@ from typing import Any
 from . import config as config_module
 from . import gc as gc_module
 from . import journal as journal_module
+from . import leases as leases_module
 from . import proxmox as proxmox_module
 from . import ssh as ssh_module
 from . import store as store_module
@@ -249,7 +250,9 @@ def _drifted_guests(ssh: Any, state_root: Path) -> list[dict]:
         cfg = guest["config"]
         tags = {t.strip() for t in str(cfg.get("tags", "")).split(";")}
         lease_id = _PXL_LEASE.search(str(cfg.get("description", "")))
-        if "pxl" not in tags and lease_id is None:
+        if (leases_module.OWNERSHIP_TAG not in tags
+                and leases_module.LEGACY_OWNERSHIP_TAG not in tags
+                and lease_id is None):
             continue
         entry = {"kind": guest["kind"], "vmid": guest["vmid"]}
         if lease_id is None:

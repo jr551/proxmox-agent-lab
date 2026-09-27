@@ -29,7 +29,7 @@ try before concluding the tool is broken.
 | `template_vmid` | warning only: unset, or no guest resolves it | set `[pve] template_vmid` to the vmid of a template, or pass `--template`/`--fresh`/`--source` explicitly |
 | `wol_mac` | warning only: `[power] mac` empty | `power wake` cannot work without it; re-run `proxmox-lab init` while ssh works, or fill it in by hand |
 | `gc_cron` | info only: no pxl-gc crontab on the host | optional backstop — install with `proxmox-lab gc install --host-change-authorized` |
-| `drift` | warning only: `pxl` guests whose metadata disagrees with `lab.db` | see "pxl metadata" below; reconcile with `lease-register` or leave it to the GC |
+| `drift` | warning only: `proxmoxagentlab` guests whose metadata disagrees with `lab.db` | see "ownership metadata" below; reconcile with `lease-register` or leave it to the GC |
 
 Skipped remote checks (`host unreachable`) never fail the run — `doctor` is
 safe to run while the host is off.
@@ -61,8 +61,8 @@ safe to run while the host is off.
 | Symptom | Diagnostic | Next step |
 |---|---|---|
 | Expired guests never reaped, host never powers off | `proxmox-lab gc status` | `crontab: absent` → the GC was never installed: `proxmox-lab gc install --host-change-authorized`. `checksum: differs` → re-run install to update the script. The `log` field tails `/var/log/pxl-gc.log` — read it for what each run decided. |
-| GC log says `skip <vmid>: not pxl` / `unparseable ... not deleting` | `qm config <vmid>` / `pct config <vmid>` on the host | Fail-closed is the design: no `pxl` tag or a malformed `pxl-lease=… pxl-expiry=…` line means *never* delete. If the guest is lab work, adopt it (`lease-register`); if it should be reaped, the stamp is wrong — fix via `qm set <vmid> --description` or destroy it by hand. |
-| GC never powers off although everything looks idle | `proxmox-lab gc status` (log tail) | Power-off needs two consecutive runs ≥10 min apart with zero running guests and zero *unexpired* pxl guests — one expired-but-still-present guest, or a `pxl-expiry=0` long-term guest, keeps the host up. Any running guest removes the clear stamp and the two-run wait restarts. |
+| GC log says `skip <vmid>: not ours (no ownership tag)` / `unparseable ... not deleting` | `qm config <vmid>` / `pct config <vmid>` on the host | Fail-closed is the design: no `proxmoxagentlab` (or pre-rename `pxl`) tag or a malformed `pxl-lease=… pxl-expiry=…` line means *never* delete. If the guest is lab work, adopt it (`lease-register`); if it should be reaped, the stamp is wrong — fix via `qm set <vmid> --description` or destroy it by hand. |
+| GC never powers off although everything looks idle | `proxmox-lab gc status` (log tail) | Power-off needs two consecutive runs ≥10 min apart with zero running guests and zero *unexpired* `proxmoxagentlab` guests — one expired-but-still-present guest, or a `pxl-expiry=0` long-term guest, keeps the host up. Any running guest removes the clear stamp and the two-run wait restarts. |
 | Guest stopped by "nothing" | `/var/log/pxl-gc.log` via `gc status`; `proxmox-lab journal` | If `pxl-expiry` passed — the lease went stale and heartbeats stopped — the GC reaped it. That is the lease contract working; keep heartbeats under `[lease] ttl_seconds` (default 2 h). |
 
 ## Guests and console

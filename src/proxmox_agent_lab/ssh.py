@@ -98,6 +98,9 @@ _PXL_INSTALL_PREFIX = "/usr/local/sbin/pxl-"
 #: The pxl log namespace ``base64`` may read (the GC's cron log).
 _PXL_LOG_PREFIX = "/var/log/pxl-"
 
+#: The GC state namespace ``install -d`` may create (the clear-stamp dir).
+_PXL_STATE_PREFIX = "/var/lib/pxl-"
+
 #: ``pvesh`` verbs that only read. ``pvesh get`` is the API read the seam uses
 #: everywhere; ``usage``/``help`` print text and change nothing. Every other
 #: verb (``set``, ``create``, ``delete``, ``start`` …) mutates host state and
@@ -166,7 +169,7 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
     needs, refusing ``link set``/``addr add``/``route replace``. ``install``
     is path-confined like ``tee``: its sources must come from the pxl temp
     namespace and its destination must land in the pxl install namespace
-    (``install -d`` may create only a pxl temp/log directory), with
+    (``install -d`` may create only a pxl temp/log/state directory), with
     value-carrying flags (``-m``, ``-o``, ``-g``, ``-t``) skipped so a mode
     is never mistaken for a path.
 
@@ -265,7 +268,8 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
         # and `install -t DIR src...` copy sources onto a destination.
         if "-d" in argv[1:] and len(operands) == 1:
             _confine(
-                "install", operands[0], (_PXL_TEMP_PREFIX, _PXL_LOG_PREFIX),
+                "install", operands[0],
+                (_PXL_TEMP_PREFIX, _PXL_LOG_PREFIX, _PXL_STATE_PREFIX),
                 "creates",
             )
         else:

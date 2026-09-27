@@ -115,7 +115,7 @@ proxmox-lab guest clone --lease "$L" --vmid 9002 --source 100
 with `--fresh`; LXC fresh needs `--ostemplate`). `guest clone` accepts any
 *vouched* source — a config template (`template: 1`) or a `policy=retain`
 registry row. Either way the guest is registered to your lease and stamped
-`pxl` metadata **before** it can ever be started.
+`proxmoxagentlab` metadata **before** it can ever be started.
 
 Adopt a pre-existing guest — e.g. one created in the Proxmox UI — with
 `proxmox-lab lease-register --lease "$L" --kind qemu --vmid <id>`; without that

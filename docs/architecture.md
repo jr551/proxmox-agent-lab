@@ -36,8 +36,8 @@ Two rules hold this shape:
   including `qm guest`/`pct exec` file IO — is one allowlisted argv through
   it. Nothing opens its own channel.
 - `leases` and `cleanup` communicate through `store.py` and the guest
-  metadata contract (`pxl` tags, `pxl-lease=`/`pxl-expiry=` description
-  line), never by importing each other's handlers.
+  metadata contract (`proxmoxagentlab` tags,
+  `pxl-lease=`/`pxl-expiry=` description line), never by importing each other's handlers.
 
 ## The `lab` facade
 

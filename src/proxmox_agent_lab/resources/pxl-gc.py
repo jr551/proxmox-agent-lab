@@ -5,7 +5,8 @@ Copied to /usr/local/sbin/pxl-gc on the Proxmox host and run from root's
 crontab (see docs/rework-plan.md section F). Two duties:
 
 1. Destroy guests whose lease expired, using ONLY guest metadata:
-   tags contain the token `pxl`, description carries a parseable
+   tags contain the token `proxmoxagentlab` (or the pre-rename `pxl`),
+   description carries a parseable
    `pxl-lease=<id> pxl-expiry=<unix epoch>` line, `pxl-expiry=0` = long-term.
    Anything that does not parse is warn-skipped, never deleted.
 2. Power the host off when idle: zero running guests of any kind AND zero
@@ -43,6 +44,10 @@ DEFAULT_STOP_TIMEOUT = 120
 
 LEASE_RE = re.compile(r"(?:^|\s)pxl-lease=(\S+)")
 EXPIRY_RE = re.compile(r"(?:^|\s)pxl-expiry=(\S+)")
+
+#: Tag tokens that mark a guest as ours. `pxl` is the pre-rename token,
+#: still honoured so guests stamped before the rename are never orphaned.
+OWNERSHIP_TAGS = frozenset({"proxmoxagentlab", "pxl"})
 
 
 def log(message):
@@ -376,8 +381,8 @@ def main(argv):
                 continue
             tags = config_value(config, "tags") or ""
             tokens = {token.strip() for token in tags.split(";") if token.strip()}
-            if "pxl" not in tokens:
-                log("skip " + vmid + ": not pxl")
+            if not (tokens & OWNERSHIP_TAGS):
+                log("skip " + vmid + ": not ours (no ownership tag)")
                 continue
             try:
                 _lease, expiry = parse_metadata(config_value(config, "description"))

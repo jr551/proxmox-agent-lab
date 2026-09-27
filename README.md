@@ -86,17 +86,17 @@ the two coexist — that is the normal case, not a special one.
 Every guest it creates is **labelled at creation**:
 
 ```
-tags:        pxl;lease-20260927174717-ae7ddc76
+tags:        proxmoxagentlab;my-mac;lease-20260927174717-ae7ddc76
 description: pxl-lease=20260927174717-ae7ddc76 pxl-expiry=1790538437
 ```
 
 Those labels are the entire boundary, and they are what every check reads:
 
-- **Cleanup only ever touches labelled guests.** A guest without a `pxl` label
+- **Cleanup only ever touches labelled guests.** A guest without a `proxmoxagentlab` label
   is never destroyed, stopped, or reclaimed — the refusal happens in the code
   path before any host command runs. Do not work around that refusal.
 - **You can see the lab in the normal web UI.** Lab guests are ordinary
-  guests, filterable by the `pxl` tag in Datacenter → the node.
+  guests, filterable by the `proxmoxagentlab` tag in Datacenter → the node.
 - **Guests you created yourself are never at risk.** No label, no lease, no
   touch. Long-term lab machines carry `pxl-expiry=0` so the collector leaves
   them running by design.

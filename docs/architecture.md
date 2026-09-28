@@ -1,50 +1,49 @@
 # Architecture
 
-How `src/proxmox_agent_lab/` is arranged, and the two contracts that keep the
-pieces interchangeable: the `lab` facade every feature module receives, and
-the lease/audit rules every mutation goes through.
+How `src/proxmox_agent_lab/` is arranged, and the three contracts that keep
+the pieces interchangeable: the `lab` facade every feature module receives,
+the single SSH seam every remote action goes through, and the lease/audit
+rules every mutation obeys.
 
 ## Layers
 
-The dependency direction is always downward: command handlers may use
-transports and state services; transports and state services never call back
-up into handlers.
+The dependency direction is always downward: command layers call services;
+services never call back up. `ssh.py` and `store.py` are the bottom — each
+owns the only resource of its kind (the `ssh` subprocess, the `lab.db`
+SQLite file).
 
 ```text
-cli.py                      parser, command policy gates, the lab facade
+cli.py                      parser, policy gates, the lab facade
+mcp.py                      stdio JSON-RPC 2.0 server, binds the SAME handlers
   |
-  +-- feature modules       android, connection, console, crash, disk,
-  |   (register(sub, lab))  diskactivity, guest, ioworkload, isoinspect,
-  |                         longterm, memflow, netcap, netgw, oci,
-  |                         onboarding, pe, recipes, share, storage,
-  |                         usb, virtio, windows
+  +-- feature modules       guest, console, transfer, gc
+  |   (register(sub, lab))
   |
-  +-- lifecycle             leases, cleanup, diagnostics
+  +-- lifecycle             leases, cleanup, power
   |
-  +-- guest channels        transfer -> guest_agent -> serial -> ws
-  |                         console  -> serial / guest_agent / transfer
-  |                         host_transport (host SSH for the opt-in modules)
+  +-- host channels         proxmox (qm/pct/pvesh wrappers) -> ssh (allowlist)
   |
-  +-- state services        state, audit, updates, config, inventory,
-  |                         journal, mariadb, secrets_store, host_policy,
-  |                         power, errors
+  +-- state services        store (lab.db), audit, journal, config,
+  |                         diagnostics, errors, state, png
   |
-  +-- protocols             api (HTTPS client), rfb, ws, png, des, s3,
-                            textmode, binparse
+  +-- host-side             resources/pxl-gc.py — standalone script, imports
+                            nothing from the package
 ```
 
 Two rules hold this shape:
 
-- `host_transport` does not import `memflow`; `memflow`, `usb`, `netcap`,
-  `disk`, `diskactivity` and `console` use it for host-side SSH.
-- `serial`, `guest_agent` and `transfer` do not import `console`; console is
-  the handler layer above them.
+- `ssh.py` is the only module that spawns `ssh`; every remote action —
+  including `qm guest`/`pct exec` file IO — is one allowlisted argv through
+  it. Nothing opens its own channel.
+- `leases` and `cleanup` communicate through `store.py` and the guest
+  metadata contract (`proxmoxagentlab` tags,
+  `pxl-lease=`/`pxl-expiry=` description line), never by importing each other's handlers.
 
 ## The `lab` facade
 
 `cli.py` loads configuration once, keeps the values other modules share as
-module attributes (`HOST`, `NODE`, `STATE_ROOT`, `LEASE_ROOT`, `audit`,
-`ProxmoxAPI`, ...), and hands *itself* to feature modules:
+module attributes (`CONFIG`, `STATE_ROOT`, `LEASE_ROOT`, `ssh`, ...), and
+hands *itself* to feature modules:
 
 ```python
 def register(sub, lab):        # called from cli.parser()
@@ -62,81 +61,69 @@ This is deliberate, not incidental:
 - Tests patch `cli` attributes (`mock.patch.object(LAB, "STATE_ROOT", ...)`);
   because every helper reads them through `lab` at call time, patching keeps
   working after a function moves to its own module.
-- Third-party or experimental modules can register subcommands against the
-  same contract.
-- The historical `proxmox_lab` path-loaded module is rebuilt by
-  `cli._module()` for callers that still import the old name.
+- `mcp.py` binds the same `cmd_*` handlers the CLI binds, so the 23-tool MCP
+  surface and the CLI cannot drift.
+- `cli._module()` rebuilds the module object (and the `proxmox_lab`
+  compatibility name) when the file is path-loaded outside `sys.modules`.
 
 Do not add a second dispatch architecture or a dependency-injection
 framework on top of this.
 
 ## The lower layer takes explicit parameters
 
-`errors`, `state`, `api`, `audit` and `updates` are pure services: they take
-the configuration, state paths and credentials they need as arguments. The
-`cli` module binds them to the process-wide config through thin wrappers, so
-the patch surface is unchanged but the services themselves hold no
-import-time snapshots.
+`errors`, `state`, `store`, `audit`, `journal` and `config` are pure
+services: they take the configuration, state paths and connections they need
+as arguments. The `cli` module binds them to the process-wide config through
+thin wrappers, so the patch surface is unchanged but the services themselves
+hold no import-time snapshots.
 
 In `leases`, the *data* functions (`load_lease`, `save_lease`,
 `active_leases`, `register_resource`, ...) take the lease/state roots
 explicitly for the same reason. The *handlers* (`cmd_lease_begin`, ...) take
 `lab`.
 
-`cleanup` orchestrates teardown entirely through `lab`: it reaches lease data
-via `lab.active_leases()` and friends rather than importing the
+`cleanup` orchestrates teardown entirely through `lab`/`store`: it reaches
+lease data via `lab.active_leases()` and friends rather than importing the
 orchestration side of `leases`, so the two lifecycle modules never import
 each other's handlers.
 
 ## Safety invariants that must survive any refactor
 
 - Every mutation belongs to a lease; `leases.require_lease_resource` /
-  `require_owned_qemu` gate guest writes.
+  `guest.require_owned` gate guest writes against the `resources` table
+  *before* any remote call.
+- `ssh.check_allowed` refuses any remote command outside `ALLOWED_COMMANDS`
+  before a process spawns; `HOST_CHANGE_COMMANDS` additionally need
+  `host_change=True`, which the CLI gates behind `--host-change-authorized`.
+- `lease-begin` does not wake the host: it probes the ssh seam and refuses
+  on an unreachable host, directing the operator to
+  `power wake --standalone-authorized`.
 - `cleanup.finalize_lease` is idempotent and records failures; a lease left
   `cleanup_failed` is retried by every later sweep.
-- Host power-off is verified by repeated API failure, never assumed.
-- `audit.audit` redacts secrets and never fails the action being audited;
-  events spool locally while the ledger is unreachable.
-- Importing any module must survive missing config or dependencies so
-  `init`/`doctor` still diagnose a broken install.
+- Host power-off is verified by repeated ssh/TCP :22 probe failure, never
+  assumed. The MCP idle sweep and the host-side `pxl-gc` cron are the two
+  nets that guarantee the host eventually goes off.
+- `audit.audit` redacts before insert into `events.data` and never fails the
+  action being audited.
+- Importing any module must survive missing config so `init`/`doctor` still
+  diagnose a broken install.
 
-## Legacy aliases and the patch surface
+## Patch-target rule for tests
 
-These names are deliberately re-exported so callers and tests keep working:
-
-| Kept on | Alias for |
-| --- | --- |
-| `cli.LabError` | `errors.LabError` |
-| `cli.utc_now` / `iso_now` / `json_dump` | `state.*` |
-| `cli.controller_lock` / `sweep_lock` / `_lock_file` | `state.*` (bound to `STATE_ROOT`/`LOCK_PATH`) |
-| `cli.ProxmoxAPI` / `wait_task` / `keychain_secret` | `api.*` (config-bound subclass) |
-| `cli.audit` / `ledger` / `redact` / `SENSITIVE_KEY` | `audit.*` |
-| `cli.check_for_updates` / `update_notice` / `UPDATE_CHECK_*` | `updates.*` |
-| `cli.load_lease` / `save_lease` / `active_leases` / ... | `leases.*` (bound roots) |
-| `cli.finalize_lease` / `shutdown_host` / `*_guest` helpers | `cleanup.*` |
-| `cli.cmd_init` / `cmd_doctor` / `cmd_journal` / ... | `diagnostics.*` |
-| `cli.fcntl` | `state.fcntl` (None on Windows) |
-| `console.TermSession` / `TermFilter` / `_open_websocket` | `serial.*` |
-| `console.agent_exec` / `exec_guest` / `write_guest_file` / ... | `guest_agent.*` |
-| `console.cmd_push` / `cmd_pull` / `cmd_s3` internals | `transfer.*` |
-
-Support decision: these aliases are *load-bearing compatibility*, not
-deprecated shims — they are how the test suite and any third-party
-`register(sub, lab)` callers reach the implementation. Removing one is a
-breaking change; if an alias is ever dropped, the removal is announced in the
-release notes first. New code should prefer the owning module.
-
-Patch-target rule for tests: patch the module that owns the code under test.
-`cli.*` names still work for everything re-exported through the facade, but
-internals that were moved (e.g. `transfer.agent_exec`, `state.fcntl`,
-`cleanup.time`) must be patched at their new home.
+Patch the module that owns the code under test. `cli.*` names work for
+everything re-exported through the facade (`cli.ssh`, `cli.CONFIG`,
+`cli.active_leases()`, ...), but internals must be patched at their new
+home — e.g. the fake seam goes in at `proxmox_agent_lab.ssh`/`proxmox`
+injection points, not an imagined `api.py`. Tests use
+`tests/support/fakessh.py` (argv-recording FakeSSH) and never spawn a real
+ssh.
 
 ## Shared helpers
 
 Retry and subprocess loops stay local to the caller that owns their policy.
-The two genuinely shared wait loops already have homes — `api.wait_task`
-(Proxmox task polling) and `guest_agent.wait_agent_ready` (agent polling) —
-and `host_transport` owns the host-SSH runner. Do not extract further
-"generic retry" utilities: a retry policy is a behavior contract, and two
-loops that look alike but answer different failure modes should stay separate
-until a third caller proves the shape.
+The genuinely shared pieces already have homes — `ssh.py` (the one remote
+runner + allowlist), `proxmox.py` (task-wait with bounded deadlines),
+`store.py` (all persistence). Do not extract further "generic" utilities: a
+retry or query policy is a behavior contract, and two loops that look alike
+but answer different failure modes should stay separate until a third caller
+proves the shape.

@@ -5,6 +5,59 @@ All notable changes to this project will be documented here. The format follows
 [Semantic Versioning](https://semver.org/).
 
 
+## [Unreleased]
+
+Rewritten as a slim SSH-only control plane. The whole remote surface is one
+ssh channel as root (`ssh-copy-id root@proxmox` is the entire credential
+setup); `qm`/`pct`/`pvesh` run through a single argv allowlist seam, and one
+local SQLite `lab.db` holds leases, lease-owned resources and the audit
+journal. The package is back to **zero runtime dependencies** — standard
+library only, Python 3.11+.
+
+### Added
+
+- `proxmox-lab mcp`: a stdlib-only stdio JSON-RPC 2.0 MCP server (no SDK)
+  exposing 23 tools that bind the same handlers as the CLI, so the two
+  surfaces cannot drift. Includes the MCP idle-shutdown backstop: no tool
+  call for `idle_shutdown_seconds` (8h default) plus zero active leases
+  triggers a verified host shutdown.
+- Host-side garbage collector: `proxmox-lab gc install|status|uninstall`
+  ships a standalone `pxl-gc` script plus one root crontab line on the
+  Proxmox host. It reads lease identity/expiry from guest metadata
+  (`pxl`/`lease-<id>` tags and the `pxl-lease=`/`pxl-expiry=` description
+  line), reaps expired-lease guests, and powers the host off when idle —
+  replacing the old MariaDB-reading hostguard.
+- `ssh.py` command allowlist: every remote argv is checked before a process
+  spawns, and the host-changing subset (`shutdown`, `crontab`, `install`,
+  `ethtool`, `tee`, `rm`) additionally requires `--host-change-authorized`.
+
+### Changed
+
+- Control plane: the HTTPS API client and scoped API token are replaced by
+  `ssh -o BatchMode=yes root@<target>`; there are no Proxmox credentials to
+  configure or store.
+- State: the JSON lease files, the MariaDB audit ledger and its spool are
+  replaced by `<state dir>/lab.db` (WAL + `busy_timeout`). No migration —
+  it is a fresh-start database.
+- Long-term leases are now a lease `kind` with `expires_at=0` and
+  `pxl-expiry=0` guest metadata rather than a separate subsystem.
+- `lease-begin` refuses on an unreachable host — it no longer wakes the
+  host itself; the operator runs `power wake --standalone-authorized`.
+- Console and transfer ride the ssh seam: screenshots via `qm monitor`
+  screendump + PPM→PNG, keystrokes via `qm sendkey`, push/pull via chunked
+  base64 guest exec.
+
+### Removed
+
+- ~50 modules of optional surface: the VNC/websocket console stack (rfb,
+  ws, des, textmode, serial, vision), Windows/PE/Android installers,
+  memflow, netcap, usb, netgw/VPN, storage/S3/MinIO and share,
+  the onboarding ceremony, host setup scripts, OCI/recipes/crash/virtio/
+  disk tooling, and the update checker.
+- The secrets backends (keychain, secret-tool, env, shared MariaDB store)
+  and the MariaDB/PyMySQL/cryptography runtime dependencies — SSH keys are
+  the entire secret surface.
+
 ## 0.18.0 - 2026-09-10
 
 ### Added

@@ -1,63 +1,88 @@
-# 📌 Long-term leases
+# Long-term leases
 
-## Purpose
-
-When work must survive the host powering off — a build box, an always-on service, debugging that spans weeks — a long-term lease keeps the host up and its guests protected and backed up, until you explicitly destroy or release it.
-
-## Commands
-
-All flags verified against `src/proxmox_agent_lab/longterm.py:register()` and `src/proxmox_agent_lab/cli.py` / `guest.py`.
-
-| Command | Key flags (verified) | Notes |
-|---|---|---|
-| `lease-begin --purpose "..." --long-term` | `--long-term`, `--purpose` | host stays on; never expires |
-| `lease-list` / `status` | — | shows `kind: long-term`, `host_pinned_on` |
-| `lease-destroy --lease ID --confirm` | `--lease`, `--confirm` | lifts Proxmox `protection`, stops & deletes lease guests |
-| `lease-release --lease ID --confirm` | `--lease`, `--confirm` | removes protection, finalizes lease, leaves retained guests stopped, may power off host |
-| `guest retain --vmid ID [--purpose ...] [--lease ID] [--forget]` | `--vmid`, `--purpose`, `--forget` | records a deliberately-kept guest in `retained.json` |
-| `backup [--force] [--keep N] [--storage ID] [--interval-days N]` | `--force`, `--keep`, `--interval-days`, `--storage` | weekly `vzdump --mode snapshot` |
-| `backup --retained --force` | `--retained`, `--force` | one-off retained-registry backup |
-| `lease-end --lease ID` | `--lease` | refuses a long-term lease; points at `lease-destroy` |
-| `lease-end --lease ID --shared-guests-authorized` | `--shared-guests-authorized` | only for cross-registered guests with expired claimants |
-
-Quick examples:
-
-```bash
-proxmox-lab lease-begin --long-term --purpose "persistent build box"
-proxmox-lab lease-list
-proxmox-lab backup --force
-proxmox-lab lease-destroy --lease <id> --confirm
-```
-
-An ordinary lease promises that **everything disappears**. A long-term lease makes the opposite promise, for the machines you want to keep — a build box, a always-on service, something you are still debugging next week.
+An ordinary lease promises that everything disappears: guests destroyed, host
+powered off. A long-term lease makes the opposite promise for the machines you
+want to keep — a build box, an always-on service, something you are still
+debugging next week.
 
 ```bash
 proxmox-lab lease-begin --long-term --purpose "persistent build box"
 ```
 
-## ⚠️ What changes
-
-Three things, and the first one costs money:
+That is one flag on the ordinary command. It changes four things, and the
+first one costs money:
 
 | | Ordinary lease | Long-term lease |
 |---|---|---|
-| 🔌 **The host** | Powered off when the last lease ends | **Stays on**, permanently |
-| ⏰ **Expiry** | 2 hours, renewed by heartbeat | Never expires |
-| 🧹 **Its guests** | Destroyed at `lease-end` | Kept, and `protection` set |
-| 💾 **Backups** | None by the lease; see the retained registry | Weekly, to the bulk storage |
-| 🚪 **Ending it** | `lease-end` | `lease-destroy --confirm` |
+| **The host** | Powered off when the last lease ends | **Stays on**, indefinitely |
+| **Expiry** | `ttl_seconds` (default 2 h), renewed by heartbeat | Never expires (`expires_at` 0) |
+| **Its guests** | Destroyed at `lease-end` | Kept, stamped `pxl-expiry=0` |
+| **Ending it** | `lease-end` | `lease-destroy --confirm` — the only exit |
 
-**While any long-term lease is active, the machine never powers down.** Not by `lease-end`, not by the idle timer, not by the watchdog. That is the whole feature, and it is also the thing that will show up on your electricity bill, so the tool says so every time:
+`lease-begin` does not send Wake-on-LAN: if the host is off, it refuses and
+tells you to run `power wake` first (a standalone power lever, gated
+`--standalone-authorized` because a person must own it). So begin a long-term
+lease while the host is up — which it will then stay.
+
+The command itself says all of this back at you:
 
 ```json
 {
-  "host_powered_off": false,
-  "host_left_running": true,
-  "reason": "1 long-term lease(s) keep this machine on: 20260101-abcd1234"
+  "kind": "long_term",
+  "expires_at": 0,
+  "warning": "This is a long-term lease: the lab machine will stay powered on until it is destroyed with 'lease-destroy'. Its guests carry pxl-expiry=0 and are never swept."
 }
 ```
 
-## 👀 Seeing what is pinned
+## Why the host stays on
+
+Three independent mechanisms all agree to leave it running:
+
+- **The controller's cleanup.** `lease-end` and `cleanup-expired` never
+  finalize a long-term lease, and when the last *ordinary* lease ends the
+  finalizer reports the host left on rather than shutting it down:
+
+  ```json
+  {
+    "host_powered_off": false,
+    "host_left_running": true,
+    "reason": "1 long-term lease(s) keep this machine on: 20260925-abcd1234",
+    "to_power_off": "destroy them with 'lease-destroy', or stop the host yourself"
+  }
+  ```
+
+- **The host-side GC.** Guests stamped `pxl-expiry=0` are never reaped and
+  count as *pinned*: `pxl-gc` logs `skip <vmid>: long-term (pxl-expiry=0)`
+  and any pinned guest vetoes the idle power-off, forever.
+
+- **The MCP idle shutdown.** It fires only when no lease is active at all;
+  a long-term lease is active, so the server never powers the host down
+  under one.
+
+See [safety-policy.md](safety-policy.md) invariants 2 and 6.
+
+## Heartbeat does nothing — by design
+
+A heartbeat exists to push an expiry forward. A long-term lease has no
+expiry, so the command answers rather than acting:
+
+```bash
+proxmox-lab lease-heartbeat --lease <id>
+```
+
+```json
+{
+  "lease": "<id>",
+  "kind": "long_term",
+  "expires_at": 0,
+  "note": "long-term leases do not expire; no heartbeat needed"
+}
+```
+
+Nothing breaks if a task heartbeats a lease it does not know is long-term;
+it just gets a no-op.
+
+## Seeing what is pinned
 
 ```bash
 proxmox-lab lease-list
@@ -66,118 +91,103 @@ proxmox-lab lease-list
 ```json
 {
   "active": [
-    {"id": "…-abcd1234", "kind": "long-term", "purpose": "build box",
-     "guests": [9001], "last_backup_at": "2026-01-08T03:00:00Z"}
+    {
+      "id": "20260925093000-abcd1234",
+      "kind": "long_term",
+      "purpose": "persistent build box",
+      "expires_at": 0,
+      "guests": [9001]
+    }
   ],
   "host_pinned_on": true,
-  "pinned_by": ["…-abcd1234"]
+  "pinned_by": ["20260925093000-abcd1234"]
 }
 ```
 
-If you ever wonder why the lab is still humming, that is the command.
+If you ever wonder why the lab is still humming, `pinned_by` is the answer.
 
-## 🛡️ Protection
+## Protection is metadata, not a guest flag
 
-Guests created under a long-term lease get Proxmox's `protection` flag, so a stray delete — from this tool, the web UI, or `qm destroy` — is refused. They are also registered with policy `retain`, so ordinary cleanup skips them.
+A guest created or registered under a long-term lease is stamped
+`pxl;lease-<id>` plus `pxl-lease=<id> pxl-expiry=0` in its description. That
+stamp is the whole protection:
 
-You cannot end a long-term lease with `lease-end`; it refuses and points you at `lease-destroy`. Two different intentions deserve two different commands.
+- this tool's cleanup and the host-side GC both skip `pxl-expiry=0`;
+- `guest destroy` still requires the guest be registered to *your* lease in
+  `lab.db`;
+- `lease-end` on another lease refuses before touching a guest a long-term
+  lease also registers (see `--shared-guests-authorized` in
+  [safety-policy.md](safety-policy.md)).
 
-The protection runs the other way too. If an *ordinary* lease has registered a guest that a long-term lease also registers — an idempotent setup command run under both, say — `lease-end` on the ordinary lease refuses before it touches anything, naming the guest and the long-term lease.
+There is deliberately **no Proxmox `protection` flag** set on the guest. A
+human running `qm destroy` on the host will still delete the machine — the
+lease then holds a dead registration, and the tool notices on the next
+operation. The pin protects against the tool and the sweeps, not against
+root on the host. Two different intentions, two different mechanisms, only
+one of which exists.
 
-To close the lease while preserving every guest registered with policy `retain`, use the distinct release operation:
+`lease-end` and `lease-abandon` both refuse a long-term lease outright and
+name `lease-destroy` — ending one is a destructive decision, not an
+administrative one.
 
-```bash
-proxmox-lab lease-release --lease <id> --confirm
-```
-
-It removes protection, finalizes the lease, leaves retained guests stopped, and powers off the host when no other lease is active. It does not weaken the destructive semantics of `lease-destroy`.
-
-## 💾 Weekly backups
-
-Every seven days, each guest is backed up with `vzdump` in **snapshot** mode — the guest keeps running — to the storage in `[lease] long_term_backup_storage`, defaulting to `[storage] bulk_storage`. Old generations are pruned to `long_term_backup_keep` (default 2).
-
-The watchdog runs them, so nothing extra needs scheduling. To take one now:
-
-```bash
-proxmox-lab backup --force
-```
-
-`last_backup_at` only advances when *every* guest in the lease succeeded, so a partial failure is retried rather than quietly waiting another week.
-
-```toml
-[lease]
-long_term_backup = true
-long_term_backup_storage = ""   # blank = [storage] bulk_storage
-long_term_backup_keep = 2
-```
-
-A slow, large disk is the right target. These are safety copies.
-
-### What this does *not* cover
-
-Only guests of an **active long-term lease**. That leaves the rest of the keep-forever set — templates, a released long-term lease's machines, persistent gateway and share workers — with no coverage at all, which is the opposite of what their value deserves. Those are covered by the retained registry instead:
-
-```bash
-proxmox-lab guest retain --vmid 101 --purpose "Ubuntu cloud-init template"
-proxmox-lab backup --retained --force        # once, now
-```
-
-`doctor` reports `retained_backup` — how many retained guests exist, which have never been backed up, and the oldest backup age — whether or not the sweep is enabled, so the gap is visible rather than assumed. To have the watchdog do it on the same weekly interval:
-
-```toml
-[lease]
-retained_backup = true              # off by default: it writes GBs on a schedule
-retained_backup_interval_days = 7
-```
-
-It is off by default deliberately. Turning it on starts writing vzdump archives of every retained guest to the bulk store, which on a slow disk is hours of wall clock and gigabytes of space — a decision for the operator, not a default. When the watchdog runs it, it runs *outside* the controller lock and under its own non-blocking lock, so a long backup can neither block a lease operation nor have a second copy started by the next five-minute tick.
-
-## Safety gate
-
-| Destructive op | Required flag | What it guards |
-|---|---|---|
-| Destroy long-term lease + its guests (`lease-destroy`) | `--confirm` | protected guests only deleted after protection is lifted; refused without `--confirm`, which previews the guests and `last_backup_at` |
-| Release lease but keep retained guests (`lease-release`) | `--confirm` | retained machines become independent of the lease, left stopped |
-| End ordinary lease with cross-registered guest | `--shared-guests-authorized` (on `lease-end`) | refuses when any `delete`-policy guest is also registered to another `active` lease (including long-term and expired-but-still-active); without the flag it names the guest/other lease and records `lease-end-refused-shared-guest`; with it, still leaves a live-owned guest as `left_to_another_lease` |
-| Host power-off while pinned | none — refused | while any long-term lease is `active`, `lease-end`/idle/watchdog reports `host_left_running: true` and does not power off — see [safety-policy.md](safety-policy.md) invariant 16 |
-
-A long-term lease suspends safety-policy invariant 6: while one is active the host stays powered on, and every command that would otherwise shut it down reports that it did not, and why. Long-term guests carry `protection` and `retain` and are removed only by `lease-destroy --confirm`, which lifts protection first.
-
-## Failure mode
-
-- `lease-end` on a long-term lease always fails and points at `lease-destroy`; this is intentional — two intentions, two commands.
-- `lease-destroy` without `--confirm` previews the loss (`qemu/9001 (buildbox)`, `Backed up so far: …`) and does not mutate. With `--confirm` it lifts protection, stops and deletes, then powers off the host only if nothing else pins it — order matters because Proxmox refuses to delete a protected guest.
-- `backup` with a partial failure does not advance `last_backup_at` — a partial failure retries instead of waiting a week (see [safety-policy.md](safety-policy.md) invariant 18). The same rule applies to retained backups.
-- A lease is active even past its expiry until finalized; an expired-but-`active` claimant still blocks a cross-registered delete unless `--shared-guests-authorized` is passed, and even then a still-live claimant keeps the guest alive (`left_to_another_lease`).
-- `retained_backup = true` is off by default because it writes GBs on a slow bulk store; run `backup --retained --force` once to prove it fits before enabling the watchdog.
-
-## 🔥 Destroying one
+## Destroying one
 
 ```bash
 proxmox-lab lease-destroy --lease <id> --confirm
 ```
 
-Without `--confirm` it refuses and shows you exactly what would be lost, including when it was last backed up:
+Without `--confirm` it refuses and previews exactly what would be lost:
 
 ```
 This permanently destroys a long-term lease and everything in it:
   qemu/9001 (buildbox)
-
-Backed up so far: 2026-01-08T03:00:00Z
 Re-run with --confirm if that is what you want.
 ```
 
-With `--confirm` it lifts the protection flag, stops and deletes the guests, and — if nothing else is holding the machine up — powers it off. The order matters: Proxmox refuses to delete a protected guest, so protection comes off first.
+With `--confirm` the order matters and is deliberate:
 
-## 🤔 When not to use one
+1. Each registered guest's stamp is rewritten to `pxl-expiry=<past>`. A
+   teardown that half-fails leaves expired guests the host-side GC will
+   reap — never guests that pin the machine on for ever.
+2. Guests are shut down (graceful first, hard stop after the timeout) and
+   destroyed.
+3. The lease record ends in state `destroyed`. On a partial failure it stays
+   `cleanup_failed` with the per-guest errors.
+4. The host powers off, verified by repeated probe failure, only if no other
+   lease — ordinary or long-term — is still active.
 
-- **For work that finishes today.** Use an ordinary lease; that is what the automatic cleanup is for.
-- **As a substitute for a server.** If something needs to be up all the time, a machine that is *designed* to stay on is a better home than a lab that merely stops turning itself off.
-- **When you would not miss it.** A long-term lease is a commitment to power draw and disk space. Anything you would shrug at losing belongs in a disposable one.
+## Failure modes
+
+- `lease-destroy` on an *ordinary* lease refuses: end those with
+  `lease-end`. The destructive verb is reserved for the kind that needs it.
+- If a destroy half-fails, re-run `lease-destroy --confirm`; the lease is
+  `cleanup_failed`, which `cleanup-expired` skips for long-term leases — the
+  sweep will not finish the job for you.
+- `power shutdown --standalone-authorized` does not check leases; it refuses
+  only while a guest is running. With all long-term guests stopped it *will*
+  power the host off — the machines then simply sit stopped until the host
+  is booted again. The pin is a policy against *automatic* power-off, not a
+  lock against a person with the flag.
+- A guest deleted out-of-band on the host leaves its registration behind;
+  `doctor` drift reporting and the next lease operation surface it.
+
+## When not to use one
+
+- **For work that finishes today.** An ordinary lease is what the automatic
+  cleanup is for.
+- **As a substitute for a server.** If something needs to be up all the
+  time, a machine designed to stay on is a better home than a lab that
+  merely stops turning itself off.
+- **When you would not miss it.** A long-term lease is a commitment to power
+  draw and disk space; anything you would shrug at losing belongs in a
+  disposable one.
 
 ## See also
 
-- [safety-policy.md](safety-policy.md) — invariants 6, 17, 18, graceful finalization and orphan handling
-- [storage.md](storage.md) — `storage status` classes and weekly backup target `[storage] bulk_storage`
-- [CONFIGURATION.md](CONFIGURATION.md#lease) — `[lease]` keys `long_term_backup*`, `retained_backup*`
-
+- [safety-policy.md](safety-policy.md) — the invariants behind the pin,
+  the shared-guest refusal, and verified shutdown
+- [INSTALL.md](INSTALL.md) — installing the host-side GC that honours
+  `pxl-expiry=0`
+- [commands.md](commands.md) — generated command reference
+- [CONFIGURATION.md](CONFIGURATION.md) — `[lease] ttl_seconds`,
+  `idle_shutdown_seconds`

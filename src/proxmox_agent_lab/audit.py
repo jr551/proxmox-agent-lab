@@ -1,29 +1,24 @@
-"""The audit facade: redaction, ledger caching, spool and migration.
+"""The audit facade: one redacted event row per action.
 
-Every action in the lab appends one redacted event. The durable store is the
-shared MariaDB ledger (``journal``/``mariadb`` own the storage details); when
-the lab host is off the events spool locally under the journal directory and
-are uploaded later. This module coordinates that without owning the wire
-protocol, the schema, or the command surface.
+Every action in the lab appends one event: what happened, to which guest,
+under which lease. The row lands in the local SQLite store (``<state dir>
+/lab.db``, see ``store.py``); everything richer than the legacy columns lives
+inside ``data`` as a JSON object -- redacted *before* it is ever inserted.
 
-Configuration and the journal root are supplied by the caller: ``cli`` binds
-the process-wide configuration and keeps the path patchable for tests. The
-ledger settings and the one-shot flags are cached *here*, for the life of the
-process, for the same reason they used to be module globals on the CLI.
+Auditing must never fail the action being audited: when an event cannot be
+recorded, one warning goes to stderr and the action continues. The store
+handle is opened lazily, on first use, so importing this module -- and
+running with a missing or broken config -- never touches the filesystem.
 """
 
 from __future__ import annotations
 
 import re
-import socket
 import sys
-import uuid
 from typing import Any
 
-from . import journal as journal_module
-from . import mariadb as mariadb_module  # noqa: F401  (settings types/ledger)
-from . import secrets_store
-from .state import utc_now
+from . import config as config_module
+from . import store as store_module
 
 SENSITIVE_KEY = re.compile(
     r"(pass(word)?|token|secret|authorization|private.?key|cipassword|ssh.?keys?)",
@@ -45,100 +40,42 @@ def redact(value: Any, key: str = "") -> Any:
     return value
 
 
-def controller_id(config: Any) -> str:
-    """This machine's name in the shared ledger."""
-    return str(config.audit.get("controller_id") or socket.gethostname())
+_STORE: store_module.Store | None = None
 
 
-_LEDGER_CACHE: Any = False
+def _store() -> store_module.Store:
+    """The process-wide store handle, opened on first use (never at import)."""
+    global _STORE
+    if _STORE is None:
+        root = config_module.state_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        _STORE = store_module.Store(root / "lab.db")
+    return _STORE
 
 
-def ledger(config: Any) -> Any:
-    """Settings for the shared MariaDB ledger, or None if not configured yet.
+def audit(
+    event: str, *, lease: str | None = None, vmid: int | None = None, **fields: Any
+) -> None:
+    """Append one redacted event row. Never raises into the action.
 
-    Cached for the life of the process: this is consulted on every audited
-    action, and rebuilding it each time would re-read the bootstrap secret.
+    The row keeps the legacy ``events`` columns (``timestamp``, ``event``,
+    ``lease``, ``vmid``, ``data``). ``data`` is the JSON object
+    ``{actor, tool, ok, target, **fields}`` with every value redacted first:
+    ``actor`` is ``"cli"``, ``tool`` defaults to the event name, ``ok`` to
+    ``True`` and ``target`` to ``None`` -- callers may override any of them
+    through ``fields``.
     """
-    global _LEDGER_CACHE
-    if _LEDGER_CACHE is False:
-        try:
-            secret = secrets_store.get(
-                config, secrets_store.BOOTSTRAP_SECRET, required=False
-            )
-        except secrets_store.SecretError:
-            secret = ""
-        _LEDGER_CACHE = journal_module.settings_from_config(config, secret)
-    return _LEDGER_CACHE
-
-
-def prime_ledger_cache(settings: Any) -> None:
-    """Record freshly provisioned settings so this process uses them now."""
-    global _LEDGER_CACHE
-    _LEDGER_CACHE = settings
-
-
-_AUTO_MIGRATED = False
-
-
-def auto_migrate_once(config: Any, journal_root: Any) -> None:
-    """Carry a controller upgraded from an older release into the shared ledger.
-
-    Runs at most once per process, and at most once per machine (a marker file
-    records it). Silent and non-fatal: an upgrade must not turn the first
-    command after it into a failure.
-    """
-    global _AUTO_MIGRATED
-    if _AUTO_MIGRATED:
-        return
-    _AUTO_MIGRATED = True
-    settings = ledger(config)
-    if settings is None or journal_module.migration_done(journal_root):
-        return
-    detail = journal_module.auto_migrate(
-        settings, journal_root, controller=controller_id(config)
-    )
-    if detail and detail.get("uploaded"):
+    try:
+        data: dict[str, Any] = {
+            "actor": "cli",
+            "tool": event,
+            "ok": True,
+            "target": None,
+        }
+        data.update(redact(fields))
+        _store().record(event, lease=lease, vmid=vmid, data=data)
+    except Exception as exc:  # noqa: BLE001 - auditing never fails the action
         print(
-            f"notice: carried {detail['uploaded']} event(s) from this "
-            "controller's previous local ledger into the shared MariaDB "
-            "ledger. The old files were left in place.",
+            f"warning: audit event {event!r} could not be recorded: {exc}",
             file=sys.stderr,
         )
-
-
-_SPOOL_NOTICE_SHOWN = False
-
-
-def _note_spooling(journal_root: Any) -> None:
-    """Say once per run that the ledger is unreachable and events are queued."""
-    global _SPOOL_NOTICE_SHOWN
-    _SPOOL_NOTICE_SHOWN = True
-    print(
-        "notice: the audit ledger is unreachable; events are being spooled to "
-        f"{journal_module.spool_path(journal_root)}. Upload them with "
-        "'proxmox-lab journal --flush-spool' once the lab host is up.",
-        file=sys.stderr,
-    )
-
-
-def audit(config: Any, journal_root: Any, event: str, **fields: Any) -> None:
-    """Append one redacted event to the shared ledger.
-
-    Never fails the action being audited. The lab host is powered off between
-    leases by design, so an unreachable ledger spools locally and is uploaded
-    later by 'proxmox-lab journal --flush-spool'.
-    """
-    now = utc_now()
-    record = {
-        "timestamp": now.isoformat().replace("+00:00", "Z"),
-        "event": event,
-        "event_id": uuid.uuid4().hex,
-        "controller": controller_id(config),
-        **redact(fields),
-    }
-    auto_migrate_once(config, journal_root)
-    outcome = journal_module.record(
-        ledger(config), journal_root, record, controller=controller_id(config)
-    )
-    if outcome == "spooled" and not _SPOOL_NOTICE_SHOWN:
-        _note_spooling(journal_root)

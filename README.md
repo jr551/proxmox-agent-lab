@@ -1,176 +1,158 @@
 # proxmox-agent-lab
 
-**Turn a spare PC into an on-demand lab an AI agent can wake, use, and switch
-back off.**
+**A skill that gives an AI agent a disposable Proxmox lab — and cleans up
+after itself.**
 
 [![CI](https://github.com/jr551/proxmox-agent-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/jr551/proxmox-agent-lab/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/jr551/proxmox-agent-lab)](https://github.com/jr551/proxmox-agent-lab/releases/latest)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-The `proxmox-lab` CLI powers a spare Proxmox host on and off, creates and
-destroys lease-owned guests, drives screens, runs commands, moves files, and
-records an audit trail. All work happens inside a **lease**: ordinary leases
-clean up and verify shutdown when they end; long-term leases deliberately keep
-the host on for persistent machines.
+The agent takes a **lease**, creates the machines it needs, works, and when
+the lease ends everything it made is destroyed and the host is switched off.
+Nothing is left behind, so this is safe to point at a Proxmox box you already
+use.
 
-> **New here?** The [documentation index](docs/README.md) lists the shortest
-> path for every task.
+## Setup
 
-## Requirements
-
-- A spare PC running [Proxmox VE 8 or 9](https://www.proxmox.com), with a wired
-  NIC and Wake-on-LAN (or another power mode).
-- Python 3.11+ on the controller.
-- A secrets backend. The default `auto` reads `PROXMOX_AGENT_LAB_*` environment
-  variables; `keychain`, `secret-tool` and `file` are explicit options. See the
-  [secrets guide](docs/CONFIGURATION.md#secrets).
-
-## Install
-
-One command installs, configures, stores secrets, and health-checks:
+**1. Trust your machine on the host** — the only host setup there is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/install.sh | bash
+ssh-copy-id root@your-proxmox-host
 ```
 
-No install? `bootstrap.sh` drops a throwaway environment under
-`$TMPDIR/proxmox-agent-lab-env` and prints the path:
+**2. Install:**
 
 ```bash
-PXL=$(curl -fsSL https://raw.githubusercontent.com/jr551/proxmox-agent-lab/main/bootstrap.sh | sh) && "$PXL" doctor
+pip install proxmox-agent-lab
 ```
 
-Full setup — Proxmox host preparation and the audit ledger — is in
-[docs/INSTALL.md](docs/INSTALL.md). Every setting is in
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
-
-### Onboard a host
-
-Two ways to bring a machine under `proxmox-lab` control. Both end with
-`onboard serve` on the controller receiving the pairing callback and writing a
-verified config.
-
-**💿 New host — boot an auto-install ISO.** Generate a pairing bundle, build a
-Proxmox ISO that installs the host and pairs it on first boot, then boot the
-spare PC from it (UEFI required):
+**3. Point it at your host and check it works:**
 
 ```bash
-proxmox-lab onboard prepare --mode iso --directory ~/pxl-pc-bundle \
-  --controller-host pc.example.com --fqdn lab.example.com \
-  --disk-serial "$TARGET_DISK_ID_SERIAL" \
-  --root-password-hash-file ~/pxl-root-password.hash --wipe-confirmed
-proxmox-lab onboard build-iso --bundle ~/pxl-pc-bundle \
-  --source ~/Downloads/proxmox-ve.iso --sha256 "$OFFICIAL_ISO_SHA256"
-proxmox-lab onboard serve --bundle ~/pxl-pc-bundle \
-  --config-out ~/.config/proxmox-agent-lab/new-lab.toml
+proxmox-lab init                       # writes a starter config
+proxmox-lab doctor                     # verifies the whole path; non-zero on failure
 ```
 
-**🖥️ Existing Proxmox host — pair in place.** On a machine that already runs
-Proxmox, generate a bundle, copy `host-setup.py` to it, and run it as root to
-create the API principal, isolated bridge and pairing — no reinstall:
+That's it. No daemon, no API token, no database to provision, nothing running
+on the host.
+
+## Use it as a skill
+
+This is a skill first. Point your agent at it and it reads the instructions
+only when a task actually needs a lab, so keeping it installed costs almost
+nothing. The agent takes a lease, works, and cleans up on the way out —
+including when the work fails:
 
 ```bash
-proxmox-lab onboard prepare --mode existing --directory ~/pxl-host-bundle \
-  --controller-host pc.example.com --fqdn lab.example.com
-proxmox-lab onboard serve --bundle ~/pxl-host-bundle \
-  --config-out ~/.config/proxmox-agent-lab/new-lab.toml
-# on the Proxmox host, as root:
-python3 host-setup.py --host-change-authorized
+# what the agent does, in short
+L=$(proxmox-lab lease-begin --purpose "build a test rig" | jq -r .id)
+trap 'proxmox-lab lease-end --lease "$L"' EXIT   # always cleans up
+
+proxmox-lab guest clone --lease "$L" --source 9000 --vmid 9101
+proxmox-lab guest run   --lease "$L" --vmid 9101 -- uname -a
+proxmox-lab push        --lease "$L" --vmid 9101 --file payload.bin --dest /tmp/payload.bin
+proxmox-lab console click --lease "$L" --vmid 9101 --x 360 --y 200
 ```
 
-A fresh Debian VPS (no Proxmox yet) uses `--mode vps` instead — it installs
-the Proxmox kernel and packages first. Details and the Wi-Fi option are in
-[docs/onboarding.md](docs/onboarding.md).
+The full instructions live in [SKILL.md](SKILL.md).
 
-## First safe workflow
+### Prefer tools over shell commands? Mount the MCP server
 
-Every task follows this shape. `lease-end` sits in a `trap` so it runs even if
-the work fails:
+That surface exists too — 29 tools over stdio:
 
-```bash
-(
-set -e
-L=$(proxmox-lab lease-begin --purpose "first run" \
-    | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
-trap 'proxmox-lab lease-end --lease "$L"' EXIT
-
-proxmox-lab guest clone --lease "$L" --template 9000 --newid 9101
-proxmox-lab guest probe --vmid 9101
-proxmox-lab guest run --lease "$L" --vmid 9101 uname -a
-)  # the trap destroys the clone and powers the host off, including on failure
+```json
+{
+  "mcpServers": {
+    "proxmox-agent-lab": {
+      "command": "proxmox-lab",
+      "args": ["mcp"]
+    }
+  }
+}
 ```
 
-`lease-end` must report `"host_powered_off": true`. If cleanup fails, run
-`proxmox-lab cleanup-expired --all` and report the exact blocker. The full
-lease skeleton is in [SKILL.md](SKILL.md); fixes are in
-[docs/troubleshooting.md](docs/troubleshooting.md).
+**Worth knowing before you mount it:** a mounted MCP server publishes its
+tool schemas into *every* session, used or not — around 2,400 tokens,
+permanently, on top of the skill. That is what the convenience costs. If you
+would rather pay it only when it earns its keep, leave the server unmounted
+and let the skill drive the CLI.
 
-## What it can do
+## Works alongside your existing Proxmox install
 
-| Capability | Command | Guide |
-|---|---|---|
-| Disposable Linux/Windows/Android guests | `guest clone` / `guest run` | [SKILL.md](SKILL.md), [docs/RECIPES.md](docs/RECIPES.md) |
-| Drive the screen | `console screenshot`, `console type`, `console click` | [docs/console.md](docs/console.md) |
-| Cloud vision | `console inspect` | [docs/console.md](docs/console.md) |
-| File transfer | `push` / `pull` | [docs/storage.md](docs/storage.md) |
-| VPN egress and leak testing | `net gateway-create` / `net leak-test` | [docs/network.md](docs/network.md) |
-| Install Windows | `windows install` | [docs/windows.md](docs/windows.md) |
-| Android emulators | `android create` | [docs/android.md](docs/android.md) |
-| Memory introspection | `memflow processes` / `scan` / `write` | [docs/memflow.md](docs/memflow.md) |
-| USB/network capture | `usb sniff` / `netcap capture` / `intercept` | [docs/usb.md](docs/usb.md), [docs/netcap.md](docs/netcap.md) |
-| Long-running persistent guests | `lease-begin --long-term` | [docs/long-term-leases.md](docs/long-term-leases.md) |
+**This is a guest, not a management layer. It shares the host; it does not own
+it.** Point it at a Proxmox server already running your real workloads and
+the two coexist — that is the normal case, not a special one.
 
-Every subcommand is mapped in [docs/commands.md](docs/commands.md).
+Every guest it creates is **labelled at creation**:
 
-## Lifecycle and safety
+```
+tags:        proxmoxagentlab;my-mac;lease-20260927174717-ae7ddc76
+description: pxl-lease=20260927174717-ae7ddc76 pxl-expiry=1790538437
+```
 
-An ordinary lease wakes the host, clones a guest, runs the work, then
-`lease-end` destroys the lease's guests and verifies the host is off. A
-`lease-begin --long-term` keeps the host and its guests running until
-`lease-destroy --confirm`. Details in
-[docs/long-term-leases.md](docs/long-term-leases.md).
+Those labels are the entire boundary, and they are what every check reads:
 
-Shutdown is verified, not assumed: `lease-end` reports whether the API stopped
-answering. If cleanup or power-off fails, the failure is recorded,
-`cleanup-expired` retries, and the host stays on when shutdown cannot be
-verified. The enforced rules are in [docs/safety-policy.md](docs/safety-policy.md):
+- **Cleanup only ever touches labelled guests.** A guest without a
+  `proxmoxagentlab` label is never destroyed, stopped, or reclaimed — the
+  refusal happens before any host command runs. Do not work around it.
+- **You can see the lab in the normal web UI** — ordinary guests, filterable
+  by the `proxmoxagentlab` tag in Datacenter → the node. The second tag is
+  the hostname of the machine that created it.
+- **Guests you created yourself are never at risk.** No label, no lease, no
+  touch. Long-term lab machines carry `pxl-expiry=0` so the collector leaves
+  them running by design.
+- **The host is only ever powered off when it is genuinely idle** — no running
+  guest, including *your* unlabelled ones — and only after two clear checks
+  several minutes apart. If anything of yours is running, the host stays up
+  and the lab tells you why in `reason`.
+- **Storage and VMIDs are yours to choose.** Fresh creates take
+  `--storage <name>`, `--disk-gb <n>` and `--vmid <id>`, so the lab shares
+  your existing pools. Check what is free first: colliding with a real VMID
+  destroys somebody's machine.
 
-- **Lease-owned guests only** — cleanup deletes only what the lease created.
-- **Verified shutdown** — `lease-end` does not claim success until the API
-  stops answering, twice.
-- **Host changes refused by default** — networking, storage, disks and
-  permissions need `--host-change-authorized`.
-- **Destructive actions are pinned** — formatting a disk requires the serial
-  number to match.
-- **Fails closed** — with VPN egress on, a dropped tunnel stops guest traffic
-  rather than leaking to your home connection.
-- **Secrets stay in the configured backend** — never in `argv`, the config
-  file, or the audit log.
+A dedicated host works too and is still the simplest deployment — it just
+removes the question entirely.
 
-This project is for systems you own or are authorized to test. See
-[RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) and [SECURITY.md](SECURITY.md).
+## The rules it holds itself to
+
+- **Lease-owned only.** Every mutation is checked against the lease registry
+  before a single host command is sent.
+- **Nothing is assumed.** A machine is only reported destroyed, or a host
+  reported off, once the host has been asked again and agrees.
+- **Host changes are opt-in.** Anything editing the host itself needs
+  `--host-change-authorized`; standalone `power wake` / `power shutdown` need
+  `--standalone-authorized`.
+- **Destructive actions are pinned.** `guest destroy` refuses without
+  `--confirm`.
+- **Fails closed.** An unreachable host, a missing lease, or guest metadata
+  that doesn't parse stops the action instead of guessing.
+- **No secrets anywhere.** Your ssh key is the only credential; nothing secret
+  enters the config, the journal, or any command line.
 
 ## Documentation
 
-- [docs/README.md](docs/README.md) — task-oriented index
-- [docs/INSTALL.md](docs/INSTALL.md) — install and first boot
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every setting and secret
-- [SKILL.md](SKILL.md) — copy-paste lease skeleton and quick reference
-- [docs/commands.md](docs/commands.md) — generated map of every subcommand
-- [docs/AGENTS.md](docs/AGENTS.md) — how an agent should drive it
-- [docs/RECIPES.md](docs/RECIPES.md) — common agent workflows
+- [docs/README.md](docs/README.md) — index of everything
+- [docs/INSTALL.md](docs/INSTALL.md) — host preparation and Wake-on-LAN
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every setting and default
+- [SKILL.md](SKILL.md) — how an agent should drive it
+- [docs/AGENTS.md](docs/AGENTS.md) — operational guidance for agents
+- [docs/commands.md](docs/commands.md) — every subcommand
+- [docs/safety-policy.md](docs/safety-policy.md) — the enforced rules
+- [docs/long-term-leases.md](docs/long-term-leases.md) — persistent machines
 - [docs/troubleshooting.md](docs/troubleshooting.md) — fix a failure
-- [docs/safety-policy.md](docs/safety-policy.md) — enforced rules
-- [docs/VERIFICATION.md](docs/VERIFICATION.md) — hardware-tested vs unit-tested
-- [CONTRIBUTING.md](CONTRIBUTING.md) — developer setup and checks
+- [docs/VERIFICATION.md](docs/VERIFICATION.md) — what has actually been tested
+- [docs/architecture.md](docs/architecture.md) — how it fits together
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development and checks
 
 ## Status
 
-Beta. Core lifecycle, console, storage, transfer, VPN, Android and Windows
-paths have been exercised against real hardware. Advanced capabilities clearly
-mark what has and has not been observed end to end. Interfaces may change
-before 1.0; compatibility for the package name and `proxmox-lab` command is a
-goal.
+Beta. The architecture is settled (ssh + one local SQLite file, nothing
+host-side but an optional garbage collector) but interfaces may change before
+1.0. What has been verified on real hardware — and what hasn't — is tracked
+honestly in [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
+For systems you own or are authorized to test: [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md)
+and [SECURITY.md](SECURITY.md).
 
 MIT licensed — see [LICENSE](LICENSE).

@@ -18,6 +18,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build",
              "__pycache__"}
+# Rework planning docs are historical evidence of the pre-rework tree: they
+# describe commands that no longer exist by design, so they stay out of the
+# live docs checks.
+SKIP_PREFIXES = ("docs/rework-",)
 LINK_RE = re.compile(r"\[[^\]]*\]\(\s*([^)\s]+)[^)]*\)")
 HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$", re.M)
 HTML_ANCHOR_RE = re.compile(r'<a\s+(?:name|id)="([^"]+)"')
@@ -49,6 +53,18 @@ def _command_tree() -> dict[tuple[str, ...], object]:
     sys.path.insert(0, str(ROOT / "src"))
     from proxmox_agent_lab import cli
 
+    factory = None
+    for name in ("parser", "build_parser", "make_parser"):
+        candidate = getattr(cli, name, None)
+        if callable(candidate):
+            factory = candidate
+            break
+    if factory is None:
+        raise SystemExit(
+            "proxmox_agent_lab.cli exposes no parser factory "
+            "(tried parser, build_parser, make_parser)"
+        )
+
     tree: dict[tuple[str, ...], object] = {}
 
     def walk(parser: object, prefix: tuple[str, ...]) -> None:
@@ -59,14 +75,17 @@ def _command_tree() -> dict[tuple[str, ...], object]:
                 if sub is not None:
                     walk(sub, prefix + (name,))
 
-    walk(cli.parser(), ())
+    walk(factory(), ())
     return tree
 
 
 def _markdown_files() -> list[Path]:
     files = []
     for path in sorted(ROOT.rglob("*.md")):
+        relative = path.relative_to(ROOT).as_posix()
         if any(part in SKIP_DIRS for part in path.relative_to(ROOT).parts):
+            continue
+        if relative.startswith(SKIP_PREFIXES):
             continue
         files.append(path)
     return files

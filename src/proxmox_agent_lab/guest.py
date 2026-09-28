@@ -1,882 +1,722 @@
-"""One way to talk to a guest, whatever the guest happens to support.
+"""Guest lifecycle over the proxmox seam: create/clone/start/stop/destroy, run/probe/list.
 
-There are three ways to run a command inside a lab guest, and which ones work
-depends on the guest, not on what the caller wants:
+The slim rework module (docs/rework-plan.md §D control mapping, §E guest_*
+shapes). Everything here goes through the injected :mod:`proxmox_agent_lab.proxmox`
+seam one argv at a time, and every mutation belongs to a lease:
 
-* **qemu-guest-agent** -- real exit codes and separated streams, but generic
-  cloud images do not ship it and it is absent during an install.
-* **serial console** -- needs no agent, but needs a login and returns a
-  transcript rather than structured output.
-* **LXC console** -- the container equivalent of the above.
+* the SQLite registry (``store.resources``) is the ownership proof --
+  :func:`require_owned` is the gate and it is store-only (zero seam calls, so
+  every refusal raises before anything is driven);
+* the durable copy is the §F guest metadata -- :func:`metadata_for` /
+  :func:`stamp_guest` delegate the format strings to :mod:`leases` and write
+  ``tags`` + ``pxl-lease=/pxl-expiry=`` description in one call wherever the
+  create command allows it (``qm create``/``pct create``), because a crash
+  between two calls is exactly how untagged guests are born;
+* registry-vouched guests -- a ``policy="retain"`` row or a config template
+  (``template: 1``) -- are clone sources and read-only surface only.
+  :func:`require_owned` refuses the retain rows it can see in the registry;
+  ``destroy`` re-checks both flavors itself (plus the ``pxl`` tag) and always
+  refuses them.
 
-Without this module every caller has to know that taxonomy, probe for it, and
-handle each case. `GuestSession` probes once and presents one interface, so
-callers -- and agents -- can say "run this in the guest" and get a result.
-
-    with GuestSession(lab, api, vmid, password=pw) as guest:
-        print(guest.channel)          # "agent" or "serial"
-        result = guest.run("uname -a")
-        print(result.stdout, result.exit_code)
+Read-only probes (:func:`cmd_probe`, :func:`cmd_list`) gate nothing and audit
+nothing; every mutating handler audits with identity fields only -- never
+typed text, file contents, or full command lines.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
-import shlex
-
-from dataclasses import dataclass, field
-from pathlib import Path
-import secrets
+import re
 import time
+from pathlib import Path
 from typing import Any
 
-from . import console
-from . import diskactivity
+from . import leases as leases_module
+from . import proxmox as proxmox_module
+from . import store as store_module
+from .errors import LabError
+
+_CONFIG_LINE = re.compile(r"^([A-Za-z0-9_-]+):\s?(.*)$")
+_PXL_EXPIRY = re.compile(r"pxl-expiry=(\d+)")
+
+DEFAULT_STOP_TIMEOUT = 120
+DEFAULT_RUN_TIMEOUT = 300
 
 
-class GuestError(RuntimeError):
-    pass
+# -- guest metadata (docs/rework-plan.md §F; format strings live in leases) --
+
+def metadata_for(lease_id: str, expires_at: int) -> tuple[str, str]:
+    """The ``(tags, description)`` pair stamping one guest as this lease's."""
+    return (
+        leases_module.metadata_tags(lease_id),
+        leases_module.metadata_description(lease_id, expires_at),
+    )
 
 
-@dataclass
-class CommandResult:
-    """What a command did, regardless of how it was delivered."""
-
-    stdout: str
-    exit_code: int | None
-    channel: str
-    stderr: str = ""
-
-    @property
-    def ok(self) -> bool:
-        """True unless the command verifiably failed.
-
-        ``exit_code`` is ``None`` when the channel cannot report one -- a
-        serial run observes output but not the process status. ``None`` means
-        "no failure observed", which is the best that channel can honestly
-        offer, so ``ok`` is "succeeded or unknown", not "succeeded". Callers
-        that need a real exit code must use the agent channel or check
-        ``exit_code`` themselves.
-        """
-        return self.exit_code in (0, None)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-            "exit_code": self.exit_code,
-            "channel": self.channel,
-            "ok": self.ok,
-        }
+def stamp_guest(
+    prox: Any, kind: str, vmid: int, lease_id: str, expires_at: int
+) -> None:
+    """Write one guest's pxl metadata (tags + expiry line) in a single call."""
+    tags, description = metadata_for(lease_id, expires_at)
+    prox.set_metadata(kind, vmid, tags=tags, description=description)
 
 
-@dataclass
-class GuestCapabilities:
-    """What this guest can actually do, discovered rather than assumed."""
+# -- the ownership gate ----------------------------------------------------
 
-    vmid: int
-    kind: str
-    agent: bool = False
-    serial: bool = False
-    graphical_console: bool = False
-    keyboard_input: bool = False
-    notes: list[str] = field(default_factory=list)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "vmid": self.vmid,
-            "kind": self.kind,
-            "guest_agent": self.agent,
-            "serial_console": self.serial,
-            "graphical_console": self.graphical_console,
-            "keyboard_input": self.keyboard_input,
-            "notes": self.notes,
-        }
+def _open_store(lab: Any) -> store_module.Store:
+    """The lab database under this lab's state root."""
+    return store_module.Store(Path(lab.STATE_ROOT) / "lab.db")
 
 
-def probe(lab: Any, api: Any, vmid: int) -> GuestCapabilities:
-    """Discover how this guest can be reached. Read-only."""
-    kind = "qemu"
-    try:
-        config = api.call("GET", f"/nodes/{lab.NODE}/qemu/{vmid}/config")
-    except lab.LabError:
-        try:
-            api.call("GET", f"/nodes/{lab.NODE}/lxc/{vmid}/config")
-            caps = GuestCapabilities(vmid=vmid, kind="lxc", serial=True)
-            caps.notes.append("LXC: use the container console; no VNC")
-            return caps
-        except lab.LabError:
-            raise GuestError(
-                f"VMID {vmid} is not a QEMU VM or LXC container on {lab.NODE}"
-            ) from None
-
-    caps = GuestCapabilities(vmid=vmid, kind=kind)
-    caps.serial = any(str(key).startswith("serial") for key in config)
-    display = str(config.get("vga") or "")
-    # RFB key events go to the emulated PS/2 keyboard, so they only reach a
-    # guest that has a graphical display. On `vga: serial0` you get a picture
-    # but typing goes nowhere -- the single most confusing failure here.
-    caps.graphical_console = not display.startswith("serial")
-    caps.keyboard_input = caps.graphical_console
-    if not caps.graphical_console:
-        caps.notes.append(
-            "display is the serial console: screenshots work, but VNC "
-            "keyboard input does not. Drive this guest over serial."
-        )
-    if console.agent_ready(lab, api, vmid):
-        try:
-            result = console.agent_exec(
-                lab, api, vmid, ["/bin/true"], timeout=5,
-            )
-            caps.agent = result.get("exitcode") == 0
-        except lab.LabError:
-            caps.agent = False
-        if not caps.agent:
-            caps.notes.append(
-                "agent pings but cannot complete a command: the guest may be "
-                "hung or its storage offline"
-            )
-    elif str(config.get("agent") or "").startswith("enabled"):
-        caps.notes.append(
-            "agent is enabled in config but not answering: the guest may "
-            "still be booting, or qemu-guest-agent is not installed"
-        )
-    return caps
+def _registry_row(
+    store: store_module.Store, lease_id: str, kind: str | None, vmid: int
+) -> dict | None:
+    for row in store.resources_for(lease_id):
+        if row.get("destroyed_at"):
+            continue
+        if kind is not None and row["kind"] != kind:
+            continue
+        if row["vmid"] is None or int(row["vmid"]) != int(vmid):
+            continue
+        return dict(row)
+    return None
 
 
-class GuestSession:
-    """A command channel to one guest, chosen automatically.
+def _unregistered(lease_id: str, kind: str | None, vmid: int) -> LabError:
+    hint_kind = kind or "qemu|lxc"
+    return LabError(
+        f"vmid {vmid} is not a registered guest of lease {lease_id}: nothing "
+        f"local vouches for it, so it is never driven or destroyed. Register "
+        f"it with 'proxmox-lab lease-register --lease {lease_id} "
+        f"--kind {hint_kind} --vmid {vmid}' first."
+    )
 
-    `prefer` picks between channels when both work. The agent is the default
-    because it reports real exit codes.
+
+def _vouched(row: dict | None, cfg: dict | None, kind: str, vmid: int) -> LabError:
+    reasons = []
+    if row is not None and row.get("policy") == "retain":
+        reasons.append("its registry row carries policy=retain")
+    if cfg is not None and _is_template(cfg):
+        reasons.append("its config is a template (template: 1)")
+    return LabError(
+        f"{kind} {vmid} is registry-vouched ({'; '.join(reasons) or 'no reason'}): "
+        f"templates and retained registry guests are clone sources and "
+        f"read-only surface, never driven or destroyed by a lease. Destroy "
+        f"the clones instead, or drop the vouching first."
+    )
+
+
+def require_owned(lab: Any, lease_id: str, kind: str | None, vmid: int) -> dict:
+    """The live ``store.resources`` row for ``(lease_id, kind, vmid)``.
+
+    The ownership gate for every mutating operation. It reads the registry
+    only -- no seam call, no config read -- so a refusal always raises before
+    anything is driven. ``kind=None`` matches whichever kind the registry
+    recorded (handlers whose CLI takes no ``--kind``).
+
+    Refused: a missing (or already destroyed) row, naming ``lease-register``
+    as the remedy; and a registry-vouched row (``policy="retain"``), which is
+    a clone source and read-only surface, never a lease-driven machine.
     """
-
-    def __init__(
-        self,
-        lab: Any,
-        api: Any,
-        vmid: int,
-        *,
-        user: str | None = None,
-        password: str | None = None,
-        prefer: str = "agent",
-        capabilities: GuestCapabilities | None = None,
-    ) -> None:
-        self.lab = lab
-        self.api = api
-        self.vmid = vmid
-        self.user = user
-        # `None` and `""` are different credentials here. `None` means no
-        # password was offered at all; `""` means the caller looked and this
-        # guest has none -- an installer, a rescue shell, a stock appliance
-        # with a blank root account. The second is a usable serial login, so
-        # every test below asks `is None`, never truthiness.
-        self._password = password
-        self.capabilities = capabilities or probe(lab, api, vmid)
-        self._term: console.TermSession | None = None
-
-        options = []
-        if self.capabilities.agent:
-            options.append("agent")
-        if self.capabilities.serial and password is not None:
-            options.append("serial")
-        if not options:
-            raise GuestError(self._no_channel_message())
-        if prefer in options:
-            self.channel = prefer
-        else:
-            self.channel = options[0]
-
-    def _no_channel_message(self) -> str:
-        caps = self.capabilities
-        if caps.serial and self._password is None:
-            return (
-                f"VMID {self.vmid} has a serial console but no guest agent. "
-                "Pass a console password to use the serial channel, or "
-                "install qemu-guest-agent in the guest. A guest with no "
-                "password set is supported: supply an empty one explicitly."
-            )
-        return (
-            f"no way in to VMID {self.vmid}: no guest agent is answering and "
-            "no serial console is configured. Add `serial0: socket` to the "
-            "VM, or install qemu-guest-agent."
-        )
-
-    # -- lifecycle ---------------------------------------------------------
-
-    def _terminal(self) -> console.TermSession:
-        if self._term is None:
-            self._term = console.TermSession(
-                self.lab, self.api, self.capabilities.kind, self.vmid
-            )
-            # `_password` is never None on this path: the constructor only
-            # offers the serial channel once a password -- possibly empty --
-            # has been supplied.
-            self._term.login(self.user or "root", self._password or "")
-        return self._term
-
-    def close(self) -> None:
-        if self._term is not None:
-            self._term.close()
-            self._term = None
-
-    def __enter__(self) -> "GuestSession":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
-
-    # -- the interface callers actually want -------------------------------
-
-    def run(self, command: str, timeout: int = 300,
-            shell: str = "/bin/sh") -> CommandResult:
-        """Run a shell command in the guest."""
-        if self.channel == "agent":
-            result = console.agent_exec(
-                self.lab, self.api, self.vmid, [shell, "-c", command],
-                timeout=timeout,
-            )
-            return CommandResult(
-                stdout=result["stdout"], stderr=result["stderr"],
-                exit_code=result["exitcode"], channel="agent",
-            )
-        output, code = self._terminal().run_status(command, timeout=timeout)
-        return CommandResult(stdout=output, exit_code=code, channel="serial")
-
-    def run_argv(self, command: list[str], timeout: int = 300) -> CommandResult:
-        """Run an argv vector without re-parsing it on the agent channel."""
-        if self.channel == "agent":
-            result = console.agent_exec(
-                self.lab, self.api, self.vmid, command, timeout=timeout,
-            )
-            return CommandResult(
-                stdout=result["stdout"], stderr=result["stderr"],
-                exit_code=result["exitcode"], channel="agent",
-            )
-        return self.run(shlex.join(command), timeout=timeout)
-
-    def read_screen(self) -> dict[str, Any]:
-        """Capture the screen. Works even when no command channel does."""
-        if not self.capabilities.graphical_console:
-            self.capabilities.notes.append(
-                "screenshot shows the rendered serial console"
-            )
-        with console.VncSession(self.lab, self.api, self.vmid) as session:
-            rgb = session.client.capture()
-            return {
-                "width": session.client.width,
-                "height": session.client.height,
-                "rgb": rgb,
-            }
-
-    def describe(self) -> dict[str, Any]:
-        return {
-            "channel": self.channel,
-            **self.capabilities.as_dict(),
-        }
+    with _open_store(lab) as store:
+        row = _registry_row(store, lease_id, kind, vmid)
+    if row is None:
+        raise _unregistered(lease_id, kind, vmid)
+    if row.get("policy") == "retain":
+        raise _vouched(row, None, str(row["kind"]), int(vmid))
+    return row
 
 
-# --- commands ------------------------------------------------------------
+# -- seam helpers ----------------------------------------------------------
+
+def _make_proxmox(config: Any) -> proxmox_module.Proxmox:
+    """The proxmox seam for this configuration (tests substitute a double)."""
+    return proxmox_module.from_config(config)
 
 
-def _lease_owns(lab: Any, lease_id: str, kind: str, vmid: int) -> bool:
-    lease = lab.load_lease(lease_id)
-    return any(
-        item.get("kind") == kind and int(item.get("vmid", -1)) == vmid
-        for item in lease.get("resources", [])
-    )
+def _ssh_of(seam: Any) -> Any:
+    """The ssh transport underneath a proxmox seam (raw ``qm config`` reads)."""
+    return getattr(seam, "_ssh", seam)
 
 
-def cmd_template(lab: Any, args: Any) -> None:
-    """Convert a stopped, lease-owned guest into a cloneable template."""
+def _guest_config(prox: Any, kind: str, vmid: int) -> dict | None:
+    """The guest's ``qm config``/``pct config`` key/values, or ``None``.
 
-    api = lab.ProxmoxAPI()
-    if not _lease_owns(lab, args.lease, args.kind, args.vmid):
-        raise lab.LabError(
-            f"VMID {args.vmid} is not a {args.kind} guest registered to this lease"
-        )
-    status = api.call(
-        "GET", f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/status/current"
-    )
-    if status.get("status") != "stopped":
-        raise lab.LabError(
-            f"VMID {args.vmid} must be stopped before template conversion "
-            f"(status={status.get('status')})"
-        )
-    result = api.call(
-        "POST", f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/template"
-    )
-    if isinstance(result, str) and result.startswith("UPID:"):
-        lab.wait_task(api, result, timeout=args.task_timeout)
-    lab.audit("guest-template", lease=args.lease, kind=args.kind,
-              vmid=args.vmid)
-    print(json.dumps(
-        {"vmid": args.vmid, "kind": args.kind, "result": result},
-        indent=2, sort_keys=True,
-    ))
-
-
-def cmd_clone(lab: Any, args: Any) -> None:
-    """Clone a lease-owned template into a new guest, registering it."""
-
-    api = lab.ProxmoxAPI()
-    # A clone source may be a guest this lease owns, or a retained template
-    # the registry vouches for -- cloning a kept template is the whole point
-    # of keeping it, and it never modifies the source.
-    from . import inventory as inventory_module
-    retained = inventory_module.entries(lab.STATE_ROOT)
-    is_retained = inventory_module.key(args.kind, args.template) in retained
-    if not is_retained and not _lease_owns(lab, args.lease, args.kind, args.template):
-        raise lab.LabError(
-            f"VMID {args.template} is not a {args.kind} guest registered to "
-            "this lease or the retained registry"
-        )
-    data: dict[str, Any] = {"newid": args.newid}
-    if args.name:
-        data["name"] = args.name
-    result = api.call(
-        "POST", f"/nodes/{lab.NODE}/{args.kind}/{args.template}/clone", data
-    )
-    # Wait for the clone task so the new config exists before it is
-    # registered; cloning a freshly-converted template races otherwise.
-    if isinstance(result, str) and result.startswith("UPID:"):
-        lab.wait_task(api, result, timeout=args.task_timeout)
-    # The clone endpoint is not the guest-creation path, so it does not
-    # auto-register; do that under the same lock every other lease mutator
-    # uses so concurrent creations cannot clobber the entry.
-    with lab.controller_lock():
-        fresh = lab.load_lease(args.lease)
-        lab.register_resource(
-            fresh, args.kind, args.newid, "delete",
-            args.name or f"clone-{args.newid}",
-        )
-    lab.audit("guest-clone", lease=args.lease, kind=args.kind,
-              template=args.template, vmid=args.newid)
-    print(json.dumps(
-        {"vmid": args.newid, "kind": args.kind, "template": args.template,
-         "result": result},
-        indent=2, sort_keys=True,
-    ))
-
-
-def _await_snapshot_task(lab: Any, api: Any, upid: Any, args: Any) -> None:
-    if isinstance(upid, str) and upid.startswith("UPID:"):
-        lab.wait_task(api, upid, timeout=args.task_timeout)
-
-
-def _snapshot_list(lab: Any, api: Any, args: Any, base: str) -> None:
-    result = api.call("GET", base) or []
-    snapshots = [
-        {
-            "name": s.get("name"),
-            "created": s.get("snaptime"),
-            "description": s.get("description"),
-            "parent": s.get("parent"),
-            "vmstate": bool(s.get("vmstate")),
-            "running": bool(s.get("running")),
-        }
-        for s in result if isinstance(s, dict)
-    ]
-    print(json.dumps({"vmid": args.vmid, "snapshots": snapshots},
-                     indent=2, sort_keys=True))
-
-
-def _snapshot_create(lab: Any, api: Any, args: Any, base: str) -> None:
-    if not args.name:
-        raise lab.LabError("snapshot create requires --name")
-    upid = api.call("POST", base, {"snapname": args.name, "description": args.description or ""})
-    _await_snapshot_task(lab, api, upid, args)
-    lab.audit("guest-snapshot", lease=args.lease, kind=args.kind,
-              vmid=args.vmid, name=args.name)
-    print(json.dumps({"vmid": args.vmid, "snapshot": args.name, "created": True},
-                     indent=2, sort_keys=True))
-
-
-def _snapshot_delete(lab: Any, api: Any, args: Any, base: str) -> None:
-    if not args.name:
-        raise lab.LabError("snapshot delete requires --name")
-    upid = api.call("DELETE", f"{base}/{args.name}")
-    _await_snapshot_task(lab, api, upid, args)
-    lab.audit("guest-snapshot-delete", lease=args.lease, kind=args.kind,
-              vmid=args.vmid, name=args.name)
-    print(json.dumps({"vmid": args.vmid, "snapshot": args.name, "deleted": True},
-                     indent=2, sort_keys=True))
-
-
-def _snapshot_rollback(lab: Any, api: Any, args: Any, base: str) -> None:
-    if not args.name:
-        raise lab.LabError("snapshot rollback requires --name")
-    status = api.call("GET", f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/status/current")
-    if status.get("status") != "stopped":
-        raise lab.LabError(
-            f"VMID {args.vmid} must be stopped before rollback "
-            f"(status={status.get('status')}); stop it first"
-        )
-    upid = api.call("POST", f"{base}/{args.name}/rollback")
-    _await_snapshot_task(lab, api, upid, args)
-    lab.audit("guest-snapshot-rollback", lease=args.lease, kind=args.kind,
-              vmid=args.vmid, name=args.name)
-    print(json.dumps({"vmid": args.vmid, "snapshot": args.name, "rolled_back": True},
-                     indent=2, sort_keys=True))
-
-
-def cmd_snapshot(lab: Any, args: Any) -> None:
-    """Create, list, roll back or delete Proxmox snapshots of a lease guest."""
-    api = lab.ProxmoxAPI()
-    if not _lease_owns(lab, args.lease, args.kind, args.vmid):
-        raise lab.LabError(f"VMID {args.vmid} is not a {args.kind} guest registered to this lease")
-    base = f"/nodes/{lab.NODE}/{args.kind}/{args.vmid}/snapshot"
-    if args.mode == "list":
-        _snapshot_list(lab, api, args, base)
-        return
-    if args.mode == "create":
-        _snapshot_create(lab, api, args, base)
-        return
-    if args.mode == "delete":
-        _snapshot_delete(lab, api, args, base)
-        return
-    if args.mode == "rollback":
-        _snapshot_rollback(lab, api, args, base)
-        return
-
-def cmd_probe(lab: Any, args: Any) -> None:
-
-    api = lab.ProxmoxAPI()
-    caps = probe(lab, api, args.vmid)
-    advice = []
-    if caps.agent:
-        advice.append("use 'guest run' or 'console exec' -- real exit codes")
-    elif caps.serial:
-        advice.append("no agent: use 'guest run --password-stdin', or "
-                      "'console text --send' for one-off lines. A guest with "
-                      "no password set works too -- pass --password-stdin and "
-                      "feed it an empty line")
-    if caps.graphical_console:
-        advice.append("VNC keyboard and pointer work on this guest")
-    else:
-        advice.append("VNC input will not reach this guest; drive it over serial")
-    print(json.dumps({**caps.as_dict(), "advice": advice}, indent=2,
-                     sort_keys=True))
-
-
-# --- detached runs -------------------------------------------------------
-
-_RUNS_DIR = "guest-runs"
-GRUN_EXIT_MARK = "grun-exit"
-
-
-def _runs_dir(lab: Any) -> Path:
-    directory = Path(lab.STATE_ROOT) / _RUNS_DIR
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
-
-
-def _record_run(lab: Any, vmid: int, pid: str, log: str,
-                command: str) -> Path:
-
-    path = _runs_dir(lab) / f"vm{vmid}-{pid}.json"
-    path.write_text(json.dumps({
-        "vmid": vmid, "pid": pid, "log": log, "command": command,
-        "started_at": lab.iso_now(),
-    }, indent=2))
-    return path
-
-
-def _find_run(lab: Any, vmid: int, pid: str) -> dict[str, Any]:
-    path = _runs_dir(lab) / f"vm{vmid}-{pid}.json"
-    if not path.is_file():
-        raise GuestError(
-            f"no detached run recorded for VMID {vmid} pid {pid} on this "
-            "controller; run it with 'guest run --detach' first"
-        )
-    return json.loads(path.read_text())
-
-
-def _agent_sh(lab: Any, api: Any, vmid: int, script: str) -> dict[str, Any]:
-    return console.agent_exec(
-        lab, api, vmid, ["/bin/sh", "-c", script], timeout=30,
-    )
-
-
-def _pid_alive(lab: Any, api: Any, vmid: int, pid: str) -> bool:
-    run = _agent_sh(lab, api, vmid, f"kill -0 {pid} 2>/dev/null; echo $?")
-    return run.get("exitcode") == 0 and run.get("stdout", "").strip() == "0"
-
-
-def cmd_log(lab: Any, args: Any) -> None:
-    """Print or follow the log of a detached guest run."""
-    api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
-    record = _find_run(lab, args.vmid, args.pid)
-    log = record["log"]
-    cursor = 0
-    if args.tail:
-        run = _agent_sh(lab, api, args.vmid,
-                        f"wc -c < {shlex.quote(log)} 2>/dev/null || echo 0")
-        total = int(run.get("stdout", "0").strip() or 0)
-        cursor = max(0, total - args.tail)
-    deadline = time.monotonic() + (args.timeout if args.follow else 0)
-    exited = False
-    while True:
-        # The guest reports the byte count of what it emitted so the cursor
-        # stays byte-aligned even when the log contains non-ASCII output.
-        token = secrets.token_hex(4)
-        marker = f"__logb{token}__"
-        run = _agent_sh(
-            lab, api, args.vmid,
-            f"LC_ALL=C out=$(tail -c +{cursor + 1} {shlex.quote(log)} "
-            f"2>/dev/null); printf '%s' \"$out\"; "
-            f"printf '\\n{marker}:%s\\n' \"${{#out}}\"",
-        )
-        output = run.get("stdout", "")
-        count = 0
-        if output:
-            split = output.rsplit(f"\n{marker}:", 1)
-            if len(split) == 2:
-                data, count_text = split
-                count_text = count_text.strip()
-                if count_text.isdigit():
-                    count = int(count_text)
-            else:
-                data = output
-            if data:
-                print(data, end="", flush=True)
-            cursor += count if count else len(data.encode("utf-8", "replace"))
-        alive = _pid_alive(lab, api, args.vmid, args.pid)
-        if not alive:
-            exited = True
-            break
-        if not args.follow:
-            break
-        if args.timeout and time.monotonic() >= deadline:
-            break
-        time.sleep(1)
-    payload = {
-        "vmid": args.vmid, "pid": args.pid, "log": log,
-        "cursor": cursor, "exited": exited,
-    }
-    print("\n" + json.dumps(payload, indent=2, sort_keys=True))
-
-
-def cmd_wait(lab: Any, args: Any) -> None:
-    """Wait for a detached guest run to exit, then report its tail."""
-
-    api = lab.ProxmoxAPI()
-    lab.load_lease(args.lease)
-    record = _find_run(lab, args.vmid, args.pid)
-    log = record["log"]
-    started = time.monotonic()
-    deadline = started + args.timeout
-    while time.monotonic() < deadline:
-        if not _pid_alive(lab, api, args.vmid, args.pid):
-            break
-        time.sleep(5)
-    elapsed = round(time.monotonic() - started)
-    exited = not _pid_alive(lab, api, args.vmid, args.pid)
-    tail = ""
-    exit_code = None
-    if exited:
-        run = _agent_sh(lab, api, args.vmid,
-                        f"tail -c 65536 {shlex.quote(log)} 2>/dev/null || true")
-        tail = run.get("stdout", "")
-        for line in reversed(tail.splitlines()):
-            marker = line.strip()
-            if marker.startswith(f"{GRUN_EXIT_MARK}:"):
-                value = marker.split(":", 1)[1].strip()
-                if value.isdigit():
-                    exit_code = int(value)
-                break
-    payload = {
-        "vmid": args.vmid, "pid": args.pid, "log": log,
-        "exited": exited, "elapsed_seconds": elapsed,
-        "exit_code": exit_code, "tail": tail[-2000:],
-    }
-    print(json.dumps(payload, indent=2, sort_keys=True))
-
-
-def cmd_run(lab: Any, args: Any) -> None:
-    import sys
-
-    api = lab.ProxmoxAPI()
-    lease = lab.load_lease(args.lease)
-    caps = probe(lab, api, args.vmid)
-    lab.require_lease_resource(lease, caps.kind, args.vmid)
-    # Without the flag this is None: "no credential offered", and the serial
-    # channel stays refused. With the flag an empty line is a real answer --
-    # "this guest has no password" -- and must reach the login as "".
-    password = sys.stdin.readline().rstrip("\r\n") if args.password_stdin else None
-    if args.detach:
-        command = shlex.join(args.command)
-        token = secrets.token_hex(4)
-        log = f"/tmp/grun-{token}.log"
-        # Keep the operator's argv as positional parameters. This lets nohup
-        # execute it directly instead of re-parsing a reconstructed shell line.
-        script = (
-            f"(nohup \"$@\" > {shlex.quote(log)} 2>&1; "
-            f"echo {GRUN_EXIT_MARK}:$? >> {shlex.quote(log)}) "
-            ">/dev/null 2>&1 & echo $!"
-        )
-        result = console.agent_exec(
-            lab, api, args.vmid, ["/bin/sh", "-c", script, "guest-run",
-                                  *args.command],
-            timeout=args.timeout,
-        )
-        if result["exitcode"] not in (0, None):
-            raise lab.LabError(
-                f"could not start detached run: {result['stderr'][:400]}"
-            )
-        pid = result.get("stdout", "").strip()
-        if not pid.isdigit():
-            raise lab.LabError(f"detached run did not report a pid: {pid!r}")
-        _record_run(lab, args.vmid, pid, log, command)
-        lab.audit("guest-run-detached", lease=args.lease, vmid=args.vmid,
-                  pid=pid)
-        print(json.dumps({
-            "vmid": args.vmid, "pid": pid, "log": log, "command": command,
-            "next": f"proxmox-lab guest log --lease {args.lease} "
-                    f"--vmid {args.vmid} --pid {pid} --follow",
-        }, indent=2, sort_keys=True))
-        return
+    Read-only and best-effort: an unreachable seam, a rejected command, or
+    output that is not text all read as "unknown", never as a reason to act.
+    """
+    tool = "pct" if kind == "lxc" else "qm"
     try:
-        with GuestSession(lab, api, args.vmid, user=args.user,
-                          password=password, prefer=args.prefer,
-                          capabilities=caps) as guest:
-            result = guest.run_argv(args.command, timeout=args.timeout)
-            payload = {"vmid": args.vmid, **result.as_dict()}
-    except GuestError as exc:
-        raise lab.LabError(str(exc)) from None
-    lab.audit("guest-run", lease=args.lease, vmid=args.vmid,
-              channel=result.channel, exit_code=result.exit_code)
-    print(json.dumps(payload, indent=2, sort_keys=True))
+        result = _ssh_of(prox).run(
+            [tool, "config", str(vmid)], timeout=proxmox_module.DEFAULT_TIMEOUT
+        )
+    except LabError:
+        return None
     if not result.ok:
-        raise lab.LabError(f"command exited {result.exit_code}")
+        return None
+    raw = result.stdout
+    if isinstance(raw, (bytes, bytearray)):
+        text = bytes(raw).decode("utf-8", "replace")
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        return None
+    parsed: dict[str, str] = {}
+    for line in text.splitlines():
+        match = _CONFIG_LINE.match(line)
+        if match and match.group(1) not in parsed:
+            parsed[match.group(1)] = match.group(2)
+    return parsed or None
 
 
-def cmd_inventory(lab: Any, args: Any) -> None:
-    """Every guest on the node, and what the controller can prove about it.
+def _is_template(cfg: dict) -> bool:
+    return str(cfg.get("template", "")).strip() in ("1", "on", "true")
 
-    A `lease-<id>` tag lives on the node for ever; the lease record that
-    explains it does not. So this prints both: the tag, and whether anything
-    local still resolves it. `orphaned` means neither a lease record nor the
-    retained registry vouches for a guest this tool created -- nothing will
-    ever clean it up, and while it runs it blocks host power-off.
-    """
 
-    api = lab.ProxmoxAPI()
-    described = lab.describe_guests(api)
-    if args.orphaned_only:
-        described = [item for item in described if item["orphaned"]]
-    elif args.retained_only:
-        described = [item for item in described if item["retained"]]
-    summary = {
-        "guests": len(described),
-        "lab_guests": sum(1 for x in described if x["lab_guest"]),
-        "lease_resolved": sum(1 for x in described if x["lease_known"]),
-        "retained": sum(1 for x in described if x["retained"]),
-        "orphaned": sum(1 for x in described if x["orphaned"]),
-    }
-    result: dict[str, Any] = {"summary": summary, "guests": described}
-    if summary["orphaned"]:
-        result["note"] = (
-            "Tags are informational: they prove some lease created a guest, "
-            "not that the controller still owns it. Ownership comes from the "
-            "lease record while it exists and from the retained registry "
-            "afterwards. Stop an orphan with 'cleanup-expired "
-            "--reclaim-orphans --host-change-authorized'."
+def _has_pxl_tag(cfg: dict) -> bool:
+    tokens = {token.strip() for token in str(cfg.get("tags", "")).split(";")}
+    return (leases_module.OWNERSHIP_TAG in tokens
+            or leases_module.LEGACY_OWNERSHIP_TAG in tokens)
+
+
+def _pxl_expiry(cfg: dict) -> int | None:
+    match = _PXL_EXPIRY.search(str(cfg.get("description", "")))
+    return int(match.group(1)) if match else None
+
+
+def _text(raw: Any) -> str:
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw).decode("utf-8", "replace")
+    return raw if isinstance(raw, str) else ""
+
+
+def _emit(payload: dict) -> dict:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return payload
+
+
+# -- registry writes -------------------------------------------------------
+
+def _lease_for_mutation(lab: Any, lease_id: str) -> dict:
+    """The lease backing a new guest; refuses unknown and dead leases."""
+    with _open_store(lab) as store:
+        row = store.get_lease(lease_id)
+    if row is None:
+        raise LabError(
+            f"unknown lease {lease_id!r}: every guest belongs to a lease. "
+            f"Open one with 'proxmox-lab lease-begin --purpose ...'."
         )
-    print(json.dumps(result, indent=2, sort_keys=True))
+    if row["state"] in store_module.TERMINAL_STATES:
+        raise LabError(
+            f"lease {lease_id} is {row['state']} and owns nothing any more. "
+            f"Open a new one with 'proxmox-lab lease-begin'."
+        )
+    return row
 
 
-def cmd_retain(lab: Any, args: Any) -> None:
-    """Adopt an existing guest into the retained registry, or drop it.
+def _register_resource(
+    lab: Any, lease_id: str, kind: str, vmid: int, *, name: str | None
+) -> None:
+    with _open_store(lab) as store:
+        store.register_resource(
+            lease_id, kind, vmid, name=name, policy="disposable"
+        )
 
-    Needed on any install that predates the registry: guests created earlier
-    carry a lease tag whose record is long gone, so nothing local vouches for
-    them and `guest inventory` calls them orphans. This is the operator saying
-    "this one is deliberate". It changes controller state only -- the guest
-    itself is never touched, and no lease is required.
+
+# -- handlers --------------------------------------------------------------
+
+def cmd_create(lab: Any, args: Any) -> dict:
+    """Create a lease-owned guest: clone the template, or build fresh.
+
+    The clone path restamps the metadata after the clone (a clone copies the
+    source's expiry, which is never ours to trust). The fresh path passes
+    tags+description in the same ``qm create``/``pct create`` call. Either way
+    the resource is registered BEFORE any start, so a half-built guest is
+    still visible to cleanup.
     """
-
-    from . import inventory as inventory_module
-
-    api = lab.ProxmoxAPI()
-    kind = args.kind
-    if args.forget:
-        removed = inventory_module.forget(lab.STATE_ROOT, kind, args.vmid)
-        lab.audit("retained-forgotten", kind=kind, vmid=args.vmid,
-                  found=removed)
-        print(json.dumps(
-            {"vmid": args.vmid, "kind": kind, "retained": False,
-             "was_registered": removed},
-            indent=2, sort_keys=True,
-        ))
-        return
-    # Refuse to vouch for something that is not there: a registry entry for a
-    # guest that does not exist would report backup coverage for nothing.
-    status = api.call("GET", f"/nodes/{lab.NODE}/{kind}/{args.vmid}/status/current")
-    entry = inventory_module.record(
-        lab.STATE_ROOT, kind=kind, vmid=args.vmid,
-        lease=args.lease or "adopted", now=lab.iso_now(),
-        purpose=args.purpose or "", name=status.get("name"),
+    lease_id, vmid, kind = str(args.lease), int(args.vmid), str(args.kind)
+    lease = _lease_for_mutation(lab, lease_id)
+    expires_at = int(lease["expires_at"])
+    name = args.name or f"pxl-{vmid}"
+    tags, description = metadata_for(lease_id, expires_at)
+    prox = _make_proxmox(lab.CONFIG)
+    template = _template_vmid(lab, args)
+    if template is None:
+        if kind == "lxc":
+            if not args.ostemplate:
+                raise LabError(
+                    "a fresh lxc guest needs --ostemplate "
+                    "(e.g. local:vztmpl/debian-12.tar.zst)"
+                )
+            rootfs = None
+            if args.storage:
+                disk_gb = int(args.disk_gb or 8)
+                rootfs = f"{args.storage}:{disk_gb}"
+            prox.lxc_create(
+                vmid,
+                ostemplate=str(args.ostemplate),
+                hostname=name,
+                tags=tags,
+                description=description,
+                rootfs=rootfs,
+            )
+        else:
+            scsi0 = None
+            if args.storage:
+                disk_gb = int(args.disk_gb or 32)
+                scsi0 = f"{args.storage}:{disk_gb}"
+            prox.qemu_create(
+                vmid,
+                name=name,
+                tags=tags,
+                description=description,
+                scsi0=scsi0,
+                memory=args.memory,
+                cores=args.cores,
+            )
+    else:
+        prox.clone(kind, template, vmid, name=name)
+        stamp_guest(prox, kind, vmid, lease_id, expires_at)
+    _register_resource(lab, lease_id, kind, vmid, name=name)
+    if args.start:
+        prox.start(kind, vmid)
+    state = prox.status(kind, vmid)
+    lab.audit(
+        "guest-create",
+        lease=lease_id,
+        vmid=vmid,
+        kind=kind,
+        name=name,
+        template=template,
+        started=bool(args.start),
     )
-    lab.audit("retained-adopted", kind=kind, vmid=args.vmid,
-              purpose=args.purpose or "", lease=args.lease)
-    print(json.dumps(
-        {"vmid": args.vmid, "kind": kind, "retained": True, "entry": entry},
-        indent=2, sort_keys=True,
-    ))
+    return _emit({
+        "lease_id": lease_id,
+        "vmid": vmid,
+        "kind": kind,
+        "name": name,
+        "state": state,
+        "tags": tags,
+        "pxl_expiry": expires_at,
+    })
 
+
+def _template_vmid(lab: Any, args: Any) -> int | None:
+    """The template to clone from, or ``None`` for a fresh build.
+
+    ``--fresh`` (or an explicitly empty ``--template``) means fresh; otherwise
+    ``--template`` wins and ``[pve] template_vmid`` is the default. An
+    unconfigured default (0) is fresh too -- never a clone from vmid 0.
+    """
+    if getattr(args, "fresh", False):
+        if args.template not in (None, ""):
+            raise LabError("--fresh contradicts --template: pick one")
+        return None
+    if args.template is not None:
+        text = str(args.template).strip()
+        if not text:
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            raise LabError(
+                f"--template must be a template vmid or empty, not {text!r}"
+            ) from None
+        if value <= 0:
+            raise LabError(f"--template must be a template vmid, not {text!r}")
+        return value
+    return int(lab.CONFIG.pve.template_vmid or 0) or None
+
+
+def cmd_clone(lab: Any, args: Any) -> dict:
+    """Clone a registry-vouched template into a new lease-owned guest.
+
+    The source need NOT be lease-owned: a ``policy="retain"`` registry row or
+    a config template (``template: 1``) is vouched for by the registry alone
+    and is accepted as a clone source. Only full copies exist on this seam.
+    """
+    lease_id, vmid, source = str(args.lease), int(args.vmid), int(args.source)
+    if not args.full:
+        raise LabError(
+            "only full copies are supported: this seam's clone always makes "
+            "a full copy of the source"
+        )
+    lease = _lease_for_mutation(lab, lease_id)
+    expires_at = int(lease["expires_at"])
+    prox = _make_proxmox(lab.CONFIG)
+    kind = _clone_source_kind(lab, prox, source)
+    prox.clone(kind, source, vmid, name=args.name)
+    stamp_guest(prox, kind, vmid, lease_id, expires_at)
+    _register_resource(lab, lease_id, kind, vmid, name=args.name)
+    state = prox.status(kind, vmid)
+    lab.audit(
+        "guest-clone",
+        lease=lease_id,
+        vmid=vmid,
+        kind=kind,
+        source=source,
+        name=args.name,
+    )
+    return _emit({
+        "lease_id": lease_id,
+        "vmid": vmid,
+        "source": source,
+        "name": args.name,
+        "state": state,
+        "upid": None,
+    })
+
+
+def _clone_source_kind(lab: Any, prox: Any, source: int) -> str:
+    """The kind of a vouched clone source; refused when nobody vouches."""
+    with _open_store(lab) as store:
+        for lease in store.list_leases(include_ended=True):
+            row = _registry_row(store, str(lease["id"]), None, source)
+            if row is not None:
+                if row.get("policy") == "retain":
+                    return str(row["kind"])
+                break
+    for kind in ("qemu", "lxc"):
+        cfg = _guest_config(prox, kind, source)
+        if cfg is not None and _is_template(cfg):
+            return kind
+    raise LabError(
+        f"clone source {source} is not a registry-vouched template: it is "
+        f"neither a retain-policy registry row nor a template (template: 1). "
+        f"Clone from a registered template, or turn {source} into one."
+    )
+
+
+def cmd_start(lab: Any, args: Any) -> dict:
+    lease_id, vmid = str(args.lease), int(args.vmid)
+    row = require_owned(lab, lease_id, None, vmid)
+    kind = str(row["kind"])
+    prox = _make_proxmox(lab.CONFIG)
+    prox.start(kind, vmid)
+    state = prox.status(kind, vmid)
+    lab.audit("guest-start", lease=lease_id, vmid=vmid, kind=kind)
+    return _emit({
+        "lease_id": lease_id,
+        "vmid": vmid,
+        "state": state,
+        "graceful": None,
+    })
+
+
+def cmd_stop(lab: Any, args: Any) -> dict:
+    """Stop a guest: graceful shutdown first, hard stop as the fallback.
+
+    ``--timeout`` bounds the graceful wait (§D teardown shape: shutdown, wait
+    for stopped, then ``stop``). It reports which path actually happened --
+    a graceful stop is never assumed.
+    """
+    lease_id, vmid = str(args.lease), int(args.vmid)
+    row = require_owned(lab, lease_id, None, vmid)
+    kind = str(row["kind"])
+    prox = _make_proxmox(lab.CONFIG)
+    timeout = int(args.timeout or 0)
+    graceful = False
+    if timeout > 0:
+        graceful = prox.shutdown(kind, vmid, timeout=float(timeout))
+    if not graceful:
+        prox.stop(kind, vmid)
+    state = prox.status(kind, vmid)
+    lab.audit(
+        "guest-stop", lease=lease_id, vmid=vmid, kind=kind, graceful=graceful
+    )
+    return _emit({
+        "lease_id": lease_id,
+        "vmid": vmid,
+        "state": state,
+        "graceful": graceful,
+    })
+
+
+def cmd_destroy(lab: Any, args: Any) -> dict:
+    """Destroy a lease-owned guest -- the one irreversible command.
+
+    ``--confirm`` is demanded before any seam call. The gate
+    (:func:`require_owned`) refuses unregistered and retain rows; this handler
+    then re-checks vouching itself and always refuses templates and retain
+    rows, and refuses a guest whose config carries no ``pxl`` tag (when the
+    config is readable -- the registry row is the pxl proof when it is not).
+    """
+    lease_id, vmid = str(args.lease), int(args.vmid)
+    if not args.confirm:
+        raise LabError(
+            "guest destroy is irreversible; pass --confirm to mean it "
+            "(there is no interactive prompt)"
+        )
+    row = require_owned(lab, lease_id, None, vmid)
+    kind = str(row["kind"])
+    with _open_store(lab) as store:
+        owner = store.owner_elsewhere(lease_id, kind, vmid)
+    if owner:
+        # `require_owned` only asks whether THIS lease has a live row. A
+        # vmid registered to two live leases (dual registration is reachable:
+        # an expired-but-active lease still counts) would let one lease
+        # destroy a machine the other is using.
+        raise LabError(
+            f"{kind} {vmid} is also registered to lease {owner}, which is "
+            f"still live: a guest another lease owns is never destroyed from "
+            f"under it (end that lease first)"
+        )
+    prox = _make_proxmox(lab.CONFIG)
+    cfg = _guest_config(prox, kind, vmid)
+    if row.get("policy") == "retain" or (cfg is not None and _is_template(cfg)):
+        raise _vouched(row, cfg, kind, vmid)
+    if cfg is not None and not _has_pxl_tag(cfg):
+        raise LabError(
+            f"{kind} {vmid} carries no pxl tag (tags={cfg.get('tags', '')!r}): "
+            f"only pxl-tagged, lease-registered guests are ever destroyed, so "
+            f"a machine somebody else owns can never be taken for ours."
+        )
+    try:
+        if prox.status(kind, vmid) == "running":
+            if not prox.shutdown(kind, vmid):
+                prox.stop(kind, vmid)
+    except proxmox_module.ProxmoxError:
+        # Vanished between the ownership check and now -- a destroy that
+        # finds nothing to destroy is still a success.
+        pass
+    prox.destroy(kind, vmid)
+    with _open_store(lab) as store:
+        store.mark_destroyed(lease_id, kind, vmid)
+    lab.audit(
+        "guest-destroy", lease=lease_id, vmid=vmid, kind=kind, purged=True
+    )
+    return _emit({
+        "lease_id": lease_id,
+        "vmid": vmid,
+        "destroyed": True,
+        "purged": True,
+    })
+
+
+def _probe_kind(prox: Any, vmid: int) -> tuple[str | None, str | None]:
+    """``(kind, state)`` for a vmid, or ``(None, None)`` when neither tool knows it."""
+    for kind in ("qemu", "lxc"):
+        try:
+            return kind, prox.status(kind, vmid)
+        except proxmox_module.ProxmoxError:
+            continue
+    return None, None
+
+
+def _safe_ip(prox: Any, vmid: int) -> str | None:
+    try:
+        return prox.guest_ip(vmid)
+    except proxmox_module.ProxmoxError:
+        return None
+
+
+def cmd_probe(lab: Any, args: Any) -> dict:
+    """How one guest can be reached, right now. Read-only."""
+    vmid = int(args.vmid)
+    prox = _make_proxmox(lab.CONFIG)
+    kind, state = _probe_kind(prox, vmid)
+    exists = kind is not None
+    running = bool(exists and state == "running")
+    if kind == "qemu":
+        agent_ok = bool(prox.guest_ping(vmid))
+        ip = _safe_ip(prox, vmid) if agent_ok else None
+        channel = "agent" if agent_ok else "ssh"
+    elif kind == "lxc":
+        # pct exec is the native channel and needs no agent; it is usable
+        # exactly while the container runs. There is no agent network view
+        # for lxc through the seam.
+        agent_ok = running
+        ip = None
+        channel = "pct"
+    else:
+        agent_ok = False
+        ip = None
+        channel = None
+    return _emit({
+        "vmid": vmid,
+        "exists": exists,
+        "running": running,
+        "kind": kind,
+        "agent_ok": agent_ok,
+        "ip": ip,
+        "channel": channel,
+    })
+
+
+def cmd_list(lab: Any, args: Any) -> dict:
+    """Every registered guest (optionally one lease's), joined with live state.
+
+    Read-only: registry rows joined against ``prox.status`` and the guest's
+    own metadata. A registered guest the node no longer knows is reported
+    ``state="missing"`` -- the registry never silently forgets it.
+    """
+    prox = _make_proxmox(lab.CONFIG)
+    with _open_store(lab) as store:
+        if args.lease is not None:
+            lease_ids = [str(args.lease)]
+        else:
+            lease_ids = [
+                str(lease["id"])
+                for lease in store.list_leases(include_ended=False)
+            ]
+        rows = [
+            row
+            for lease_id in lease_ids
+            for row in store.resources_for(lease_id)
+            if not row.get("destroyed_at")
+        ]
+    guests = []
+    for row in sorted(rows, key=lambda item: int(item["vmid"])):
+        kind, vmid = str(row["kind"]), int(row["vmid"])
+        try:
+            state = prox.status(kind, vmid)
+        except proxmox_module.ProxmoxError:
+            state = "missing"
+        cfg = _guest_config(prox, kind, vmid)
+        guests.append({
+            "vmid": vmid,
+            "kind": kind,
+            "name": row.get("name"),
+            "lease_id": str(row["lease_id"]),
+            "state": state,
+            "tags": cfg.get("tags") if cfg is not None else None,
+            "pxl_expiry": _pxl_expiry(cfg) if cfg is not None else None,
+        })
+    return _emit({"guests": guests})
+
+
+def cmd_run(lab: Any, args: Any) -> dict:
+    """Run one command in a lease-owned guest; the guest's real exit code.
+
+    The channel follows the kind: ``pct exec`` for lxc, the qemu guest agent
+    for qemu. A non-zero exit is a result, not an error. Only ``argv0`` and
+    the exit code are audited -- never the command text or its output.
+    """
+    lease_id, vmid = str(args.lease), int(args.vmid)
+    row = require_owned(lab, lease_id, None, vmid)
+    kind = str(row["kind"])
+    command = [str(part) for part in (args.command or [])]
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        raise LabError("run needs a command to execute")
+    prox = _make_proxmox(lab.CONFIG)
+    started = time.monotonic()
+    if kind == "lxc":
+        result = prox.pct_exec(vmid, command, timeout=float(args.timeout))
+    else:
+        result = prox.guest_exec(vmid, command, timeout=float(args.timeout))
+    duration_ms = int((time.monotonic() - started) * 1000)
+    lab.audit(
+        "guest-run",
+        lease=lease_id,
+        vmid=vmid,
+        argv0=command[0],
+        exit_code=result.exit_code,
+    )
+    return _emit({
+        "lease_id": lease_id,
+        "vmid": vmid,
+        "exit_code": result.exit_code,
+        "stdout": _text(result.stdout),
+        "stderr": _text(result.stderr),
+        "duration_ms": duration_ms,
+    })
+
+
+# -- CLI surface -----------------------------------------------------------
 
 def register(sub: Any, lab: Any) -> None:
     from .cli import _bind
 
-
-    guest = sub.add_parser("guest", help="talk to a guest over any channel")
+    guest = sub.add_parser("guest", help="guest lifecycle over the proxmox seam")
     guest_sub = guest.add_subparsers(dest="guest_command", required=True)
 
-    inventory_cmd = guest_sub.add_parser(
-        "inventory",
-        help="every guest, its lease tag, and whether anything local owns it",
+    create = guest_sub.add_parser(
+        "create",
+        help="create a lease-owned guest from the template, or fresh",
     )
-    inventory_cmd.add_argument(
-        "--orphaned-only", action="store_true",
-        help="only guests no lease record or retained registry vouches for",
+    create.add_argument("--lease", required=True)
+    create.add_argument("--vmid", type=int, required=True)
+    create.add_argument("--name")
+    create.add_argument("--memory", type=int, help="qemu only")
+    create.add_argument("--cores", type=int, help="qemu only")
+    create.add_argument("--start", action="store_true",
+                        help="start the guest once it is registered")
+    create.add_argument("--ostemplate",
+                        help="LXC ostemplate (fresh lxc create only)")
+    create.add_argument("--storage",
+                        help="fresh-create target storage, e.g. local-lvm "
+                             "(LXC rootfs / QEMU scsi0)")
+    create.add_argument("--disk-gb", type=int, default=None,
+                        help="rootfs/disk size in GB for fresh creates "
+                             "(default: 8 LXC, 32 QEMU)")
+    create.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
+    create.add_argument(
+        "--template",
+        help="source template vmid; empty (or --fresh) builds from scratch "
+             "(default: [pve] template_vmid)",
     )
-    inventory_cmd.add_argument(
-        "--retained-only", action="store_true",
-        help="only guests in the retained registry",
-    )
-    inventory_cmd.set_defaults(func=_bind(lab, cmd_inventory))
+    create.add_argument("--fresh", action="store_true",
+                        help="build from scratch instead of cloning a template")
+    create.set_defaults(func=_bind(lab, cmd_create))
 
-    retain_cmd = guest_sub.add_parser(
-        "retain",
-        help="record an existing guest as deliberately kept (or --forget it)",
-        description="Adds a guest to the retained registry so the controller "
-                    "keeps vouching for it after its lease record is gone: it "
-                    "stops being reported as an orphan and becomes eligible "
-                    "for retained backups. Controller state only -- the guest "
-                    "is never modified.",
+    clone = guest_sub.add_parser(
+        "clone", help="clone a registry-vouched template into a new guest"
     )
-    retain_cmd.add_argument("--vmid", type=int, required=True)
-    retain_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
-    retain_cmd.add_argument("--purpose", help="why this guest is kept")
-    retain_cmd.add_argument("--lease", help="the lease that created it, if known")
-    retain_cmd.add_argument("--forget", action="store_true",
-                            help="remove the guest from the registry instead")
-    retain_cmd.set_defaults(func=_bind(lab, cmd_retain))
+    clone.add_argument("--lease", required=True)
+    clone.add_argument("--vmid", type=int, required=True)
+    clone.add_argument("--source", type=int, required=True)
+    clone.add_argument("--name")
+    clone.add_argument("--full", action="store_true", default=True,
+                       help="full copy (the only clone mode on this seam)")
+    clone.set_defaults(func=_bind(lab, cmd_clone))
 
-    probe_cmd = guest_sub.add_parser(
+    start = guest_sub.add_parser("start", help="start a lease-owned guest")
+    start.add_argument("--lease", required=True)
+    start.add_argument("--vmid", type=int, required=True)
+    start.set_defaults(func=_bind(lab, cmd_start))
+
+    stop = guest_sub.add_parser(
+        "stop", help="stop a lease-owned guest (graceful, then hard)"
+    )
+    stop.add_argument("--lease", required=True)
+    stop.add_argument("--vmid", type=int, required=True)
+    stop.add_argument("--timeout", type=int, default=DEFAULT_STOP_TIMEOUT,
+                      help="seconds to wait for a graceful stop "
+                           "(default: %(default)s; 0 = hard stop)")
+    stop.set_defaults(func=_bind(lab, cmd_stop))
+
+    destroy = guest_sub.add_parser(
+        "destroy", help="destroy a lease-owned guest (irreversible)"
+    )
+    destroy.add_argument("--lease", required=True)
+    destroy.add_argument("--vmid", type=int, required=True)
+    destroy.add_argument("--confirm", action="store_true",
+                         help="required: there is no interactive prompt")
+    destroy.set_defaults(func=_bind(lab, cmd_destroy))
+
+    probe = guest_sub.add_parser(
         "probe", help="how can this guest be reached? (read-only)"
     )
-    probe_cmd.add_argument("--vmid", type=int, required=True)
-    probe_cmd.set_defaults(func=_bind(lab, cmd_probe))
+    probe.add_argument("--vmid", type=int, required=True)
+    probe.set_defaults(func=_bind(lab, cmd_probe))
 
-    activity_cmd = guest_sub.add_parser(
-        "disk-activity",
-        help="is this guest really writing? (samples twice, compares signals)",
-        description=(
-            "Measures disk writes across an interval instead of trusting the "
-            "Proxmox 'diskwrite' counter, which has been observed reading 0 "
-            "for a whole session on a qcow2 guest that was demonstrably "
-            "writing. Read-only. With --ground-truth it also reads QEMU's own "
-            "block-layer counters over the monitor endpoint and 'du' on the "
-            "backing image file over the opt-in host SSH channel, and names "
-            "any signal that disagrees with the others. A signal that is "
-            "switched off or refused is reported, never fatal."
-        ),
+    listing = guest_sub.add_parser(
+        "list", help="registered guests joined with live state (read-only)"
     )
-    activity_cmd.add_argument("--vmid", type=int, required=True)
-    activity_cmd.add_argument("--lease", help="required with --ground-truth")
-    activity_cmd.add_argument(
-        "--ground-truth", action="store_true",
-        help="also read QEMU blockstats and host-side du, and report which "
-             "signals disagree (needs a lease that owns the guest)",
-    )
-    activity_cmd.add_argument(
-        "--interval", type=float,
-        default=diskactivity.DEFAULT_INTERVAL_SECONDS,
-        help="seconds between the two samples (default: %(default)s)",
-    )
-    activity_cmd.add_argument(
-        "--timeout", type=float,
-        default=diskactivity.DEFAULT_DEADLINE_SECONDS,
-        help="overall deadline for the measurement (default: %(default)s)",
-    )
-    activity_cmd.set_defaults(func=_bind(lab, diskactivity.cmd_disk_activity))
+    listing.add_argument("--lease", help="narrow to one lease")
+    listing.set_defaults(func=_bind(lab, cmd_list))
 
-    run_cmd = guest_sub.add_parser(
-        "run", help="run a command, picking the channel automatically"
+    run = guest_sub.add_parser(
+        "run", help="run a command in a lease-owned guest"
     )
-    run_cmd.add_argument("--lease", required=True)
-    run_cmd.add_argument("--vmid", type=int, required=True)
-    run_cmd.add_argument("--user", help="console user, for the serial channel")
-    run_cmd.add_argument("--password-stdin", action="store_true",
-                         help="console password on stdin, enabling serial. "
-                              "An empty line means the guest has no password "
-                              "and is accepted; omitting the flag is not")
-    run_cmd.add_argument("--prefer", choices=("agent", "serial"),
-                         default="agent")
-    run_cmd.add_argument("--timeout", type=int, default=300)
-    run_cmd.add_argument("--detach", action="store_true",
-                         help="start in the background and return immediately "
-                              "(agent channel; Linux guests)")
-    run_cmd.add_argument("command", nargs="+")
-    run_cmd.set_defaults(func=_bind(lab, cmd_run))
-
-    log_cmd = guest_sub.add_parser(
-        "log", help="print or stream the log of a detached guest run"
-    )
-    log_cmd.add_argument("--lease", required=True)
-    log_cmd.add_argument("--vmid", type=int, required=True)
-    log_cmd.add_argument("--pid", required=True)
-    log_cmd.add_argument("--tail", type=int,
-                         help="start from the last N bytes of the log")
-    log_cmd.add_argument("--follow", action="store_true",
-                         help="stream new output until the run exits or timeout")
-    log_cmd.add_argument("--timeout", type=int, default=60,
-                         help="seconds to follow (default 60)")
-    log_cmd.set_defaults(func=_bind(lab, cmd_log))
-
-    wait_cmd = guest_sub.add_parser(
-        "wait", help="wait for a detached guest run to exit and report its tail"
-    )
-    wait_cmd.add_argument("--lease", required=True)
-    wait_cmd.add_argument("--vmid", type=int, required=True)
-    wait_cmd.add_argument("--pid", required=True)
-    wait_cmd.add_argument("--timeout", type=int, default=3600)
-    wait_cmd.set_defaults(func=_bind(lab, cmd_wait))
-
-    template_cmd = guest_sub.add_parser(
-        "template",
-        help="convert a stopped lease-owned guest into a cloneable template",
-    )
-    template_cmd.add_argument("--lease", required=True)
-    template_cmd.add_argument("--vmid", type=int, required=True)
-    template_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
-    template_cmd.add_argument("--task-timeout", type=int, default=300)
-    template_cmd.set_defaults(func=_bind(lab, cmd_template))
-
-    clone_cmd = guest_sub.add_parser(
-        "clone", help="clone a lease-owned template into a new guest"
-    )
-    clone_cmd.add_argument("--lease", required=True)
-    clone_cmd.add_argument("--template", type=int, required=True)
-    clone_cmd.add_argument("--newid", type=int, required=True)
-    clone_cmd.add_argument("--name")
-    clone_cmd.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
-    clone_cmd.add_argument("--task-timeout", type=int, default=600)
-    clone_cmd.set_defaults(func=_bind(lab, cmd_clone))
-
-    snap = guest_sub.add_parser(
-        "snapshot",
-        help="create/list/rollback/delete Proxmox snapshots (kernel iteration)",
-    )
-    snap.add_argument("--lease", required=True)
-    snap.add_argument("--vmid", type=int, required=True)
-    snap.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
-    snap.add_argument("--mode", choices=("create", "list", "rollback", "delete"),
-                      required=True)
-    snap.add_argument("--name", help="snapshot name (create/rollback/delete)")
-    snap.add_argument("--description")
-    snap.add_argument("--task-timeout", type=int, default=600)
-    snap.set_defaults(func=_bind(lab, cmd_snapshot))
+    run.add_argument("--lease", required=True)
+    run.add_argument("--vmid", type=int, required=True)
+    run.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT,
+                     help="seconds before the run is abandoned "
+                          "(default: %(default)s)")
+    run.add_argument("command", nargs=argparse.REMAINDER,
+                     help="command and arguments (use -- before flag-like args)")
+    run.set_defaults(func=_bind(lab, cmd_run))

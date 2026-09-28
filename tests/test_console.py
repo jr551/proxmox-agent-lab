@@ -1,2837 +1,801 @@
-"""Offline tests for the console, image, transfer and Windows helpers.
+"""Tests for the slim console surface: screendump PPM->PNG and key input.
 
-Nothing here touches PC2 or the network: the RFB client is driven against a
-scripted in-memory server, and S3 signing is checked against a fixed clock.
+Everything runs against the scripted ``FakeSSH`` seam via the ``_make_ssh``
+patch and a real store registry under a temporary state root -- no network,
+no real ssh, no host. Pinned here: the key table (shift glyphs and named
+keys), `type` pacing and its never-audited text, the screenshot pipeline
+(golden 2x2 P6 PPM -> PNG, fixed /tmp/pxl-* host temp), the LXC
+"unsupported" path, and the ownership gate firing before any seam call.
 """
 
 from __future__ import annotations
 
-import os
+import argparse
+import contextlib
+import io
+import json
 from pathlib import Path
 
-# Point every module at a fixture config *before* importing the package:
-# site values are read at import time.
 import sys  # noqa: E402
 
 # Shared bootstrap: fixture configuration plus a per-process state directory,
 # applied before any proxmox_agent_lab import. `support` sits beside this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from support import bootstrap  # noqa: E402,F401
-import shutil
-import tempfile
+import tempfile  # noqa: E402
+import time  # noqa: E402
+import unittest  # noqa: E402
+from unittest import mock  # noqa: E402
 
-import base64
-import io
-import json
-from pathlib import Path
-import struct
-import sys
-import tempfile
-import unittest
-from unittest import mock
-import zlib
+sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-SRC = Path(__file__).parents[1] / "src"
-sys.path.insert(0, str(SRC))
-SCRIPTS = SRC / "proxmox_agent_lab"
+from proxmox_agent_lab import config as config_module  # noqa: E402
+from proxmox_agent_lab import console as console_module  # noqa: E402
+from proxmox_agent_lab import png as png_module  # noqa: E402
+from proxmox_agent_lab import store as store_module  # noqa: E402
+from proxmox_agent_lab.errors import LabError  # noqa: E402
+from support.fakessh import FakeSSH  # noqa: E402
 
-from proxmox_agent_lab import des as lab_des  # noqa: E402
-from proxmox_agent_lab import console as lab_console  # noqa: E402
-from proxmox_agent_lab import transfer as lab_transfer  # noqa: E402
-from proxmox_agent_lab import netgw as lab_netgw  # noqa: E402
-from proxmox_agent_lab import png as lab_png  # noqa: E402
-from proxmox_agent_lab import rfb as lab_rfb  # noqa: E402
-from proxmox_agent_lab import s3 as lab_s3  # noqa: E402
-from proxmox_agent_lab import storage as lab_storage  # noqa: E402
-from proxmox_agent_lab import textmode as lab_textmode  # noqa: E402
-from proxmox_agent_lab import windows as lab_windows  # noqa: E402
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+GOLDEN_RGB = bytes(range(12))
+#: QEMU screendump's format: binary P6. 2x2 pixels, exactly 12 raster bytes.
+GOLDEN_PPM = b"P6\n2 2\n255\n" + GOLDEN_RGB
 
 
-class FakeTransport:
-    """Scripted RFB server side, plus a record of what the client sent.
+class _Lab:
+    """The lab facade surface console handlers touch.
 
-    A passive fake cannot catch a missing client message, so `writes` records
-    each send in order and `test_handshake_message_order` asserts the exact
-    sequence the protocol requires.
+    CONFIG/STATE_ROOT as the real facade carries them; ``audit`` records
+    instead of writing, so a test can assert exactly what was (not) logged.
     """
 
-    def __init__(self, script: bytes) -> None:
-        self.inbound = io.BytesIO(script)
-        self.sent = bytearray()
-        self.writes: list[bytes] = []
-
-    def read_exact(self, count: int) -> bytes:
-        data = self.inbound.read(count)
-        if len(data) != count:
-            raise AssertionError(f"script exhausted: wanted {count}, got {len(data)}")
-        return data
-
-    def send(self, data: bytes) -> None:
-        self.sent += data
-        self.writes.append(data)
-
-
-def build_server_script(width: int, height: int, pixels: bytes,
-                        encoding: int = lab_rfb.ENC_RAW) -> bytes:
-    out = bytearray()
-    out += b"RFB 003.008\n"
-    out += bytes([1, 2])                      # one security type: VNC auth
-    out += bytes(range(16))                   # challenge
-    out += struct.pack(">I", 0)               # auth OK
-    name = b"lab"
-    out += struct.pack(">HH", width, height)
-    out += bytes(16)                          # server pixel format (ignored)
-    out += struct.pack(">I", len(name)) + name
-    payload = pixels if encoding == lab_rfb.ENC_RAW else (
-        struct.pack(">I", len(zlib.compress(pixels))) + zlib.compress(pixels)
-    )
-    out += struct.pack(">BxH", 0, 1)          # FramebufferUpdate, 1 rectangle
-    out += struct.pack(">HHHHi", 0, 0, width, height, encoding)
-    out += payload
-    return bytes(out)
-
-
-def bgrx(rgb_pixels: list[tuple[int, int, int]]) -> bytes:
-    return b"".join(bytes([b, g, r, 0]) for r, g, b in rgb_pixels)
-
-
-class DesTests(unittest.TestCase):
-    def test_known_answer_vectors(self) -> None:
-        self.assertEqual(
-            lab_des.encrypt_block(
-                bytes.fromhex("0123456789ABCDEF"), bytes.fromhex("4E6F772069732074")
-            ).hex().upper(),
-            "3FA40E8A984D4815",
-        )
-        self.assertEqual(
-            lab_des.encrypt_block(bytes(8), bytes(8)).hex().upper(),
-            "8CA64DE9C1B123A7",
-        )
-
-    def test_vnc_response_length_and_determinism(self) -> None:
-        challenge = bytes(range(16))
-        first = lab_des.vnc_response("ticket12", challenge)
-        self.assertEqual(len(first), 16)
-        self.assertEqual(first, lab_des.vnc_response("ticket12", challenge))
-        self.assertNotEqual(first, lab_des.vnc_response("ticket13", challenge))
-
-    def test_password_is_truncated_to_eight_bytes(self) -> None:
-        challenge = bytes(range(16))
-        self.assertEqual(
-            lab_des.vnc_response("abcdefgh", challenge),
-            lab_des.vnc_response("abcdefghIGNORED", challenge),
-        )
-
-
-class PngTests(unittest.TestCase):
-    def test_round_trip_header_and_size(self) -> None:
-        png = lab_png.encode_png(2, 1, bytes([255, 0, 0, 0, 255, 0]))
-        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
-        width, height = struct.unpack(">II", png[16:24])
-        self.assertEqual((width, height), (2, 1))
-        self.assertTrue(png.endswith(b"IEND\xae\x42\x60\x82"))
-
-    def test_rejects_wrong_buffer_length(self) -> None:
-        with self.assertRaises(ValueError):
-            lab_png.encode_png(2, 2, b"\x00" * 3)
-
-    def test_coordinate_grid_preserves_canvas_and_labels_original_axes(self) -> None:
-        width, height = 220, 120
-        original = bytes((10, 20, 30)) * (width * height)
-        gridded = lab_png.overlay_coordinate_grid(width, height, original, 100)
-        self.assertEqual(len(gridded), len(original))
-        untouched = (50 * width + 50) * 3
-        grid_line = (50 * width + 100) * 3
-        self.assertEqual(gridded[untouched:untouched + 3], original[untouched:untouched + 3])
-        self.assertNotEqual(gridded[grid_line:grid_line + 3],
-                            original[grid_line:grid_line + 3])
-        encoded = lab_png.encode_png(width, height, gridded)
-        self.assertEqual(struct.unpack(">II", encoded[16:24]), (width, height))
-
-    def test_change_highlight_dims_stable_pixels_and_outlines_delta(self) -> None:
-        width, height = 3, 1
-        previous = bytes((100, 100, 100)) * 3
-        current = bytearray(previous)
-        current[3:6] = bytes((220, 100, 100))
-        highlighted, changed = lab_png.highlight_changes(
-            width, height, bytes(current), previous
-        )
-        self.assertEqual(changed, 1)
-        self.assertEqual(highlighted[3:6], current[3:6])
-        self.assertEqual(highlighted[0:3], b"\xff\x00\xff")
-        self.assertEqual(highlighted[6:9], b"\xff\x00\xff")
-
-    def test_unchanged_frame_dims_every_channel_with_integer_rounding(self) -> None:
-        current = bytes((0, 1, 255, 99, 100, 101))
-        output, changed = lab_png.highlight_changes(2, 1, current, current)
-        self.assertEqual(output, bytes((0, 0, 89, 34, 35, 35)))
-        self.assertEqual(changed, 0)
-
-    def test_zero_threshold_marks_even_identical_pixels_changed(self) -> None:
-        current = bytes((3, 40, 250)) * 2
-        self.assertEqual(lab_png.highlight_changes(2, 1, current, current, 0),
-                         (current, 2))
-
-    def test_threshold_applies_to_each_channel_inclusively(self) -> None:
-        for channel in range(3):
-            current = bytearray((100, 100, 100))
-            current[channel] = 124
-            self.assertEqual(lab_png.highlight_changes(1, 1, bytes(current), b"\x64" * 3),
-                             (bytes(current), 1))
-            current[channel] = 123
-            output, changed = lab_png.highlight_changes(1, 1, bytes(current), b"\x64" * 3)
-            self.assertEqual(changed, 0)
-            self.assertEqual(output[channel], 43)
-
-    def test_change_highlight_rejects_mismatched_frames(self) -> None:
-        with self.assertRaises(ValueError):
-            lab_png.highlight_changes(2, 1, b"\x00" * 6, b"\x00" * 3)
-
-    def test_stitch_horizontal_places_frames_left_to_right(self) -> None:
-        red = bytes((255, 0, 0)) * (2 * 2)
-        blue = bytes((0, 0, 255)) * (3 * 2)
-        width, height, stitched = lab_png.stitch_horizontal(
-            [(2, 2, red, ""), (3, 2, blue, "")], gap=1
-        )
-        self.assertEqual((width, height), (2 + 1 + 3, 2))
-        # row 0: red pixel, red pixel, gap (black), blue, blue, blue
-        self.assertEqual(stitched[0:3], b"\xff\x00\x00")
-        self.assertEqual(stitched[6:9], b"\x00\x00\x00")
-        self.assertEqual(stitched[9:12], b"\x00\x00\xff")
-
-    def test_stitch_horizontal_handles_frames_of_different_heights(self) -> None:
-        short = bytes((1, 2, 3)) * (2 * 1)
-        tall = bytes((4, 5, 6)) * (2 * 3)
-        width, height, stitched = lab_png.stitch_horizontal(
-            [(2, 1, short, ""), (2, 3, tall, "")], gap=0
-        )
-        self.assertEqual((width, height), (4, 3))
-        self.assertEqual(len(stitched), width * height * 3)
-        # the short frame's second row (row 1 of the canvas) is unfilled/black
-        second_row_short_side = (1 * width + 0) * 3
-        self.assertEqual(
-            stitched[second_row_short_side:second_row_short_side + 3],
-            b"\x00\x00\x00",
-        )
-
-    def test_stitch_horizontal_rejects_empty_input(self) -> None:
-        with self.assertRaises(ValueError):
-            lab_png.stitch_horizontal([])
-
-    def test_downscale_keeps_the_aspect_ratio_and_bounds_the_long_edge(self) -> None:
-        rgb = b"\x10\x20\x30" * (1920 * 1080)
-        width, height, out = lab_png.downscale_rgb(1920, 1080, rgb, 1280)
-        self.assertEqual((width, height), (1280, 720))
-        self.assertEqual(len(out), 1280 * 720 * 3)
-        # A flat source must survive averaging exactly.
-        self.assertEqual(set(out[i:i + 3] for i in range(0, len(out), 3)),
-                         {b"\x10\x20\x30"})
-
-    def test_downscale_leaves_an_already_small_image_untouched(self) -> None:
-        rgb = b"\x01\x02\x03" * (100 * 80)
-        width, height, out = lab_png.downscale_rgb(100, 80, rgb, 1280)
-        self.assertEqual((width, height), (100, 80))
-        self.assertIs(out, rgb)
-
-    def test_downscale_averages_its_box_rather_than_dropping_pixels(self) -> None:
-        """Nearest-neighbour would return one source pixel; averaging blends.
-
-        A 2x2 image of two black and two white pixels must come back as one
-        mid-grey pixel, not as whichever corner happened to be sampled.
-        """
-        rgb = b"\x00\x00\x00" + b"\xff\xff\xff" + b"\xff\xff\xff" + b"\x00\x00\x00"
-        width, height, out = lab_png.downscale_rgb(2, 2, rgb, 1)
-        self.assertEqual((width, height), (1, 1))
-        self.assertEqual(out, b"\x7f\x7f\x7f")
-
-    def test_downscale_rejects_a_mismatched_buffer_or_zero_edge(self) -> None:
-        with self.assertRaises(ValueError):
-            lab_png.downscale_rgb(4, 4, b"\x00" * 10, 2)
-        with self.assertRaises(ValueError):
-            lab_png.downscale_rgb(4, 4, b"\x00" * 48, 0)
-
-    def test_decode_png_round_trips_every_compression_level(self) -> None:
-        rgb = bytes((x * 5 + y * 11) % 256 for y in range(9) for x in range(7 * 3))
-        for level in (0, 6, 9):
-            encoded = lab_png.encode_png(7, 9, rgb, level=level)
-            self.assertEqual(lab_png.decode_png(encoded), (7, 9, rgb))
-
-    def test_decode_png_reverses_every_scanline_filter(self) -> None:
-        """QEMU's encoder picks filters adaptively, so all five must work."""
-        width, height = 6, 5
-        rgb = bytes((x * 37 + y * 91) % 256
-                    for y in range(height) for x in range(width * 3))
-        stride = width * 3
-        for filter_type in range(5):
-            raw = bytearray()
-            previous = bytes(stride)
-            for row in range(height):
-                line = bytearray(rgb[row * stride:(row + 1) * stride])
-                # Apply the filter, then check the decoder undoes it.
-                if filter_type == 1:
-                    line = bytearray(
-                        (line[i] - (line[i - 3] if i >= 3 else 0)) & 0xFF
-                        for i in range(stride)
-                    )
-                elif filter_type == 2:
-                    line = bytearray(
-                        (line[i] - previous[i]) & 0xFF for i in range(stride)
-                    )
-                elif filter_type in (3, 4):
-                    original = bytes(line)
-                    line = bytearray(stride)
-                    for i in range(stride):
-                        left = original[i - 3] if i >= 3 else 0
-                        up = previous[i]
-                        if filter_type == 3:
-                            predictor = (left + up) >> 1
-                        else:
-                            up_left = (
-                                rgb[(row - 1) * stride + i - 3]
-                                if row and i >= 3 else 0
-                            )
-                            estimate = left + up - up_left
-                            da, db, dc = (abs(estimate - left),
-                                          abs(estimate - up),
-                                          abs(estimate - up_left))
-                            predictor = (
-                                left if da <= db and da <= dc
-                                else up if db <= dc else up_left
-                            )
-                        line[i] = (original[i] - predictor) & 0xFF
-                raw.append(filter_type)
-                raw += line
-                previous = rgb[row * stride:(row + 1) * stride]
-            encoded = (
-                b"\x89PNG\r\n\x1a\n"
-                + lab_png._chunk(b"IHDR", struct.pack(
-                    ">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-                + lab_png._chunk(b"IDAT", zlib.compress(bytes(raw), 6))
-                + lab_png._chunk(b"IEND", b"")
-            )
-            self.assertEqual(
-                lab_png.decode_png(encoded), (width, height, rgb),
-                f"filter type {filter_type} did not round-trip",
-            )
-
-    def test_decode_png_refuses_what_it_cannot_read(self) -> None:
-        for candidate in (b"not a png at all........",
-                          b"\x89PNG\r\n\x1a\n" + b"\x00" * 8):
-            with self.assertRaises(ValueError):
-                lab_png.decode_png(candidate)
-        # 16-bit and palette PNGs are refused rather than guessed at.
-        for depth, colour in ((16, 2), (8, 3)):
-            header = lab_png._chunk(b"IHDR", struct.pack(
-                ">IIBBBBB", 2, 2, depth, colour, 0, 0, 0))
-            with self.assertRaises(ValueError):
-                lab_png.decode_png(b"\x89PNG\r\n\x1a\n" + header)
-
-    def test_stitch_horizontal_rejects_mismatched_frame_buffer(self) -> None:
-        with self.assertRaises(ValueError):
-            lab_png.stitch_horizontal([(2, 2, b"\x00" * 3, "")])
-
-
-class RfbTests(unittest.TestCase):
-    def test_capture_decodes_raw_rectangle(self) -> None:
-        expected = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (10, 20, 30)]
-        transport = FakeTransport(build_server_script(2, 2, bgrx(expected)))
-        client = lab_rfb.RFBClient(transport, "ticket")
-        self.assertEqual((client.width, client.height), (2, 2))
-        self.assertEqual(
-            client.capture(), b"".join(bytes(pixel) for pixel in expected)
-        )
-
-    def test_capture_decodes_zlib_rectangle(self) -> None:
-        expected = [(1, 2, 3), (4, 5, 6)]
-        transport = FakeTransport(
-            build_server_script(2, 1, bgrx(expected), lab_rfb.ENC_ZLIB)
-        )
-        client = lab_rfb.RFBClient(transport, "ticket")
-        self.assertEqual(client.capture(), bytes([1, 2, 3, 4, 5, 6]))
-
-    def test_client_answers_the_auth_challenge(self) -> None:
-        transport = FakeTransport(build_server_script(1, 1, bgrx([(0, 0, 0)])))
-        lab_rfb.RFBClient(transport, "sekrit")
-        self.assertIn(b"RFB 003.008\n", bytes(transport.sent))
-        self.assertIn(
-            lab_des.vnc_response("sekrit", bytes(range(16))), bytes(transport.sent)
-        )
-
-    def test_handshake_message_order(self) -> None:
-        """The server stalls unless every handshake message is sent, in order.
-
-        Regression guard: the chosen-security-type byte was originally
-        missing, which a passive fake server did not notice but a real one
-        did -- it simply never sent the challenge.
-        """
-        transport = FakeTransport(build_server_script(1, 1, bgrx([(0, 0, 0)])))
-        lab_rfb.RFBClient(transport, "sekrit")
-        self.assertEqual(transport.writes[0], b"RFB 003.008\n")
-        self.assertEqual(transport.writes[1], b"\x02", "chosen security type")
-        self.assertEqual(
-            transport.writes[2], lab_des.vnc_response("sekrit", bytes(range(16)))
-        )
-        self.assertEqual(transport.writes[3], b"\x01", "ClientInit, shared")
-        self.assertEqual(transport.writes[4][0], 0, "SetPixelFormat")
-        self.assertEqual(len(transport.writes[4]), 20)
-        self.assertEqual(transport.writes[5][0], 2, "SetEncodings")
-
-    def test_key_combo_parsing(self) -> None:
-        modifiers, keysym = lab_rfb.parse_key_combo("ctrl-alt-delete")
-        self.assertEqual(
-            modifiers, [lab_rfb.KEYSYMS["ctrl"], lab_rfb.KEYSYMS["alt"]]
-        )
-        self.assertEqual(keysym, lab_rfb.KEYSYMS["delete"])
-        self.assertEqual(lab_rfb.parse_key_combo("f2"), ([], lab_rfb.KEYSYMS["f2"]))
-        with self.assertRaises(lab_rfb.RFBError):
-            lab_rfb.parse_key_combo("ctrl-nosuchkey")
-
-    def test_uppercase_and_symbols_take_shift(self) -> None:
-        self.assertEqual(lab_rfb.char_keysym("a"), (ord("a"), False))
-        self.assertEqual(lab_rfb.char_keysym("A"), (ord("A"), True))
-        self.assertEqual(lab_rfb.char_keysym("!"), (ord("!"), True))
-
-    def test_pointer_and_key_wire_format(self) -> None:
-        transport = FakeTransport(build_server_script(4, 4, bgrx([(0, 0, 0)] * 16)))
-        client = lab_rfb.RFBClient(transport, "t")
-        transport.sent.clear()
-        client.pointer(3, 2, 1)
-        self.assertEqual(bytes(transport.sent), struct.pack(">BBHH", 5, 1, 3, 2))
-        transport.sent.clear()
-        client.key(0xFF0D, True)
-        self.assertEqual(bytes(transport.sent), struct.pack(">BBHI", 4, 1, 0, 0xFF0D))
-
-
-class TextModeTests(unittest.TestCase):
-    def test_strip_ansi(self) -> None:
-        self.assertEqual(
-            lab_textmode.strip_ansi("\x1b[32mok\x1b[0m\r\ndone"), "ok\ndone"
-        )
-
-    def test_graphical_screen_is_not_reported_as_text(self) -> None:
-        rgb = bytes(
-            value % 251 for value in range(640 * 480 * 3)
-        )  # many distinct colours
-        self.assertFalse(lab_textmode.analyse(rgb, 640, 480)["looks_like_text_console"])
-
-    def test_flat_desktop_with_icons_is_not_reported_as_text(self) -> None:
-        width, height = 1280, 800
-        rgb = bytearray(b"\x35\x70\xa0" * (width * height))
-        for index in range(10_000):
-            offset = index * 3
-            rgb[offset:offset + 3] = bytes(
-                (index % 251, (index * 3) % 251, (index * 7) % 251)
-            )
-        analysis = lab_textmode.analyse(bytes(rgb), width, height)
-        self.assertGreater(analysis["distinct_colours"], 24)
-        self.assertFalse(analysis["looks_like_text_console"])
-
-    def test_two_colour_grid_is_reported_as_text(self) -> None:
-        rgb = b"\x00\x00\x00" * (640 * 400)
-        analysis = lab_textmode.analyse(rgb, 640, 400)
-        self.assertTrue(analysis["looks_like_text_console"])
-
-
-class S3Tests(unittest.TestCase):
-    def test_presign_is_deterministic_for_a_fixed_clock(self) -> None:
-        with mock.patch.object(
-            lab_s3, "credentials", return_value=("AKID", "SECRET")
-        ), mock.patch.object(
-            lab_s3, "_now", return_value=("20260807T120000Z", "20260807")
-        ):
-            first = lab_s3.presign("dir/file.bin", expires=900)
-            second = lab_s3.presign("dir/file.bin", expires=900)
-        self.assertEqual(first, second)
-        self.assertIn("X-Amz-Signature=", first)
-        self.assertIn("X-Amz-Expires=900", first)
-        self.assertTrue(first.startswith(f"{lab_s3.ENDPOINT}/{lab_s3.BUCKET}/"))
-
-    def test_presign_rejects_absurd_expiry(self) -> None:
-        with self.assertRaises(lab_s3.S3Error):
-            lab_s3.presign("k", expires=0)
-        with self.assertRaises(lab_s3.S3Error):
-            lab_s3.presign("k", expires=99_999_999)
-
-    def test_no_credential_is_embedded_in_the_repository(self) -> None:
-        source = (SCRIPTS / "s3.py").read_text()
-        self.assertNotIn("GK", source.replace("BUCKET", ""))
-        self.assertIn("Keychain", source)
-
-
-class WindowsTests(unittest.TestCase):
-    def test_generated_password_meets_complexity_rules(self) -> None:
-        for _ in range(20):
-            password = lab_windows.generate_password()
-            self.assertTrue(any(c.islower() for c in password))
-            self.assertTrue(any(c.isupper() for c in password))
-            self.assertTrue(any(c.isdigit() for c in password))
-            self.assertTrue(any(not c.isalnum() for c in password))
-
-    def test_unattend_is_well_formed_and_escapes_values(self) -> None:
-        from xml.etree import ElementTree
-
-        xml = lab_windows.render_unattend(
-            locale="en-GB",
-            timezone="GMT Standard Time",
-            hostname="win-lab",
-            owner="a & b",
-            image_index=2,
-            driver_branch="2k25",
-            admin_password="p<a>ss&1",
-        )
-        root = ElementTree.fromstring(xml)
-        self.assertTrue(root.tag.endswith("unattend"))
-        self.assertIn("a &amp; b", xml)
-        self.assertIn("p&lt;a&gt;ss&amp;1", xml)
-
-    def test_answer_iso_contains_the_answer_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "unattend.iso"
-            xml = lab_windows.render_unattend(
-                locale="en-GB", timezone="GMT Standard Time", hostname="h",
-                owner="o", image_index=1, driver_branch="2k25",
-                admin_password="Pw1!",
-            )
-            lab_windows.build_answer_iso(xml, target)
-            produced = target if target.exists() else target.with_suffix(".iso.cdr")
-            self.assertTrue(produced.exists(), "no ISO was produced")
-            blob = produced.read_bytes()
-            self.assertIn(b"AUTOUNATTEND.XML", blob.upper())
-            self.assertIn(b"<unattend", blob)
-
-
-class StorageGuardTests(unittest.TestCase):
-    """Formatting a disk is irreversible; every guard gets a test."""
-
-    def _lab(self, disks: list) -> Any:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "testnode"
-        api = mock.Mock()
-        api.call.return_value = disks
-        lab.ProxmoxAPI.return_value = api
-        return lab, api
-
-    def _args(self, **overrides: Any) -> Any:
-        base = dict(
-            lease="L", device="/dev/sdb", filesystem="ext4",
-            content=lab_storage.DEFAULT_CONTENT, expect_serial=None,
-            expect_size_gb=None, wipe_confirmed=False,
-            host_change_authorized=True, timeout=60,
-        )
-        base.update(overrides)
-        args = mock.Mock(**base)
-        # Mock(name=...) names the mock rather than setting an attribute.
-        args.name = overrides.get("name", "test-bulk")
-        return args
-
-    USB = {"devpath": "/dev/sdb", "size": 1_000_204_886_016, "serial": "TESTSERIAL",
-           "model": "Portable", "type": "hdd", "used": None, "osdisk": 0}
-
-    def test_refuses_without_host_change_authorization(self) -> None:
-        lab, _ = self._lab([self.USB])
-        with self.assertRaises(RuntimeError) as caught:
-            lab_storage.cmd_add_disk(lab, self._args(host_change_authorized=False))
-        self.assertIn("host-level", str(caught.exception))
-
-    def test_refuses_the_os_disk(self) -> None:
-        lab, _ = self._lab([{**self.USB, "osdisk": 1}])
-        with self.assertRaises(RuntimeError) as caught:
-            lab_storage.cmd_add_disk(lab, self._args())
-        self.assertIn("OS disk", str(caught.exception))
-
-    def test_refuses_a_disk_already_in_use(self) -> None:
-        lab, _ = self._lab([{**self.USB, "used": "LVM"}])
-        with self.assertRaises(RuntimeError) as caught:
-            lab_storage.cmd_add_disk(lab, self._args())
-        self.assertIn("already in use", str(caught.exception))
-
-    def test_refuses_on_serial_mismatch(self) -> None:
-        lab, _ = self._lab([self.USB])
-        with self.assertRaises(RuntimeError) as caught:
-            lab_storage.cmd_add_disk(lab, self._args(expect_serial="OTHER"))
-        self.assertIn("serial mismatch", str(caught.exception))
-
-    def test_refuses_on_size_mismatch(self) -> None:
-        lab, _ = self._lab([self.USB])
-        with self.assertRaises(RuntimeError) as caught:
-            lab_storage.cmd_add_disk(lab, self._args(expect_size_gb=250))
-        self.assertIn("size mismatch", str(caught.exception))
-
-    def test_refuses_an_unknown_device(self) -> None:
-        lab, _ = self._lab([self.USB])
-        with self.assertRaises(RuntimeError) as caught:
-            lab_storage.cmd_add_disk(lab, self._args(device="/dev/sdz"))
-        self.assertIn("not a disk", str(caught.exception))
-
-    def test_matching_serial_and_size_proceed(self) -> None:
-        lab, api = self._lab([self.USB])
-
-        def call(method: str, path: str, data: Any = None) -> Any:
-            if path.endswith("/disks/list"):
-                return [self.USB]
-            return "UPID:testnode:task"
-
-        api.call.side_effect = call
-        lab.wait_task.return_value = {"exitstatus": "OK"}
-        lab_storage.cmd_add_disk(
-            lab, self._args(expect_serial="TESTSERIAL", expect_size_gb=1000)
-        )
-        formatted = [
-            c for c in api.call.call_args_list if "disks/directory" in c[0][1]
+    def __init__(self, state_root: Path) -> None:
+        self.STATE_ROOT = Path(state_root)
+        self.CONFIG = config_module.get()
+        self.audits: list[dict] = []
+
+    def audit(self, event: str, **fields: object) -> None:
+        self.audits.append({"event": event, **fields})
+
+
+def _register_lease_guest(lab: _Lab, lease_id: str, kind: str,
+                          vmid: int) -> None:
+    """Seed the registry: one active lease owning one live guest."""
+    with store_module.Store(Path(lab.STATE_ROOT) / "lab.db") as db:
+        db.create_lease(lease_id, expires_at=int(time.time()) + 3600)
+        db.register_resource(lease_id, kind, vmid)
+
+
+class KeyTableTests(unittest.TestCase):
+    """key_for: the pinned character table and key-name pass-through."""
+
+    def test_single_characters_translate_through_the_table(self) -> None:
+        cases = [
+            ("a", "a"), ("z", "z"), ("A", "shift-a"), ("Z", "shift-z"),
+            ("5", "5"), ("0", "0"),
+            ("!", "shift-1"), ("@", "shift-2"), ("#", "shift-3"),
+            ("$", "shift-4"), ("%", "shift-5"), ("^", "shift-6"),
+            ("&", "shift-7"), ("*", "shift-8"), ("(", "shift-9"),
+            (")", "shift-0"), ("_", "shift-minus"), ("+", "shift-equal"),
+            (" ", "spc"), (".", "dot"), (",", "comma"), ("-", "minus"),
+            ("=", "equal"), ("/", "slash"), (";", "semicolon"),
+            ("'", "quote"), ("\\", "backslash"), ("\t", "tab"),
+            ("\n", "ret"),
         ]
-        self.assertEqual(len(formatted), 1, "the format call should fire once")
-        self.assertEqual(formatted[0][0][2]["device"], "/dev/sdb")
-
-    def test_failing_to_set_content_types_is_not_a_success(self) -> None:
-        """Found live: the disk was formatted and registered, setting content
-        types failed, and the command still exited 0. A caller then uploaded
-        to a storage that would not accept the content."""
-        import contextlib
-        import io
-
-        lab, api = self._lab([self.USB])
-
-        def call(method: str, path: str, data: Any = None) -> Any:
-            if path.endswith("/disks/list"):
-                return [self.USB]
-            if method == "PUT" and path.startswith("/storage/"):
-                raise RuntimeError("HTTP 500: storage 'test-bulk' is busy")
-            return "UPID:testnode:task"
-
-        api.call.side_effect = call
-        lab.wait_task.return_value = {"exitstatus": "OK"}
-        printed = io.StringIO()
-        with contextlib.redirect_stdout(printed):
-            with self.assertRaises(RuntimeError) as caught:
-                lab_storage.cmd_add_disk(lab, self._args())
-        self.assertIn("set-content", str(caught.exception))
-        # The partial state is still reported, so recovery does not need the
-        # command to be rerun (which would reformat the disk).
-        result = json.loads(printed.getvalue())
-        self.assertFalse(result["content_configured"])
-        self.assertIn("content_warning", result)
-        self.assertEqual(result["storage"], "test-bulk")
-        self.assertFalse(lab.audit.call_args.kwargs["content_configured"])
-
-
-class SerialSessionTests(unittest.TestCase):
-    """A serial console echoes what you type and wraps long lines, so these
-    cover the parsing that separates a command's output from its own echo."""
-
-    def _session(self, transcript_for):
-        from proxmox_agent_lab import console as lab_console
-
-        session = lab_console.TermSession.__new__(lab_console.TermSession)
-        sent: list[str] = []
-        session.send_line = sent.append  # type: ignore[method-assign]
-
-        def fake_expect(patterns, timeout=60.0, poke=False):
-            return patterns[0], transcript_for(sent[-1], patterns[0])
-
-        session.expect = fake_expect  # type: ignore[method-assign]
-        return session, sent
-
-    def test_login_returns_when_a_guest_never_asks_for_a_password(self) -> None:
-        """A guest with no password set drops straight to a shell.
-
-        The login waited only for "assword:", so such a guest hung for the
-        whole timeout -- which made an empty console password useless even
-        once the channel guards accepted one.
-        """
-        from proxmox_agent_lab import console as lab_console
-
-        session = lab_console.TermSession.__new__(lab_console.TermSession)
-        sent: list[str] = []
-        session.send_line = sent.append  # type: ignore[method-assign]
-        # A getty that prints "login:", takes the user, and shows a prompt.
-        scripted = [TimeoutError, ("login:", ""), ("# ", "")]
-
-        def fake_expect(patterns, timeout=60.0, poke=False):
-            step = scripted.pop(0)
-            if step is TimeoutError:
-                raise TimeoutError("no prompt yet")
-            self.assertIn(step[0], patterns)
-            return step
-
-        session.expect = fake_expect  # type: ignore[method-assign]
-        session.login("root", "")
-
-        self.assertEqual(sent, ["", "root"])
-        self.assertEqual(scripted, [])
-
-    def test_login_still_sends_the_password_when_one_is_asked_for(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        session = lab_console.TermSession.__new__(lab_console.TermSession)
-        sent: list[str] = []
-        session.send_line = sent.append  # type: ignore[method-assign]
-        scripted = [TimeoutError, ("login:", ""), ("assword:", ""), ("$ ", "")]
-
-        def fake_expect(patterns, timeout=60.0, poke=False):
-            step = scripted.pop(0)
-            if step is TimeoutError:
-                raise TimeoutError("no prompt yet")
-            self.assertIn(step[0], patterns)
-            return step
-
-        session.expect = fake_expect  # type: ignore[method-assign]
-        session.login("alpine", "hunter2")
-
-        self.assertEqual(sent, ["", "alpine", "hunter2"])
-
-    def test_markers_are_not_matched_by_the_command_echo(self) -> None:
-        seen: dict[str, str] = {}
-
-        def transcript(typed: str, end_marker: str) -> str:
-            seen["typed"] = typed
-            seen["end"] = end_marker
-            begin = end_marker.replace("__e", "__b", 1)
-            return f"{typed}\n{begin}\nhello\n{end_marker}0\n"
-
-        session, sent = self._session(transcript)
-        session.run("echo hello")
-        # The echoed command must not contain either marker verbatim,
-        # otherwise expect() returns before the command has even run.
-        self.assertNotIn(seen["end"], seen["typed"])
-        self.assertNotIn(seen["end"].replace("__e", "__b", 1), seen["typed"])
-        # But the shell must still reconstruct them.
-        self.assertIn(seen["end"], seen["typed"].replace('""', ""))
-
-    def test_run_returns_output_without_the_echo_or_markers(self) -> None:
-        def transcript(typed: str, end_marker: str) -> str:
-            begin = end_marker.replace("__e", "__b", 1)
-            return f"{typed}\r\n{begin}\r\nnameserver 10.66.0.1\r\n{end_marker}0\r\n"
-
-        session, _ = self._session(transcript)
-        output, code = session.run_status("cat /etc/resolv.conf")
-        self.assertEqual(output, "nameserver 10.66.0.1")
-        self.assertEqual(code, 0)
-
-    def test_wrapped_echo_does_not_leak_into_the_output(self) -> None:
-        """A console hard-wraps long commands mid-token; output must survive."""
-        def transcript(typed: str, end_marker: str) -> str:
-            begin = end_marker.replace("__e", "__b", 1)
-            wrapped = typed[:20] + "\r\n" + typed[20:]
-            return f"{wrapped}\r\n{begin}\r\nREACHABLE\r\n{end_marker}0\r\n"
-
-        session, _ = self._session(transcript)
-        self.assertEqual(session.run("ping -c2 -W3 1.1.1.1 && echo yes"),
-                         "REACHABLE")
-
-    def test_nonzero_exit_code_is_reported(self) -> None:
-        def transcript(typed: str, end_marker: str) -> str:
-            begin = end_marker.replace("__e", "__b", 1)
-            return f"{typed}\n{begin}\nboom\n{end_marker}7\n"
-
-        session, _ = self._session(transcript)
-        self.assertEqual(session.run_status("false"), ("boom", 7))
-
-    def test_guest_output_is_not_double_base64_decoded(self) -> None:
-        """Proxmox pre-decodes guest output; decoding again corrupts it.
-
-        Only output that is *coincidentally* valid base64 was affected -- a
-        bare timestamp, a hex digest -- so the bug hid behind an exception
-        fallback that made everything else look correct.
-        """
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.NODE = "testnode"
-        api = mock.Mock()
-        api.call.side_effect = [
-            {"pid": 1},
-            {"exited": 1, "exitcode": 0, "out-data": "1786125185\n",
-             "err-data": ""},
-        ]
-        result = lab_console.agent_exec(lab, api, 9000, ["true"])
-        self.assertEqual(result["stdout"], "1786125185\n")
-        self.assertEqual(result["exitcode"], 0)
-
-    def test_a_signal_killed_process_is_never_reported_as_exitcode_none(self) -> None:
-        """qemu-guest-agent reports either exitcode or signal, never both.
-
-        Every caller decides success with `exitcode not in (0, None)`. If a
-        signal-killed process (OOM, crash, an external kill) came back as
-        exitcode None, it would look exactly like the "no code available"
-        case the serial channel legitimately has, instead of the failure it
-        actually is.
-        """
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.NODE = "testnode"
-        api = mock.Mock()
-        api.call.side_effect = [
-            {"pid": 1},
-            {"exited": 1, "signal": 9, "out-data": "", "err-data": ""},
-        ]
-        result = lab_console.agent_exec(lab, api, 9000, ["sleep", "300"])
-        self.assertEqual(result["signal"], 9)
-        self.assertNotIn(result["exitcode"], (0, None))
-        self.assertEqual(result["exitcode"], 137)
-
-    def test_send_line_declares_byte_length_not_character_length(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        session = lab_console.TermSession.__new__(lab_console.TermSession)
-        frames: list[bytes] = []
-        session.socket = type("S", (), {"send": lambda _s, d: frames.append(d)})()
-        session.send_line("café")
-        header, _, payload = frames[0].partition(b":")[2].partition(b":")
-        self.assertEqual(int(header), len(payload),
-                         "length prefix must count bytes, not characters")
-
-
-class VpnGatewayTests(unittest.TestCase):
-    def test_wg_config_pulls_every_key_from_the_keychain(self) -> None:
-        with mock.patch.object(
-            lab_netgw, "_keychain", side_effect=lambda account: f"<{account}>"
-        ), mock.patch.object(lab_netgw, "VPN_ENABLED", True):
-            config = lab_netgw.render_wg_config()
-        self.assertIn("PrivateKey = <wg-private-key>", config)
-        self.assertIn("PresharedKey = <wg-preshared-key>", config)
-        self.assertIn("PublicKey = <wg-peer-public-key>", config)
-        self.assertIn(f"Endpoint = {lab_netgw.WG_ENDPOINT}", config)
-        self.assertIn("AllowedIPs = 0.0.0.0/0, ::/0", config)
-
-    def test_forwarding_fails_closed_without_the_tunnel(self) -> None:
-        rules = lab_netgw.render_nftables()
-        self.assertIn("type filter hook forward priority 0; policy drop;", rules)
-        self.assertIn('iifname "__LAB_IF__" oifname "wg0" accept', rules)
-        self.assertIn('oifname "wg0" masquerade', rules)
-        # The leak that matters: every accept must egress via the tunnel.
-        accepts = [
-            line.strip() for line in rules.splitlines()
-            if line.strip().endswith("accept") and "policy" not in line
-        ]
-        self.assertTrue(accepts)
-        for line in accepts:
-            self.assertIn('"wg0"', line, f"accept rule bypasses the tunnel: {line}")
-
-    def test_interface_names_are_resolved_at_provision_time(self) -> None:
-        """Hardcoded names fail silently: rules that never match look fine."""
-        script = lab_netgw.provision_script()
-        self.assertIn(lab_netgw.LAB_GATEWAY_IP, script)
-        self.assertNotIn("__LAB_GATEWAY_IP__", script)
-        self.assertIn("s/__LAB_IF__/$LAB_IF/g", script)
-        # And it must refuse to proceed rather than install rules that
-        # silently match nothing.
-        self.assertIn("cannot build the ruleset", script)
-        self.assertIn("exit 1", script)
-        for rendered in (lab_netgw.render_nftables(), lab_netgw.render_dnsmasq()):
-            self.assertIn("__LAB_IF__", rendered)
-            self.assertNotIn('"eth1"', rendered)
-
-    def test_bootstrap_password_is_cleared_after_use(self) -> None:
-        """The one-time cipassword must not survive provisioning.
-
-        Asserts the behaviour, not the source text: the implementation is
-        shared in console.clear_bootstrap_password, so grepping netgw.py for
-        the payload would pass on a comment and fail on a working refactor.
-        """
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        api = mock.Mock()
-        self.assertTrue(lab_netgw._clear_bootstrap_password(lab, api, 101))
-        api.call.assert_called_once_with(
-            "PUT", "/nodes/aipve/qemu/101/config", {"delete": "cipassword"}
-        )
-
-    def test_bootstrap_password_clear_failure_is_reported(self) -> None:
-        """A failed clear must return False, never silently claim success."""
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        api = mock.Mock()
-        api.call.side_effect = RuntimeError("boom")
-        self.assertFalse(lab_netgw._clear_bootstrap_password(lab, api, 101))
-
-    def test_verify_requires_a_lease_and_checks_handshake_age(self) -> None:
-        source = (SCRIPTS / "netgw.py").read_text()
-        self.assertIn("lab.load_lease(args.lease)", source)
-        self.assertIn("max_handshake_age", source)
-        # A handshake that merely exists is not proof of a live tunnel.
-        self.assertNotIn('"ok": last > 0,', source)
-
-    def test_dnsmasq_points_guests_at_the_tunnel_resolver(self) -> None:
-        config = lab_netgw.render_dnsmasq()
-        self.assertIn(f"server={lab_netgw.WG_DNS}", config)
-        self.assertIn("no-resolv", config)
-        self.assertIn(
-            f"dhcp-option=option:router,{lab_netgw.LAB_GATEWAY_IP}", config
-        )
-
-    def test_probes_are_wrapped_in_command_substitution(self) -> None:
-        """`echo X={cmd}` echoes the command text instead of running it."""
-        source = (SCRIPTS / "netgw.py").read_text()
-        for bad in ("echo PING={_ping()}", "echo DOWN={_ping()}",
-                    "echo BACK={_ping()}"):
-            self.assertNotIn(bad, source, f"{bad} must be wrapped in $( … )")
-
-    def test_inconclusive_kill_switch_is_not_reported_as_a_leak(self) -> None:
-        """A probe that returns nothing is unproven, never a detected leak.
-
-        The first live run emitted "KILL SWITCH LEAK" purely because the probe
-        was broken. A false alarm here is as damaging as a missed leak.
-        """
-        source = (SCRIPTS / "netgw.py").read_text()
-        self.assertIn('checks.get("fails_closed") is False', source)
-        self.assertIn('checks.get("fails_closed") is None', source)
-        self.assertIn("not a detected leak", source)
-
-    def test_command_substitution_is_not_arithmetic_expansion(self) -> None:
-        """`$(` immediately followed by `(` is arithmetic, and hangs the shell.
-
-        The leak-test fetch helper is wrapped in parentheses, so composing it
-        as `$({fetch})` produced `$((curl ...)` -- the shell waited forever at
-        a continuation prompt instead of running anything.
-        """
-        source = (SCRIPTS / "netgw.py").read_text()
-        self.assertNotIn(
-            "$({_fetch", source,
-            "wrap _fetch as `$( {…} )`; `$({…})` becomes `$((` and hangs",
-        )
-        fetch = lab_netgw._fetch("https://example.invalid")
-        composed = f"echo IP=$( {fetch} )"
-        self.assertNotIn("$((", composed)
-
-    def test_no_key_material_in_the_repository(self) -> None:
-        source = (SCRIPTS / "netgw.py").read_text()
-        import re as _re
-
-        self.assertIsNone(
-            _re.search(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{43}=", source),
-            "a WireGuard-shaped key is embedded in lab_netgw.py",
-        )
-
-    def test_host_bridge_refuses_without_authorization(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        args = mock.Mock(host_change_authorized=False)
-        with self.assertRaises(RuntimeError) as caught:
-            lab_netgw.cmd_host_bridge(lab, args)
-        self.assertIn("host networking", str(caught.exception))
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-class ScreenshotCommandTests(unittest.TestCase):
-    def test_temporal_baselines_are_isolated_by_lease(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        with tempfile.TemporaryDirectory() as tmp:
-            lab.STATE_ROOT = Path(tmp)
-            first = b"\x00\x00\x00" * 4
-            changed = b"\xff\xff\xff" * 4
-            _, initial = lab_console._model_frame(
-                lab, "lease-one", 7, first, 2, 2
-            )
-            _, other_lease = lab_console._model_frame(
-                lab, "lease-two", 7, changed, 2, 2
-            )
-            _, repeated = lab_console._model_frame(
-                lab, "lease-one", 7, changed, 2, 2
-            )
-
-        self.assertFalse(initial["baseline"])
-        self.assertFalse(other_lease["baseline"])
-        self.assertTrue(repeated["baseline"])
-
-    def test_inspect_refuses_to_transmit_an_unowned_guest(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.load_lease.return_value = {
-            "resources": [{"kind": "qemu", "vmid": 8}]
-        }
-        lab.require_lease_resource.side_effect = RuntimeError(
-            "VMID 7 is not a qemu guest registered to this lease"
-        )
-        args = mock.Mock(lease="lease-12345678", vmid=7)
-        with mock.patch.object(lab_console, "VncSession") as vnc, \
-             mock.patch.object(lab_console.vision, "analyze_png") as analyze:
-            with self.assertRaises(RuntimeError) as caught:
-                lab_console.cmd_inspect(lab, args)
-        self.assertIn("not a qemu guest registered", str(caught.exception))
-        vnc.assert_not_called()
-        analyze.assert_not_called()
-
-    def test_inspect_requires_lease_ownership_and_audits_provider(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.load_lease.return_value = {
-            "resources": [{"kind": "qemu", "vmid": 7}]
-        }
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 2, 2
-        session.client.capture.return_value = b"\x00\x00\x00" * 4
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab.STATE_ROOT = Path(tmp)
-            out = Path(tmp) / "inspect.png"
-            args = mock.Mock(
-                lease="lease-12345678", vmid=7, settle=2.0, out=str(out),
-                prompt=None, timeout=120, max_tokens=1024, provider="auto",
-            )
-            with mock.patch.object(lab_console, "VncSession",
-                                   return_value=session), \
-                 mock.patch.object(lab, "ProxmoxAPI"), \
-                 mock.patch.object(lab_console.vision, "analyze_png",
-                                   return_value={
-                                       "provider": "nvidia",
-                                       "model": lab_console.vision.MODEL,
-                                       "analysis": {"screen": "gui"},
-                                   }) as analyze, \
-                 mock.patch("builtins.print") as printed:
-                lab_console.cmd_inspect(lab, args)
-                payload = json.loads(printed.call_args.args[0])
-                original_png = out.read_bytes()
-                model_png = analyze.call_args.args[1]
-                grid_existed = Path(payload["model_input"]["path"]).exists()
-
-        self.assertEqual(payload["transmitted_to"], "integrate.api.nvidia.com")
-        self.assertEqual(payload["vision"]["analysis"]["screen"], "gui")
-        self.assertEqual(payload["model_input"]["grid_step"], 100)
-        self.assertEqual(payload["model_input"]["origin"], "top-left")
-        self.assertTrue(payload["model_input"]["path"].endswith("-grid.png"))
-        self.assertTrue(grid_existed)
-        self.assertNotEqual(model_png, original_png)
-        self.assertIn("X increases right", analyze.call_args.kwargs["prompt"])
-        lab.audit.assert_called_once_with(
-            "console-vision-inspect", lease=args.lease, vmid=7,
-            provider="nvidia", model=lab_console.vision.MODEL,
-        )
-
-    def test_cmd_screenshot_writes_a_file(self) -> None:
-        """Regression: the module `png` was shadowed by a local of the same
-        name, so this command raised UnboundLocalError. Testing the encoder
-        alone did not catch it -- only calling the command does."""
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.capture.return_value = b"\x00\x00\x00" * 4
-        session.client.width, session.client.height = 2, 2
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab.STATE_ROOT = Path(tmp)
-            out = Path(tmp) / "shot.png"
-            args = mock.Mock(vmid=1, out=str(out), settle=0, timeout=5,
-                             upload=False, url_expiry=60, ocr=False,
-                             for_model=False)
-            with mock.patch.object(lab_console, "VncSession",
-                                   return_value=session), \
-                 mock.patch.object(lab, "ProxmoxAPI"), \
-                 mock.patch("builtins.print"):
-                lab_console.cmd_screenshot(lab, args)
-            self.assertTrue(out.exists())
-            self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
-
-    def _screenshot(self, **overrides: object) -> dict:
-        """Run cmd_screenshot over a fake VNC session, return the JSON."""
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        width = int(overrides.pop("width", 32))
-        height = int(overrides.pop("height", 16))
-        session.client.capture.return_value = bytes(
-            (x * 3 + y * 29) % 256 for y in range(height) for x in range(width * 3)
-        )
-        session.client.width, session.client.height = width, height
-        with tempfile.TemporaryDirectory() as tmp:
-            lab.STATE_ROOT = Path(tmp)
-            defaults = dict(vmid=1, out=str(Path(tmp) / "shot.png"), settle=0,
-                            timeout=5, upload=False, url_expiry=60, ocr=False,
-                            for_model=False, via="vnc")
-            defaults.update(overrides)
-            args = mock.Mock(**defaults)
-            with mock.patch.object(lab_console, "VncSession",
-                                   return_value=session), \
-                 mock.patch.object(lab, "ProxmoxAPI"), \
-                 mock.patch("builtins.print") as printed:
-                lab_console.cmd_screenshot(lab, args)
-            self.audited = lab.audit
-            return json.loads(printed.call_args.args[0])
-
-    def test_for_model_returns_a_bounded_base64_copy_of_the_screen(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        result = self._screenshot(for_model=True)
-        image = result["image"]
-        self.assertEqual(image["encoding"], "base64")
-        self.assertEqual(image["mime_type"], "image/png")
-        self.assertEqual((image["original_width"], image["original_height"]),
-                         (32, 16))
-        self.assertEqual(image["scale"], 1.0)
-        decoded = base64.b64decode(image["base64"])
-        self.assertEqual(lab_png.decode_png(decoded)[:2], (32, 16))
-        self.assertLessEqual(image["base64_bytes"],
-                             lab_console.IMAGE_MAX_BASE64_BYTES)
-        # The fact and the size, never the image itself.
-        audited = [call for call in self.audited.call_args_list
-                   if call.args[0] == "console-screenshot-for-model"]
-        self.assertEqual(len(audited), 1)
-        self.assertEqual(audited[0].kwargs["bytes"], image["bytes"])
-        self.assertNotIn("base64", audited[0].kwargs)
-
-    def test_a_plain_screenshot_never_carries_a_base64_blob(self) -> None:
-        result = self._screenshot()
-        self.assertNotIn("image", result)
-        self.assertFalse(
-            [call for call in self.audited.call_args_list
-             if call.args[0] == "console-screenshot-for-model"]
-        )
-
-    def test_the_handback_steps_the_scale_down_until_it_fits(self) -> None:
-        """Incompressible pixels must be shrunk, never emitted unbounded."""
-        import random
-
-        from proxmox_agent_lab import console as lab_console
-
-        width, height = 800, 600
-        rgb = random.Random(11).randbytes(width * height * 3)
-        image = lab_console._image_handback(
-            rgb, width, height, reason="cap test", hint="hint",
-        )
-        self.assertLess(image["scale"], 1.0)
-        self.assertEqual(image["width"], lab_console.IMAGE_MIN_EDGE)
-        self.assertLessEqual(image["base64_bytes"],
-                             lab_console.IMAGE_MAX_BASE64_BYTES)
-        self.assertEqual(len(base64.b64decode(image["base64"])), image["bytes"])
-
-    def test_the_handback_refuses_rather_than_emit_over_the_cap(self) -> None:
-        import random
-
-        from proxmox_agent_lab import console as lab_console
-
-        width, height = 800, 600
-        rgb = random.Random(11).randbytes(width * height * 3)
-        with mock.patch.object(lab_console, "IMAGE_MAX_BASE64_BYTES", 100_000):
-            image = lab_console._image_handback(
-                rgb, width, height, reason="cap test", hint="hint",
-            )
-        self.assertNotIn("base64", image)
-        self.assertIn("over the 100000 byte cap", image["error"])
-        # It still reports what it tried, so the caller knows why.
-        self.assertEqual(image["width"], lab_console.IMAGE_MIN_EDGE)
-
-    def test_a_small_screen_is_never_shrunk_below_the_readability_floor(self) -> None:
-        import random
-
-        from proxmox_agent_lab import console as lab_console
-
-        rgb = random.Random(5).randbytes(200 * 150 * 3)
-        with mock.patch.object(lab_console, "IMAGE_MAX_BASE64_BYTES", 1_000):
-            image = lab_console._image_handback(
-                rgb, 200, 150, reason="floor test", hint="hint",
-            )
-        self.assertEqual((image["width"], image["height"]), (200, 150))
-        self.assertEqual(image["scale"], 1.0)
-        self.assertIn("error", image)
-
-    def test_the_removed_ocr_flag_explains_itself_before_touching_the_guest(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        args = mock.Mock(vmid=1, ocr=True, via="vnc")
-        with mock.patch.object(lab_console, "VncSession") as vnc:
-            with self.assertRaises(RuntimeError) as caught:
-                lab_console.cmd_screenshot(lab, args)
-        message = str(caught.exception)
-        self.assertIn("--ocr was removed", message)
-        self.assertIn("--for-model", message)
-        self.assertIn("console inspect", message)
-        vnc.assert_not_called()
-        lab.ProxmoxAPI.assert_not_called()
-
-    def test_the_removed_import_font_command_explains_itself(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        with self.assertRaises(RuntimeError) as caught:
-            lab_console.cmd_import_font(lab, mock.Mock())
-        message = str(caught.exception)
-        self.assertIn("import-font", message)
-        self.assertIn("--for-model", message)
-
-    def test_cmd_screenshot_burst_stitches_captures_over_time(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.capture.return_value = b"\x00\x00\x00" * 4
-        session.client.width, session.client.height = 2, 2
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab.STATE_ROOT = Path(tmp)
-            out = Path(tmp) / "burst.png"
-            args = mock.Mock(vmid=1, out=str(out), count=3, interval=10.0,
-                             timeout=5, upload=False, url_expiry=60)
-            with mock.patch.object(lab_console, "VncSession",
-                                   return_value=session), \
-                 mock.patch.object(lab, "ProxmoxAPI"), \
-                 mock.patch.object(lab_console.time, "sleep") as sleep, \
-                 mock.patch("builtins.print") as printed:
-                lab_console.cmd_screenshot_burst(lab, args)
-            payload = json.loads(printed.call_args.args[0])
-
-            self.assertEqual(session.client.capture.call_count, 3)
-            self.assertEqual(sleep.call_count, 2)  # never sleeps after the last
-            sleep.assert_called_with(10.0)
-            self.assertEqual(payload["frame_count"], 3)
-            self.assertEqual(payload["width"], 2 * 3 + 4 * 2)  # 3 frames + 2 gaps
-            self.assertTrue(out.exists())
-            self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
-
-    def test_cmd_screenshot_burst_rejects_a_bad_count(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        args = mock.Mock(vmid=1, count=0, interval=10.0)
-        with self.assertRaises(RuntimeError) as caught:
-            lab_console.cmd_screenshot_burst(lab, args)
-        self.assertIn("--count", str(caught.exception))
-
-    def test_save_screenshot_flags_identical_repeat_frames(self) -> None:
-        """A pixel-identical repeat capture is reported as possibly stale."""
-        from proxmox_agent_lab import console as lab_console
-
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp)
-            first = lab_console._save_screenshot(
-                7, b"\x00\x00\x00" * 4, 2, 2,
-                override=str(Path(tmp) / "a.png"), state_root=state,
-            )
-            repeat = lab_console._save_screenshot(
-                7, b"\x00\x00\x00" * 4, 2, 2,
-                override=str(Path(tmp) / "b.png"), state_root=state,
-            )
-            changed = lab_console._save_screenshot(
-                7, b"\xff\xff\xff" * 4, 2, 2,
-                override=str(Path(tmp) / "c.png"), state_root=state,
-            )
-
-        self.assertFalse(first["identical_to_previous_capture"])
-        self.assertNotIn("stale_possible", first)
-        self.assertTrue(repeat["identical_to_previous_capture"])
-        self.assertIn("stale_possible", repeat)
-        self.assertIn("recapture before acting", repeat["stale_possible"])
-        self.assertFalse(changed["identical_to_previous_capture"])
-        self.assertNotIn("stale_possible", changed)
-
-    def test_click_requires_independent_target_verification(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 2, 2
-        session.client.capture.return_value = b"\x00\x00\x00" * 4
-
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "after.png"
-            args = mock.Mock(
-                lease="lease-12345678", vmid=1, x=0, y=0, button=1,
-                double=False, screenshot_after=2.5, screenshot_out=str(out),
-                target="OK", empty_space=False, calibration_settle=1.0,
-                vision_timeout=10, provider="auto",
-            )
-            with mock.patch.object(lab, "STATE_ROOT", Path(tmp)), \
-                 mock.patch.object(lab_console, "VncSession",
-                                   return_value=session), \
-                 mock.patch.object(lab, "ProxmoxAPI"), \
-                 mock.patch.object(lab_console.vision, "analyze_png",
-                                   return_value={
-                                       "provider": "nvidia",
-                                       "analysis": {
-                                           "controls": [
-                                               {"label": "OK",
-                                                "bbox": [0, 0, 2, 2]},
-                                           ],
-                                           "recommended_action": {
-                                               "kind": "click", "value": "0,0",
-                                           },
-                                       },
-                                   }), \
-                 mock.patch.object(lab_console.vision, "verifies_target",
-                                   side_effect=[(False, "wrong target"),
-                                                (True, "matched")]), \
-                 mock.patch("builtins.print") as printed:
-                # A rejected checkpoint moves the cursor but cannot click.
-                lab_console.cmd_click(lab, args)
-                first = json.loads(printed.call_args.args[0])
-                self.assertFalse(first["clicked"])
-                self.assertFalse(first["verification"]["accepted"])
-                session.client.click.assert_not_called()
-
-                # Only an independent positive verdict performs the click.
-                lab_console.cmd_click(lab, args)
-                payload = json.loads(printed.call_args.args[0])
-
-            self.assertEqual(session.client.click.call_count, 1)
-            session.client.click.assert_called_with(0, 0, button=1, double=False)
-            self.assertTrue(out.read_bytes().startswith(b"\x89PNG"))
-            self.assertEqual(payload["screenshot_after"]["path"], str(out))
-            self.assertTrue(payload["verification"]["accepted"])
-            self.assertEqual(payload["control_bbox"], [0, 0, 2, 2])
-
-    def test_click_empty_space_bypasses_target_verification(self) -> None:
-        import argparse
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        parser = argparse.ArgumentParser()
-        lab_console.register(parser.add_subparsers(), lab)
-        args = parser.parse_args([
-            "console", "click", "--lease", "lease-12345678", "--vmid", "1",
-            "--x", "1", "--y", "1", "--button", "3", "--empty-space",
-        ])
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 2, 2
-
-        with mock.patch.object(lab_console, "VncSession",
-                               return_value=session), \
-             mock.patch.object(lab, "ProxmoxAPI"), \
-             mock.patch.object(lab_console.vision, "analyze_png") as analyze, \
-             mock.patch("builtins.print") as printed:
-            lab_console.cmd_click(lab, args)
-
-        session.client.click.assert_called_once_with(1, 1, button=3, double=False)
-        session.client.capture.assert_not_called()
-        analyze.assert_not_called()
-        lab.audit.assert_called_once_with(
-            "console-click-unverified", lease="lease-12345678", vmid=1,
-            x=1, y=1, button=3,
-        )
-        payload = json.loads(printed.call_args.args[0])
-        self.assertEqual(payload["clicked"], [1, 1])
-        self.assertTrue(payload["empty_space"])
-        self.assertIn("unverified", payload["verification"]["reason"])
-
-    def test_has_gui_locked_up_true_when_nothing_changes(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 4, 4
-        session.client.capture.return_value = b"\x00\x00\x00" * 16
-        args = mock.Mock(lease="lease-1", vmid=1, settle=0.0,
-                         timeout=5, threshold=24)
-        with mock.patch.object(lab_console, "VncSession",
-                               return_value=session), \
-             mock.patch.object(lab, "ProxmoxAPI"), \
-             mock.patch("builtins.print") as printed:
-            lab_console.cmd_has_gui_locked_up(lab, args)
-        payload = json.loads(printed.call_args.args[0])
-
-        self.assertEqual(session.client.pointer.call_count, 2)
-        self.assertTrue(payload["locked_up"])
-        self.assertEqual(payload["changed_pixels_per_probe"], [0, 0])
-        self.assertIn("caveat", payload)
-        lab.audit.assert_called_once_with(
-            "console-has-gui-locked-up", lease="lease-1", vmid=1,
-            locked_up=True,
-        )
-
-    def test_has_gui_locked_up_false_when_a_probe_sees_change(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 4, 4
-        blank = b"\x00\x00\x00" * 16
-        changed = b"\xff\xff\xff" * 16
-        session.client.capture.side_effect = [blank, changed, changed]
-        args = mock.Mock(lease="lease-1", vmid=1, settle=0.0,
-                         timeout=5, threshold=24)
-        with mock.patch.object(lab_console, "VncSession",
-                               return_value=session), \
-             mock.patch.object(lab, "ProxmoxAPI"), \
-             mock.patch("builtins.print") as printed:
-            lab_console.cmd_has_gui_locked_up(lab, args)
-        payload = json.loads(printed.call_args.args[0])
-
-        self.assertFalse(payload["locked_up"])
-        self.assertNotIn("caveat", payload)
-
-    def test_has_terminal_locked_up_refuses_a_graphical_screen(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 8, 8
-        # Many distinct colours: textmode.analyse should call this graphical.
-        session.client.capture.return_value = bytes(range(192))
-        args = mock.Mock(vmid=1, samples=2, interval=0.0, timeout=5, threshold=24)
-        with mock.patch.object(lab_console, "VncSession",
-                               return_value=session), \
-             mock.patch.object(lab, "ProxmoxAPI"):
-            with self.assertRaises(RuntimeError) as caught:
-                lab_console.cmd_has_terminal_locked_up(lab, args)
-        self.assertIn("not a text console", str(caught.exception))
-
-    def test_has_terminal_locked_up_true_when_static(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 8, 8
-        # A handful of colours reads as a text console to textmode.analyse.
-        frame = (b"\x00\x00\x00" * 60) + (b"\xff\xff\xff" * 4)
-        session.client.capture.return_value = frame
-        args = mock.Mock(vmid=1, samples=3, interval=0.0, timeout=5, threshold=24)
-        with mock.patch.object(lab_console, "VncSession",
-                               return_value=session), \
-             mock.patch.object(lab, "ProxmoxAPI"), \
-             mock.patch("builtins.print") as printed:
-            lab_console.cmd_has_terminal_locked_up(lab, args)
-        payload = json.loads(printed.call_args.args[0])
-
-        self.assertTrue(payload["locked_up"])
-        self.assertEqual(payload["changed_pixels_per_sample"], [0, 0])
-        self.assertIn("caveat", payload)
-
-    def test_has_terminal_locked_up_rejects_too_few_samples(self) -> None:
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        args = mock.Mock(vmid=1, samples=1, interval=0.0)
-        with self.assertRaises(RuntimeError) as caught:
-            lab_console.cmd_has_terminal_locked_up(lab, args)
-        self.assertIn("--samples", str(caught.exception))
-
-    def test_inspect_audits_vision_failure(self) -> None:
-        """A rejected vision analysis must leave a journal trail."""
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.load_lease.return_value = {
-            "resources": [{"kind": "qemu", "vmid": 7}]
-        }
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 2, 2
-        session.client.capture.return_value = b"\x00\x00\x00" * 4
-        message = (
-            "no vision provider returned a valid analysis: "
-            "nvidia: rejected (some/vision-model: screen is not a non-empty string)"
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab.STATE_ROOT = Path(tmp)
-            args = mock.Mock(
-                lease="lease-12345678", vmid=7, settle=2.0,
-                out=str(Path(tmp) / "inspect.png"), prompt=None, timeout=120,
-                max_tokens=1024, provider="nvidia",
-            )
-            with mock.patch.object(lab_console, "VncSession",
-                                   return_value=session), \
-                 mock.patch.object(lab, "ProxmoxAPI"), \
-                 mock.patch.object(lab_console.vision, "analyze_png",
-                                   side_effect=lab_console.vision.VisionError(
-                                       message
-                                   )), \
-                 mock.patch("builtins.print") as printed:
-                with self.assertRaises(RuntimeError) as caught:
-                    lab_console.cmd_inspect(lab, args)
-                payload = json.loads(printed.call_args.args[0])
-
-        self.assertEqual(str(caught.exception), message)
-        # The failure is still raised and still reported; the image is
-        # additive, never a way to hide that no provider could read the screen.
-        self.assertEqual(payload["vision_error"], message)
-        lab.audit.assert_called_once_with(
-            "console-vision-inspect-failed", lease=args.lease, vmid=7,
-            error=message[:200], provider="nvidia", image_returned=True,
-            image_bytes=payload["image"]["bytes"],
-        )
-        self.assertNotIn("base64", lab.audit.call_args.kwargs)
-
-    def _inspect_failure(self, image_fallback: bool) -> dict:
-        """Drive cmd_inspect through a total vision failure, return the JSON."""
-        from proxmox_agent_lab import console as lab_console
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.load_lease.return_value = {"resources": [{"kind": "qemu", "vmid": 7}]}
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 32, 16
-        session.client.capture.return_value = bytes(
-            (x * 7 + y * 13) % 256
-            for y in range(16) for x in range(32 * 3)
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            lab.STATE_ROOT = Path(tmp)
-            args = mock.Mock(
-                lease="lease-12345678", vmid=7, settle=2.0,
-                out=str(Path(tmp) / "inspect.png"), prompt=None, timeout=120,
-                max_tokens=1024, provider="auto", image_fallback=image_fallback,
-            )
-            with mock.patch.object(lab_console, "VncSession",
-                                   return_value=session), \
-                 mock.patch.object(lab, "ProxmoxAPI"), \
-                 mock.patch.object(
-                     lab_console.vision, "analyze_png",
-                     side_effect=lab_console.vision.VisionError("all offline"),
-                 ), \
-                 mock.patch("builtins.print") as printed:
-                with self.assertRaises(RuntimeError):
-                    lab_console.cmd_inspect(lab, args)
-                return json.loads(printed.call_args.args[0])
-
-    def test_total_vision_failure_hands_the_screen_back_as_base64(self) -> None:
-        payload = self._inspect_failure(image_fallback=True)
-        image = payload["image"]
-        self.assertEqual(image["encoding"], "base64")
-        self.assertEqual(image["mime_type"], "image/png")
-        self.assertEqual((image["original_width"], image["original_height"]),
-                         (32, 16))
-        self.assertEqual((image["width"], image["height"]), (32, 16))
-        self.assertEqual(image["scale"], 1.0)
-        self.assertIn("no vision provider", image["reason"])
-        self.assertIn("your own vision", image["agent_hint"])
-        decoded = base64.b64decode(image["base64"])
-        self.assertEqual(lab_png.decode_png(decoded)[:2], (32, 16))
-        self.assertEqual(image["bytes"], len(decoded))
-        self.assertLessEqual(image["base64_bytes"],
-                             lab_console.IMAGE_MAX_BASE64_BYTES)
-
-    def test_no_image_fallback_suppresses_the_blob(self) -> None:
-        payload = self._inspect_failure(image_fallback=False)
-        self.assertNotIn("image", payload)
-        self.assertEqual(payload["vision_error"], "all offline")
-
-
-class ChunkedTransferTests(unittest.TestCase):
-    """Chunked push/pull: part keys, reassembly, and hash verification."""
-
-    def _lab(self) -> mock.Mock:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        lab.STATE_ROOT = "/tmp/pb-state"
-        lab.load_lease.return_value = {"resources": []}
-        lab.iso_now = lambda: "2026-08-11T00:00:00Z"
-        return lab
-
-    def _args(self, lab: mock.Mock, *argv: str) -> object:
-        import argparse
-
-        parser = argparse.ArgumentParser()
-        lab_console.register(parser.add_subparsers(), lab)
-        return parser.parse_args(list(argv))
-
-    def test_fetch_parts_command_has_all_urls_and_hash(self) -> None:
-        command = lab_transfer._fetch_parts_command(
-            ["https://s3/part-0", "https://s3/part-1"], "/tmp/out.bin"
-        )
-        self.assertEqual(command[0], "/bin/sh")
-        script = command[2]
-        self.assertIn("https://s3/part-0", script)
-        self.assertIn("https://s3/part-1", script)
-        self.assertIn("cat /tmp/pp-* > /tmp/out.bin", script)
-        self.assertIn("sha256sum /tmp/out.bin", script)
-
-    def test_push_chunked_uploads_parts_and_verifies(self) -> None:
-        import hashlib
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = self._lab()
-            source = Path(tmp) / "payload.bin"
-            payload = b"a" * (2 * 1024 * 1024 + 13)  # 2 parts at 1 MiB
-            source.write_bytes(payload)
-            api = mock.Mock()
-            lab.ProxmoxAPI.return_value = api
-            fake_s3 = mock.Mock()
-            fake_s3.put_bytes.return_value = "push/abc/payload.bin"
-            fake_s3.presign.return_value = "https://s3/part"
-            with mock.patch.object(lab_transfer, "SINGLE_OBJECT_MAX_MB", 0), \
-                 mock.patch.object(lab_transfer, "s3", fake_s3), \
-                 mock.patch.object(
-                     lab_transfer, "agent_exec",
-                     return_value={
-                         "exitcode": 0,
-                         "stdout": hashlib.sha256(payload).hexdigest(),
-                         "stderr": "",
-                     },
-                 ):
-                args = self._args(
-                    lab, "push", "--lease", "L1", "--vmid", "7",
-                    "--file", str(source), "--chunk-size", "1",
-                )
-                lab_transfer.cmd_push(lab, args)
-            keys = [c.args[0] for c in fake_s3.put_bytes.call_args_list]
-            self.assertEqual(len(keys), 3)
-            self.assertTrue(all(
-                k.endswith(("/part-0000", "/part-0001", "/part-0002"))
-                for k in keys
-            ))
-
-    def test_push_chunked_raises_on_guest_hash_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = self._lab()
-            source = Path(tmp) / "payload.bin"
-            source.write_bytes(b"a" * (2 * 1024 * 1024 + 1))
-            api = mock.Mock()
-            lab.ProxmoxAPI.return_value = api
-            fake_s3 = mock.Mock()
-            fake_s3.put_bytes.return_value = "push/abc/payload.bin"
-            fake_s3.presign.return_value = "https://s3/part"
-            with mock.patch.object(lab_transfer, "SINGLE_OBJECT_MAX_MB", 0), \
-                 mock.patch.object(lab_transfer, "s3", fake_s3), \
-                 mock.patch.object(
-                     lab_transfer, "agent_exec",
-                     return_value={"exitcode": 0, "stdout": "deadbeef",
-                                   "stderr": ""},
-                 ):
-                args = self._args(
-                    lab, "push", "--lease", "L1", "--vmid", "7",
-                    "--file", str(source), "--chunk-size", "1",
-                    "--sha256", "0" * 64,
-                )
-                with self.assertRaises(RuntimeError) as caught:
-                    lab_transfer.cmd_push(lab, args)
-            self.assertIn("sha256 mismatch", str(caught.exception))
-
-    def test_pull_skips_when_local_file_already_matches(self) -> None:
-        import hashlib
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = self._lab()
-            out = Path(tmp) / "artifact.iso"
-            payload = b"x" * (2 * 1024 * 1024 + 7)
-            out.write_bytes(payload)
-            expected = hashlib.sha256(payload).hexdigest()
-            api = mock.Mock()
-            lab.ProxmoxAPI.return_value = api
-            with mock.patch.object(lab_transfer, "s3", mock.Mock()), \
-                 mock.patch.object(lab_transfer, "agent_exec") as execute:
-                args = self._args(
-                    lab, "pull", "--lease", "L1", "--vmid", "7",
-                    "--remote", "/tmp/artifact.iso", "--out", str(out),
-                    "--sha256", expected,
-                )
-                lab_transfer.cmd_pull(lab, args)
-            execute.assert_not_called()
-
-    def test_pull_assembles_parts_and_checks_guest_hash(self) -> None:
-        import hashlib
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = self._lab()
-            out = Path(tmp) / "artifact.iso"
-            payload = b"y" * (1024 * 1024 + 1)  # two 1 MiB parts
-            expected = hashlib.sha256(payload).hexdigest()
-            api = mock.Mock()
-            lab.ProxmoxAPI.return_value = api
-            fake_s3 = mock.Mock()
-            fake_s3.list_objects.return_value = []
-            half = len(payload) // 2
-            fake_s3.get_bytes.side_effect = [payload[:half],
-                                             payload[half:]]
-            fake_s3.presign.return_value = "https://s3/put"
-            with mock.patch.object(lab_transfer, "SINGLE_OBJECT_MAX_MB", 0), \
-                 mock.patch.object(lab_transfer, "s3", fake_s3), \
-                 mock.patch.object(
-                     lab_transfer, "agent_exec",
-                     side_effect=[
-                         {"exitcode": 0, "stdout": str(len(payload)),
-                          "stderr": ""},
-                         {"exitcode": 0, "stdout": str(len(payload)),
-                          "stderr": ""},
-                         {"exitcode": 0, "stdout": expected, "stderr": ""},
-                     ],
-                 ):
-                args = self._args(
-                    lab, "pull", "--lease", "L1", "--vmid", "7",
-                    "--remote", "/tmp/artifact.iso", "--out", str(out),
-                    "--chunk-size", "1",
-                )
-                lab_transfer.cmd_pull(lab, args)
-            self.assertEqual(out.read_bytes(), payload)
-            self.assertEqual(fake_s3.get_bytes.call_count, 2)
-            self.assertEqual(fake_s3.delete_object.call_count, 2)
-
-
-class SerialDebugTests(unittest.TestCase):
-    """--send-raw framing and --from-reset attach-before-reset ordering."""
-
-    def _lab(self) -> mock.Mock:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        lab.load_lease.return_value = {"resources": []}
-        # A reset keeps the QEMU process alive, so --from-reset only applies to
-        # a guest that is already running.
-        lab.guest_status.return_value = "running"
-        return lab
-
-    def _text_args(self, **overrides: object) -> object:
-        import argparse
-
-        defaults = dict(
-            vmid=9001, kind="qemu", seconds=0.0, timeout=0.01, follow=False,
-            send=None, send_raw=None, nudge=False, from_reset=False,
-            lease=None,
-        )
-        defaults.update(overrides)
-        return argparse.Namespace(**defaults)
-
-    def test_send_raw_frames_bytes_without_trailing_newline(self) -> None:
-        session = lab_console.TermSession.__new__(lab_console.TermSession)
-        sent: list[bytes] = []
-        session.socket = mock.Mock(send=sent.append)
-        session.send_raw("cont")
-        self.assertEqual(sent, [b"0:4:cont"])
-
-    def test_from_reset_requires_follow(self) -> None:
-        lab = self._lab()
-        args = self._text_args(from_reset=True, lease="L1")
-        with self.assertRaisesRegex(RuntimeError, "requires --follow"):
-            lab_console.cmd_text(lab, args)
-
-    def test_from_reset_rejects_lxc(self) -> None:
-        lab = self._lab()
-        args = self._text_args(
-            from_reset=True, follow=True, lease="L1", kind="lxc"
-        )
-        with self.assertRaisesRegex(RuntimeError, "QEMU"):
-            lab_console.cmd_text(lab, args)
-
-    def test_from_reset_requires_lease(self) -> None:
-        lab = self._lab()
-        args = self._text_args(from_reset=True, follow=True)
-        with self.assertRaisesRegex(RuntimeError, "requires --lease"):
-            lab_console.cmd_text(lab, args)
-
-    def test_from_reset_attaches_serial_before_resetting(self) -> None:
-        lab = self._lab()
-        order: list[str] = []
-        api = mock.Mock()
-        lab.ProxmoxAPI.return_value = api
-
-        def api_call(method: str, path: str, *a: object, **k: object) -> None:
-            if path.endswith("/status/reset"):
-                order.append("reset")
-
-        api.call.side_effect = api_call
-
-        class FakeSession:
-            """Filters like the real session does, so the fake cannot pass a
-            stream the production path would have rejected."""
-
-            def __init__(self, *a: object, **k: object) -> None:
-                order.append("attach")
-                self.socket = mock.Mock()
-                self.socket.read_available.return_value = b""
-                self.filter = lab_console.TermFilter()
-
-            def read_bytes(self, timeout: float) -> bytes:
-                return self.filter.feed(self.socket.read_available(timeout))
-
-            def flush_bytes(self) -> bytes:
-                return self.filter.flush()
-
-            def __enter__(self) -> "FakeSession":
-                return self
-
-            def __exit__(self, *a: object) -> None:
-                return None
-
-        args = self._text_args(from_reset=True, follow=True, lease="L1")
-        with mock.patch.object(lab_console, "TermSession", FakeSession):
-            lab_console.cmd_text(lab, args)
-        self.assertEqual(order[:2], ["attach", "reset"])
-        api.call.assert_any_call(
-            "POST", "/nodes/aipve/qemu/9001/status/reset"
-        )
-        lab.require_lease_resource.assert_called_once()
-
-
-class TermTransportFilterTests(unittest.TestCase):
-    """Found live: a termproxy status line was returned as guest serial output.
-
-    It contaminated saved boot logs and could be sent on to a debugger as if
-    the guest had printed it. These assert that transport records are removed
-    whether or not they arrive whole, and that real guest text is not.
-    """
-
-    BANNER = b"starting serial terminal on interface serial0 (press Ctrl+O to exit)\n"
-    # What a Proxmox 9.2 node actually sends: no suffix, CRLF terminated.
-    LIVE_BANNER = b"starting serial terminal on interface serial0\r\n"
-
-    def test_handshake_and_banner_in_one_read_are_both_removed(self) -> None:
-        term = lab_console.TermFilter()
-        out = term.feed(b"OK\n" + self.BANNER + b"Booting ReactOS\n")
-        self.assertEqual(out, b"Booting ReactOS\n")
-
-    def test_handshake_without_a_newline_is_removed(self) -> None:
-        term = lab_console.TermFilter()
-        self.assertEqual(term.feed(b"OK" + self.BANNER), b"")
-        self.assertEqual(term.feed(b"guest\n"), b"guest\n")
-
-    def test_records_split_across_reads_are_still_removed(self) -> None:
-        """A websocket read is not a record boundary."""
-        term = lab_console.TermFilter()
-        chunks = [b"O", b"K\nstarting serial ter",
-                  b"minal on interface serial0 (press Ctrl+O to exit)",
-                  b"\nBooting ReactOS\n"]
-        out = b"".join(term.feed(chunk) for chunk in chunks)
-        self.assertEqual(out, b"Booting ReactOS\n")
-        self.assertEqual(term.flush(), b"")
-
-    def test_the_framing_a_real_node_sends(self) -> None:
-        """Captured from a Proxmox 9.2 node: the ack arrives alone with no
-        newline, a blank CRLF can precede the record, the record is CRLF
-        terminated, and guest bytes then arrive a few at a time. The first fix
-        for this issue stripped nothing here, because the blank line looked
-        like guest output and ended the search."""
-        term = lab_console.TermFilter()
-        frames = [
-            b"OK",
-            b"\r\n",
-            b"starting serial terminal on interface serial0\r\n",
-            b"\r\n",
-            b"\x1b[?2", b"004", b"l\r", b"\x1b[", b"?2004h",
-            b"de", b"bian", b"@", b"host", b":~", b"$ ",
-        ]
-        out = b"".join(term.feed(frame) for frame in frames) + term.flush()
-        self.assertNotIn(b"starting serial terminal", out)
-        self.assertIn(b"debian@host:~$ ", out)
-
-    def test_an_lxc_style_pair_of_records_is_removed_before_the_prompt(self) -> None:
-        term = lab_console.TermFilter()
-        out = term.feed(b"OK") + term.feed(
-            b"Connected to tty 1\r\n"
-            b"Type <Ctrl+a q> to exit the console, "
-            b"<Ctrl+a Ctrl+a> to enter Ctrl+a itself\r\n"
-        ) + term.feed(b"root@ct:~# ")
-        self.assertEqual(out, b"root@ct:~# ")
-
-    def test_the_record_is_still_removed_after_guest_echo(self) -> None:
-        """It is not always the first thing on the stream."""
-        term = lab_console.TermFilter()
-        out = term.feed(b"OK\r\n\r\n") + term.feed(
-            b"starting serial terminal on interface serial0\r\n[    0.00] boot\n"
-        )
-        self.assertNotIn(b"starting serial", out)
-        self.assertIn(b"[    0.00] boot\n", out)
-
-    def test_the_stopped_guest_refusal_is_not_guest_output(self) -> None:
-        """Captured live from a stopped guest: the ticket is issued, the socket
-        opens, and this is all that ever arrives. Saved into a boot log it
-        reads as something the guest printed."""
-        term = lab_console.TermFilter()
-        out = term.feed(b"OK") + term.feed(b"VM 9231 not running\r\n")
-        self.assertEqual(out + term.flush(), b"")
-
-    def test_a_guest_line_about_something_not_running_survives(self) -> None:
-        term = lab_console.TermFilter()
-        term.feed(b"OK")
-        line = b"systemd: nginx.service is not running, restarting\n"
-        self.assertEqual(term.feed(line), line)
-
-    def test_a_short_ambiguous_tail_is_not_held_back(self) -> None:
-        """An interactive prompt has no newline; holding it would hang a
-        debugger waiting for a byte that has already arrived."""
-        term = lab_console.TermFilter()
-        term.feed(b"OK")
-        self.assertEqual(term.feed(b"C"), b"C")
-        self.assertEqual(term.feed(b"on"), b"on")
-
-    def test_a_guest_line_beginning_with_ok_is_preserved(self) -> None:
-        """The old prefix test truncated any guest line starting 'OK'."""
-        term = lab_console.TermFilter()
-        term.feed(b"OK\n")
-        self.assertEqual(term.feed(b"OKAY device ready\n"),
-                         b"OKAY device ready\n")
-
-    def test_guest_output_is_never_held_waiting_for_a_record(self) -> None:
-        """Held bytes must be limited to something that could still be one."""
-        term = lab_console.TermFilter()
-        term.feed(b"OK\n")
-        self.assertEqual(term.feed(b"kdb:> "), b"kdb:> ")
-
-    def test_a_truncated_record_is_not_leaked_when_the_session_ends(self) -> None:
-        term = lab_console.TermFilter()
-        self.assertEqual(term.feed(b"OK\nstarting serial terminal on inter"), b"")
-        self.assertEqual(term.flush(), b"")
-
-    def test_a_bare_handshake_reads_as_no_guest_output(self) -> None:
-        term = lab_console.TermFilter()
-        self.assertEqual(term.feed(b"OK"), b"")
-        self.assertEqual(term.flush(), b"")
-
-    def test_the_lxc_console_banner_is_removed_too(self) -> None:
-        term = lab_console.TermFilter()
-        out = term.feed(
-            b"OK\nConnected to tty 1\n"
-            b"Type <Ctrl+a q> to exit the console, "
-            b"<Ctrl+a Ctrl+a> to enter Ctrl+a itself\n"
-            b"root@ct:~# "
-        )
-        self.assertEqual(out, b"root@ct:~# ")
-
-    def test_session_read_returns_guest_text_only(self) -> None:
-        session = lab_console.TermSession.__new__(lab_console.TermSession)
-        session.filter = lab_console.TermFilter()
-        reads = [b"OK\n" + self.BANNER, b"Booting ReactOS\n", b""]
-        session.socket = mock.Mock()
-        session.socket.read_available.side_effect = \
-            lambda _t: reads.pop(0) if reads else b""
-        self.assertEqual(session.read(0.6), "Booting ReactOS\n")
-
-    def test_a_transport_only_read_does_not_end_the_capture(self) -> None:
-        """Found live: the record filtered down to no bytes, read() read that
-        as a gap in guest output and stopped, and the prompt arriving right
-        after it was lost. Removing noise must not remove signal."""
-        session = lab_console.TermSession.__new__(lab_console.TermSession)
-        session.filter = lab_console.TermFilter()
-        session.last_read_was_empty = True
-        reads = [b"OK", b"\r\n", self.LIVE_BANNER, b"debian@host:~$ "]
-        session.socket = mock.Mock()
-        session.socket.read_available.side_effect = \
-            lambda _t: reads.pop(0) if reads else b""
-        text = session.read(2.0)
-        self.assertIn("debian@host:~$ ", text)
-        self.assertNotIn("starting serial terminal", text)
-
-    def test_the_bridge_client_sees_the_same_filtered_stream(self) -> None:
-        """The JSON wrapper was not the only leaking path; the bridge was too."""
-        reads = [b"OK\n" + self.BANNER, b"Booting ReactOS\n"]
-
-        class FakeTerm:
-            def __init__(self, *a: object, **k: object) -> None:
-                self.filter = lab_console.TermFilter()
-                self.socket = mock.Mock()
-                self.socket.read_available.side_effect = \
-                    lambda _t: reads.pop(0) if reads else b""
-
-            def read_bytes(self, timeout: float) -> bytes:
-                return self.filter.feed(self.socket.read_available(timeout))
-
-            def __enter__(self) -> "FakeTerm":
-                return self
-
-            def __exit__(self, *a: object) -> None:
-                return None
-
-        import select as select_module
-
-        sent: list[bytes] = []
-        client = mock.Mock()
-        client.recv.return_value = b""          # third pass: client disconnects
-        idle = [([], [], []), ([], [], [])]     # let both guest reads through
-
-        def fake_select(readable, _w, _x, _timeout):
-            return idle.pop(0) if idle else (readable, [], [])
-
-        with mock.patch.object(lab_console, "TermSession", FakeTerm), \
-             mock.patch.object(select_module, "select", fake_select), \
-             mock.patch.object(
-                 lab_console, "_bridge_send_all",
-                 side_effect=lambda _c, data: bool(sent.append(data)) or True):
-            lab_console._bridge_serve(
-                mock.Mock(), mock.Mock(), "qemu", 9001, client
-            )
-        self.assertEqual(b"".join(sent), b"Booting ReactOS\n")
-        self.assertNotIn(b"starting serial terminal", b"".join(sent))
-
-
-class SerialAttachTests(unittest.TestCase):
-    """Found live on a Proxmox 9.2 node: `termproxy` issues a ticket for a
-    *stopped* guest and the websocket opens, then 'qm terminal' writes
-    "VM <id> not running" into the stream and exits. So the documented
-    attach-before-power-on capture produced a log with one transport sentence
-    in it, and the attach itself could not tell that anything was wrong."""
-
-    def _lab(self, *statuses: str) -> mock.Mock:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        remaining = list(statuses)
-        lab.guest_status.side_effect = \
-            lambda *_a: remaining.pop(0) if remaining else statuses[-1]
-        return lab
-
-    def test_attach_waits_for_a_stopped_guest_then_attaches(self) -> None:
-        lab = self._lab("stopped", "stopped", "running")
-        with mock.patch.object(lab_console, "TermSession",
-                               return_value="session") as term, \
-             mock.patch.object(lab_console.time, "sleep") as slept:
-            session = lab_console._attach_term(
-                lab, mock.Mock(), "qemu", 9001, wait=30, poll=0.01
-            )
-        self.assertEqual(session, "session")
-        self.assertEqual(lab.guest_status.call_count, 3)
-        self.assertEqual(term.call_count, 1, "attach only once the guest is up")
-        self.assertEqual(slept.call_count, 2)
-
-    def test_without_waiting_a_stopped_guest_is_a_clear_error(self) -> None:
-        """It used to return a session that streamed 'VM 9001 not running' as
-        if the guest had printed it, and exit 0."""
-        lab = self._lab("stopped")
-        with mock.patch.object(lab_console, "TermSession") as term:
-            with self.assertRaisesRegex(RuntimeError, "is not running"):
-                lab_console._attach_term(lab, mock.Mock(), "qemu", 9001)
-        term.assert_not_called()
-
-    def test_a_running_guest_is_attached_without_waiting(self) -> None:
-        lab = self._lab("running")
-        with mock.patch.object(lab_console, "TermSession",
-                               return_value="session"), \
-             mock.patch.object(lab_console.time, "sleep") as slept:
-            self.assertEqual(
-                lab_console._attach_term(lab, mock.Mock(), "qemu", 9001,
-                                         wait=30),
-                "session",
-            )
-        slept.assert_not_called()
-
-    def test_the_wait_is_bounded(self) -> None:
-        lab = self._lab("stopped")
-        with mock.patch.object(lab_console, "TermSession"), \
-             mock.patch.object(lab_console.time, "sleep"):
-            with self.assertRaisesRegex(
-                RuntimeError, "did not become available within"
-            ):
-                lab_console._attach_term(
-                    lab, mock.Mock(), "qemu", 9001, wait=0.02, poll=0.01
-                )
-
-    def test_a_real_configuration_error_is_not_retried(self) -> None:
-        """Waiting is for 'not yet', not for a guest with no serial device."""
-        lab = self._lab("running")
-        with mock.patch.object(
-            lab_console, "TermSession",
-            side_effect=RuntimeError(
-                "termproxy did not return a ticket for qemu/9001"
-            ),
-        ) as term:
-            with self.assertRaisesRegex(RuntimeError, "termproxy"):
-                lab_console._attach_term(
-                    lab, mock.Mock(), "qemu", 9001, wait=5, poll=0.01
-                )
-        self.assertEqual(term.call_count, 1)
-
-    def test_an_unreadable_status_counts_as_not_running(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.guest_status.side_effect = RuntimeError("HTTP 500")
-        with mock.patch.object(lab_console, "TermSession") as term:
-            with self.assertRaisesRegex(RuntimeError, "is not running"):
-                lab_console._attach_term(lab, mock.Mock(), "qemu", 9001)
-        term.assert_not_called()
-
-
-class ConsoleTlsTests(unittest.TestCase):
-    """Found live: the console websocket disabled certificate checks even with
-    [proxmox] verify_tls = true, so only the REST path was protected."""
-
-    def _open(self, verify: bool) -> tuple[object, dict]:
-        import ssl as ssl_module
-
-        context = ssl_module.create_default_context()
-        wrapped = mock.Mock()
-        recorded: dict = {}
-
-        def wrap_socket(_raw: object, **kwargs: object) -> object:
-            recorded.update(kwargs)
-            return wrapped
-
-        context.wrap_socket = wrap_socket        # type: ignore[method-assign]
-        wrapped.recv.side_effect = [
-            b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-            b"Sec-WebSocket-Protocol: binary\r\n"
-            b"Sec-WebSocket-Accept: 3SC6TZx4582OZaOogPVxMx5CGS0=\r\n\r\n"
-        ]
-        from proxmox_agent_lab import ws as lab_ws
-
-        with mock.patch.object(lab_ws.ssl, "create_default_context",
-                               return_value=context), \
-             mock.patch.object(lab_ws.socket, "create_connection",
-                               return_value=mock.Mock()), \
-             mock.patch.object(lab_ws.os, "urandom",
-                               return_value=b"a" * 16):
-            lab_ws.WebSocket(
-                "pve.example", 8006, "/api2/json/x", {}, {},
-                verify_tls=verify,
-            )
-        return context, recorded
-
-    def test_verified_mode_checks_the_certificate_and_hostname(self) -> None:
-        import ssl as ssl_module
-
-        context, recorded = self._open(True)
-        self.assertTrue(context.check_hostname)
-        self.assertEqual(context.verify_mode, ssl_module.CERT_REQUIRED)
-        self.assertEqual(recorded.get("server_hostname"), "pve.example")
-
-    def test_the_self_signed_opt_out_is_still_available(self) -> None:
-        import ssl as ssl_module
-
-        context, recorded = self._open(False)
-        self.assertFalse(context.check_hostname)
-        self.assertEqual(context.verify_mode, ssl_module.CERT_NONE)
-        self.assertIsNone(recorded.get("server_hostname"))
-
-    def test_the_console_passes_the_configured_policy_through(self) -> None:
-        lab = mock.Mock()
-        lab.HOST, lab.PORT, lab.NODE = "pve.example", 8006, "aipve"
-        lab.TOKEN_USER, lab.TOKEN_NAME = "agent@pve", "lab"
-        lab.keychain_secret.return_value = "secret"
-        for verify in (True, False):
-            lab.VERIFY_TLS = verify
-            with mock.patch.object(lab_console.ws, "WebSocket") as socket_class:
-                lab_console._open_websocket(
-                    lab, "qemu", 9001, {"port": "5900", "ticket": "t"}, 20.0
-                )
-            self.assertEqual(
-                socket_class.call_args.kwargs["verify_tls"], verify
-            )
-
-
-class MonitorScreenshotTests(unittest.TestCase):
-    """'console screenshot --via monitor' writes a file on the *host*, so the
-    path, the format and the cleanup are all fixed by the code, not the
-    caller."""
-
-    def _args(self, **overrides: object) -> object:
-        import argparse
-
-        defaults = dict(vmid=9001, lease="20260821120000-abc0", via="monitor",
-                        out=None, for_model=False, upload=False, timeout=25.0,
-                        url_expiry=3600, settle=0.0)
-        defaults.update(overrides)
-        return argparse.Namespace(**defaults)
-
-    def test_the_only_monitor_command_is_a_png_screendump(self) -> None:
-        path = lab_console._monitor_remote_path("20260821120000-abc0", 9001)
-        command = lab_console._screendump_command(path)
-        self.assertTrue(command.startswith("screendump "))
-        self.assertTrue(command.endswith(" -f png"))
-        self.assertIn(lab_console.MONITOR_SCREENSHOT_ROOT, command)
-
-    def test_the_host_path_is_lease_scoped(self) -> None:
-        first = lab_console._monitor_remote_path("lease-one", 9001)
-        second = lab_console._monitor_remote_path("lease-two", 9001)
-        self.assertIn("/lease-one/", first)
-        self.assertIn("/lease-two/", second)
-        self.assertNotEqual(first, second)
-
-    def test_a_lease_id_cannot_escape_the_screenshot_root(self) -> None:
-        path = lab_console._monitor_remote_path("../../etc/x", 9001)
-        self.assertTrue(
-            path.startswith(lab_console.MONITOR_SCREENSHOT_ROOT + "/")
-        )
-        self.assertNotIn("..", path)
-
-    def test_paths_and_formats_outside_the_contract_are_refused(self) -> None:
-        for candidate in (
-            "/etc/shadow.png",
-            f"{lab_console.MONITOR_SCREENSHOT_ROOT}/x/shot.ppm",
-            f"{lab_console.MONITOR_SCREENSHOT_ROOT}/../shot.png",
-            f"{lab_console.MONITOR_SCREENSHOT_ROOT}/x/two words.png",
-        ):
-            with self.assertRaises(ValueError):
-                lab_console._screendump_command(candidate)
-
-    def test_non_png_bytes_from_the_host_are_rejected(self) -> None:
+        for char, expected in cases:
+            with self.subTest(char=char):
+                self.assertEqual(console_module.key_for(char), [expected])
+
+    def test_named_keys_and_combinations_pass_through(self) -> None:
+        for token in ("ret", "f2", "spc", "tab", "ctrl-alt-delete",
+                      "shift-a", "shift-minus"):
+            with self.subTest(token=token):
+                self.assertEqual(console_module.key_for(token), [token])
+
+    def test_unknown_key_lists_the_accepted_names(self) -> None:
+        for token in ("", "é", "banana", "ctrl-nope", "shift-é"):
+            with self.subTest(token=token):
+                with self.assertRaises(LabError) as caught:
+                    console_module.key_for(token)
+                message = str(caught.exception)
+                self.assertIn("ret", message)
+                self.assertIn("f2", message)
+                self.assertIn("ctrl-alt-delete", message)
+
+
+class PpmTests(unittest.TestCase):
+    """ppm_to_png semantics: golden conversion, loud failure on junk."""
+
+    def test_golden_ppm_round_trips_and_junk_raises(self) -> None:
+        png = png_module.ppm_to_png(GOLDEN_PPM)
+        self.assertTrue(png.startswith(PNG_MAGIC))
+        self.assertEqual(png_module.decode_png(png), (2, 2, GOLDEN_RGB))
         with self.assertRaises(ValueError):
-            lab_console._png_dimensions(b"not a png at all........")
-
-    def _run(self, lab: mock.Mock, api: mock.Mock, memflow: mock.Mock,
-             **overrides: object) -> dict:
-        # Importing it first guarantees the package attribute exists, so the
-        # lazy 'from . import host_transport' inside the command sees the double.
-        from proxmox_agent_lab import host_transport as _real   # noqa: F401
-
-        with mock.patch("proxmox_agent_lab.host_transport", memflow):
-            return lab_console._screenshot_via_monitor(
-                lab, api, self._args(**overrides)
-            )
-
-    def _memflow(self, png: bytes) -> mock.Mock:
-        memflow = mock.Mock()
-        memflow.host_read_bytes.return_value = png
-        memflow.host_remove_file.return_value = True
-        return memflow
-
-    def _png(self) -> bytes:
-        return lab_png.encode_png(2, 1, bytes([1, 2, 3, 4, 5, 6]))
-
-    def test_the_capture_is_fetched_and_the_host_copy_deleted(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        api = mock.Mock()
-        api.call.return_value = ""
-        memflow = self._memflow(self._png())
-        with tempfile.TemporaryDirectory() as tmp:
-            result = self._run(lab, api, memflow,
-                               out=str(Path(tmp) / "shot.png"))
-        self.assertEqual(result["source"], "monitor")
-        self.assertEqual((result["width"], result["height"]), (2, 1))
-        self.assertTrue(result["host_file_removed"])
-        sent = api.call.call_args.args[2]["command"]
-        self.assertTrue(sent.endswith(" -f png"))
-        memflow.host_remove_file.assert_called_once()
-        self.assertEqual(
-            memflow.host_remove_file.call_args.args[1],
-            memflow.host_read_bytes.call_args.args[1],
-        )
-        # Nothing of ours is left on the host, not even the directory.
-        memflow.host_remove_empty_dir.assert_called_once()
-        self.assertEqual(
-            memflow.host_remove_empty_dir.call_args.args[1],
-            memflow.host_mkdir.call_args.args[1],
-        )
-        audited = lab.audit.call_args.kwargs
-        self.assertEqual(audited["source"], "monitor")
-        self.assertNotIn("image", audited)
-
-    def test_the_host_file_is_deleted_even_when_the_fetch_fails(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        api = mock.Mock()
-        api.call.return_value = ""
-        memflow = self._memflow(b"")
-        memflow.host_read_bytes.side_effect = RuntimeError("no such file")
-        with self.assertRaisesRegex(RuntimeError, "no such file"):
-            self._run(lab, api, memflow)
-        memflow.host_remove_file.assert_called_once()
-
-    def test_a_monitor_refusal_in_the_body_is_an_error(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        api = mock.Mock()
-        api.call.return_value = (
-            "Currently only 'png' and 'ppm' formats are supported."
-        )
-        memflow = self._memflow(self._png())
-        with self.assertRaisesRegex(RuntimeError, "screendump refused"):
-            self._run(lab, api, memflow)
-        memflow.host_remove_file.assert_called_once()
-
-    def test_it_requires_a_lease_and_ownership_before_touching_the_host(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        memflow = self._memflow(self._png())
-        with self.assertRaisesRegex(RuntimeError, "requires --lease"):
-            self._run(lab, mock.Mock(), memflow, lease=None)
-        memflow.require_host_ssh.assert_not_called()
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.require_lease_resource.side_effect = RuntimeError("not registered")
-        with self.assertRaisesRegex(RuntimeError, "not registered"):
-            self._run(lab, mock.Mock(), memflow)
-        memflow.require_host_ssh.assert_not_called()
-
-    def test_for_model_returns_the_capture_as_bounded_base64(self) -> None:
-        """The monitor path has a PNG, not a framebuffer, so it decodes it."""
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        api = mock.Mock()
-        api.call.return_value = ""
-        memflow = self._memflow(self._png())
-        with tempfile.TemporaryDirectory() as tmp:
-            result = self._run(lab, api, memflow, for_model=True,
-                               out=str(Path(tmp) / "shot.png"))
-        image = result["image"]
-        self.assertEqual(image["mime_type"], "image/png")
-        self.assertEqual((image["original_width"], image["original_height"]),
-                         (2, 1))
-        decoded = base64.b64decode(image["base64"])
-        self.assertTrue(decoded.startswith(b"\x89PNG"))
-        self.assertEqual(lab_png.decode_png(decoded)[:2], (2, 1))
-        # The fact and the size are audited; the pixels never are.
-        audited = [call for call in lab.audit.call_args_list
-                   if call.args[0] == "console-screenshot-for-model"]
-        self.assertEqual(len(audited), 1)
-        self.assertEqual(audited[0].kwargs["bytes"], image["bytes"])
-        self.assertNotIn("base64", audited[0].kwargs)
-
-    def test_a_screenshot_without_for_model_carries_no_base64(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        api = mock.Mock()
-        api.call.return_value = ""
-        with tempfile.TemporaryDirectory() as tmp:
-            result = self._run(lab, api, self._memflow(self._png()),
-                               out=str(Path(tmp) / "shot.png"))
-        self.assertNotIn("image", result)
+            png_module.ppm_to_png(b"not a ppm at all")
 
 
-class StorageGarbageCollectionTests(unittest.TestCase):
-    """Deleting a disk image is irreversible, so the only safe default is a
-    report, and a false 'orphan' must be impossible rather than unlikely."""
-
-    STORES = [
-        {"storage": "local-lvm", "content": "images,rootdir"},
-        {"storage": "usb-bulk", "content": "images,iso,backup"},
-        {"storage": "local", "content": "iso,vztmpl"},
-    ]
-    VOLUMES = {
-        "local-lvm": [
-            {"volid": "local-lvm:vm-9001-disk-0", "vmid": 9001,
-             "size": 34_359_738_368, "format": "raw"},
-            {"volid": "local-lvm:vm-9001-state-before-update", "vmid": 9001,
-             "size": 4_294_967_296, "format": "raw"},
-        ],
-        "usb-bulk": [
-            {"volid": "usb-bulk:9002/vm-9002-disk-0.raw", "vmid": 9002,
-             "size": 107_374_182_400, "used": 40_000_000_000, "format": "raw"},
-            # Provisioned 10 GB, but only 2.8 MB was ever written -- a create
-            # that failed early. Deleting it returns the 2.8 MB, not the 10 GB.
-            {"volid": "usb-bulk:9003/vm-9003-disk-0.raw", "vmid": 9003,
-             "size": 10_737_418_240, "used": 2_826_240, "format": "raw"},
-        ],
-    }
-    # 9001 is in use; 9002's config mentions its volume with options appended;
-    # 9003 no longer exists at all.
-    CONFIGS = {
-        9001: {"scsi0": "local-lvm:vm-9001-disk-0,discard=on,size=32G"},
-        9002: {"virtio0": "usb-bulk:9002/vm-9002-disk-0.raw,iothread=1,size=100G"},
-    }
-    # A snapshot's vmstate volume is listed as ordinary images content but
-    # appears only in the snapshot's own config.
-    SNAPSHOTS = {
-        9001: [{"name": "before-update"}, {"name": "current"}],
-        9002: [],
-    }
-    SNAPSHOT_CONFIGS = {
-        (9001, "before-update"): {
-            "vmstate": "local-lvm:vm-9001-state-before-update",
-            "scsi0": "local-lvm:vm-9001-disk-0,discard=on,size=32G",
-        },
-    }
-
-    def _lab(self) -> tuple:
-        import re
-
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.NODE = "aipve"
-        api = mock.Mock()
-
-        def call(method: str, path: str, data: Any = None) -> Any:
-            if path == "/nodes/aipve/storage":
-                return self.STORES
-            if path == "/cluster/resources":
-                return [{"vmid": vmid, "type": "qemu"} for vmid in self.CONFIGS]
-            matched = re.fullmatch(r"/nodes/aipve/qemu/(\d+)/config", path)
-            if matched:
-                return self.CONFIGS[int(matched.group(1))]
-            matched = re.fullmatch(r"/nodes/aipve/qemu/(\d+)/snapshot", path)
-            if matched:
-                return self.SNAPSHOTS[int(matched.group(1))]
-            matched = re.fullmatch(
-                r"/nodes/aipve/qemu/(\d+)/snapshot/([^/]+)/config", path
-            )
-            if matched:
-                return self.SNAPSHOT_CONFIGS[
-                    (int(matched.group(1)), matched.group(2))
-                ]
-            matched = re.fullmatch(
-                r"/nodes/aipve/storage/([^/]+)/content", path
-            )
-            if matched:
-                return self.VOLUMES.get(matched.group(1), [])
-            if method == "DELETE":
-                return None
-            raise AssertionError(f"unexpected call {method} {path}")
-
-        api.call.side_effect = call
-        lab.ProxmoxAPI.return_value = api
-        return lab, api
-
-    def _args(self, **overrides: Any) -> Any:
-        import argparse
-
-        base = dict(storage=None, vmid=None, dry_run=False, delete=False,
-                    host_change_authorized=False, lease=None)
-        base.update(overrides)
-        return argparse.Namespace(**base)
-
-    def _run(self, **overrides: Any) -> tuple:
-        import contextlib
-        import io
-
-        lab, api = self._lab()
-        out = io.StringIO()
-        error = None
-        with contextlib.redirect_stdout(out):
-            try:
-                lab_storage.cmd_gc(lab, self._args(**overrides))
-            except RuntimeError as exc:
-                error = str(exc)
-        return json.loads(out.getvalue()), error, lab, api
-
-    def test_only_unreferenced_volumes_are_reported(self) -> None:
-        result, error, _, _ = self._run()
-        self.assertIsNone(error)
-        self.assertEqual(
-            [x["volid"] for x in result["orphaned_volumes"]],
-            ["usb-bulk:9003/vm-9003-disk-0.raw"],
-        )
-        self.assertEqual(result["referenced_volumes"], 3)
-        self.assertEqual(result["orphaned_provisioned_gb"], 10.74)
-
-    def test_a_volume_named_in_a_config_with_options_is_referenced(self) -> None:
-        """The config value is 'volid,iothread=1,size=100G', never a bare
-        volid, so an exact-match check would have called it an orphan."""
-        result, _, _, _ = self._run()
-        self.assertNotIn(
-            "usb-bulk:9002/vm-9002-disk-0.raw",
-            [x["volid"] for x in result["orphaned_volumes"]],
-        )
-
-    def test_reclaimable_space_is_reported_separately_from_provisioned(self) -> None:
-        """Found on the node: four orphans read as 51.54 GB, which was their
-        provisioned size. They held 9.33 MB between them, so deleting them --
-        an irreversible act -- would have returned essentially nothing. The two
-        numbers have to be distinguishable before anyone acts on them."""
-        result, _, _, _ = self._run()
-        self.assertEqual(result["orphaned_provisioned_gb"], 10.74)
-        self.assertEqual(result["orphaned_on_disk_gb"], 0.003)
-        self.assertEqual(result["orphaned_volumes"][0]["used_gb"], 0.003)
-
-    def test_a_snapshot_state_volume_is_never_an_orphan(self) -> None:
-        """It is listed as ordinary images content but appears only in the
-        snapshot's own config, so a live-config-only scan would have offered
-        to delete the thing a rollback needs."""
-        result, _, _, _ = self._run()
-        self.assertNotIn(
-            "local-lvm:vm-9001-state-before-update",
-            [x["volid"] for x in result["orphaned_volumes"]],
-        )
-
-    def test_an_unreadable_snapshot_list_also_refuses_to_classify(self) -> None:
-        lab, api = self._lab()
-        original = api.call.side_effect
-
-        def call(method: str, path: str, data: Any = None) -> Any:
-            if path.endswith("/9001/snapshot"):
-                raise RuntimeError("HTTP 500")
-            return original(method, path, data)
-
-        api.call.side_effect = call
-        with self.assertRaisesRegex(RuntimeError, "Refusing to classify"):
-            lab_storage.cmd_gc(lab, self._args())
-
-    def test_reporting_is_the_default_and_deletes_nothing(self) -> None:
-        result, error, _, api = self._run()
-        self.assertTrue(result["dry_run"])
-        self.assertEqual(result["deleted"], [])
-        self.assertIsNone(error)
-        self.assertFalse(
-            [c for c in api.call.call_args_list if c.args[0] == "DELETE"]
-        )
-
-    def test_deleting_needs_host_change_authorization(self) -> None:
-        result, error, _, api = self._run(delete=True)
-        self.assertIn("host-change-authorized", error or "")
-        self.assertEqual(result["deleted"], [])
-        self.assertFalse(
-            [c for c in api.call.call_args_list if c.args[0] == "DELETE"]
-        )
-
-    def test_authorized_deletion_removes_only_this_run_s_orphans(self) -> None:
-        result, error, lab, api = self._run(
-            delete=True, host_change_authorized=True
-        )
-        self.assertIsNone(error)
-        self.assertEqual(result["deleted"], ["usb-bulk:9003/vm-9003-disk-0.raw"])
-        deletes = [c.args[1] for c in api.call.call_args_list
-                   if c.args[0] == "DELETE"]
-        self.assertEqual(
-            deletes,
-            ["/nodes/aipve/storage/usb-bulk/content/"
-             "usb-bulk:9003/vm-9003-disk-0.raw"],
-        )
-        audited = lab.audit.call_args
-        self.assertEqual(audited.args[0], "storage-volume-deleted")
-        self.assertEqual(audited.kwargs["volid"],
-                         "usb-bulk:9003/vm-9003-disk-0.raw")
-        self.assertEqual(audited.kwargs["size_gb"], 10.74)
-        self.assertEqual(audited.kwargs["used_gb"], 0.003)
-
-    def test_an_unreadable_guest_config_refuses_to_classify_anything(self) -> None:
-        """If one config cannot be read, a volume it references would look
-        unreferenced. Nothing may be called an orphan in that case."""
-        lab, api = self._lab()
-        original = api.call.side_effect
-
-        def call(method: str, path: str, data: Any = None) -> Any:
-            if path.endswith("/9002/config"):
-                raise RuntimeError("HTTP 500: permission denied")
-            return original(method, path, data)
-
-        api.call.side_effect = call
-        with self.assertRaisesRegex(RuntimeError, "Refusing to classify"):
-            lab_storage.cmd_gc(lab, self._args())
-
-    def test_only_images_capable_stores_are_scanned(self) -> None:
-        _, _, _, api = self._run()
-        scanned = [
-            c.args[1] for c in api.call.call_args_list
-            if "/content" in c.args[1]
-        ]
-        self.assertNotIn("/nodes/aipve/storage/local/content", scanned)
-
-    def test_the_vmid_filter_narrows_the_report(self) -> None:
-        result, _, _, _ = self._run(vmid=9001)
-        self.assertEqual(result["orphaned_volumes"], [])
-
-
-class StorageClassTests(unittest.TestCase):
-    def test_the_bulk_store_is_labelled_bulk(self) -> None:
-        with mock.patch.object(lab_storage, "_DEFAULT_BULK", "usb-bulk"):
-            self.assertEqual(lab_storage.storage_class("usb-bulk"), "bulk")
-            self.assertEqual(lab_storage.storage_class("local-lvm"), "fast")
-            self.assertEqual(lab_storage.storage_class(""), "fast")
-
-
-class ConsoleLeaseGuardTests(unittest.TestCase):
-    """The sequence reported in issue #92, driven against real lease state.
-
-    A guest created and registered under one lease, then reached for under
-    the next one. The report was that the input commands answered
-    `keys_sent: 1` and delivered nothing; these tests pin the actual
-    behaviour -- a refusal raised before any transmission -- and that the
-    refusal names its remedy.
-    """
-
-    VMID = 9246
+class _ConsoleCase(unittest.TestCase):
+    """A temp state root, a scripted FakeSSH seam, recorded sleeps."""
 
     def setUp(self) -> None:
-        from proxmox_agent_lab import cli as lab_cli
-
-        self.lab = lab_cli
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        self.addCleanup(self.tmp.cleanup)
-        self.addCleanup(setattr, lab_cli, "LEASE_ROOT", lab_cli.LEASE_ROOT)
-        self.addCleanup(setattr, lab_cli, "STATE_ROOT", lab_cli.STATE_ROOT)
-        lab_cli.LEASE_ROOT = root / "leases"
-        lab_cli.STATE_ROOT = root
-
-        # Lease one creates the guest, registers it, and ends.
-        self.first = "20260814120000-aaaaaaaa"
-        lab_cli.save_lease({
-            "id": self.first, "state": "active", "kind": "session",
-            "resources": [], "initial_vmids": [],
-        })
-        lab_cli.register_resource(
-            lab_cli.load_lease(self.first), "qemu", self.VMID, "retain",
-            "probe",
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.lab = _Lab(self.root)
+        self.fake = FakeSSH()
+        self.sleeps: list[float] = []
+        seam = mock.patch.object(
+            console_module, "_make_ssh", lambda config: self.fake
         )
-        ended = lab_cli.load_lease(self.first)
-        ended["state"] = "ended"
-        lab_cli.save_lease(ended)
+        seam.start()
+        self.addCleanup(seam.stop)
+        clock = mock.patch.object(
+            console_module, "_sleep", self.sleeps.append
+        )
+        clock.start()
+        self.addCleanup(clock.stop)
 
-        # Lease two begins with that guest already on the node.
-        self.second = "20260814130000-bbbbbbbb"
-        lab_cli.save_lease({
-            "id": self.second, "state": "active", "kind": "session",
-            "resources": [], "initial_vmids": [self.VMID],
-        })
+    def capture(self, function: object, args: argparse.Namespace) -> dict:
+        """Run one handler; its JSON stdout must mirror what it returns."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            payload = function(self.lab, args)  # type: ignore[operator]
+        printed = json.loads(out.getvalue())
+        self.assertEqual(printed, payload)
+        return printed
 
-    def _refuses(self, run):
-        api = mock.Mock()
-        with mock.patch.object(self.lab, "ProxmoxAPI", return_value=api), \
-             mock.patch.object(self.lab, "audit"), \
-             mock.patch.object(lab_console, "VncSession") as vnc, \
-             mock.patch("builtins.print") as printed:
-            with self.assertRaises(self.lab.LabError) as caught:
-                run()
-        api.call.assert_not_called()
-        vnc.assert_not_called()
-        printed.assert_not_called()
-        return caught.exception
 
-    def _keys_args(self, lease, via="vnc"):
-        return mock.Mock(
-            lease=lease, vmid=self.VMID, keys=["enter"], via=via, delay=0,
-            screenshot_after=None, screenshot_out=None,
+class ScreenshotTests(_ConsoleCase):
+    def test_qemu_screenshot_writes_png_over_a_read_only_host_temp(self) -> None:
+        self.fake.add(r"^qm status 101$", stdout=b"status: running\n")
+        self.fake.add(r"^qm monitor 101$")
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=GOLDEN_PPM)
+        out_path = self.root / "shot.png"
+        result = self.capture(
+            console_module.cmd_screenshot,
+            argparse.Namespace(vmid=101, out=str(out_path)),
+        )
+        png = out_path.read_bytes()
+        self.assertTrue(png.startswith(PNG_MAGIC))
+        self.assertEqual(
+            result,
+            {
+                "vmid": 101, "path": str(out_path), "bytes": len(png),
+                "width": 2, "height": 2,
+            },
+        )
+        monitor = [
+            call for call in self.fake.calls
+            if call["argv"][:2] == ["qm", "monitor"]
+        ]
+        self.assertEqual(len(monitor), 1)
+        self.assertEqual(
+            monitor[0]["stdin"], b"screendump /tmp/pxl-shot-101.ppm\nquit\n"
+        )
+        cats = [
+            call for call in self.fake.calls if call["argv"][0] == "cat"
+        ]
+        self.assertEqual(len(cats), 1)
+        self.assertTrue(
+            cats[0]["argv"][1].startswith("/tmp/pxl-"),
+            f"host temp must live in /tmp/pxl-*, got {cats[0]['argv'][1]!r}",
+        )
+        # The fact and the size only, never the pixels.
+        self.assertEqual(
+            self.lab.audits,
+            [{"event": "console-screenshot", "vmid": 101, "bytes": len(png)}],
         )
 
-    def test_keys_type_and_sendkey_refuse_a_previous_lease_guest(self) -> None:
-        def typing() -> None:
-            args = mock.Mock(
-                lease=self.second, vmid=self.VMID, text="hello",
-                text_stdin=False, delay=0, enter=False,
-                screenshot_after=None, screenshot_out=None,
+    def test_default_output_lands_in_the_state_screens_directory(self) -> None:
+        self.fake.add(r"^qm status 101$", stdout=b"status: running\n")
+        self.fake.add(r"^qm monitor 101$")
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=GOLDEN_PPM)
+        result = self.capture(
+            console_module.cmd_screenshot,
+            argparse.Namespace(vmid=101, out=None),
+        )
+        path = Path(result["path"])
+        self.assertEqual(path.parent.name, "screens")
+        self.assertEqual(path.parent.parent, self.root)
+        self.assertTrue(path.name.startswith("pxl-shot-101-"))
+        self.assertTrue(path.read_bytes().startswith(PNG_MAGIC))
+
+    def test_lxc_screenshot_is_unsupported_and_never_touches_qm_monitor(
+        self,
+    ) -> None:
+        self.fake.add(r"^pct status 102$", stdout=b"status: stopped\n")
+        result = self.capture(
+            console_module.cmd_screenshot,
+            argparse.Namespace(vmid=102, out=None),
+        )
+        self.assertEqual(
+            result,
+            {
+                "vmid": 102,
+                "supported": False,
+                "reason": "lxc guests have no qm monitor",
+            },
+        )
+        for call in self.fake.calls:
+            self.assertNotIn("qm monitor", " ".join(call["argv"]))
+        self.assertFalse((self.root / "screens").exists())
+        self.assertEqual(self.lab.audits, [])
+
+    def test_bad_screendump_is_an_error_and_writes_nothing(self) -> None:
+        self.fake.add(r"^qm status 101$", stdout=b"status: running\n")
+        self.fake.add(r"^qm monitor 101$")
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=b"junk")
+        out_path = self.root / "nope.png"
+        with self.assertRaises(LabError) as caught:
+            console_module.cmd_screenshot(
+                self.lab, argparse.Namespace(vmid=101, out=str(out_path))
             )
-            lab_console.cmd_type(self.lab, args)
+        self.assertIn("PPM", str(caught.exception))
+        self.assertFalse(out_path.exists())
 
-        def sendkey() -> None:
-            args = self.lab.parser().parse_args([
-                "api", "--lease", self.second, "--method", "PUT",
-                "--path", f"/nodes/{self.lab.NODE}/qemu/{self.VMID}/sendkey",
-                "--data", "key=ret",
-            ])
-            self.lab.cmd_api(args)
 
-        cases = {
-            "keys --via vnc": lambda: lab_console.cmd_keys(
-                self.lab, self._keys_args(self.second, "vnc")),
-            "keys --via api": lambda: lab_console.cmd_keys(
-                self.lab, self._keys_args(self.second, "api")),
-            "type": typing,
-            "api sendkey": sendkey,
+class TypeTests(_ConsoleCase):
+    def setUp(self) -> None:
+        super().setUp()
+        _register_lease_guest(self.lab, "L1", "qemu", 101)
+        self.fake.add(r"^qm sendkey 101")
+
+    def type_args(self, **overrides: object) -> argparse.Namespace:
+        fields: dict = {
+            "lease": "L1", "vmid": 101, "text": "", "text_stdin": False,
+            "enter": False, "chars_per_second": 20.0,
         }
-        for label, run in cases.items():
-            with self.subTest(command=label):
-                error = self._refuses(run)
-                self.assertIn(
-                    f"VMID {self.VMID} existed before this lease", str(error)
-                )
+        fields.update(overrides)
+        return argparse.Namespace(**fields)
 
-    def test_the_refusal_names_the_command_that_fixes_it(self) -> None:
-        error = self._refuses(
-            lambda: lab_console.cmd_keys(self.lab, self._keys_args(self.second))
+    def test_paces_between_sends_and_enter_appends_ret(self) -> None:
+        result = self.capture(
+            console_module.cmd_type,
+            self.type_args(text="Hi!", enter=True, chars_per_second=1000.0),
         )
-        self.assertIn(
-            f"proxmox-lab lease-register --lease {self.second} --kind qemu "
-            f"--vmid {self.VMID} --allow-existing",
-            str(error),
+        sends = [call["argv"] for call in self.fake.calls]
+        self.assertEqual(
+            sends,
+            [
+                ["qm", "sendkey", "101", "shift-h"],
+                ["qm", "sendkey", "101", "i"],
+                ["qm", "sendkey", "101", "shift-1"],
+                ["qm", "sendkey", "101", "ret"],
+            ],
         )
-
-    def test_a_guest_missing_from_the_snapshot_is_still_refused(self) -> None:
-        """The pre-existing branch is not the only guard.
-
-        If the new lease's `initial_vmids` snapshot never saw the guest -- a
-        different controller created it, or the snapshot raced it -- the
-        registration check still has to refuse, and still has to say how to
-        register it.
-        """
-        third = "20260814140000-cccccccc"
-        self.lab.save_lease({
-            "id": third, "state": "active", "kind": "session",
-            "resources": [], "initial_vmids": [],
-        })
-        message = str(self._refuses(
-            lambda: lab_console.cmd_keys(self.lab, self._keys_args(third, "api"))
-        ))
-        self.assertIn(
-            f"VMID {self.VMID} is not a qemu guest registered to this lease",
-            message,
+        # Between every pair of sends, paced to at most 20 keys/second even
+        # though 1000 was asked for.
+        self.assertEqual(len(self.sleeps), len(sends) - 1)
+        self.assertGreaterEqual(min(self.sleeps), 0.05)
+        self.assertEqual(
+            result,
+            {"vmid": 101, "lease": "L1", "sent": 4, "chars": 3,
+             "enter": True},
         )
-        self.assertIn(
-            f"proxmox-lab lease-register --lease {third} --kind qemu "
-            f"--vmid {self.VMID}",
-            message,
-        )
-        # Nothing pre-existed here, so --allow-existing is not the remedy.
-        self.assertNotIn("--allow-existing", message)
-
-    def test_registering_the_guest_lets_the_input_through(self) -> None:
-        """The other half of the guard: once registered, input is sent."""
-        self.lab.register_resource(
-            self.lab.load_lease(self.second), "qemu", self.VMID, "retain",
-            "probe",
-        )
-        api = mock.Mock()
-        with mock.patch.object(self.lab, "ProxmoxAPI", return_value=api), \
-             mock.patch.object(self.lab, "audit"), \
-             mock.patch("builtins.print") as printed:
-            lab_console.cmd_keys(self.lab, self._keys_args(self.second, "api"))
-        api.call.assert_any_call(
-            "PUT", f"/nodes/{self.lab.NODE}/qemu/{self.VMID}/sendkey",
-            {"key": "enter"},
-        )
-        self.assertEqual(json.loads(printed.call_args.args[0])["keys_sent"], 1)
-
-    def test_a_serial_display_guest_refuses_vnc_input(self) -> None:
-        """vga: serial means the PS/2 keyboard does not exist.
-
-        Reporting keys_sent on such a guest claimed a delivery that never
-        happened; the command must refuse before transmitting.
-        """
-        self.lab.register_resource(
-            self.lab.load_lease(self.second), "qemu", self.VMID, "retain",
-            "probe",
-        )
-        api = mock.Mock()
-        api.call.return_value = {"vga": "serial0"}
-        with mock.patch.object(self.lab, "ProxmoxAPI", return_value=api), \
-             mock.patch.object(self.lab, "audit"):
-            with self.assertRaises(RuntimeError) as caught:
-                lab_console.cmd_keys(
-                    self.lab, self._keys_args(self.second, "api"))
-        self.assertIn("no graphical display", str(caught.exception))
-        # The sendkey call must never be reached.
-        self.assertNotIn(
-            mock.call("PUT",
-                      f"/nodes/{self.lab.NODE}/qemu/{self.VMID}/sendkey",
-                      {"key": "enter"}),
-            api.call.call_args_list,
+        # The text is never audited -- it may be a password.
+        self.assertNotIn("Hi!", json.dumps(self.lab.audits))
+        self.assertEqual(
+            self.lab.audits,
+            [{"event": "console-type", "lease": "L1", "vmid": 101,
+              "chars": 3}],
         )
 
-    def test_force_overrides_the_serial_display_guard(self) -> None:
-        self.lab.register_resource(
-            self.lab.load_lease(self.second), "qemu", self.VMID, "retain",
-            "probe",
+    def test_unmappable_character_types_nothing(self) -> None:
+        with self.assertRaises(LabError):
+            console_module.cmd_type(self.lab, self.type_args(text="oké"))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_text_stdin_reads_the_text(self) -> None:
+        with mock.patch("sys.stdin", io.StringIO("ab")):
+            self.capture(
+                console_module.cmd_type,
+                self.type_args(text_stdin=True),
+            )
+        self.assertEqual(
+            [call["argv"] for call in self.fake.calls],
+            [["qm", "sendkey", "101", "a"], ["qm", "sendkey", "101", "b"]],
         )
-        api = mock.Mock()
-        api.call.return_value = {"vga": "serial0"}
-        args = self._keys_args(self.second, "api")
-        args.force = True
-        with mock.patch.object(self.lab, "ProxmoxAPI", return_value=api), \
-             mock.patch.object(self.lab, "audit"), \
-             mock.patch("builtins.print"):
-            lab_console.cmd_keys(self.lab, args)
-        api.call.assert_any_call(
-            "PUT", f"/nodes/{self.lab.NODE}/qemu/{self.VMID}/sendkey",
-            {"key": "enter"},
+        self.assertEqual(len(self.sleeps), 1)
+
+    def test_no_text_and_no_enter_is_refused(self) -> None:
+        with self.assertRaises(LabError):
+            console_module.cmd_type(self.lab, self.type_args(text=""))
+        self.assertEqual(self.fake.calls, [])
+
+
+class KeysTests(_ConsoleCase):
+    def setUp(self) -> None:
+        super().setUp()
+        _register_lease_guest(self.lab, "L1", "qemu", 101)
+        self.fake.add(r"^qm sendkey 101")
+
+    def keys_args(self, keys: list, **overrides: object) -> argparse.Namespace:
+        fields: dict = {
+            "lease": "L1", "vmid": 101, "keys": keys, "screenshot_after": None,
+        }
+        fields.update(overrides)
+        return argparse.Namespace(**fields)
+
+    def test_every_name_goes_out_in_one_sendkey_call(self) -> None:
+        result = self.capture(
+            console_module.cmd_keys,
+            self.keys_args(["ret", "f2", "ctrl-alt-delete"]),
+        )
+        self.assertEqual(
+            [call["argv"] for call in self.fake.calls],
+            [["qm", "sendkey", "101", "ret", "f2", "ctrl-alt-delete"]],
+        )
+        self.assertEqual(
+            result,
+            {"vmid": 101, "lease": "L1", "sent_keys": 3, "ok": True},
+        )
+        # Key names can spell typed content: only the count is logged.
+        self.assertEqual(
+            self.lab.audits,
+            [{"event": "console-keys", "lease": "L1", "vmid": 101,
+              "count": 3}],
+        )
+
+    def test_character_tokens_translate_through_the_table(self) -> None:
+        self.capture(
+            console_module.cmd_keys, self.keys_args(["A", "!", "spc"])
+        )
+        self.assertEqual(
+            [call["argv"] for call in self.fake.calls],
+            [["qm", "sendkey", "101", "shift-a", "shift-1", "spc"]],
+        )
+
+    def test_unknown_key_name_lists_names_and_sends_nothing(self) -> None:
+        with self.assertRaises(LabError) as caught:
+            console_module.cmd_keys(self.lab, self.keys_args(["nope"]))
+        message = str(caught.exception)
+        self.assertIn("ret", message)
+        self.assertIn("f2", message)
+        self.assertIn("ctrl-alt-delete", message)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_screenshot_after_captures_through_the_pipeline(self) -> None:
+        self.fake.add(r"^qm monitor 101$")
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=GOLDEN_PPM)
+        result = self.capture(
+            console_module.cmd_keys,
+            self.keys_args(["ret"], screenshot_after=0.5),
+        )
+        self.assertEqual(self.sleeps, [0.5])
+        shot = result["screenshot"]
+        self.assertEqual(
+            {key: shot[key] for key in ("vmid", "width", "height")},
+            {"vmid": 101, "width": 2, "height": 2},
+        )
+        png = Path(shot["path"]).read_bytes()
+        self.assertTrue(png.startswith(PNG_MAGIC))
+        self.assertEqual(shot["bytes"], len(png))
+        self.assertEqual(
+            [event["event"] for event in self.lab.audits],
+            ["console-keys", "console-screenshot"],
         )
 
 
-class InputDeliverySignalTests(unittest.TestCase):
-    """`keys_sent` counts transmission, not arrival.
+class GateTests(_ConsoleCase):
+    """The ownership gate refuses before the seam is ever built."""
 
-    The post-action capture is the only evidence the controller has that the
-    input landed anywhere, so it is reported explicitly rather than left for
-    the caller to derive from a nested screenshot field.
+    def assert_gate_refuses(self, function: object,
+                            args: argparse.Namespace) -> str:
+        seam = mock.Mock(
+            side_effect=AssertionError("seam built before the ownership gate")
+        )
+        with mock.patch.object(console_module, "_make_ssh", seam):
+            with self.assertRaises(LabError) as caught:
+                function(self.lab, args)  # type: ignore[operator]
+        seam.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+        return str(caught.exception)
+
+    def test_keys_refuses_an_unregistered_guest(self) -> None:
+        message = self.assert_gate_refuses(
+            console_module.cmd_keys,
+            argparse.Namespace(
+                lease="L1", vmid=999, keys=["ret"], screenshot_after=None
+            ),
+        )
+        self.assertIn("lease-register", message)
+
+    def test_type_refuses_an_unregistered_guest(self) -> None:
+        message = self.assert_gate_refuses(
+            console_module.cmd_type,
+            argparse.Namespace(
+                lease="L1", vmid=999, text="x", text_stdin=False,
+                enter=False, chars_per_second=20.0,
+            ),
+        )
+        self.assertIn("lease-register", message)
+
+    def test_keys_refuses_a_registered_container(self) -> None:
+        _register_lease_guest(self.lab, "L1", "lxc", 102)
+        message = self.assert_gate_refuses(
+            console_module.cmd_keys,
+            argparse.Namespace(
+                lease="L1", vmid=102, keys=["ret"], screenshot_after=None
+            ),
+        )
+        self.assertIn("lxc", message)
+
+
+class RegisterTests(unittest.TestCase):
+    """`console` registers the capture, keyboard and pointer surface."""
+
+    #: Every console subcommand the surface promises. Pointer input, burst
+    #: capture, grid overlay and calibration are ported from vnc-mcp
+    #: (BSD 2-Clause, see NOTICE) and ride the same seam.
+    EXPECTED = {
+        "screenshot", "type", "keys", "move", "click", "drag",
+        "calibrate", "grid", "burst",
+    }
+
+    @staticmethod
+    def _subcommand_names(parser: argparse.ArgumentParser) -> set[str]:
+        names: set[str] = set()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                names |= set(action.choices)
+        return names
+
+    def test_exactly_the_expected_console_subcommands_exist(self) -> None:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command", required=True)
+        console_module.register(sub, object())
+        self.assertEqual(
+            self._subcommand_names(sub.choices["console"]), self.EXPECTED
+        )
+        for argv in (
+            ["console", "screenshot", "--vmid", "1"],
+            ["console", "type", "--lease", "L", "--vmid", "1", "--text", "x"],
+            ["console", "keys", "--lease", "L", "--vmid", "1", "ret"],
+            ["console", "move", "--lease", "L", "--vmid", "1",
+             "--x", "5", "--y", "6"],
+            ["console", "click", "--lease", "L", "--vmid", "1",
+             "--x", "5", "--y", "6"],
+            ["console", "drag", "--lease", "L", "--vmid", "1",
+             "--x", "5", "--y", "6", "--to-x", "7", "--to-y", "8"],
+            ["console", "calibrate", "--vmid", "1"],
+            ["console", "grid", "--vmid", "1"],
+            ["console", "burst", "--vmid", "1"],
+        ):
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                self.assertTrue(callable(args.func))
+
+    def test_cut_console_subcommands_stay_gone(self) -> None:
+        # Names from the pre-rework console stack. None may come back: each
+        # needs a guest agent or a websocket server this project does not run.
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command", required=True)
+        console_module.register(sub, object())
+        for dead in ("inspect", "text", "bridge", "exec",
+                     "screenshot-burst", "preflight", "share", "vision"):
+            with self.subTest(dead=dead):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(["console", dead, "--vmid", "1"])
+
+
+def _ppm(width: int, height: int) -> bytes:
+    """A binary P6 framebuffer of exactly this size."""
+    return f"P6\n{width} {height}\n255\n".encode() + bytes(width * height * 3)
+
+
+def calibration_positions() -> list[tuple[str, float, float]]:
+    """The marker grid `console calibrate --action start` lays down."""
+    from proxmox_agent_lab import calibration
+
+    return calibration.marker_positions(640, 480)
+
+
+def cleanup_calibration(client_id: str, endpoint: str,
+                        width: int, height: int) -> None:
+    """Drop a saved calibration so one test cannot leak into the next."""
+    from proxmox_agent_lab import calibration
+
+    calibration.remove(client_id, endpoint, width, height)
+
+
+class PointerTests(_ConsoleCase):
+    """Lease-gated mouse input over HMP, and the coordinate guard.
+
+    The pointer rides `qm monitor` (`mouse_set`/`mouse_move`/`mouse_button`),
+    the only input transport that stays inside the ssh allowlist: QMP would
+    need socat/nc/python3 on the host, and the seam refuses those on purpose.
+    Pinned here: the tablet is selected before every gesture, a click is a
+    press+release pair, a drag interpolates, an out-of-bounds or uncalibrated
+    point is refused before any input, and an HMP rejection is never mistaken
+    for a delivered click.
     """
 
-    def _run(self, command, frames):
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        session.client.width, session.client.height = 2, 2
-        session.client.type_text.return_value = 5
-        results = []
-        with tempfile.TemporaryDirectory() as tmp:
-            lab.STATE_ROOT = Path(tmp)
-            args = mock.Mock(
-                lease="lease-12345678", vmid=7, keys=["enter"], via="vnc",
-                delay=0, text="hello", text_stdin=False, enter=False,
-                screenshot_after=1.0,
-                screenshot_out=str(Path(tmp) / "after.png"),
-            )
-            with mock.patch.object(lab_console, "VncSession",
-                                   return_value=session), \
-                 mock.patch.object(lab, "ProxmoxAPI"), \
-                 mock.patch("builtins.print") as printed:
-                for frame in frames:
-                    session.client.capture.return_value = frame
-                    command(lab, args)
-                    results.append(json.loads(printed.call_args.args[0]))
-        return results
+    def setUp(self) -> None:
+        super().setUp()
+        _register_lease_guest(self.lab, "lease-a", "qemu", 101)
+        self.fake.add(r"^qm status 101$", stdout=b"status: running\n")
+        self.fake.add(r"^qm monitor 101$", stdout=b"")
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=_ppm(640, 480))
 
-    BLACK = b"\x00\x00\x00" * 4
-    WHITE = b"\xff\xff\xff" * 4
+    def monitor_scripts(self) -> list[str]:
+        return [
+            call["stdin"].decode()
+            for call in self.fake.calls
+            if call["argv"][:2] == ["qm", "monitor"]
+        ]
 
-    def test_keys_reports_an_unchanged_screen_as_possible_non_delivery(self) -> None:
-        first, repeat, changed = self._run(
-            lab_console.cmd_keys, [self.BLACK, self.BLACK, self.WHITE]
+    def input_scripts(self) -> list[str]:
+        """Only the scripts that MOVE or PRESS something.
+
+        Resolving a point legitimately takes one screendump to learn the
+        framebuffer size, so "nothing at all reached the host" is the wrong
+        assertion for a refusal. What must never happen is input.
+        """
+        return [s for s in self.monitor_scripts() if "mouse_" in s]
+
+    def click_args(self, **overrides: object) -> argparse.Namespace:
+        base: dict[str, object] = {
+            "lease": "lease-a", "vmid": 101, "x": 100, "y": 200,
+            "button": "left", "double": False, "space": "framebuffer",
+            "client": None, "screenshot_after": None,
+        }
+        base.update(overrides)
+        return argparse.Namespace(**base)  # type: ignore[arg-type]
+
+    def test_click_selects_the_tablet_then_presses_and_releases(self) -> None:
+        payload = self.capture(console_module.cmd_click, self.click_args())
+        self.assertTrue(payload["clicked"])
+        self.assertEqual((payload["x"], payload["y"]), (100, 200))
+        self.assertEqual(payload["coordinates"], "framebuffer")
+        scripts = self.monitor_scripts()
+        self.assertTrue(any("mouse_set 3" in s for s in scripts))
+        self.assertTrue(any("mouse_move 100 200" in s for s in scripts))
+        self.assertTrue(any("mouse_button 1" in s for s in scripts))
+        self.assertTrue(any("mouse_button 0" in s for s in scripts))
+        # the audit records the pixel, never anything read off the screen
+        self.assertEqual(
+            self.lab.audits[-1],
+            {"event": "console-click", "lease": "lease-a", "vmid": 101,
+             "x": 100, "y": 200, "button": "left", "clicks": 1},
         )
 
-        # The very first capture has nothing to compare against, and a first
-        # capture is not evidence that anything moved.
-        self.assertIsNone(first["screen_changed"])
-        self.assertIn("no earlier capture", first["agent_hint"])
+    def test_double_click_is_two_complete_press_release_pairs(self) -> None:
+        self.capture(console_module.cmd_click, self.click_args(double=True))
+        scripts = self.monitor_scripts()
+        self.assertEqual(sum("mouse_button 1" in s for s in scripts), 2)
+        self.assertEqual(sum("mouse_button 0" in s for s in scripts), 2)
 
-        self.assertFalse(repeat["screen_changed"])
-        self.assertIn("may not have reached the guest", repeat["agent_hint"])
-        self.assertIn("registered to the lease", repeat["agent_hint"])
-        # A signal, never a guard: the command still reports what it sent.
-        self.assertEqual(repeat["keys_sent"], 1)
-
-        self.assertTrue(changed["screen_changed"])
-        self.assertNotIn("agent_hint", changed)
-
-    def test_type_reports_the_same_delivery_signal(self) -> None:
-        _, repeat, changed = self._run(
-            lab_console.cmd_type, [self.BLACK, self.BLACK, self.WHITE]
-        )
-
-        self.assertFalse(repeat["screen_changed"])
-        self.assertIn("typed characters", repeat["agent_hint"])
-        self.assertEqual(repeat["characters_sent"], 5)
-        self.assertTrue(changed["screen_changed"])
-        self.assertNotIn("agent_hint", changed)
-
-    def test_the_signal_is_skipped_without_a_post_action_screenshot(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        session = mock.MagicMock()
-        session.__enter__.return_value = session
-        args = mock.Mock(
-            lease="lease-12345678", vmid=7, keys=["enter"], via="vnc", delay=0,
-            screenshot_after=None, screenshot_out=None,
-        )
-        with mock.patch.object(lab_console, "VncSession",
-                               return_value=session), \
-             mock.patch.object(lab, "ProxmoxAPI"), \
-             mock.patch("builtins.print") as printed:
-            lab_console.cmd_keys(lab, args)
-        result = json.loads(printed.call_args.args[0])
-
-        self.assertEqual(result["keys_sent"], 1)
-        self.assertNotIn("screen_changed", result)
-        self.assertNotIn("agent_hint", result)
-        self.assertNotIn("screenshot_after", result)
-
-    def test_a_first_capture_is_not_reported_as_a_change(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp)
-            first = lab_console._save_screenshot(
-                7, self.BLACK, 2, 2,
-                override=str(state / "a.png"), state_root=state,
-            )
-            second = lab_console._save_screenshot(
-                7, self.WHITE, 2, 2,
-                override=str(state / "b.png"), state_root=state,
-            )
-
-        self.assertFalse(first["comparable_to_previous_capture"])
-        self.assertTrue(second["comparable_to_previous_capture"])
-        self.assertIsNone(
-            lab_console._delivery_signal(first, "keystrokes")["screen_changed"]
+    def test_the_right_button_is_qemus_button_three(self) -> None:
+        self.capture(
+            console_module.cmd_click, self.click_args(button="right")
         )
         self.assertTrue(
-            lab_console._delivery_signal(second, "keystrokes")["screen_changed"]
+            any("mouse_button 3" in s for s in self.monitor_scripts())
         )
-        self.assertEqual(lab_console._delivery_signal(None, "keystrokes"), {})
+
+    def test_move_never_clicks(self) -> None:
+        payload = self.capture(
+            console_module.cmd_move,
+            argparse.Namespace(
+                lease="lease-a", vmid=101, x=5, y=6,
+                space="framebuffer", client=None,
+            ),
+        )
+        self.assertFalse(payload["clicked"])
+        self.assertFalse(
+            any("mouse_button" in s for s in self.monitor_scripts())
+        )
+
+    def test_drag_interpolates_between_the_endpoints(self) -> None:
+        self.capture(
+            console_module.cmd_drag,
+            argparse.Namespace(
+                lease="lease-a", vmid=101, x=0, y=0, to_x=100, to_y=0,
+                steps=4, space="framebuffer", client=None,
+                screenshot_after=None,
+            ),
+        )
+        moves = [s for s in self.monitor_scripts() if "mouse_move" in s]
+        # one for the start point, then 4 interpolated hops
+        self.assertEqual(len(moves), 5)
+        self.assertIn("mouse_move 100 0", moves[-1])
+
+    def test_a_point_outside_the_framebuffer_is_refused_before_any_input(
+        self,
+    ) -> None:
+        with self.assertRaises(LabError) as caught:
+            self.capture(console_module.cmd_click, self.click_args(x=9999))
+        self.assertIn("640x480", str(caught.exception))
+        self.assertEqual(self.input_scripts(), [])
+        self.assertEqual(self.lab.audits, [])
+
+    def test_a_monitor_rejection_is_not_a_delivered_click(self) -> None:
+        # HMP is silent on success and prints "unknown command: ..." on
+        # refusal, so exit status alone would report a dropped click as
+        # a delivered one.
+        self.fake._rules.clear()
+        self.fake.add(r"^qm status 101$", stdout=b"status: running\n")
+        self.fake.add(
+            r"^qm monitor 101$",
+            stdout=b"unknown command: 'mouse_button 1'\n",
+        )
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=_ppm(640, 480))
+        with self.assertRaises(LabError) as caught:
+            self.capture(console_module.cmd_click, self.click_args())
+        self.assertIn("rejected", str(caught.exception))
+        self.assertEqual(self.lab.audits, [])
+
+    def test_pointer_input_refuses_an_unowned_guest(self) -> None:
+        with self.assertRaises(LabError):
+            self.capture(console_module.cmd_click, self.click_args(lease="lease-b"))
+        self.assertEqual(self.input_scripts(), [])
+
+    def test_image_space_without_a_calibration_is_refused(self) -> None:
+        # Passing image-space numbers to the tablet as framebuffer pixels is
+        # exactly the wrong-pixel click this guard exists to prevent.
+        with self.assertRaises(LabError) as caught:
+            self.capture(
+                console_module.cmd_click,
+                self.click_args(x=30, y=60, space="image", client="my-ide"),
+            )
+        self.assertIn("calibrat", str(caught.exception).lower())
+        self.assertEqual(self.input_scripts(), [])
+
+    def test_image_space_with_a_saved_calibration_maps_the_point(self) -> None:
+        from proxmox_agent_lab import calibration
+
+        calibration.upsert(
+            calibration.Record(
+                client_id="my-ide", client_name="My IDE", endpoint_id="101",
+                width=640, height=480, x_a=2.0, x_b=0.0, y_a=2.0, y_b=0.0,
+                rmse=0.1, rounds=1, created_at=1, updated_at=1,
+            )
+        )
+        self.addCleanup(cleanup_calibration, "my-ide", "101", 640, 480)
+        payload = self.capture(
+            console_module.cmd_click,
+            self.click_args(x=30, y=60, space="image", client="My IDE"),
+        )
+        self.assertEqual((payload["x"], payload["y"]), (60, 120))
+        self.assertEqual(payload["coordinates"], "image->framebuffer")
+
+    def test_a_poor_fit_still_refuses_the_click(self) -> None:
+        # A saved calibration whose residual is too high means the client's
+        # scaling changed; clicking off it is the failure being prevented.
+        from proxmox_agent_lab import calibration
+
+        calibration.upsert(
+            calibration.Record(
+                client_id="my-ide", client_name="My IDE", endpoint_id="101",
+                width=640, height=480, x_a=2.0, x_b=0.0, y_a=2.0, y_b=0.0,
+                rmse=99.0, rounds=1, created_at=1, updated_at=1,
+            )
+        )
+        self.addCleanup(cleanup_calibration, "my-ide", "101", 640, 480)
+        with self.assertRaises(LabError):
+            self.capture(
+                console_module.cmd_click,
+                self.click_args(x=30, y=60, space="image", client="my-ide"),
+            )
+        self.assertEqual(self.input_scripts(), [])
+
+    def test_drag_steps_are_bounded(self) -> None:
+        with self.assertRaises(LabError):
+            self.capture(
+                console_module.cmd_drag,
+                argparse.Namespace(
+                    lease="lease-a", vmid=101, x=0, y=0, to_x=10, to_y=10,
+                    steps=0, space="framebuffer", client=None,
+                    screenshot_after=None,
+                ),
+            )
+
+
+class CalibrateAndCaptureTests(_ConsoleCase):
+    """`calibrate`, `grid` and `burst` over the same read-only seam."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _register_lease_guest(self.lab, "lease-a", "qemu", 101)
+        self.fake.add(r"^qm status 101$", stdout=b"status: running\n")
+        self.fake.add(r"^qm monitor 101$", stdout=b"")
+        self.fake.add(r"^cat /tmp/pxl-shot-101\.ppm$", stdout=_ppm(640, 480))
+
+    def test_calibrate_start_marks_the_grid_without_touching_the_guest(
+        self,
+    ) -> None:
+        payload = self.capture(
+            console_module.cmd_calibrate,
+            argparse.Namespace(
+                vmid=101, action="start", samples=None, client="My IDE",
+            ),
+        )
+        self.assertEqual(payload["framebuffer"], [640, 480])
+        self.assertEqual(len(payload["markers"]), 9)
+        self.assertTrue(Path(payload["screenshot"]["path"]).exists())
+        # markers are burned into the returned image only: the guest was
+        # never clicked, only screenshotted
+        self.assertEqual(
+            [a["event"] for a in self.lab.audits], ["console-screenshot"]
+        )
+
+    def test_calibrate_refuses_a_generic_client_identity(self) -> None:
+        with self.assertRaises(LabError) as caught:
+            self.capture(
+                console_module.cmd_calibrate,
+                argparse.Namespace(
+                    vmid=101, action="start", samples=None, client="mcp",
+                ),
+            )
+        self.assertIn("generic", str(caught.exception))
+
+    def test_calibrate_refuses_too_few_readings(self) -> None:
+        with self.assertRaises(LabError) as caught:
+            self.capture(
+                console_module.cmd_calibrate,
+                argparse.Namespace(
+                    vmid=101, action="commit",
+                    samples='[{"id":"M1","x":1,"y":1}]', client="My IDE",
+                ),
+            )
+        self.assertIn("at least two", str(caught.exception))
+
+    def test_calibrate_commits_a_real_fit_and_says_it_is_saved(self) -> None:
+        # A 0.5x client: report readings at half the marker's real position.
+        samples = [
+            {"id": mid, "x": round(fx / 2), "y": round(fy / 2)}
+            for mid, fx, fy in calibration_positions()
+        ]
+        payload = self.capture(
+            console_module.cmd_calibrate,
+            argparse.Namespace(
+                vmid=101, action="commit", samples=json.dumps(samples),
+                client="My IDE",
+            ),
+        )
+        self.assertTrue(payload["saved"])
+        self.assertTrue(payload["trustworthy"])
+        self.assertEqual(payload["markers_used"], 9)
+        self.assertAlmostEqual(payload["x"]["a"], 2.0, places=1)
+        self.addCleanup(cleanup_calibration, "my-ide", "101", 640, 480)
+
+    def test_grid_keeps_the_untouched_capture_as_evidence(self) -> None:
+        payload = self.capture(
+            console_module.cmd_grid,
+            argparse.Namespace(vmid=101, out=None, step=100),
+        )
+        self.assertTrue(Path(payload["path"]).exists())
+        # the clean capture survives alongside the annotated one
+        self.assertTrue(Path(payload["original"]).exists())
+        self.assertNotEqual(payload["path"], payload["original"])
+
+    def test_burst_stitches_several_frames_and_keeps_each_one(self) -> None:
+        payload = self.capture(
+            console_module.cmd_burst,
+            argparse.Namespace(vmid=101, out=None, frames=3, interval=0.1),
+        )
+        self.assertEqual(payload["frames"], 3)
+        self.assertEqual(len(payload["frame_paths"]), 3)
+        self.assertTrue(Path(payload["path"]).exists())
+        # frames are never scaled to match, so a stable guest tiles exactly
+        self.assertEqual(payload["width"], 640 * 3 + 4 * 2)
+        self.assertEqual(self.lab.audits[-1]["event"], "console-burst")
+        self.assertEqual(self.sleeps, [0.1, 0.1])
+
+    def test_burst_frame_count_is_bounded(self) -> None:
+        for frames in (1, 31):
+            with self.subTest(frames=frames):
+                with self.assertRaises(LabError):
+                    self.capture(
+                        console_module.cmd_burst,
+                        argparse.Namespace(
+                            vmid=101, out=None, frames=frames, interval=0.5,
+                        ),
+                    )
+
+
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

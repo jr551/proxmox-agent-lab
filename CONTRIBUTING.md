@@ -1,11 +1,12 @@
 # Contributing
 
-Thanks for helping turn spare hardware into safer research infrastructure.
+Thanks for helping make automated lab work safer and more repeatable.
 
 ## Ground rules
 
-- Keep the package compatible with Python 3.11+. Prefer the standard library;
-  the existing MariaDB client uses `PyMySQL` and `cryptography`.
+- Keep the package compatible with Python 3.11+ and standard-library only:
+  there are no runtime dependencies, and none may be added without a recorded
+  decision (the rework deliberately dropped PyMySQL/cryptography).
 - Put values that differ between labs in `config.py`, with documentation and a
   safe default.
 - Never commit credentials, host addresses, MAC addresses, VMIDs, device

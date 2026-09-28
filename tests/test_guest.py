@@ -1,514 +1,729 @@
-"""Offline tests for guest template/clone and detached-run commands."""
+"""Offline tests for guest lifecycle over the proxmox seam (rework wave 4).
+
+`guest.py` is the slim lifecycle layer over `proxmox.py`: create/clone stamp
+the §F metadata contract (exact `qm clone` + `qm set`, or one `qm create`/
+`pct create` call), every mutation gates on the SQLite registry before any
+seam call, and destroy refuses anything registry-vouched. Everything runs
+against `FakeSSH` behind a real `Proxmox` (so remote argv is asserted) or a
+stub seam — no network, no real ssh, no wall-clock dependence.
+"""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 from pathlib import Path
-import tempfile
-import unittest
-from unittest import mock
 
-SRC = Path(__file__).parents[1] / "src"
-import sys
+import sys  # noqa: E402
 
+# Shared bootstrap: fixture configuration plus a per-process state directory,
+# applied before any proxmox_agent_lab import. `support` sits beside this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from support import bootstrap  # noqa: E402,F401
+import json  # noqa: E402
+import tempfile  # noqa: E402
+import unittest  # noqa: E402
+from unittest import mock  # noqa: E402
 
-sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from proxmox_agent_lab import console as lab_console  # noqa: E402
+from proxmox_agent_lab import config as config_module  # noqa: E402
+from proxmox_agent_lab import errors  # noqa: E402
 from proxmox_agent_lab import guest as lab_guest  # noqa: E402
+from proxmox_agent_lab import leases as leases_module  # noqa: E402
+from proxmox_agent_lab import proxmox as proxmox_module  # noqa: E402
+from proxmox_agent_lab import store as store_module  # noqa: E402
+from support.fakessh import FakeSSH  # noqa: E402
+
+LEASE = "abs-guest-lease"
+OTHER_LEASE = "abs-other-lease"
+EXPIRY = 1_800_000_000
 
 
-def _lab(tmp: str) -> mock.Mock:
-    lab = mock.Mock()
-    lab.LabError = RuntimeError
-    lab.NODE = "aipve"
-    lab.STATE_ROOT = str(Path(tmp) / "state")
-    lab.iso_now = lambda: "2026-08-11T00:00:00Z"
-    lab.load_lease.return_value = {
-        "resources": [{"kind": "qemu", "vmid": 7, "policy": "delete",
-                       "name": "builder"}],
-    }
-    lab.controller_lock = mock.MagicMock()
-    return lab
+class GuestCase(unittest.TestCase):
+    """A temp state root, a lab facade double, and a FakeSSH-backed seam."""
 
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.lab = mock.Mock()
+        self.lab.STATE_ROOT = self.root
+        self.lab.CONFIG = config_module.get()
+        self.fake = FakeSSH()
+        self.prox = proxmox_module.Proxmox(
+            self.fake, "pve", sleep=lambda _seconds: None
+        )
+        patcher = mock.patch.object(
+            lab_guest, "_make_proxmox", lambda config: self.prox
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-def _args(lab: mock.Mock, *argv: str) -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    lab_guest.register(parser.add_subparsers(), lab)
-    return parser.parse_args(list(argv))
+    # -- fixtures -----------------------------------------------------------
 
+    def store(self) -> store_module.Store:
+        return store_module.Store(self.root / "lab.db")
 
-class GuestTemplateTests(unittest.TestCase):
-    def test_template_requires_lease_ownership(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            lab.load_lease.return_value = {"resources": []}
-            with self.assertRaises(RuntimeError) as caught:
-                lab_guest.cmd_template(lab, _args(lab, "guest", "template",
-                                                  "--lease", "L1",
-                                                  "--vmid", "7"))
-            self.assertIn("not a qemu guest registered", str(caught.exception))
-
-    def test_template_refuses_running_guest(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            api = mock.Mock()
-            api.call.return_value = {"status": "running"}
-            lab.ProxmoxAPI.return_value = api
-            with self.assertRaises(RuntimeError) as caught:
-                lab_guest.cmd_template(lab, _args(lab, "guest", "template",
-                                                  "--lease", "L1",
-                                                  "--vmid", "7"))
-            self.assertIn("must be stopped", str(caught.exception))
-
-    def test_template_converts_stopped_guest_and_audits(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            api = mock.Mock()
-            api.call.return_value = {"status": "stopped"}
-            lab.ProxmoxAPI.return_value = api
-            lab_guest.cmd_template(lab, _args(lab, "guest", "template",
-                                              "--lease", "L1",
-                                              "--vmid", "7"))
-            api.call.assert_any_call(
-                "POST", "/nodes/aipve/qemu/7/template"
-            )
-            lab.audit.assert_called_once_with(
-                "guest-template", lease="L1", kind="qemu", vmid=7)
-
-    def test_clone_registers_new_guest_under_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            api = mock.Mock()
-            api.call.return_value = {}
-            lab.ProxmoxAPI.return_value = api
-            lab_guest.cmd_clone(lab, _args(lab, "guest", "clone",
-                                           "--lease", "L1",
-                                           "--template", "7",
-                                           "--newid", "8",
-                                           "--name", "builder-copy"))
-            api.call.assert_any_call(
-                "POST", "/nodes/aipve/qemu/7/clone",
-                {"newid": 8, "name": "builder-copy"},
-            )
-            lab.register_resource.assert_called_once()
-            kind, vmid = lab.register_resource.call_args.args[1], \
-                lab.register_resource.call_args.args[2]
-            self.assertEqual((kind, vmid), ("qemu", 8))
-            lab.audit.assert_called_once_with(
-                "guest-clone", lease="L1", kind="qemu", template=7, vmid=8,
+    def open_lease(self, lease_id: str = LEASE) -> None:
+        with self.store() as store:
+            store.create_lease(
+                lease_id, kind="ordinary", purpose="test", expires_at=EXPIRY
             )
 
-    def test_clone_accepts_a_retained_template(self) -> None:
-        """A retained template is not lease-owned but must still clone.
+    def register_guest(
+        self, lease_id: str, kind: str, vmid: int, *,
+        name: str | None = None, policy: str = "disposable",
+    ) -> None:
+        with self.store() as store:
+            store.register_resource(
+                lease_id, kind, vmid, name=name, policy=policy
+            )
 
-        Retained guests are deliberately kept out of lease records, so a
-        lease-ownership-only guard made the documented clone-a-template
-        workflow unreachable for them.
+    def resources(self, lease_id: str = LEASE) -> list[dict]:
+        with self.store() as store:
+            return store.resources_for(lease_id)
+
+    # -- dispatch through the registered CLI surface -------------------------
+
+    def run_cmd(self, *argv: str):
+        """Parse `argv` through `guest.register` and dispatch.
+
+        Asserts the established output contract on the way: what the handler
+        printed on stdout is exactly the payload it returned.
         """
-        import json as _json
-        from proxmox_agent_lab import inventory as lab_inventory
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command", required=True)
+        lab_guest.register(sub, self.lab)
+        args = parser.parse_args(list(argv))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            payload = args.func(args)
+        self.assertEqual(json.loads(out.getvalue()), payload)
+        return payload
 
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            # The template is NOT in the lease's resources.
-            lab.load_lease.return_value = {"resources": []}
-            api = mock.Mock()
-            api.call.return_value = {}
-            lab.ProxmoxAPI.return_value = api
-            # But it IS in the retained registry.
-            state_root = Path(lab.STATE_ROOT)
-            state_root.mkdir(parents=True, exist_ok=True)
-            lab_inventory.record(
-                state_root, kind="qemu", vmid=7, lease="old-lease",
-                now="2026-08-11T00:00:00Z", purpose="kept template",
-            )
-            lab_guest.cmd_clone(lab, _args(lab, "guest", "clone",
-                                           "--lease", "L1",
-                                           "--template", "7",
-                                           "--newid", "8"))
-            api.call.assert_any_call(
-                "POST", "/nodes/aipve/qemu/7/clone", {"newid": 8},
-            )
-            lab.register_resource.assert_called_once()
-
-    def test_clone_still_refuses_an_unvouched_guest(self) -> None:
-        """A guest that is neither lease-owned nor retained is refused."""
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            lab.load_lease.return_value = {"resources": []}
-            api = mock.Mock()
-            lab.ProxmoxAPI.return_value = api
-            Path(lab.STATE_ROOT).mkdir(parents=True, exist_ok=True)
-            with self.assertRaises(RuntimeError) as caught:
-                lab_guest.cmd_clone(lab, _args(lab, "guest", "clone",
-                                               "--lease", "L1",
-                                               "--template", "7",
-                                               "--newid", "8"))
-            self.assertIn("retained registry", str(caught.exception))
-            api.call.assert_not_called()
-
-    def test_snapshot_list_reads_proxmox_field_names(self) -> None:
-        """Proxmox returns name/snaptime/description/parent, not snapname."""
-        import json as _json
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            api = mock.Mock()
-            api.call.return_value = [
-                {"name": "snap1", "snaptime": 1789081046,
-                 "description": "test", "vmstate": 0},
-                {"name": "current", "parent": "snap1", "running": 1,
-                 "description": "You are here!"},
-            ]
-            lab.ProxmoxAPI.return_value = api
-            printed = []
-            with mock.patch("builtins.print",
-                            side_effect=lambda s: printed.append(s)):
-                lab_guest.cmd_snapshot(lab, _args(lab, "guest", "snapshot",
-                                                 "--lease", "L1", "--vmid", "7",
-                                                 "--mode", "list"))
-            snapshots = _json.loads(printed[0])["snapshots"]
-            self.assertEqual(snapshots[0]["name"], "snap1")
-            self.assertEqual(snapshots[0]["created"], 1789081046)
-            self.assertEqual(snapshots[1]["name"], "current")
-            self.assertEqual(snapshots[1]["parent"], "snap1")
-            self.assertTrue(snapshots[1]["running"])
+    def argvs(self) -> list[list[str]]:
+        return [call["argv"] for call in self.fake.calls]
 
 
-
-class GuestRunArgvTests(unittest.TestCase):
-    def test_agent_runs_exact_argv_without_a_shell_reparse(self) -> None:
-        lab = mock.Mock()
-        api = mock.Mock()
-        session = lab_guest.GuestSession(
-            lab, api, 7,
-            capabilities=lab_guest.GuestCapabilities(7, "qemu", agent=True),
-        )
-        command = [
-            "bash", "-lc", "ls -l /tmp/t1 /tmp/t2 2>&1\nprintf '%s' \"two words\"",
+class SurfaceTests(GuestCase):
+    def test_register_exposes_exactly_the_eight_guest_subcommands(self) -> None:
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command", required=True)
+        lab_guest.register(sub, self.lab)
+        self.assertEqual(sorted(sub.choices), ["guest"])
+        [action] = [
+            item for item in sub.choices["guest"]._actions
+            if isinstance(item, argparse._SubParsersAction)
         ]
+        self.assertEqual(
+            sorted(action.choices),
+            ["clone", "create", "destroy", "list", "probe", "run",
+             "start", "stop"],
+        )
+
+
+class MetadataContractTests(GuestCase):
+    def test_metadata_for_delegates_the_format_strings(self) -> None:
+        tags, description = lab_guest.metadata_for(LEASE, EXPIRY)
+        self.assertEqual(tags, leases_module.metadata_tags(LEASE))
+        self.assertEqual(description,
+                         leases_module.metadata_description(LEASE, EXPIRY))
+        parts = tags.split(";")
+        self.assertEqual(parts[0], "proxmoxagentlab")
+        self.assertEqual(parts[-1], f"lease-{LEASE}")
+        self.assertNotIn("pxl", parts)
+        self.assertEqual(description,
+                         f"pxl-lease={LEASE} pxl-expiry={EXPIRY}")
+
+    def test_stamp_guest_writes_both_fields_in_one_call(self) -> None:
+        seam = mock.Mock()
+        lab_guest.stamp_guest(seam, "lxc", 102, LEASE, EXPIRY)
+        seam.set_metadata.assert_called_once_with(
+            "lxc", 102,
+            tags=leases_module.metadata_tags(LEASE),
+            description=f"pxl-lease={LEASE} pxl-expiry={EXPIRY}",
+        )
+        self.assertEqual(seam.mock_calls[0][0], "set_metadata")
+
+
+class RequireOwnedTests(GuestCase):
+    def test_returns_the_registry_row(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        row = lab_guest.require_owned(self.lab, LEASE, "qemu", 101)
+        self.assertEqual(row["name"], "alpha")
+        self.assertEqual(row["kind"], "qemu")
+        self.assertEqual(int(row["vmid"]), 101)
+        self.assertEqual(row["policy"], "disposable")
+        # kind=None matches whichever kind the registry recorded.
+        self.assertEqual(
+            lab_guest.require_owned(self.lab, LEASE, None, 101)["vmid"],
+            row["vmid"],
+        )
+        self.assertEqual(self.argvs(), [])
+
+    def test_absent_rows_are_refused_naming_lease_register(self) -> None:
+        self.open_lease()
+        with self.assertRaises(errors.LabError) as caught:
+            lab_guest.require_owned(self.lab, LEASE, "qemu", 101)
+        self.assertIn("lease-register", str(caught.exception))
+        # the wrong kind is just as absent -- lookup is keyed on all three
+        self.register_guest(LEASE, "lxc", 101)
+        with self.assertRaises(errors.LabError) as caught:
+            lab_guest.require_owned(self.lab, LEASE, "qemu", 101)
+        self.assertIn("lease-register", str(caught.exception))
+
+    def test_a_destroyed_row_is_no_longer_owned(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101)
+        with self.store() as store:
+            store.mark_destroyed(LEASE, "qemu", 101)
+        with self.assertRaises(errors.LabError) as caught:
+            lab_guest.require_owned(self.lab, LEASE, None, 101)
+        self.assertIn("lease-register", str(caught.exception))
+
+    def test_registry_vouched_rows_are_refused_naming_the_vouching(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, policy="retain")
+        with self.assertRaises(errors.LabError) as caught:
+            lab_guest.require_owned(self.lab, LEASE, None, 101)
+        message = str(caught.exception)
+        self.assertIn("registry-vouched", message)
+        self.assertIn("retain", message)
+        # the gate is store-only: a refusal raises before any seam call
+        self.assertEqual(self.argvs(), [])
+
+
+class CreateTests(GuestCase):
+    def test_create_from_a_template_restamps_the_metadata(self) -> None:
+        self.open_lease()
+        self.fake.add(r"^qm clone 9000 101")
+        self.fake.add(r"^qm set 101")
+        self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
+        payload = self.run_cmd(
+            "guest", "create", "--lease", LEASE, "--vmid", "101",
+            "--name", "alpha", "--template", "9000",
+        )
+        tags, description = metadata = lab_guest.metadata_for(LEASE, EXPIRY)
+        self.assertEqual(metadata, (leases_module.metadata_tags(LEASE),
+                                    f"pxl-lease={LEASE} pxl-expiry={EXPIRY}"))
+        self.assertEqual(self.argvs()[0],
+                         ["qm", "clone", "9000", "101", "--name", "alpha"])
+        self.assertEqual(
+            self.argvs()[1],
+            ["qm", "set", "101", "--tags", tags,
+             "--description", description],
+        )
+        self.assertEqual(payload, {
+            "lease_id": LEASE, "vmid": 101, "kind": "qemu", "name": "alpha",
+            "state": "stopped", "tags": tags, "pxl_expiry": EXPIRY,
+        })
+        self.assertEqual(
+            [(row["kind"], int(row["vmid"]), row["policy"])
+             for row in self.resources()],
+            [("qemu", 101, "disposable")],
+        )
+        self.lab.audit.assert_called_once_with(
+            "guest-create", lease=LEASE, vmid=101, kind="qemu", name="alpha",
+            template=9000, started=False,
+        )
+
+    def test_the_configured_template_vmid_is_the_default(self) -> None:
+        self.open_lease()
+        self.fake.add(r"^qm clone 9025 101")
+        self.fake.add(r"^qm set 101")
+        self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
+        self.run_cmd("guest", "create", "--lease", LEASE, "--vmid", "101")
+        # [pve] template_vmid in the fixture config is 9025
+        self.assertEqual(self.argvs()[0],
+                         ["qm", "clone", "9025", "101", "--name", "pxl-101"])
+
+    def test_fresh_qemu_create_stamps_in_the_create_call(self) -> None:
+        self.open_lease()
+        self.fake.add(r"^qm create 101")
+        self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
+        self.run_cmd(
+            "guest", "create", "--lease", LEASE, "--vmid", "101",
+            "--name", "alpha", "--fresh", "--memory", "2048", "--cores", "2",
+        )
+        tags, description = lab_guest.metadata_for(LEASE, EXPIRY)
+        self.assertEqual(self.argvs()[0], [
+            "qm", "create", "101", "--name", "alpha",
+            "--net0", "virtio,bridge=vmbr0",
+            "--memory", "2048", "--cores", "2",
+            "--tags", tags, "--description", description,
+        ])
+        # single-call stamping: create + status, and nothing else
+        self.assertEqual(len(self.argvs()), 2)
+
+    def test_an_explicitly_empty_template_is_a_fresh_create(self) -> None:
+        self.open_lease()
+        self.fake.add(r"^qm create 101")
+        self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
+        self.run_cmd(
+            "guest", "create", "--lease", LEASE, "--vmid", "101",
+            "--template", "",
+        )
+        self.assertEqual(self.argvs()[0][:2], ["qm", "create"])
+        self.assertEqual(len(self.argvs()), 2)
+
+    def test_fresh_lxc_create_stamps_in_the_create_call(self) -> None:
+        self.open_lease()
+        self.fake.add(r"^pct create 102")
+        self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        self.run_cmd(
+            "guest", "create", "--lease", LEASE, "--vmid", "102",
+            "--kind", "lxc", "--fresh", "--name", "ct7",
+            "--ostemplate", "local:vztmpl/debian-12.tar.zst",
+        )
+        tags, description = lab_guest.metadata_for(LEASE, EXPIRY)
+        self.assertEqual(self.argvs()[0], [
+            "pct", "create", "102", "local:vztmpl/debian-12.tar.zst",
+            "--hostname", "ct7", "--tags", tags, "--description", description,
+        ])
+        # no `pct set` fallback: one call carried the metadata
+        self.assertEqual(len(self.argvs()), 2)
+
+    def test_fresh_lxc_create_passes_the_storage_rootfs(self) -> None:
+        # Hosts whose 'local' dir storage lacks rootdir need --storage:
+        # pct create gets --rootfs <storage>:<gb>.
+        self.open_lease()
+        self.fake.add(r"^pct create 102")
+        self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        self.run_cmd(
+            "guest", "create", "--lease", LEASE, "--vmid", "102",
+            "--kind", "lxc", "--fresh", "--name", "ct8",
+            "--ostemplate", "local:vztmpl/debian-12.tar.zst",
+            "--storage", "local-lvm", "--disk-gb", "4",
+        )
+        tags, description = lab_guest.metadata_for(LEASE, EXPIRY)
+        self.assertEqual(self.argvs()[0], [
+            "pct", "create", "102", "local:vztmpl/debian-12.tar.zst",
+            "--hostname", "ct8", "--rootfs", "local-lvm:4",
+            "--tags", tags, "--description", description,
+        ])
+
+    def test_create_registers_the_resource_before_it_starts(self) -> None:
+        self.open_lease()
+        self.fake.add(r"^qm clone 9000 101")
+        self.fake.add(r"^qm set 101")
+        self.fake.add(r"^qm start 101")
+        self.fake.add(r"^qm status 101", stdout=b"status: running\n")
+        events: list[str] = []
+        real_run = self.fake.run
+
+        def recording_run(argv, **kwargs):
+            events.append(" ".join(argv))
+            return real_run(argv, **kwargs)
+
+        self.fake.run = recording_run
+        real_register = store_module.Store.register_resource
+
+        def recording_register(store_self, lease_id, kind, vmid, **kwargs):
+            events.append("register")
+            return real_register(store_self, lease_id, kind, vmid, **kwargs)
+
         with mock.patch.object(
-            lab_console, "agent_exec",
-            return_value={"exitcode": 0, "stdout": "", "stderr": ""},
-        ) as execute:
-            result = session.run_argv(command, timeout=120)
+            store_module.Store, "register_resource", recording_register
+        ):
+            self.run_cmd(
+                "guest", "create", "--lease", LEASE, "--vmid", "101",
+                "--template", "9000", "--start",
+            )
+        self.assertLess(events.index("register"), events.index("qm start 101"))
+        self.assertEqual(self.resources()[0]["policy"], "disposable")
 
-        execute.assert_called_once_with(lab, api, 7, command, timeout=120)
-        self.assertTrue(result.ok)
-
-    def test_cmd_run_passes_parser_argv_to_the_guest(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            command = ["bash", "-lc", "printf '%s' 'two words'\n"]
-            capabilities = lab_guest.GuestCapabilities(7, "qemu", agent=True)
-            with mock.patch.object(lab_guest, "probe", return_value=capabilities), \
-                 mock.patch.object(lab_guest, "GuestSession") as session_class:
-                session = session_class.return_value.__enter__.return_value
-                session.run_argv.return_value = lab_guest.CommandResult(
-                    stdout="", stderr="", exit_code=0, channel="agent",
-                )
-                lab_guest.cmd_run(
-                    lab,
-                    _args(lab, "guest", "run", "--lease", "L1",
-                          "--vmid", "7", "--", *command),
-                )
-
-            session.run_argv.assert_called_once_with(command, timeout=300)
+    def test_a_mutation_needs_a_live_lease(self) -> None:
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd("guest", "create", "--lease", LEASE, "--vmid", "101")
+        self.assertIn("lease-begin", str(caught.exception))
+        self.assertEqual(self.argvs(), [])
+        self.open_lease()
+        with self.store() as store:
+            store.set_lease_state(LEASE, "ended", ended=True)
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd("guest", "create", "--lease", LEASE, "--vmid", "101")
+        self.assertIn("lease-begin", str(caught.exception))
+        self.assertEqual(self.argvs(), [])
 
 
-class DetachedRunTests(unittest.TestCase):
-    def _record(self, tmp: str) -> str:
-        run_dir = Path(tmp) / "state" / "guest-runs"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "vm7-12345.json").write_text(
-            '{"vmid": 7, "pid": "12345", "log": "/tmp/grun-abcd.log", '
-            '"command": "make -j2", "started_at": "2026-08-11T00:00:00Z"}'
+class CloneTests(GuestCase):
+    def test_clone_accepts_a_vouched_template_without_ownership(self) -> None:
+        # 9000 belongs to nobody here: template: 1 in its config vouches.
+        self.open_lease()
+        self.fake.add(r"^qm config 9000",
+                      stdout=b"template: 1\ntags: pxl;lease-abs-other-lease\n")
+        self.fake.add(r"^qm clone 9000 101")
+        self.fake.add(r"^qm set 101")
+        self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
+        payload = self.run_cmd(
+            "guest", "clone", "--lease", LEASE, "--vmid", "101",
+            "--source", "9000", "--name", "beta",
         )
-        return "/tmp/grun-abcd.log"
-
-    def test_run_detach_starts_and_records(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            capabilities = lab_guest.GuestCapabilities(7, "qemu", agent=True)
-            with mock.patch.object(lab_guest, "probe", return_value=capabilities), \
-                 mock.patch.object(
-                    lab_console, "agent_exec",
-                    return_value={"exitcode": 0, "stdout": "4242\n",
-                                  "stderr": ""},
-                 ) as execute:
-                lab_guest.cmd_run(lab, _args(
-                    lab, "guest", "run", "--lease", "L1", "--vmid", "7",
-                    "--detach", "--", "bash", "-lc",
-                    "printf '%s' 'two words'\n",
-                ))
-            agent_command = execute.call_args.args[3]
-            self.assertIn('nohup "$@"', agent_command[2])
-            self.assertIn("grun-exit:$?", agent_command[2])
-            self.assertEqual(
-                agent_command[3:],
-                ["guest-run", "bash", "-lc", "printf '%s' 'two words'\n"],
-            )
-            record = Path(tmp) / "state" / "guest-runs" / "vm7-4242.json"
-            self.assertTrue(record.is_file())
-            lab.audit.assert_called_once_with(
-                "guest-run-detached", lease="L1", vmid=7, pid="4242",
-            )
-
-    def test_log_reads_tail_and_stops_on_exit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            log = self._record(tmp)
-
-            def fake_exec(lab, api, vmid, command, timeout=30):
-                script = command[2]
-                if "tail -c" in script:
-                    return {"exitcode": 0, "stdout": "line one\nline two\n",
-                            "stderr": ""}
-                if "kill -0" in script:
-                    return {"exitcode": 0, "stdout": "1", "stderr": ""}
-                return {"exitcode": 0, "stdout": "", "stderr": ""}
-
-            with mock.patch.object(lab_console, "agent_exec",
-                                   side_effect=fake_exec):
-                lab_guest.cmd_log(lab, _args(lab, "guest", "log",
-                                             "--lease", "L1",
-                                             "--vmid", "7",
-                                             "--pid", "12345"))
-            self.assertEqual(log, "/tmp/grun-abcd.log")
-
-    def test_wait_reports_exit_code_from_marker(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            self._record(tmp)
-
-            def fake_exec(lab, api, vmid, command, timeout=30):
-                script = command[2]
-                if "tail -c 65536" in script:
-                    return {"exitcode": 0,
-                            "stdout": "build ok\ngrun-exit:0\n", "stderr": ""}
-                if "kill -0" in script:
-                    return {"exitcode": 0, "stdout": "1", "stderr": ""}
-                return {"exitcode": 0, "stdout": "", "stderr": ""}
-
-            with mock.patch.object(lab_console, "agent_exec",
-                                   side_effect=fake_exec):
-                lab_guest.cmd_wait(lab, _args(lab, "guest", "wait",
-                                              "--lease", "L1",
-                                              "--vmid", "7",
-                                              "--pid", "12345",
-                                              "--timeout", "10"))
-
-    def test_log_uses_byte_marker_for_cursor(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            self._record(tmp)
-
-            def fake_exec(lab, api, vmid, command, timeout=30):
-                script = command[2]
-                if "out=$(tail" in script:
-                    return {"exitcode": 0,
-                            "stdout": "data\n__logb1234__:5\n\n",
-                            "stderr": ""}
-                if "kill -0" in script:
-                    return {"exitcode": 0, "stdout": "1", "stderr": ""}
-                return {"exitcode": 0, "stdout": "", "stderr": ""}
-
-            with mock.patch.object(lab_console, "agent_exec",
-                                   side_effect=fake_exec):
-                lab_guest.cmd_log(lab, _args(lab, "guest", "log",
-                                             "--lease", "L1",
-                                             "--vmid", "7",
-                                             "--pid", "12345"))
-
-    def test_snapshot_create_lists_and_rollback(self) -> None:
-        import json as _json
-
-        with tempfile.TemporaryDirectory() as tmp:
-            lab = _lab(tmp)
-            api = mock.Mock()
-            lab.ProxmoxAPI.return_value = api
-            lab.wait_task = mock.Mock()
-
-            # create
-            api.call.return_value = "UPID:aipve:00000001:00000001:1:qmsnapshot:7:"
-            lab_guest.cmd_snapshot(lab, _args(lab, "guest", "snapshot",
-                                             "--lease", "L1", "--vmid", "7",
-                                             "--mode", "create",
-                                             "--name", "before-kernel"))
-            api.call.assert_any_call(
-                "POST", "/nodes/aipve/qemu/7/snapshot",
-                {"snapname": "before-kernel", "description": ""},
-            )
-            lab.wait_task.assert_called_once()
-
-            # rollback requires stopped
-            api.call.side_effect = None
-            api.call.return_value = {"status": "running"}
-            with self.assertRaises(RuntimeError) as caught:
-                lab_guest.cmd_snapshot(lab, _args(lab, "guest", "snapshot",
-                                                 "--lease", "L1", "--vmid", "7",
-                                                 "--mode", "rollback",
-                                                 "--name", "before-kernel"))
-            self.assertIn("must be stopped", str(caught.exception))
-
-            # rollback on stopped guest posts to the right path
-            api.call.side_effect = None
-            api.call.return_value = "UPID:aipve:00000001:00000002:1:qmsnapshot:7:"
-            status_calls = {"count": 0}
-            def rollback_call(method, path, data=None):
-                if path.endswith("/status/current"):
-                    return {"status": "stopped"}
-                return "UPID:aipve:00000001:00000003:1:qmsnapshot:7:"
-            api.call.side_effect = rollback_call
-            lab.wait_task.reset_mock()
-            lab_guest.cmd_snapshot(lab, _args(lab, "guest", "snapshot",
-                                             "--lease", "L1", "--vmid", "7",
-                                             "--mode", "rollback",
-                                             "--name", "before-kernel"))
-            api.call.assert_any_call(
-                "POST", "/nodes/aipve/qemu/7/snapshot/before-kernel/rollback"
-            )
-            lab.audit.assert_any_call(
-                "guest-snapshot-rollback", lease="L1", kind="qemu", vmid=7,
-                name="before-kernel",
-            )
-
-
-class EmptyConsolePasswordTests(unittest.TestCase):
-    """A guest with no password set must still be drivable over serial.
-
-    ReactOS, a stock installer, a rescue shell and a blank-root appliance all
-    have no console password. Treating "" as falsy made them unreachable: the
-    serial channel was refused even though the credential was correct.
-    """
-
-    def _serial_only(self) -> lab_guest.GuestCapabilities:
-        return lab_guest.GuestCapabilities(7, "qemu", agent=False, serial=True)
-
-    def test_an_explicit_empty_password_enables_the_serial_channel(self) -> None:
-        session = lab_guest.GuestSession(
-            mock.Mock(), mock.Mock(), 7, password="",
-            capabilities=self._serial_only(),
+        self.assertEqual(self.argvs()[1],
+                         ["qm", "clone", "9000", "101", "--name", "beta"])
+        self.assertEqual(payload, {
+            "lease_id": LEASE, "vmid": 101, "source": 9000, "name": "beta",
+            "state": "stopped", "upid": None,
+        })
+        self.assertEqual(
+            [(row["kind"], int(row["vmid"]), row["policy"])
+             for row in self.resources()],
+            [("qemu", 101, "disposable")],
         )
-        self.assertEqual(session.channel, "serial")
 
-    def test_no_password_at_all_still_refuses_the_serial_channel(self) -> None:
-        with self.assertRaises(lab_guest.GuestError) as caught:
-            lab_guest.GuestSession(
-                mock.Mock(), mock.Mock(), 7,
-                capabilities=self._serial_only(),
+    def test_clone_accepts_a_retain_row_of_another_lease(self) -> None:
+        self.open_lease()
+        self.open_lease(OTHER_LEASE)
+        self.register_guest(OTHER_LEASE, "lxc", 9002,
+                            name="golden", policy="retain")
+        self.fake.add(r"^pct clone 9002 101")
+        self.fake.add(r"^pct set 101")
+        self.fake.add(r"^pct status 101", stdout=b"status: stopped\n")
+        self.run_cmd(
+            "guest", "clone", "--lease", LEASE, "--vmid", "101",
+            "--source", "9002", "--name", "beta",
+        )
+        # the row carries the kind: clone straight off the registry
+        self.assertEqual(self.argvs()[0],
+                         ["pct", "clone", "9002", "101", "--hostname", "beta"])
+
+    def test_clone_refuses_a_source_nobody_vouches_for(self) -> None:
+        self.open_lease()
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "clone", "--lease", LEASE, "--vmid", "101",
+                "--source", "9000",
+            )
+        self.assertIn("registry-vouched", str(caught.exception))
+        self.assertEqual(
+            [argv for argv in self.argvs() if "clone" in argv], []
+        )
+
+
+class StartStopTests(GuestCase):
+    def test_start_reports_the_reached_state(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(r"^qm start 101")
+        self.fake.add(r"^qm status 101", stdout=b"status: running\n")
+        payload = self.run_cmd(
+            "guest", "start", "--lease", LEASE, "--vmid", "101"
+        )
+        self.assertEqual(payload, {
+            "lease_id": LEASE, "vmid": 101,
+            "state": "running", "graceful": None,
+        })
+        self.lab.audit.assert_called_once_with(
+            "guest-start", lease=LEASE, vmid=101, kind="qemu"
+        )
+
+    def test_stop_is_graceful_and_never_assumed(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "lxc", 102, name="beta")
+        self.fake.add(r"^pct shutdown 102")
+        self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        payload = self.run_cmd(
+            "guest", "stop", "--lease", LEASE, "--vmid", "102",
+            "--timeout", "5",
+        )
+        self.assertEqual(payload, {
+            "lease_id": LEASE, "vmid": 102,
+            "state": "stopped", "graceful": True,
+        })
+        self.assertEqual(
+            [argv for argv in self.argvs() if argv[1] == "stop"], []
+        )
+        self.lab.audit.assert_called_once_with(
+            "guest-stop", lease=LEASE, vmid=102, kind="lxc", graceful=True
+        )
+
+    def test_stop_falls_back_to_a_hard_stop(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        seam = mock.Mock()
+        seam.shutdown.return_value = False
+        seam.status.return_value = "stopped"
+        with mock.patch.object(
+            lab_guest, "_make_proxmox", lambda config: seam
+        ):
+            payload = self.run_cmd(
+                "guest", "stop", "--lease", LEASE, "--vmid", "101",
+                "--timeout", "5",
+            )
+        self.assertEqual(payload["graceful"], False)
+        seam.stop.assert_called_once_with("qemu", 101)
+
+
+class DestroyTests(GuestCase):
+    def test_destroy_demands_confirm_before_any_seam_call(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd("guest", "destroy", "--lease", LEASE, "--vmid", "101")
+        self.assertIn("--confirm", str(caught.exception))
+        self.assertEqual(self.argvs(), [])
+
+    def test_destroy_refuses_an_unregistered_guest(self) -> None:
+        self.open_lease()
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "destroy", "--lease", LEASE, "--vmid", "101",
+                "--confirm",
+            )
+        self.assertIn("lease-register", str(caught.exception))
+        self.assertEqual(self.argvs(), [])
+
+    def test_destroy_refuses_retain_rows_naming_the_vouching(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, policy="retain")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "destroy", "--lease", LEASE, "--vmid", "101",
+                "--confirm",
             )
         message = str(caught.exception)
-        self.assertIn("Pass a console password", message)
-        self.assertIn("no password set is supported", message)
+        self.assertIn("registry-vouched", message)
+        self.assertIn("retain", message)
+        self.assertEqual(self.argvs(), [])
 
-    def test_an_empty_password_reaches_the_login_as_an_empty_string(self) -> None:
-        session = lab_guest.GuestSession(
-            mock.Mock(), mock.Mock(), 7, password="",
-            capabilities=self._serial_only(),
+    def test_destroy_refuses_templates_naming_the_vouching(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, policy="disposable")
+        self.fake.add(r"^qm config 101", stdout=b"template: 1\n")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "destroy", "--lease", LEASE, "--vmid", "101",
+                "--confirm",
+            )
+        message = str(caught.exception)
+        self.assertIn("registry-vouched", message)
+        self.assertIn("template: 1", message)
+        self.assertEqual(
+            [argv for argv in self.argvs() if argv[1] == "destroy"], []
         )
-        with mock.patch.object(lab_console, "TermSession") as term_class:
-            session._terminal()
-        term_class.return_value.login.assert_called_once_with("root", "")
 
-    def _run_capturing_password(self, tmp: str, stdin: str,
-                                *extra: str) -> object:
-        lab = _lab(tmp)
-        capabilities = self._serial_only()
-        with mock.patch.object(lab_guest, "probe", return_value=capabilities), \
-             mock.patch.object(lab_guest, "GuestSession") as session_class, \
-             mock.patch.object(sys, "stdin", io.StringIO(stdin)):
-            session = session_class.return_value.__enter__.return_value
-            session.run_argv.return_value = lab_guest.CommandResult(
-                stdout="", stderr="", exit_code=0, channel="serial",
+    def test_destroy_refuses_guests_without_the_pxl_tag(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, policy="disposable")
+        self.fake.add(r"^qm config 101", stdout=b"tags: somebody-elses\n")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "destroy", "--lease", LEASE, "--vmid", "101",
+                "--confirm",
             )
-            lab_guest.cmd_run(
-                lab,
-                _args(lab, "guest", "run", "--lease", "L1", "--vmid", "7",
-                      *extra, "--", "uname", "-a"),
+        message = str(caught.exception)
+        self.assertIn("pxl", message)
+        self.assertIn("tag", message)
+        self.assertEqual(
+            [argv for argv in self.argvs() if argv[1] == "destroy"], []
+        )
+
+    def test_destroy_marks_and_audits(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(
+            r"^qm config 101",
+            stdout=b"tags: pxl;lease-abs-guest-lease\n"
+                   b"description: pxl-lease=abs-guest-lease "
+                   b"pxl-expiry=1800000000\n",
+        )
+        self.fake.add(r"^qm destroy 101")
+        payload = self.run_cmd(
+            "guest", "destroy", "--lease", LEASE, "--vmid", "101",
+            "--confirm",
+        )
+        self.assertEqual(payload, {
+            "lease_id": LEASE, "vmid": 101,
+            "destroyed": True, "purged": True,
+        })
+        self.assertEqual(
+            [argv for argv in self.argvs() if argv[1] == "destroy"],
+            [["qm", "destroy", "101", "--purge", "1"]],
+        )
+        self.assertIsNotNone(self.resources()[0]["destroyed_at"])
+        self.lab.audit.assert_called_once_with(
+            "guest-destroy", lease=LEASE, vmid=101, kind="qemu", purged=True
+        )
+
+    def test_destroy_refuses_a_guest_another_live_lease_owns(self) -> None:
+        # require_owned only asks whether THIS lease has a row. Dual
+        # registration is reachable (an expired-but-active lease still
+        # counts), so one lease must not destroy the other's machine.
+        self.open_lease()
+        self.open_lease(OTHER_LEASE)
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.register_guest(OTHER_LEASE, "qemu", 101, name="alpha")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "destroy", "--lease", LEASE, "--vmid", "101",
+                "--confirm",
             )
-        return session_class.call_args.kwargs["password"]
+        self.assertIn(OTHER_LEASE, str(caught.exception))
+        self.assertNotIn(
+            ["qm", "destroy", "101", "--purge", "1"], self.argvs()
+        )
+        self.assertEqual(
+            [c for c in self.argvs() if c[0] in ("qm", "pct")], []
+        )
+    def test_destroy_stops_a_running_guest_before_destroying(self) -> None:
+        # pct/qm destroy refuse a running guest; destroy must stop it first.
+        self.open_lease()
+        self.register_guest(LEASE, "lxc", 102, name="beta")
+        self.fake.add(
+            r"^pct config 102",
+            stdout=b"tags: pxl;lease-abs-guest-lease\n"
+                   b"description: pxl-lease=abs-guest-lease "
+                   b"pxl-expiry=1800000000\n",
+        )
+        self.fake.add(r"^pct status 102", stdout=b"status: running\n", times=1)
+        self.fake.add(r"^pct shutdown 102")
+        self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        self.fake.add(r"^pct destroy 102")
+        payload = self.run_cmd(
+            "guest", "destroy", "--lease", LEASE, "--vmid", "102",
+            "--confirm",
+        )
+        self.assertTrue(payload["destroyed"])
+        seq = [" ".join(c["argv"][:2]) for c in self.fake.calls]
+        self.assertLess(seq.index("pct shutdown"), seq.index("pct destroy"))
 
-    def test_cmd_run_forwards_an_empty_password_from_stdin(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(
-                self._run_capturing_password(tmp, "\n", "--password-stdin"),
-                "",
+
+class RunTests(GuestCase):
+    def test_lxc_run_reports_the_real_exit_code(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "lxc", 102, name="beta")
+        self.fake.add(r"^pct exec 102", returncode=3,
+                      stdout=b"out\n", stderr=b"err\n")
+        payload = self.run_cmd(
+            "guest", "run", "--lease", LEASE, "--vmid", "102",
+            "echo", "super-secret-token",
+        )
+        self.assertEqual(self.argvs()[0],
+                         ["pct", "exec", "102", "--", "echo",
+                          "super-secret-token"])
+        self.assertEqual(payload["exit_code"], 3)
+        self.assertEqual(payload["stdout"], "out\n")
+        self.assertEqual(payload["stderr"], "err\n")
+        self.assertIsInstance(payload["duration_ms"], int)
+        self.assertEqual(
+            {key for key in payload},
+            {"lease_id", "vmid", "exit_code", "stdout", "stderr",
+             "duration_ms"},
+        )
+
+    def test_run_audits_argv0_and_the_exit_code_only(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "lxc", 102, name="beta")
+        self.fake.add(r"^pct exec 102", returncode=3)
+        self.run_cmd(
+            "guest", "run", "--lease", LEASE, "--vmid", "102",
+            "echo", "super-secret-token",
+        )
+        self.lab.audit.assert_called_once_with(
+            "guest-run", lease=LEASE, vmid=102, argv0="echo", exit_code=3
+        )
+        for call in self.lab.audit.call_args_list:
+            self.assertNotIn("super-secret-token", repr(call.args))
+            self.assertNotIn("super-secret-token", repr(call.kwargs))
+
+    def test_qemu_run_uses_the_agent_channel(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(
+            r"^qm guest exec 101",
+            stdout=b'{"exitcode": 5, "out-data": "aGkK", "err-data": ""}',
+        )
+        payload = self.run_cmd(
+            "guest", "run", "--lease", LEASE, "--vmid", "101", "/bin/true"
+        )
+        self.assertEqual(self.argvs()[0], [
+            "qm", "guest", "exec", "101", "--synchronous", "--timeout", "300",
+            "--", "/bin/true",
+        ])
+        self.assertEqual(payload["exit_code"], 5)
+        self.assertEqual(payload["stdout"], "hi\n")
+        self.assertEqual(payload["stderr"], "")
+
+    def test_run_refuses_an_unregistered_guest_before_any_seam_call(self) -> None:
+        self.open_lease()
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "run", "--lease", LEASE, "--vmid", "101", "true"
             )
+        self.assertIn("lease-register", str(caught.exception))
+        self.assertEqual(self.argvs(), [])
 
-    def test_cmd_run_forwards_none_when_the_flag_is_absent(self) -> None:
-        """A caller who forgot the flag must not get a blank-password login."""
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertIsNone(self._run_capturing_password(tmp, "secret\n"))
 
-    def test_cmd_run_still_forwards_a_real_password(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(
-                self._run_capturing_password(tmp, "hunter2\n",
-                                             "--password-stdin"),
-                "hunter2",
-            )
+class ProbeTests(GuestCase):
+    def test_probe_reports_an_agent_reachable_qemu_guest(self) -> None:
+        self.fake.add(r"^qm status 101", stdout=b"status: running\n")
+        self.fake.add(r"^qm guest ping 101")
+        self.fake.add(
+            r"^qm guest network-get-interfaces 101",
+            stdout=b'[{"name": "eth0", "ip-addresses": '
+                   b'[{"ip-address-type": "ipv4", '
+                   b'"ip-address": "10.0.0.5"}]}]',
+        )
+        payload = self.run_cmd("guest", "probe", "--vmid", "101")
+        self.assertEqual(payload, {
+            "vmid": 101, "exists": True, "running": True, "kind": "qemu",
+            "agent_ok": True, "ip": "10.0.0.5", "channel": "agent",
+        })
 
-    def test_probe_advice_says_a_passwordless_guest_is_supported(self) -> None:
-        import contextlib
-        import json
+    def test_probe_reports_the_pct_channel_for_lxc(self) -> None:
+        self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        payload = self.run_cmd("guest", "probe", "--vmid", "102")
+        self.assertEqual(payload, {
+            "vmid": 102, "exists": True, "running": False, "kind": "lxc",
+            "agent_ok": False, "ip": None, "channel": "pct",
+        })
 
-        lab = mock.Mock()
-        lab.NODE = "aipve"
-        stdout = io.StringIO()
-        with mock.patch.object(lab_guest, "probe",
-                               return_value=self._serial_only()), \
-             contextlib.redirect_stdout(stdout):
-            lab_guest.cmd_probe(lab, mock.Mock(vmid=7))
-        advice = " ".join(json.loads(stdout.getvalue())["advice"])
-        self.assertIn("no password set works too", advice)
+    def test_probe_reports_a_guest_the_node_does_not_know(self) -> None:
+        payload = self.run_cmd("guest", "probe", "--vmid", "4242")
+        self.assertEqual(payload, {
+            "vmid": 4242, "exists": False, "running": False, "kind": None,
+            "agent_ok": False, "ip": None, "channel": None,
+        })
+
+
+class ListTests(GuestCase):
+    def test_list_joins_the_registry_with_live_states(self) -> None:
+        self.open_lease()
+        self.open_lease(OTHER_LEASE)
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.register_guest(OTHER_LEASE, "lxc", 102, name="beta")
+        self.register_guest(OTHER_LEASE, "qemu", 103, name="gone")
+        with self.store() as store:
+            store.mark_destroyed(OTHER_LEASE, "qemu", 103)
+        self.fake.add(r"^qm status 101", stdout=b"status: running\n")
+        self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        self.fake.add(
+            r"^qm config 101",
+            stdout=b"tags: pxl;lease-abs-guest-lease\n"
+                   b"description: pxl-lease=abs-guest-lease "
+                   b"pxl-expiry=1800000000\n",
+        )
+        self.fake.add(
+            r"^pct config 102",
+            stdout=b"tags: pxl;lease-abs-other-lease\n"
+                   b"description: pxl-lease=abs-other-lease pxl-expiry=0\n",
+        )
+        payload = self.run_cmd("guest", "list")
+        self.assertEqual(payload, {"guests": [
+            {"vmid": 101, "kind": "qemu", "name": "alpha",
+             "lease_id": LEASE, "state": "running",
+             "tags": "pxl;lease-abs-guest-lease", "pxl_expiry": EXPIRY},
+            {"vmid": 102, "kind": "lxc", "name": "beta",
+             "lease_id": OTHER_LEASE, "state": "stopped",
+             "tags": "pxl;lease-abs-other-lease", "pxl_expiry": 0},
+        ]})
+        narrowed = self.run_cmd("guest", "list", "--lease", OTHER_LEASE)
+        self.assertEqual([guest["vmid"] for guest in narrowed["guests"]],
+                         [102])
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class LeaseGateRegressionTests(unittest.TestCase):
-    """`guest log` requires --lease, so it must actually validate it.
-
-    Regression: a refactor dropped `lab.load_lease(args.lease)` from cmd_log
-    while argparse still marked --lease required, so any string was accepted
-    and the authorisation check silently did nothing.
-    """
-
-    def test_log_validates_the_lease_before_reading_a_run(self) -> None:
-        lab = mock.Mock()
-        lab.LabError = RuntimeError
-        lab.load_lease.side_effect = RuntimeError("no such lease")
-        args = mock.Mock(lease="BOGUS", vmid=101, pid="1",
-                         tail=None, follow=False, timeout=1)
-        with mock.patch.object(lab_guest, "_find_run") as find_run:
-            with self.assertRaises(RuntimeError):
-                lab_guest.cmd_log(lab, args)
-        lab.load_lease.assert_called_once_with("BOGUS")
-        find_run.assert_not_called()
-
-
-class GuestShellRegressionTests(unittest.TestCase):
-    """Provisioning scripts are bash, so the guest-side helper must use bash.
-
-    Regression: a dedup pass silently pointed the shared helper at /bin/sh.
-    These scripts declare `#!/bin/bash` and open with `set -euo pipefail`.
-    dash only gained `pipefail` in 0.5.12 (Debian 13, Ubuntu 24.04), so on
-    older guests -- Debian 11/12, Ubuntu 22.04 -- /bin/sh aborts on line 2.
-    Run them under the interpreter they declare.
-    """
-
-    def test_exec_guest_script_runs_under_bash(self) -> None:
-        lab = mock.Mock()
-        lab.NODE = "aipve"
-        from proxmox_agent_lab import guest_agent
-
-        with mock.patch.object(guest_agent, "agent_exec") as agent_exec:
-            lab_console.exec_guest_script(lab, mock.Mock(), 101, "set -euo pipefail")
-        argv = agent_exec.call_args.args[3]
-        self.assertEqual(argv[0], "/bin/bash", f"dash cannot run these: {argv}")

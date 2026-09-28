@@ -1,0 +1,48 @@
+proxmox-agent-lab
+==================
+
+This project embeds code ported from an external project.
+
+------------------------------------------------------------------------
+src/proxmox_agent_lab/calibration.py
+------------------------------------------------------------------------
+
+Ported to Python from:
+
+    vnc-mcp
+    https://github.com/tuaris/vnc-mcp
+    src/calibration.zig
+
+    Copyright (c) 2026, The Daniel Morante Company, Inc.
+    Licensed under the BSD 2-Clause "Simplified" License
+    https://github.com/tuaris/vnc-mcp/blob/master/LICENSE
+
+What was taken
+--------------
+The per-(client, endpoint, resolution) coordinate calibration approach:
+the record shape, the two independent per-axis least-squares solves, the
+degenerate-input guard, the client-identity normalisation, and the
+status-line vocabulary (ACTIVE / STALE / ABSENT / DISABLED / UNKNOWN).
+
+What was changed
+----------------
+Rewritten in Python for this project. The transport was replaced: the
+original drove a VNC/RFB connection and drew markers on the remote
+framebuffer, whereas this project places markers through the Proxmox
+`qm monitor` screendump and applies the transform to `qm sendkey`
+coordinates. The store lives under this tool's state directory rather
+than `~/.config/vnc-mcp`, so the two projects never share or overwrite
+each other's calibration state. Behaviour notes added: the RMSE
+acceptability threshold, the tolerant sample parser, and clamping
+applied to the mapped point.
+
+Why
+---
+GUI automation fails in a specific, repeatable way: an agent reads a
+screenshot that its viewer has downscaled, then clicks a framebuffer
+pixel estimated from that image, and the click lands near the target
+rather than on it. Measuring the mapping once per client, endpoint and
+resolution is the fix, and the arithmetic is independent of whatever
+transport delivers the pixels. No part of the original remains linked;
+this is a source-level port under the terms of its licence, which
+requires the above notice.

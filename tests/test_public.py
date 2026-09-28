@@ -10,7 +10,8 @@ SCRIPT = Path(__file__).parents[1] / "scripts/check-public.py"
 
 
 class PublicContentCheckTests(unittest.TestCase):
-    def make_tree(self, marker: str) -> tuple[Path, Path]:
+    def make_tree(self, marker: str,
+                  config_text: str | None = None) -> tuple[Path, Path]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         parent = Path(temp.name)
@@ -20,7 +21,9 @@ class PublicContentCheckTests(unittest.TestCase):
         source.parent.mkdir()
         source.write_text(f'NODE = "{marker}"\n')
         config = parent / "config.toml"
-        config.write_text(f'[proxmox]\nnode = "{marker}"\n')
+        if config_text is None:
+            config_text = f'[pve]\nnode = "{marker}"\n'
+        config.write_text(config_text)
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         subprocess.run(["git", "add", "."], cwd=root, check=True)
         return root, config
@@ -46,7 +49,28 @@ class PublicContentCheckTests(unittest.TestCase):
         result = self.run_check(root, config)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("matches local [proxmox] node", result.stderr)
+        self.assertIn("matches local [pve] node", result.stderr)
+
+    def test_retains_distinctive_ssh_target_detection(self):
+        root, config = self.make_tree(
+            "lab-node-42",
+            config_text='[ssh]\ntarget = "lab-node-42"\n',
+        )
+
+        result = self.run_check(root, config)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("matches local [ssh] target", result.stderr)
+
+    def test_ignores_generic_ssh_alias(self):
+        root, config = self.make_tree(
+            "proxmox",
+            config_text='[ssh]\ntarget = "proxmox"\n',
+        )
+
+        result = self.run_check(root, config)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

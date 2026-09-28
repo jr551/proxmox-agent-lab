@@ -31,7 +31,7 @@ pip install proxmox-agent-lab
 
 ```bash
 proxmox-lab init                       # writes a starter config
-proxmox-lab doctor                    # verifies the whole path; non-zero on failure
+proxmox-lab doctor                     # verifies the whole path; non-zero on failure
 ```
 
 That's it. No daemon, no API token, no database to provision, nothing running
@@ -50,8 +50,9 @@ L=$(proxmox-lab lease-begin --purpose "build a test rig" | jq -r .id)
 trap 'proxmox-lab lease-end --lease "$L"' EXIT   # always cleans up
 
 proxmox-lab guest clone --lease "$L" --source 9000 --vmid 9101
-proxmox-lab guest run   --lease "$L" --vmid 9101 uname -a
+proxmox-lab guest run   --lease "$L" --vmid 9101 -- uname -a
 proxmox-lab push        --lease "$L" --vmid 9101 --file payload.bin --dest /tmp/payload.bin
+proxmox-lab console click --lease "$L" --vmid 9101 --x 360 --y 200
 ```
 
 The full instructions live in [SKILL.md](SKILL.md).
@@ -72,7 +73,7 @@ That surface exists too — 29 tools over stdio:
 ```
 
 **Worth knowing before you mount it:** a mounted MCP server publishes its
-tool schemas into *every* session, used or not — around 1,600 tokens,
+tool schemas into *every* session, used or not — around 2,400 tokens,
 permanently, on top of the skill. That is what the convenience costs. If you
 would rather pay it only when it earns its keep, leave the server unmounted
 and let the skill drive the CLI.
@@ -92,11 +93,12 @@ description: pxl-lease=20260927174717-ae7ddc76 pxl-expiry=1790538437
 
 Those labels are the entire boundary, and they are what every check reads:
 
-- **Cleanup only ever touches labelled guests.** A guest without a `proxmoxagentlab` label
-  is never destroyed, stopped, or reclaimed — the refusal happens in the code
-  path before any host command runs. Do not work around that refusal.
-- **You can see the lab in the normal web UI.** Lab guests are ordinary
-  guests, filterable by the `proxmoxagentlab` tag in Datacenter → the node.
+- **Cleanup only ever touches labelled guests.** A guest without a
+  `proxmoxagentlab` label is never destroyed, stopped, or reclaimed — the
+  refusal happens before any host command runs. Do not work around it.
+- **You can see the lab in the normal web UI** — ordinary guests, filterable
+  by the `proxmoxagentlab` tag in Datacenter → the node. The second tag is
+  the hostname of the machine that created it.
 - **Guests you created yourself are never at risk.** No label, no lease, no
   touch. Long-term lab machines carry `pxl-expiry=0` so the collector leaves
   them running by design.
@@ -134,8 +136,10 @@ removes the question entirely.
 - [docs/INSTALL.md](docs/INSTALL.md) — host preparation and Wake-on-LAN
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every setting and default
 - [SKILL.md](SKILL.md) — how an agent should drive it
+- [docs/AGENTS.md](docs/AGENTS.md) — operational guidance for agents
 - [docs/commands.md](docs/commands.md) — every subcommand
 - [docs/safety-policy.md](docs/safety-policy.md) — the enforced rules
+- [docs/long-term-leases.md](docs/long-term-leases.md) — persistent machines
 - [docs/troubleshooting.md](docs/troubleshooting.md) — fix a failure
 - [docs/VERIFICATION.md](docs/VERIFICATION.md) — what has actually been tested
 - [docs/architecture.md](docs/architecture.md) — how it fits together

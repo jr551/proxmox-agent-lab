@@ -7,6 +7,8 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+## 0.19.0 - 2026-09-28
+
 Rewritten as a slim SSH-only control plane. The whole remote surface is one
 ssh channel as root (`ssh-copy-id root@proxmox` is the entire credential
 setup); `qm`/`pct`/`pvesh` run through a single argv allowlist seam, and one
@@ -17,19 +19,32 @@ library only, Python 3.11+.
 ### Added
 
 - `proxmox-lab mcp`: a stdlib-only stdio JSON-RPC 2.0 MCP server (no SDK)
-  exposing 23 tools that bind the same handlers as the CLI, so the two
+  exposing 29 tools that bind the same handlers as the CLI, so the two
   surfaces cannot drift. Includes the MCP idle-shutdown backstop: no tool
   call for `idle_shutdown_seconds` (8h default) plus zero active leases
   triggers a verified host shutdown.
 - Host-side garbage collector: `proxmox-lab gc install|status|uninstall`
   ships a standalone `pxl-gc` script plus one root crontab line on the
   Proxmox host. It reads lease identity/expiry from guest metadata
-  (`pxl`/`lease-<id>` tags and the `pxl-lease=`/`pxl-expiry=` description
-  line), reaps expired-lease guests, and powers the host off when idle —
+  (`proxmoxagentlab`/`lease-<id>` tags and the `pxl-lease=`/`pxl-expiry=`
+  description line), reaps expired-lease guests, and powers the host off when idle —
   replacing the old MariaDB-reading hostguard.
 - `ssh.py` command allowlist: every remote argv is checked before a process
   spawns, and the host-changing subset (`shutdown`, `crontab`, `install`,
   `ethtool`, `tee`, `rm`) additionally requires `--host-change-authorized`.
+- Console pointer input and capture (ported from vnc-mcp, BSD-2, credited):
+  `console move|click|drag` drive the QEMU HID tablet over `qm monitor` HMP —
+  the only input transport that stays inside the ssh allowlist (QMP needs a
+  host-side interpreter, which the seam refuses). `console grid` burns a
+  labelled coordinate grid into a screenshot, `console burst` stitches a
+  multi-frame capture, and `console calibrate` measures how the calling
+  client scales screenshots so clicks read off a downscaled image land on
+  the real pixel — `--space image` is refused without a trustworthy fit.
+- Guest ownership labels are now human-readable:
+  `proxmoxagentlab;<controller-hostname>;lease-<id>` tags plus the
+  `pxl-lease=`/`pxl-expiry=` description line. Every matcher (GC, orphan
+  scan, destroy gate, doctor drift) still honours the pre-rename `pxl` tag,
+  so nothing stamped before the rename is orphaned.
 
 ### Changed
 
@@ -46,6 +61,12 @@ library only, Python 3.11+.
 - Console and transfer ride the ssh seam: screenshots via `qm monitor`
   screendump + PPM→PNG, keystrokes via `qm sendkey`, push/pull via chunked
   base64 guest exec.
+
+### Fixed
+
+- `gc install` no longer fails halfway: the seam's `install -d` path
+  confinement now includes `/var/lib/pxl-*`, so the script, the GC state
+  directory and the crontab line all land in one run.
 
 ### Removed
 

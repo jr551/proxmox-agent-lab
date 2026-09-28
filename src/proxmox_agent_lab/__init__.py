@@ -5,4 +5,4 @@ lease bounds the work; when it ends, the guests it created are destroyed and
 the host is switched off if — and only if — it is genuinely idle.
 """
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"

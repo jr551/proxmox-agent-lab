@@ -53,6 +53,14 @@ def _store() -> store_module.Store:
     return _STORE
 
 
+def close_store() -> None:
+    """Close the process-wide store handle if open (clean up resources)."""
+    global _STORE
+    if _STORE is not None:
+        _STORE.close()
+        _STORE = None
+
+
 def audit(
     event: str, *, lease: str | None = None, vmid: int | None = None, **fields: Any
 ) -> None:

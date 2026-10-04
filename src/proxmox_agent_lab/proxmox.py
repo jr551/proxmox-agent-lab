@@ -153,8 +153,8 @@ class Proxmox:
             timeout=DEFAULT_TIMEOUT,
         )
         payload = _json_value(_require(result, action), action)
-        if isinstance(payload, str) and payload.isdecimal():
-            return int(payload)
+        if isinstance(payload, str) and payload.strip().isdecimal():
+            return int(payload.strip())
         if isinstance(payload, int) and not isinstance(payload, bool) and payload > 0:
             return payload
         raise ProxmoxError(f"{action}: expected a VMID")
@@ -527,7 +527,9 @@ class Proxmox:
                 if not isinstance(address, dict):
                     continue
                 if str(address.get("ip-address-type", "")).lower() == "ipv4":
-                    return str(address.get("ip-address"))
+                    ip = str(address.get("ip-address") or "").strip()
+                    if ip and not ip.startswith("127."):
+                        return ip
         return None
 
     def lxc_interfaces(self, vmid: int) -> list:

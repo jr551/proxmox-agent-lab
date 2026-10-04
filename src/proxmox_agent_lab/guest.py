@@ -229,6 +229,8 @@ def _assert_disk_fits(prox: Any, storage: str, disk_gb: int) -> None:
     This is a read of storage status, then a hard stop, before any create.
     Memory is not part of the check: RAM headroom is the caller's judgment.
     """
+    if disk_gb <= 0:
+        raise LabError(f"disk size must be a positive integer in GB, not {disk_gb}")
     row = next(
         (
             item for item in prox.storage_status()
@@ -308,11 +310,17 @@ def cmd_create(lab: Any, args: Any) -> dict:
     still visible to cleanup.
     """
     lease_id, vmid, kind = str(args.lease), int(args.vmid), str(args.kind)
+    if vmid <= 0:
+        raise LabError(f"vmid must be a positive integer, not {vmid}")
+    if getattr(args, "memory", None) is not None and int(args.memory) <= 0:
+        raise LabError("--memory must be a positive integer in MB")
+    if getattr(args, "cores", None) is not None and int(args.cores) <= 0:
+        raise LabError("--cores must be a positive integer")
     if getattr(args, "iso", None) and kind != "qemu":
         raise LabError("--iso is only for a fresh qemu guest")
     lease = _lease_for_mutation(lab, lease_id)
     expires_at = int(lease["expires_at"])
-    name = args.name or f"pxl-{vmid}"
+    name = getattr(args, "name", None) or f"pxl-{vmid}"
     tags, description = metadata_for(lease_id, expires_at)
     prox = _make_proxmox(lab.CONFIG)
     template = _template_vmid(lab, args)

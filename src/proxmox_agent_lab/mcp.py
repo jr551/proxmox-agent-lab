@@ -170,7 +170,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "guest_create",
         "description": (
-            "Create a lease-owned guest from the template. "
+            "Create a lease-owned guest from the template, or fresh. "
             "Call guest_nextid first and pass that vmid. "
             "Read storage_status for free disk and status for "
             "memory.free, memory.total, and cpu_count. Size the disk "
@@ -183,10 +183,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
             required=("lease_id", "vmid"),
             lease_id=_STR,
             vmid=_INT,
+            kind=_KIND,
             name=_STR,
             memory=_INT,
             cores=_INT,
             start=_BOOL,
+            template=_INT,
             ostemplate=_STR,
             storage=_STR,
             disk_gb=_INT,
@@ -320,6 +322,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             vmid=_INT,
             local_path=_STR,
             remote_path=_STR,
+            sha256=_STR,
+            timeout={**_INT, "maximum": _MAX_TIMEOUT},
         ),
     },
     {
@@ -331,6 +335,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             vmid=_INT,
             local_path=_STR,
             remote_path=_STR,
+            sha256=_STR,
+            timeout={**_INT, "maximum": _MAX_TIMEOUT},
         ),
     },
     {
@@ -650,15 +656,19 @@ def _dispatch_guest_nextid(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
 def _dispatch_guest_create(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
     from . import guest
 
+    kind = str(a.get("kind") or ("lxc" if a.get("ostemplate") else "qemu"))
     return _invoke(
         guest.cmd_create,
         lab,
         _ns(
             a,
             lease=a["lease_id"],
-            kind="qemu",
+            kind=kind,
+            name=a.get("name"),
+            memory=a.get("memory"),
+            cores=a.get("cores"),
             start=a.get("start", True),
-            template=None,
+            template=a.get("template"),
             ostemplate=a.get("ostemplate"),
             storage=a.get("storage"),
             disk_gb=a.get("disk_gb"),
@@ -909,8 +919,8 @@ def _dispatch_push_file(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
             lease=a["lease_id"],
             file=a["local_path"],
             dest=a["remote_path"],
-            sha256=None,
-            timeout=transfer.DEFAULT_TIMEOUT,
+            sha256=a.get("sha256"),
+            timeout=int(a.get("timeout") or transfer.DEFAULT_TIMEOUT),
         ),
     )
 
@@ -926,8 +936,8 @@ def _dispatch_pull_file(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
             lease=a["lease_id"],
             remote=a["remote_path"],
             out=a["local_path"],
-            sha256=None,
-            timeout=transfer.DEFAULT_TIMEOUT,
+            sha256=a.get("sha256"),
+            timeout=int(a.get("timeout") or transfer.DEFAULT_TIMEOUT),
         ),
     )
 

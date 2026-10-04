@@ -186,7 +186,7 @@ active lease the server performs the verified host shutdown itself.
 | `lease_destroy` | forcibly destroy a lease and its guests (`confirm`) |
 | `lease_register` | adopt an existing guest into a lease |
 | `guest_nextid` | next free cluster VMID (read-only; pass it to `guest_create`) |
-| `guest_create` | create a lease-owned guest (`fresh`, `iso`, `disk_bus`, `nic`, `bridge`) |
+| `guest_create` | create a lease-owned guest (`fresh`, `kind`, `template`, `iso`, `disk_bus`, `nic`, `bridge`) |
 | `guest_media` | change a qemu guest's CD or floppy |
 | `guest_clone` | clone a vouched template into a lease-owned guest |
 | `guest_start` | start a lease-owned guest |

@@ -17,6 +17,7 @@ from typing import Any
 
 from .errors import LabError
 from . import guest as guest_module
+from . import proxmox as proxmox_module
 
 _FIELDS = ("storage", "type", "active", "enabled", "used", "avail", "total", "content")
 _MEDIA = frozenset({"iso", "vztmpl"})
@@ -86,7 +87,13 @@ def cmd_content(lab: Any, args: Any) -> dict:
     volumes = []
     for name, kinds in chosen:
         for kind in sorted(kinds):
-            for item in prox.storage_content(name, kind):
+            try:
+                items = prox.storage_content(name, kind)
+            except proxmox_module.ProxmoxError:
+                if wanted is not None:
+                    raise
+                continue
+            for item in items:
                 if not isinstance(item, dict):
                     continue
                 if str(item.get("content") or kind) not in _MEDIA:

@@ -34,12 +34,10 @@ class AuditTests(unittest.TestCase):
         # The lazy per-process handle must not leak across tests -- close it
         # rather than dropping an open connection on the floor.
         def _close_cached_store() -> None:
-            if audit_module._STORE is not None:
-                audit_module._STORE.close()
-            audit_module._STORE = None
+            audit_module.close_store()
 
+        audit_module.close_store()
         self.addCleanup(_close_cached_store)
-        audit_module._STORE = None
 
     def rows(self) -> list[dict]:
         handle = store_module.Store(self.root / "lab.db")

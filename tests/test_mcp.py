@@ -798,6 +798,83 @@ class StatusToolTests(McpTestCase):
         self.assertEqual(payload["cpu_count"], 4)
         self.assertTrue(payload["reachable"])
 
+    def test_guest_create_lxc_dispatches_pct_create(self):
+        fake = FakeSSH()
+        fake.add("^true$")
+        fake.add(r"^pct create 200 local:vztmpl/debian\.tar\.zst")
+        fake.add(r"^pct start 200")
+        fake.add(r"^pct status 200", stdout=b"status: running\n")
+        seam = proxmox_module.Proxmox(fake, "pve")
+        with self.db() as database:
+            database.create_lease("leasetest-02", purpose="lxc", expires_at=9999999999)
+        with mock.patch.object(
+            guest_module, "_make_proxmox", lambda config: seam
+        ), _InProcessMcp(self.lab) as server:
+            response = server.call(
+                "guest_create",
+                {
+                    "lease_id": "leasetest-02",
+                    "vmid": 200,
+                    "kind": "lxc",
+                    "ostemplate": "local:vztmpl/debian.tar.zst",
+                    "fresh": True,
+                },
+            )
+        payload = self.result_payload(response)
+        self.assertEqual(payload["kind"], "lxc")
+        self.assertEqual(payload["vmid"], 200)
+        self.assertEqual(payload["state"], "running")
+        argv0s = [call["argv"][0] for call in fake.calls]
+        self.assertIn("pct", argv0s)
+        self.assertNotIn("qm", argv0s)
+
+    def test_guest_create_with_template(self):
+        fake = FakeSSH()
+        fake.add("^true$")
+        fake.add(r"^qm config 9000", stdout=b"template: 1\n")
+        fake.add(r"^pct config 9000", stdout=b"")
+        fake.add(r"^qm clone 9000 201")
+        fake.add(r"^qm set 201")
+        fake.add(r"^qm start 201")
+        fake.add(r"^qm status 201", stdout=b"status: running\n")
+        seam = proxmox_module.Proxmox(fake, "pve")
+        with self.db() as database:
+            database.create_lease("leasetest-03", purpose="tpl", expires_at=9999999999)
+        with mock.patch.object(
+            guest_module, "_make_proxmox", lambda config: seam
+        ), _InProcessMcp(self.lab) as server:
+            response = server.call(
+                "guest_create",
+                {
+                    "lease_id": "leasetest-03",
+                    "vmid": 201,
+                    "template": 9000,
+                },
+            )
+        payload = self.result_payload(response)
+        self.assertEqual(payload["vmid"], 201)
+        self.assertEqual(payload["state"], "running")
+
+    def test_push_and_pull_file_accept_sha256_and_timeout(self):
+        with self.db() as database:
+            database.create_lease("leasetest-04", purpose="files", expires_at=9999999999)
+            database.register_resource("leasetest-04", "qemu", 100)
+        with _InProcessMcp(self.lab) as server:
+            # Bad sha256 or non-existent file will fail, but schema validation passes
+            response = server.call(
+                "push_file",
+                {
+                    "lease_id": "leasetest-04",
+                    "vmid": 100,
+                    "local_path": "/tmp/nonexistent-file-42",
+                    "remote_path": "/tmp/dest",
+                    "sha256": "0" * 64,
+                    "timeout": 60,
+                },
+            )
+            # Fails with internal error (-32603) because file doesn't exist, not invalid params (-32602)
+            self.assertEqual(response["error"]["code"], mcp.INTERNAL_ERROR)
+
 
 if __name__ == "__main__":
     unittest.main()

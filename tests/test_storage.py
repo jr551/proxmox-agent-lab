@@ -112,6 +112,46 @@ class StorageContentTests(unittest.TestCase):
         self.assertIn("missing", str(caught.exception))
         self.assertEqual(len(self.fake.calls), 1)
 
+    def test_content_gracefully_skips_offline_stores_when_unconstrained(self) -> None:
+        self.fake.add(
+            r"^pvesh get /nodes/pve/storage ",
+            stdout=(
+                b'[{"storage":"local","content":"iso"},'
+                b'{"storage":"offline-nfs","content":"iso"}]'
+            ),
+        )
+        self.fake.add(
+            r"^pvesh get /nodes/pve/storage/local/content --content iso",
+            stdout=b'[{"volid":"local:iso/debian.iso","content":"iso","size":4}]',
+        )
+        self.fake.add(
+            r"^pvesh get /nodes/pve/storage/offline-nfs/content",
+            returncode=1,
+            stderr=b"storage 'offline-nfs' is not active\n",
+        )
+        args = mock.Mock(storage=None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            payload = storage_module.cmd_content(self.lab, args)
+        self.assertEqual(
+            [row["volid"] for row in payload["volumes"]],
+            ["local:iso/debian.iso"],
+        )
+
+    def test_content_raises_on_offline_store_when_explicitly_requested(self) -> None:
+        self.fake.add(
+            r"^pvesh get /nodes/pve/storage ",
+            stdout=b'[{"storage":"offline-nfs","content":"iso"}]',
+        )
+        self.fake.add(
+            r"^pvesh get /nodes/pve/storage/offline-nfs/content",
+            returncode=1,
+            stderr=b"storage 'offline-nfs' is not active\n",
+        )
+        args = mock.Mock(storage="offline-nfs")
+        with self.assertRaises(proxmox_module.ProxmoxError):
+            storage_module.cmd_content(self.lab, args)
+
 
 if __name__ == "__main__":
     unittest.main()

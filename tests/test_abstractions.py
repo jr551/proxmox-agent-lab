@@ -247,6 +247,9 @@ class AuditTests(unittest.TestCase):
     event, and an unrecordable event is reported, never raised into the
     action."""
 
+    def tearDown(self) -> None:
+        audit_module.close_store()
+
     def test_redaction_masks_secrets_at_any_depth(self) -> None:
         masked = audit_module.redact({
             "password": "a",

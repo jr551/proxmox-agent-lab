@@ -422,6 +422,39 @@ class CreateTests(GuestCase):
         self.assertEqual([argv[0] for argv in self.argvs()], ["pvesh"])
         self.assertEqual(self.resources(), [])
 
+    def test_create_refuses_non_positive_vmid(self) -> None:
+        self.open_lease()
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd("guest", "create", "--lease", LEASE, "--vmid", "0")
+        self.assertIn("positive integer", str(caught.exception))
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd("guest", "create", "--lease", LEASE, "--vmid", "-5")
+        self.assertIn("positive integer", str(caught.exception))
+
+    def test_create_refuses_non_positive_memory_and_cores(self) -> None:
+        self.open_lease()
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "create", "--lease", LEASE, "--vmid", "101",
+                "--memory", "0",
+            )
+        self.assertIn("--memory must be a positive integer", str(caught.exception))
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "create", "--lease", LEASE, "--vmid", "101",
+                "--cores", "-1",
+            )
+        self.assertIn("--cores must be a positive integer", str(caught.exception))
+
+    def test_create_refuses_non_positive_disk_gb(self) -> None:
+        self.open_lease()
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "create", "--lease", LEASE, "--vmid", "101",
+                "--fresh", "--storage", "local-lvm", "--disk-gb", "-2",
+            )
+        self.assertIn("disk size must be a positive integer", str(caught.exception))
+
     def test_create_registers_the_resource_before_it_starts(self) -> None:
         self.open_lease()
         self.fake.add(r"^qm config 9000$", stdout=b"template: 1\nname: tpl\n")

@@ -28,7 +28,8 @@ Authoritative flags verified against `src/proxmox_agent_lab/cli.py` and the
 | `proxmox-lab power wake` / `proxmox-lab power shutdown` | `--standalone-authorized` | bare host power outside any lease — a person, not the lease finalizer, owns shutdown |
 
 The same gates exist on the MCP surface as data, not flags: `lease_destroy`,
-`guest_destroy` and `cleanup_expired` must carry `"confirm": true`; a missing
+`guest_destroy`, `guest_template` and `cleanup_expired` must carry `"confirm": true`
+(`guest_snapshot` requires it for `delete` and `rollback`); a missing
 or false value fails `-32602` before anything runs. The server exposes no `gc`, no `memflow`, and no standalone
 `power wake`/`shutdown` tool. Host maintenance, live memory access and bare
 power stay on the CLI.

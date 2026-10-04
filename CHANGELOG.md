@@ -7,6 +7,22 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+## 0.24.0 - 2026-10-04
+
+### Added
+
+- MCP `guest_create` supports `kind` (`qemu` | `lxc`) and `template` (int), enabling creation of LXC containers and explicit template cloning over MCP. If `ostemplate` is supplied, `kind` defaults to `lxc`.
+- MCP `push_file` and `pull_file` schemas and handlers accept optional `sha256` digest verification and custom `timeout` seconds, aligning with the CLI push/pull options.
+
+### Fixed
+
+- Closed leaked SQLite database connection in `audit.py` on test teardown, resolving `ResourceWarning: unclosed database` in strict test suites.
+- `storage content` now skips unreachable or disabled storage pools gracefully when scanning all stores on the node instead of failing the entire query. Explicit `--storage <name>` requests still surface store errors.
+- `guest_ip` ignores loopback IPv4 addresses (`127.x.x.x`) that may be reported on non-loopback interfaces.
+- `cluster_nextid` handles string outputs with leading/trailing whitespace cleanly.
+- `guest create` enforces positive integers for `--vmid`, `--memory`, `--cores`, and `--disk-gb`, refusing invalid non-positive values before calling Proxmox commands.
+- Updated documentation across `docs/AGENTS.md`, `docs/VERIFICATION.md`, and `docs/safety-policy.md` to reflect all 38 MCP tools, current 419 unit tests, and confirmation requirements.
+
 ## 0.23.0 - 2026-10-04
 
 ### Added

@@ -55,7 +55,7 @@ class ProxmoxTests(unittest.TestCase):
         self.assertEqual(call["timeout"], 30.0)
 
     def test_cluster_nextid_reads_the_json_string(self) -> None:
-        self.ssh.add(r"pvesh get /cluster/nextid", stdout=b'"120"\n')
+        self.ssh.add(r"pvesh get /cluster/nextid", stdout=b'" 120 "\n')
         self.assertEqual(self.pve.cluster_nextid(), 120)
         self.assertEqual(
             self.ssh.calls[0]["argv"],
@@ -347,6 +347,10 @@ class ProxmoxTests(unittest.TestCase):
             {
                 "name": "lo",
                 "ip-addresses": [{"ip-address": "127.0.0.1", "ip-address-type": "ipv4"}],
+            },
+            {
+                "name": "dummy0",
+                "ip-addresses": [{"ip-address": "127.0.1.1", "ip-address-type": "ipv4"}],
             },
             {
                 "name": "eth0",

@@ -47,7 +47,7 @@ That does not mean the suite is thin — it means the boundary between
 
 ## The suite that exists
 
-373 tests, warning-clean (`PYTHONWARNINGS=error`), run with:
+419 tests, warning-clean (`PYTHONWARNINGS=error`), run with:
 
 ```bash
 python3 -m unittest discover -s tests -q
@@ -72,7 +72,7 @@ Three harnesses do the heavy lifting:
   power-off decision run end to end.
 - **Real stdio for the MCP server** — `test_mcp.py` spawns
   `proxmox-lab mcp` and speaks newline-delimited JSON-RPC over real pipes:
-  `initialize`, `tools/list` returning exactly 33 schema'd tools,
+  `initialize`, `tools/list` returning exactly 38 schema'd tools,
   `tools/call` dispatch, error shapes, and the idle-shutdown self-wake.
 
 ## What the suite proves

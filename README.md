@@ -1,18 +1,20 @@
 # proxmox-agent-lab
 
-**Disposable Proxmox guests over SSH. The lease cleans them up. Powering the host off is optional.**
+**Proxmox skill and MCP server for AI agents to operate VMs and containers over SSH. Clean Python, stdlib only, zero dependencies.**
 
 [![CI](https://github.com/jr551/proxmox-agent-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/jr551/proxmox-agent-lab/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/jr551/proxmox-agent-lab)](https://github.com/jr551/proxmox-agent-lab/releases/latest)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/MCP-38%20tools-purple)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-One machine, one Proxmox host, root SSH. Your key is the only credential.
-Python 3.11+, no extra packages.
+A Proxmox skill and MCP server built for AI agents (Cursor, Claude, or any MCP client) to safely operate Proxmox VE virtual machines and LXC containers over SSH. Written in pure, dependency-free Python (standard library only) — your SSH key is the only credential, and nothing needs to be installed on the hypervisor.
+
+Operate guests with fail-closed safety: every mutation belongs to an active lease, resources are tracked in a local SQLite database (`lab.db`), and teardown cleans up only lease-owned guests. Includes full guest lifecycle management, command execution, chunked file transfer, and console control (keystrokes and screenshots). Host power management (Wake-on-LAN and verified shutdown) is strictly optional and off by default.
 
 ## Why this one
 
-[ProxmoxMCP-Plus](https://github.com/RekklesNA/ProxmoxMCP-Plus) and [canvrno/ProxmoxMCP](https://github.com/canvrno/ProxmoxMCP) authenticate with a Proxmox API token and call the HTTPS API. This one does not. Your SSH key is the only credential, and every remote command is one argv on an allowlist. A lease owns each guest and deletes it when the lease ends. The host stays up unless `[power] auto_shutdown` is on. `guest create` refuses a disk larger than the free space on that store. Cleanup will not touch a guest without the `proxmoxagentlab` tag. The package is the Python standard library only.
+[ProxmoxMCP-Plus](https://github.com/RekklesNA/ProxmoxMCP-Plus) and [canvrno/ProxmoxMCP](https://github.com/canvrno/ProxmoxMCP) authenticate with a Proxmox API token and call the HTTPS API. This one does not. Your SSH key is the only credential, and every remote command is one argv on an allowlist. A lease owns each guest and deletes it when the lease ends. The host stays up unless `[power] auto_shutdown` is on. `guest create` refuses a disk larger than the free space on that store. Cleanup will not touch a guest without the `proxmoxagentlab` tag. The package is the Python standard library only with zero external dependencies.
 
 ## 🚀 Setup
 

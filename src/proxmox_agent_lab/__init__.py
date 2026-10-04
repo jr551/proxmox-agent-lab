@@ -1,9 +1,8 @@
-"""Lease-managed, fail-closed control of a Proxmox home lab.
+"""Proxmox skill and MCP server for AI agents.
 
-Give an AI agent disposable Proxmox guests that clean up after themselves. A
-lease bounds the work; when it ends, the guests it created are destroyed.
-The host stays up unless `[power] auto_shutdown` is true and nothing else
-is running.
+Operate Proxmox VE virtual machines and containers over root SSH in pure
+Python with fail-closed leased guests, file transfer, and console control.
+Host power management is strictly optional.
 """
 
 __version__ = "0.24.0"

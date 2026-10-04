@@ -1,6 +1,6 @@
 ---
 name: proxmox-agent-lab
-description: Drive a self-hosted Proxmox lab over root SSH with leased, fail-closed guests. Host power-off is optional. Create, start, probe, and destroy VMs and LXC containers, run commands, move files, and type at or screenshot guest consoles — from the `proxmox-lab` CLI or its stdio MCP server. Use for authorized security research, clean-machine testing, installers, home labs, or spare-PC virtualization.
+description: Proxmox skill and MCP server for AI agents to operate VMs and containers over root SSH in pure Python. Leased guests, fail-closed safety, file transfer, and console control. Host power-off is strictly optional. Use for software testing, builds, security research, or homelab automation.
 ---
 
 # proxmox-agent-lab
@@ -11,7 +11,7 @@ credential. All lease, resource, and journal state lives in one local SQLite
 file (`lab.db`, under `[state] dir`). Host power-off is optional
 (`[power] auto_shutdown`, default false). **Nothing runs on the
 Proxmox host** except `qm`/`pct`/`pvesh` — plus one optional garbage-collector
-cron line (`gc install`). Zero third-party dependencies.
+cron line (`gc install`). Zero third-party dependencies, standard library only.
 
 ## Why this one
 
@@ -208,7 +208,7 @@ active lease the server performs the verified host shutdown itself.
 | `console_calibrate` | measure this client's image scaling (`action`, `samples`) |
 | `console_grid` | screenshot with a coordinate grid burned in |
 | `console_burst` | capture several frames in one call, stitched |
-| `cleanup_expired` | sweep expired leases (`confirm`; may power off an idle host) |
+| `cleanup_expired` | sweep expired leases (`confirm`; powers host off only if auto_shutdown enabled) |
 | `journal_query` | audit events from lab.db (read-only) |
 | `doctor` | end-to-end health check (read-only) |
 | `status` | host, leases, `memory.free`, `memory.total`, `cpu_count` (read-only; same as `proxmox-lab status`) |
@@ -290,9 +290,9 @@ them yourself — `lease-register` is the way in.
   are rejected before anything is sent. Remote output and MCP errors are
   redacted before reaching the journal.
 - **GC backstop.** `gc install` puts one root crontab line on the host
-  (`/usr/local/sbin/pxl-gc`, every 10 min): it destroys guests whose
-  `pxl-expiry` has passed and powers the host off when nothing is running —
-  the net for agents that walked away.
+  (`/usr/local/sbin/pxl-gc`, every 10 min): it reaps guests whose
+  `pxl-expiry` has passed and (when configured) powers the host off when
+  nothing is running — the safety net for agents that walked away.
 
 ## Memory, from underneath
 

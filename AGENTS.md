@@ -5,7 +5,7 @@
 
 ## Project Overview
 
-`proxmox-agent-lab` is a Python package and agent skill for operating a disposable Proxmox research lab. It is a slim SSH-only control plane: `ssh-copy-id root@proxmox` is the whole credential story, `qm`/`pct`/`pvesh` run over one SSH seam, one local SQLite `lab.db` holds leases, resources and the audit journal, and `proxmox-lab mcp` serves the same operations as a 38-tool MCP surface. The `proxmox-lab` CLI takes a lease, creates and operates lease-owned VMs/LXCs, transfers files and drives the console, then destroys lease-owned resources and verifies the host powered off.
+`proxmox-agent-lab` is a Python package and agent skill for AI agents to operate Proxmox VE VMs and containers. It is a slim SSH-only control plane: `ssh-copy-id root@proxmox` is the whole credential story, `qm`/`pct`/`pvesh` run over one SSH seam, one local SQLite `lab.db` holds leases, resources and the audit journal, and `proxmox-lab mcp` serves the same operations as a 38-tool MCP surface. The `proxmox-lab` CLI takes a lease, creates and operates lease-owned VMs/LXCs, transfers files and drives the console, then destroys lease-owned resources when the lease ends (with host power-off strictly optional).
 
 Use it only for systems the operator owns or is authorized to test. The safety model is part of the product: leases, ownership checks, expiry, audit redaction, the remote-command allowlist, explicit host-change gates, and verified shutdown must remain intact.
 
@@ -34,7 +34,7 @@ Use it only for systems the operator owns or is authorized to test. The safety m
 
 5. **Power and the host-side GC**
    - `power.py` sends the WoL magic packet over stdlib UDP and implements verified shutdown: `shutdown -h now`, then repeated ssh/TCP :22 probe failure — power-off is a proven fact, never assumed. Standalone `power wake`/`power shutdown` are refused without `--standalone-authorized`.
-   - `resources/pxl-gc.py` is a standalone stdlib-only script (no package imports) installed to `/usr/local/sbin/pxl-gc` plus one root crontab line by `gc.py` (`gc install|status|uninstall`, gated `--host-change-authorized` except `status`). It reaps expired-lease pxl-tagged guests and powers the host off when clear — it reads guest metadata, never the controller's database.
+   - `resources/pxl-gc.py` is a standalone stdlib-only script (no package imports) installed to `/usr/local/sbin/pxl-gc` plus one root crontab line by `gc.py` (`gc install|status|uninstall`, gated `--host-change-authorized` except `status`). It reaps expired-lease pxl-tagged guests and (when idle power-off is configured) powers the host off when clear — it reads guest metadata, never the controller's database.
 
 6. **Guest channels**
    - `guest.py` covers create/clone/start/stop/destroy/run/probe/list through `proxmox.py`; `transfer.py` pushes/pulls files via chunked base64 over guest exec; `console.py` takes screenshots (`qm monitor` screendump → PPM → PNG) and sends keystrokes (`qm sendkey`). Every mutation goes through `guest.require_owned` against the store before any remote call.

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "proxmox-agent-lab"
 version = "0.24.0"
-description = "A skill that gives an AI agent disposable Proxmox guests that clean up after themselves."
+description = "Proxmox skill and MCP server for AI agents to operate VMs and containers over SSH."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -17,6 +17,10 @@ keywords = [
     "malware-analysis",
     "wake-on-lan",
     "ai-agents",
+    "mcp",
+    "mcp-server",
+    "agent-skill",
+    "python",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

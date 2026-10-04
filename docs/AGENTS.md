@@ -70,8 +70,8 @@ Notes that matter:
 - Results arrive as `content[0].text` carrying the same JSON the CLI prints;
   `console_screenshot` returns the PNG inline as `png_base64`.
 - Every call refreshes the idle clock and records name + ok + target only —
-  after `idle_shutdown_seconds` (default 8h) with no active lease the server
-  powers the host off itself. Going silent is not a way to keep the host up.
+  when `[power] auto_shutdown` is enabled, after `idle_shutdown_seconds` (default 8h)
+  with no active lease the server powers the host off. Going silent is not a way to keep the host up.
 - No `gc`, no `memflow`, and no standalone `power wake`/`shutdown` tools
   exist. Host maintenance, live memory access and bare power are CLI work.
 

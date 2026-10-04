@@ -321,8 +321,8 @@ INFRA_TAG = cleanup_module.INFRA_TAG
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="proxmox-lab",
-        description="Lease-managed, fail-closed control of a Proxmox home lab "
-                    "that powers itself on and off.",
+        description="Proxmox skill and MCP server for AI agents to operate "
+                    "VMs and containers over SSH.",
     )
     root.add_argument("--version", action="version", version=__version__)
     sub = root.add_subparsers(dest="command", required=True)

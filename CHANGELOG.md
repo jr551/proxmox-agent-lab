@@ -7,6 +7,22 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+## 0.22.0 - 2026-10-04
+
+### Added
+
+- Fresh qemu guests can be an old machine: `--disk-bus ide`, `--nic`
+  (`pcnet`, `ne2k_pci`, and the other Proxmox models), `--cpu`,
+  `--machine`, `--vga`, `--ostype`, and `--boot`.
+- `guest media` changes the CD or floppy of a lease-owned qemu guest
+  without rebooting, so a multi-disk installer can be driven.
+- `status` reports `memory.free`, `memory.total`, `memory.used`, and
+  `cpu_count` from the node, so a guest can be sized from what is free.
+- `guest create` refuses a fresh disk larger than the free space on
+  that store before anything is created. The error names the store and
+  the free amount. Memory stays the operator's judgment: leave the host
+  some RAM.
+
 ## 0.21.0 - 2026-10-04
 
 ### Added

@@ -106,6 +106,22 @@ class GuestCase(unittest.TestCase):
     def argvs(self) -> list[list[str]]:
         return [call["argv"] for call in self.fake.calls]
 
+    def script_storage(
+        self, storage: str = "local-lvm", avail: int = 100 * 1024 ** 3
+    ) -> None:
+        """Enough free space for a fresh disk, from a read-only storage list."""
+        payload = json.dumps([{
+            "storage": storage,
+            "type": "lvmthin",
+            "active": 1,
+            "enabled": 1,
+            "used": 1,
+            "avail": avail,
+            "total": avail + 1,
+            "content": "images,rootdir",
+        }]).encode()
+        self.fake.add(r"^pvesh get /nodes/pve/storage ", stdout=payload)
+
 
 class SurfaceTests(GuestCase):
     def test_register_exposes_the_guest_subcommands(self) -> None:
@@ -119,7 +135,7 @@ class SurfaceTests(GuestCase):
         ]
         self.assertEqual(
             sorted(action.choices),
-            ["clone", "create", "destroy", "list", "probe", "run",
+            ["clone", "create", "destroy", "list", "media", "probe", "run",
              "snapshot", "start", "stop", "template"],
         )
 
@@ -280,6 +296,7 @@ class CreateTests(GuestCase):
 
     def test_fresh_qemu_create_attaches_an_iso_and_boots_it_first(self) -> None:
         self.open_lease()
+        self.script_storage()
         self.fake.add(r"^qm create 101")
         self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
         self.run_cmd(
@@ -287,13 +304,47 @@ class CreateTests(GuestCase):
             "--fresh", "--storage", "local-lvm", "--disk-gb", "8",
             "--iso", "local:iso/alpine.iso",
         )
-        argv = self.argvs()[0]
+        self.assertEqual(self.argvs()[0][0], "pvesh")
+        argv = next(item for item in self.argvs() if item[:2] == ["qm", "create"])
         self.assertIn("--ide2", argv)
         self.assertEqual(
             argv[argv.index("--ide2") + 1], "local:iso/alpine.iso,media=cdrom"
         )
         self.assertIn("order=ide2;scsi0", argv)
         self.assertIn("virtio-scsi-pci", argv)
+
+    def test_fresh_ide_guest_gets_an_old_nic_and_no_scsi(self) -> None:
+        self.open_lease()
+        self.script_storage()
+        self.fake.add(r"^qm create 101")
+        self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
+        self.run_cmd(
+            "guest", "create", "--lease", LEASE, "--vmid", "101", "--fresh",
+            "--storage", "local-lvm", "--disk-gb", "2", "--disk-bus", "ide",
+            "--nic", "pcnet", "--cpu", "pentium", "--machine", "pc",
+            "--vga", "cirrus", "--ostype", "other",
+            "--boot", "order=floppy;ide2;ide0",
+            "--iso", "local:iso/nt.iso", "--memory", "64", "--cores", "1",
+        )
+        self.assertEqual(self.argvs()[0][0], "pvesh")
+        argv = next(item for item in self.argvs() if item[:2] == ["qm", "create"])
+        self.assertIn("--ide0", argv)
+        self.assertNotIn("--scsi0", argv)
+        self.assertNotIn("virtio-scsi-pci", argv)
+        self.assertEqual(
+            argv[argv.index("--net0") + 1], "pcnet,bridge=vmbr0"
+        )
+        self.assertIn("order=floppy;ide2;ide0", argv)
+        self.assertIn("pentium", argv)
+
+    def test_a_bad_nic_never_reaches_the_seam(self) -> None:
+        self.open_lease()
+        with self.assertRaises(errors.LabError):
+            self.run_cmd(
+                "guest", "create", "--lease", LEASE, "--vmid", "101",
+                "--fresh", "--nic", "virtio,bridge=vmbr1",
+            )
+        self.assertEqual(self.argvs(), [])
 
     def test_a_bad_iso_volid_never_reaches_the_seam(self) -> None:
         self.open_lease()
@@ -336,6 +387,7 @@ class CreateTests(GuestCase):
         # Hosts whose 'local' dir storage lacks rootdir need --storage:
         # pct create gets --rootfs <storage>:<gb>.
         self.open_lease()
+        self.script_storage()
         self.fake.add(r"^pct create 102")
         self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
         self.run_cmd(
@@ -345,11 +397,29 @@ class CreateTests(GuestCase):
             "--storage", "local-lvm", "--disk-gb", "4",
         )
         tags, description = lab_guest.metadata_for(LEASE, EXPIRY)
-        self.assertEqual(self.argvs()[0], [
+        self.assertEqual(self.argvs()[0][0], "pvesh")
+        self.assertEqual(self.argvs()[1], [
             "pct", "create", "102", "local:vztmpl/debian-12.tar.zst",
             "--hostname", "ct8", "--rootfs", "local-lvm:4",
             "--tags", tags, "--description", description,
         ])
+
+    def test_fresh_create_refuses_a_disk_larger_than_the_store(self) -> None:
+        self.open_lease()
+        free = 5 * 1024 ** 3
+        self.script_storage(avail=free)
+        self.fake.add(r"^qm create 101")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "create", "--lease", LEASE, "--vmid", "101",
+                "--fresh", "--storage", "local-lvm", "--disk-gb", "8",
+            )
+        message = str(caught.exception)
+        self.assertIn("local-lvm", message)
+        self.assertIn(str(free), message)
+        self.assertIn("8 GB", message)
+        self.assertEqual([argv[0] for argv in self.argvs()], ["pvesh"])
+        self.assertEqual(self.resources(), [])
 
     def test_create_registers_the_resource_before_it_starts(self) -> None:
         self.open_lease()

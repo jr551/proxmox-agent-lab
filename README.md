@@ -56,7 +56,7 @@ That clones your template into a free VMID. If `doctor` warned, use `--fresh` an
 | 💾 | `proxmox-lab storage status` | Free space on each store. Read-only |
 | 🕸️ | `proxmox-lab netcap capture --lease "$L" --vmid N --out cap.pcap` | Pcap of that VM's tap only. TLS stays ciphertext |
 | 🧠 | `proxmox-lab memflow read --lease "$L" --vmid N --addr 0x1000` | Read a running qemu guest from outside it |
-| 🔌 | `proxmox-lab mcp` | The same operations as 33 tools over stdio |
+| 🔌 | `proxmox-lab mcp` | The same operations as 34 tools over stdio |
 
 Agents follow [SKILL.md](SKILL.md). Everything else is in [docs/README.md](docs/README.md).
 

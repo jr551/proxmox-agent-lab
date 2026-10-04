@@ -185,22 +185,47 @@ class Proxmox:
         memory: int | None = None,
         cores: int | None = None,
         iso: str | None = None,
+        ide0: str | None = None,
+        cpu: str | None = None,
+        machine: str | None = None,
+        vga: str | None = None,
+        ostype: str | None = None,
+        boot: str | None = None,
     ) -> None:
         argv = ["qm", "create", str(vmid), "--name", name, "--net0", net0]
         if scsi0 is not None:
             argv += ["--scsi0", scsi0]
+        if ide0 is not None:
+            argv += ["--ide0", ide0]
         if memory is not None:
             argv += ["--memory", str(memory)]
         if cores is not None:
             argv += ["--cores", str(cores)]
+        if cpu is not None:
+            argv += ["--cpu", cpu]
+        if machine is not None:
+            argv += ["--machine", machine]
+        if vga is not None:
+            argv += ["--vga", vga]
+        if ostype is not None:
+            argv += ["--ostype", ostype]
         if iso is not None:
             # CD first, then the disk, so an empty disk does not hide the
-            # installer. virtio-scsi is what current installers expect to
-            # see when a scsi disk was requested.
+            # installer. virtio-scsi is what current installers expect when
+            # the disk is scsi. An IDE disk is a different machine: no
+            # scsi controller, and the CD is ide2 beside ide0.
             argv += ["--ide2", f"{iso},media=cdrom"]
-            argv += ["--boot", "order=ide2;scsi0" if scsi0 else "order=ide2"]
+            if boot is None:
+                if scsi0 is not None:
+                    boot = "order=ide2;scsi0"
+                elif ide0 is not None:
+                    boot = "order=ide2;ide0"
+                else:
+                    boot = "order=ide2"
             if scsi0 is not None:
                 argv += ["--scsihw", "virtio-scsi-pci"]
+        if boot is not None:
+            argv += ["--boot", boot]
         argv += ["--tags", tags, "--description", description]
         _require(self._ssh.run(argv, timeout=CREATE_TIMEOUT), f"qm create {vmid}")
 
@@ -312,6 +337,22 @@ class Proxmox:
         if purge and tool == "qm":
             argv += ["--purge", "1"]
         _require(self._ssh.run(argv, timeout=DEFAULT_TIMEOUT), f"{tool} destroy {vmid}")
+
+    def set_cdrom(self, vmid: int, volid: str | None) -> None:
+        """Point ide2 at a CD, or eject it. The disk on ide0 is left alone."""
+        if volid is None:
+            argv = ["qm", "set", str(vmid), "--ide2", "none,media=cdrom"]
+        else:
+            argv = ["qm", "set", str(vmid), "--ide2", f"{volid},media=cdrom"]
+        _require(self._ssh.run(argv, timeout=DEFAULT_TIMEOUT), f"qm set {vmid} cdrom")
+
+    def set_floppy(self, vmid: int, volid: str | None) -> None:
+        """Insert a floppy image, or remove the floppy drive's media."""
+        if volid is None:
+            argv = ["qm", "set", str(vmid), "--delete", "floppy"]
+        else:
+            argv = ["qm", "set", str(vmid), "--floppy", volid]
+        _require(self._ssh.run(argv, timeout=DEFAULT_TIMEOUT), f"qm set {vmid} floppy")
 
     def make_template(self, kind: str, vmid: int) -> None:
         """Convert a stopped guest into a Proxmox template (``qm``/``pct template``)."""

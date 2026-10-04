@@ -44,6 +44,7 @@ guest lifecycle over the proxmox seam
 - `proxmox-lab guest create` — create a lease-owned guest from the template, or fresh
 - `proxmox-lab guest destroy` — destroy a lease-owned guest (irreversible)
 - `proxmox-lab guest list` — registered guests joined with live state (read-only)
+- `proxmox-lab guest media` — change the CD or floppy of a lease-owned qemu guest
 - `proxmox-lab guest probe` — how can this guest be reached? (read-only)
 - `proxmox-lab guest run` — run a command in a lease-owned guest
 - `proxmox-lab guest snapshot` — list, create, delete or roll back snapshots

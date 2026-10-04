@@ -1,6 +1,6 @@
 """The MCP server: stdio JSON-RPC 2.0, stdlib only, no SDK.
 
-``proxmox-lab mcp`` serves the 33-tool surface over
+``proxmox-lab mcp`` serves the 34-tool surface over
 stdin/stdout. The wire format is newline-delimited JSON -- one complete
 JSON-RPC message per line, UTF-8, with no ``Content-Length`` framing. stdout
 carries protocol messages only; everything else goes to stderr.
@@ -160,7 +160,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "guest_create",
-        "description": "Create a lease-owned guest from the template.",
+        "description": (
+            "Create a lease-owned guest from the template. "
+            "Read storage_status first and size the disk to the task "
+            "with headroom; a disk larger than that store's free space "
+            "is refused. Leave the host RAM headroom."
+        ),
         "inputSchema": _schema(
             required=("lease_id", "vmid"),
             lease_id=_STR,
@@ -172,6 +177,16 @@ TOOLS: tuple[dict[str, Any], ...] = (
             ostemplate=_STR,
             storage=_STR,
             disk_gb=_INT,
+            disk_bus={"type": "string", "enum": ["scsi", "ide"]},
+            nic=_STR,
+            bridge=_STR,
+            cpu=_STR,
+            machine=_STR,
+            vga={"type": "string", "enum": ["std", "cirrus", "vmware", "none"]},
+            ostype=_STR,
+            boot=_STR,
+            iso=_STR,
+            fresh=_BOOL,
         ),
     },
     {
@@ -184,6 +199,21 @@ TOOLS: tuple[dict[str, Any], ...] = (
             source=_INT,
             name=_STR,
             full=_BOOL,
+        ),
+    },
+    {
+        "name": "guest_media",
+        "description": (
+            "Change the CD or floppy of a lease-owned qemu guest. "
+            "Does not reboot."
+        ),
+        "inputSchema": _schema(
+            required=("lease_id", "vmid"),
+            lease_id=_STR,
+            vmid=_INT,
+            cdrom=_STR,
+            floppy=_STR,
+            eject={"type": "string", "enum": ["cdrom", "floppy"]},
         ),
     },
     {
@@ -583,10 +613,19 @@ def _dispatch_guest_create(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
             kind="qemu",
             start=a.get("start", True),
             template=None,
-            fresh=False,
             ostemplate=a.get("ostemplate"),
             storage=a.get("storage"),
             disk_gb=a.get("disk_gb"),
+            fresh=bool(a.get("fresh")),
+            iso=a.get("iso"),
+            disk_bus=a.get("disk_bus") or "scsi",
+            nic=a.get("nic") or "virtio",
+            bridge=a.get("bridge") or "vmbr0",
+            cpu=a.get("cpu"),
+            machine=a.get("machine"),
+            vga=a.get("vga"),
+            ostype=a.get("ostype"),
+            boot=a.get("boot"),
         ),
     )
 
@@ -598,6 +637,22 @@ def _dispatch_guest_clone(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
         guest.cmd_clone,
         lab,
         _ns(a, lease=a["lease_id"], full=a.get("full", True)),
+    )
+
+
+def _dispatch_guest_media(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import guest
+
+    return _invoke(
+        guest.cmd_media,
+        lab,
+        _ns(
+            a,
+            lease=a["lease_id"],
+            cdrom=a.get("cdrom"),
+            floppy=a.get("floppy"),
+            eject=a.get("eject"),
+        ),
     )
 
 
@@ -1040,6 +1095,7 @@ _DISPATCH: dict[str, Callable[[Any, dict[str, Any]], dict[str, Any]]] = {
     "lease_register": _dispatch_lease_register,
     "guest_create": _dispatch_guest_create,
     "guest_clone": _dispatch_guest_clone,
+    "guest_media": _dispatch_guest_media,
     "guest_start": _dispatch_guest_start,
     "guest_stop": _dispatch_guest_stop,
     "guest_destroy": _dispatch_guest_destroy,

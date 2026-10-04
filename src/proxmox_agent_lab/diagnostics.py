@@ -532,6 +532,17 @@ def cmd_journal(lab: Any, args: argparse.Namespace) -> None:
 
 # -- status ----------------------------------------------------------------
 
+def _nonneg_int(value: Any) -> int | None:
+    """A non-negative integer from a node-status field, or None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return None
+
+
 def cmd_status(lab: Any, args: argparse.Namespace) -> None:
     """Host + lease overview. Read-only; works while the host is off."""
     config = lab.CONFIG
@@ -585,9 +596,26 @@ def cmd_status(lab: Any, args: argparse.Namespace) -> None:
         output["pveversion_error"] = str(exc)[:200]
     if node:
         try:
-            output["uptime_seconds"] = prox.node_status().get("uptime")
+            node_status = prox.node_status()
         except LabError:
-            pass
+            node_status = None
+        if isinstance(node_status, dict):
+            if "uptime" in node_status:
+                output["uptime_seconds"] = node_status.get("uptime")
+            memory = node_status.get("memory")
+            if isinstance(memory, dict):
+                figure = {
+                    key: value
+                    for key in ("free", "total", "used")
+                    if (value := _nonneg_int(memory.get(key))) is not None
+                }
+                if "free" in figure:
+                    output["memory"] = figure
+            cpuinfo = node_status.get("cpuinfo")
+            if isinstance(cpuinfo, dict):
+                cpus = _nonneg_int(cpuinfo.get("cpus"))
+                if cpus is not None:
+                    output["cpu_count"] = cpus
     guests: dict[str, list[int]] = {"qemu": [], "lxc": []}
     for kind, tool in (("qemu", "qm"), ("lxc", "pct")):
         result = ssh.run([tool, "list"], timeout=_REMOTE_CHECK_TIMEOUT)

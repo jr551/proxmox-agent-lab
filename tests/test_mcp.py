@@ -1,4 +1,4 @@
-"""Tests for the MCP server (``mcp.py``): the 33-tool surface over stdio.
+"""Tests for the MCP server (``mcp.py``): the 34-tool surface over stdio.
 
 Two harnesses, both speaking real newline-delimited JSON-RPC bytes:
 
@@ -51,6 +51,7 @@ TOOL_NAMES = [
     "lease_register",
     "guest_create",
     "guest_clone",
+    "guest_media",
     "guest_start",
     "guest_stop",
     "guest_destroy",
@@ -396,13 +397,13 @@ class InProcessProtocolTests(McpTestCase):
         self.assertIn("version", result["serverInfo"])
         self.assertEqual(result["capabilities"], {"tools": {}})
 
-    def test_tools_list_is_exactly_the_33_tools_with_schemas(self):
+    def test_tools_list_is_exactly_the_34_tools_with_schemas(self):
         with _InProcessMcp(self.lab) as server:
             listed = server.request({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/list",
             })
         tools = listed["result"]["tools"]
-        self.assertEqual(len(tools), 33)
+        self.assertEqual(len(tools), 34)
         self.assertEqual([t["name"] for t in tools], TOOL_NAMES)
         for tool in tools:
             schema = tool["inputSchema"]

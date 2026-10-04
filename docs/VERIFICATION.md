@@ -127,7 +127,7 @@ Verified as code behavior, area by area:
   scanned boot text. The helper's own argv shape (subcommand, numeric vmid,
   bounded hex) is refused at the seam. Building that helper on a host is
   not what the suite does.
-- **MCP.** Over real stdio: initialize shape, the static 33-tool list, bad
+- **MCP.** Over real stdio: initialize shape, the static 34-tool list, bad
   params as `-32602` naming the field, action failures as `-32603` with
   redacted messages, notifications answered with silence, every call
   refreshing the idle clock, and the idle sweep firing a verified shutdown

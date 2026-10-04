@@ -41,6 +41,19 @@ _CONFIG_LINE = re.compile(r"^([A-Za-z0-9_-]+):\s?(.*)$")
 _PXL_EXPIRY = re.compile(r"pxl-expiry=(\d+)")
 _SNAP_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 _ISO_VOLID = re.compile(r"^[A-Za-z0-9_.-]+:iso/[A-Za-z0-9_.+-]+$")
+_NIC_MODELS = frozenset({
+    "virtio", "e1000", "rtl8139", "pcnet", "ne2k_pci", "vmxnet3",
+})
+_DISK_BUSES = frozenset({"scsi", "ide"})
+_VGA_MODELS = frozenset({"std", "cirrus", "vmware", "none"})
+_OSTYPES = frozenset({"other", "wxp", "w2k", "l24", "l26", "solaris"})
+_MACHINE = re.compile(r"^(pc|q35)(-[A-Za-z0-9._+-]+)?$")
+_CPU_TYPE = re.compile(r"^[A-Za-z0-9_+-]{1,32}$")
+_BRIDGE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,14}$")
+_BOOT = re.compile(
+    r"^order=(ide[0-3]|scsi[0-9]|floppy|net0|sata[0-5])"
+    r"(;(ide[0-3]|scsi[0-9]|floppy|net0|sata[0-5]))*$"
+)
 _MAX_SNAPSHOT_DESCRIPTION = 200
 
 DEFAULT_STOP_TIMEOUT = 120
@@ -200,6 +213,51 @@ def _emit(payload: dict) -> dict:
 
 # -- registry writes -------------------------------------------------------
 
+_GIB = 1024 ** 3
+
+
+def _format_free(nbytes: int) -> str:
+    """Free space as GiB when it lands on a GiB boundary, plus the raw bytes."""
+    if nbytes >= 0 and nbytes % _GIB == 0:
+        return f"{nbytes // _GIB} GiB ({nbytes} bytes)"
+    return f"{nbytes} bytes"
+
+
+def _assert_disk_fits(prox: Any, storage: str, disk_gb: int) -> None:
+    """Refuse a fresh disk larger than the free space on ``storage``.
+
+    This is a read of storage status, then a hard stop, before any create.
+    Memory is not part of the check: RAM headroom is the caller's judgment.
+    """
+    row = next(
+        (
+            item for item in prox.storage_status()
+            if isinstance(item, dict) and item.get("storage") == storage
+        ),
+        None,
+    )
+    if row is None:
+        raise LabError(
+            f"storage {storage!r} is not on this node, so a {disk_gb} GB "
+            f"disk cannot be checked against free space. "
+            f"'proxmox-lab storage status' lists the stores."
+        )
+    avail = row.get("avail")
+    try:
+        free = int(avail)
+    except (TypeError, ValueError):
+        raise LabError(
+            f"storage {storage!r} did not report free space "
+            f"(avail={avail!r}); refusing a {disk_gb} GB disk"
+        ) from None
+    if disk_gb * _GIB > free:
+        raise LabError(
+            f"refusing a {disk_gb} GB disk on storage {storage!r}: "
+            f"{_format_free(free)} free. Pick a smaller disk. "
+            f"'proxmox-lab storage status' shows each store."
+        )
+
+
 def _lease_for_mutation(lab: Any, lease_id: str) -> dict:
     """The lease backing a new guest; refuses unknown and dead leases."""
     with _open_store(lab) as store:
@@ -256,6 +314,7 @@ def cmd_create(lab: Any, args: Any) -> dict:
             rootfs = None
             if args.storage:
                 disk_gb = int(args.disk_gb or 8)
+                _assert_disk_fits(prox, str(args.storage), disk_gb)
                 rootfs = f"{args.storage}:{disk_gb}"
             prox.lxc_create(
                 vmid,
@@ -271,19 +330,61 @@ def cmd_create(lab: Any, args: Any) -> dict:
                 raise LabError(
                     "--iso must be a storage volid like local:iso/name.iso"
                 )
-            scsi0 = None
+            bus = str(getattr(args, "disk_bus", None) or "scsi")
+            if bus not in _DISK_BUSES:
+                raise LabError("--disk-bus must be scsi or ide")
+            nic = str(getattr(args, "nic", None) or "virtio")
+            if nic not in _NIC_MODELS:
+                raise LabError(
+                    "--nic must be one of " + ", ".join(sorted(_NIC_MODELS))
+                )
+            bridge = str(getattr(args, "bridge", None) or "vmbr0")
+            if _BRIDGE.fullmatch(bridge) is None:
+                raise LabError("--bridge must be a bridge name like vmbr0")
+            cpu = _hardware_token(getattr(args, "cpu", None), _CPU_TYPE, "--cpu")
+            machine = _hardware_token(
+                getattr(args, "machine", None), _MACHINE, "--machine"
+            )
+            vga = getattr(args, "vga", None) or None
+            if vga is not None and vga not in _VGA_MODELS:
+                raise LabError(
+                    "--vga must be one of " + ", ".join(sorted(_VGA_MODELS))
+                )
+            ostype = getattr(args, "ostype", None) or None
+            if ostype is not None and ostype not in _OSTYPES:
+                raise LabError(
+                    "--ostype must be one of " + ", ".join(sorted(_OSTYPES))
+                )
+            boot = getattr(args, "boot", None) or None
+            if boot is not None and _BOOT.fullmatch(str(boot)) is None:
+                raise LabError(
+                    "--boot must look like order=ide2;ide0 "
+                    "(ide, scsi, sata, floppy, or net0)"
+                )
+            disk = None
             if args.storage:
-                disk_gb = int(args.disk_gb or 32)
-                scsi0 = f"{args.storage}:{disk_gb}"
+                disk_gb = int(args.disk_gb or (8 if bus == "ide" else 32))
+                _assert_disk_fits(prox, str(args.storage), disk_gb)
+                disk = f"{args.storage}:{disk_gb}"
+            net0 = None
+            if nic != "virtio" or bridge != "vmbr0":
+                net0 = f"{nic},bridge={bridge}"
             prox.qemu_create(
                 vmid,
                 name=name,
                 tags=tags,
                 description=description,
-                scsi0=scsi0,
+                scsi0=disk if bus == "scsi" else None,
+                ide0=disk if bus == "ide" else None,
                 memory=args.memory,
                 cores=args.cores,
                 iso=str(iso) if iso else None,
+                net0=net0 or "virtio,bridge=vmbr0",
+                cpu=cpu,
+                machine=machine,
+                vga=vga,
+                ostype=ostype,
+                boot=boot,
             )
     else:
         if getattr(args, "iso", None):
@@ -606,6 +707,14 @@ def cmd_list(lab: Any, args: Any) -> dict:
     return _emit({"guests": guests})
 
 
+def _hardware_token(value: str | None, pattern: re.Pattern[str], flag: str) -> str | None:
+    if value is None or value == "":
+        return None
+    if pattern.fullmatch(str(value)) is None:
+        raise LabError(f"{flag} is not a plain hardware name")
+    return str(value)
+
+
 def _snapshot_name(name: str) -> str:
     if name == "current" or _SNAP_NAME.fullmatch(name) is None:
         raise LabError(
@@ -752,6 +861,46 @@ def cmd_template(lab: Any, args: Any) -> dict:
     })
 
 
+def cmd_media(lab: Any, args: Any) -> dict:
+    """Change the CD or floppy of a lease-owned qemu guest.
+
+    Setup disks for an old installer are not one image. This swaps the
+    media the guest will see at the next read; it does not reboot.
+    """
+    lease_id, vmid = str(args.lease), int(args.vmid)
+    row = require_owned(lab, lease_id, None, vmid)
+    kind = str(row["kind"])
+    if kind != "qemu":
+        raise LabError(f"{kind} {vmid} has no qemu CD or floppy to change")
+    cdrom = getattr(args, "cdrom", None) or None
+    floppy = getattr(args, "floppy", None) or None
+    eject = getattr(args, "eject", None) or None
+    if eject is not None and eject not in ("cdrom", "floppy"):
+        raise LabError("--eject must be cdrom or floppy")
+    if not any((cdrom, floppy, eject)):
+        raise LabError("pass --cdrom, --floppy, or --eject")
+    if cdrom is not None and _ISO_VOLID.fullmatch(str(cdrom)) is None:
+        raise LabError("--cdrom must be a storage volid like local:iso/name.iso")
+    if floppy is not None and _ISO_VOLID.fullmatch(str(floppy)) is None:
+        raise LabError("--floppy must be a storage volid like local:iso/disk1.img")
+    prox = _make_proxmox(lab.CONFIG)
+    changed = []
+    if eject == "cdrom" or cdrom is not None:
+        prox.set_cdrom(vmid, None if eject == "cdrom" else str(cdrom))
+        changed.append("cdrom")
+    if eject == "floppy" or floppy is not None:
+        prox.set_floppy(vmid, None if eject == "floppy" else str(floppy))
+        changed.append("floppy")
+    lab.audit("guest-media", lease=lease_id, vmid=vmid, slots=",".join(changed))
+    return _emit({
+        "lease_id": lease_id,
+        "vmid": vmid,
+        "cdrom": cdrom,
+        "floppy": floppy,
+        "ejected": eject,
+    })
+
+
 def cmd_run(lab: Any, args: Any) -> dict:
     """Run one command in a lease-owned guest; the guest's real exit code.
 
@@ -817,7 +966,8 @@ def register(sub: Any, lab: Any) -> None:
                              "(LXC rootfs / QEMU scsi0)")
     create.add_argument("--disk-gb", type=int, default=None,
                         help="rootfs/disk size in GB for fresh creates "
-                             "(default: 8 LXC, 32 QEMU)")
+                             "(default: 8 LXC, 32 QEMU). Refused when "
+                             "larger than the free space on --storage")
     create.add_argument("--kind", choices=("qemu", "lxc"), default="qemu")
     create.add_argument(
         "--template",
@@ -831,6 +981,36 @@ def register(sub: Any, lab: Any) -> None:
         help="fresh qemu only: boot this CD volid (local:iso/name.iso). "
              "The image's own menu may still default to the hard disk",
     )
+    create.add_argument(
+        "--disk-bus", choices=("scsi", "ide"), default="scsi",
+        help="fresh qemu disk bus (default scsi; ide for old installers)",
+    )
+    create.add_argument(
+        "--nic", default="virtio",
+        help="fresh qemu NIC model (default virtio; pcnet or ne2k_pci "
+             "for guests with no virtio driver)",
+    )
+    create.add_argument(
+        "--bridge", default="vmbr0",
+        help="fresh qemu bridge for net0 (default vmbr0)",
+    )
+    create.add_argument("--cpu", help="fresh qemu CPU type, for example pentium")
+    create.add_argument(
+        "--machine", help="fresh qemu machine, pc or q35",
+    )
+    create.add_argument(
+        "--vga", choices=("std", "cirrus", "vmware", "none"),
+        help="fresh qemu display",
+    )
+    create.add_argument(
+        "--ostype",
+        choices=("other", "wxp", "w2k", "l24", "l26", "solaris"),
+        help="fresh qemu OS hint for Proxmox",
+    )
+    create.add_argument(
+        "--boot",
+        help="fresh qemu boot order, for example order=floppy;ide2;ide0",
+    )
     create.set_defaults(func=_bind(lab, cmd_create))
 
     clone = guest_sub.add_parser(
@@ -843,6 +1023,19 @@ def register(sub: Any, lab: Any) -> None:
     clone.add_argument("--full", action="store_true", default=True,
                        help="full copy (the only clone mode on this seam)")
     clone.set_defaults(func=_bind(lab, cmd_clone))
+
+    media = guest_sub.add_parser(
+        "media", help="change the CD or floppy of a lease-owned qemu guest"
+    )
+    media.add_argument("--lease", required=True)
+    media.add_argument("--vmid", type=int, required=True)
+    media.add_argument("--cdrom", help="volid to put in the CD drive")
+    media.add_argument("--floppy", help="volid to put in the floppy drive")
+    media.add_argument(
+        "--eject", choices=("cdrom", "floppy"),
+        help="remove that drive's media",
+    )
+    media.set_defaults(func=_bind(lab, cmd_media))
 
     start = guest_sub.add_parser("start", help="start a lease-owned guest")
     start.add_argument("--lease", required=True)

@@ -31,6 +31,17 @@ Rules that follow from that, and they are not negotiable:
 - **Check VMID and storage before creating.** Use an unused VMID and a pool
   that exists on this host: `guest create --vmid <free> --storage <pool>
   --disk-gb <n>`. A collision destroys a real machine.
+- **Size the guest from what is free.** Before `guest create`, run
+  `proxmox-lab storage status` and `proxmox-lab status`. Storage status
+  gives each store's `avail` in bytes. Status gives `memory.free`,
+  `memory.total`, and `cpu_count`. Choose a disk and a memory size the
+  task needs, with a little headroom, and stop there. A small test guest
+  stays small: a few GB of disk and a gigabyte or two of RAM is enough
+  to boot and look. Leave the rest of the store, and leave the host
+  enough RAM to keep running — the node and its other guests are using
+  it. A disk larger than that store's free space is refused before
+  anything is created; the error names the store and how much is free.
+  Memory is your judgment. Leave headroom.
 - **Do not force a power-off.** `lease-end` powers the host down only when
   nothing is running and two clear checks agree. If it leaves the host up,
   read the `reason` it prints — usually the operator's own guests. Report it;
@@ -118,7 +129,7 @@ asked for persistence. See [docs/long-term-leases.md](docs/long-term-leases.md).
 | `proxmox-lab lease-destroy --lease L --confirm` | forcibly end a lease (the only exit for long-term) |
 | `proxmox-lab lease-abandon --lease L --confirm` | close a lease, touching neither guests nor host power |
 | `proxmox-lab cleanup-expired` | sweep expired leases; `--all`, or `--reclaim-orphans` with `--host-change-authorized` |
-| `proxmox-lab guest create --lease L --vmid N` | clone `[pve] template_vmid` when it is `template: 1` (`--fresh` builds from scratch; `--iso local:iso/name.iso` boots that CD; a normal VM is refused) |
+| `proxmox-lab guest create --lease L --vmid N` | clone `[pve] template_vmid` when it is `template: 1` (`--fresh` builds from scratch; `--iso local:iso/name.iso` boots that CD; a normal VM is refused; a disk larger than the store's free space is refused) |
 | `proxmox-lab guest clone --lease L --vmid N --source M` | clone a registry-vouched template |
 | `proxmox-lab guest start --lease L --vmid N` / `guest stop` | lifecycle; stop is graceful then hard |
 | `proxmox-lab guest destroy --lease L --vmid N --confirm` | irreversible delete of a lease-owned guest |
@@ -148,7 +159,7 @@ asked for persistence. See [docs/long-term-leases.md](docs/long-term-leases.md).
 ## MCP server
 
 Point an MCP client at `proxmox-lab mcp` — a stdlib-only JSON-RPC 2.0 server
-on stdio (newline-delimited messages) exposing these 33 tools. They call the
+on stdio (newline-delimited messages) exposing these 34 tools. They call the
 same functions as the CLI; results are `content[0].text` carrying the CLI JSON
 body (screenshots as `png_base64`). Errors are JSON-RPC errors: `-32602` for
 schema/`confirm`/key-name violations, `-32603` for a failed action (redacted).
@@ -163,7 +174,8 @@ active lease the server performs the verified host shutdown itself.
 | `lease_list` | leases (active unless `include_ended`) |
 | `lease_destroy` | forcibly destroy a lease and its guests (`confirm`) |
 | `lease_register` | adopt an existing guest into a lease |
-| `guest_create` | create a lease-owned guest from the template |
+| `guest_create` | create a lease-owned guest (`fresh`, `iso`, `disk_bus`, `nic`) |
+| `guest_media` | change a qemu guest's CD or floppy |
 | `guest_clone` | clone a vouched template into a lease-owned guest |
 | `guest_start` | start a lease-owned guest |
 | `guest_stop` | stop a lease-owned guest (graceful, then hard) |

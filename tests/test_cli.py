@@ -92,6 +92,7 @@ class ParserBuildTests(unittest.TestCase):
             ["guest", "snapshot", "--help"],
             ["guest", "snapshot", "list", "--help"],
             ["guest", "template", "--help"],
+            ["guest", "media", "--help"],
             ["storage", "status", "--help"],
             ["netcap", "capture", "--help"],
             ["push", "--help"],

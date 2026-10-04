@@ -468,7 +468,10 @@ class StatusTests(DiagnosticsTestCase):
         self.ssh.add(r"^pveversion$", stdout=b"pve-manager/9.0.0\n")
         self.ssh.add(
             r"^pvesh get /nodes/pve/status --output-format json$",
-            stdout=b'{"uptime": 42}',
+            stdout=(
+                b'{"uptime": 42, "memory": {"free": 1000, "total": 4000, '
+                b'"used": 3000}, "cpuinfo": {"cpus": 8}}'
+            ),
         )
         self.ssh.add(r"^qm list$", stdout=b"     1001 guest1 running\n")
         self.ssh.add(r"^pct list$", stdout=b"VMID       Status     Name\n")
@@ -477,6 +480,10 @@ class StatusTests(DiagnosticsTestCase):
         self.assertTrue(out["reachable"])
         self.assertEqual(out["pveversion"], "pve-manager/9.0.0")
         self.assertEqual(out["uptime_seconds"], 42)
+        self.assertEqual(
+            out["memory"], {"free": 1000, "total": 4000, "used": 3000}
+        )
+        self.assertEqual(out["cpu_count"], 8)
         self.assertEqual(
             out["guests"], {"qemu": [1001], "lxc": []}
         )

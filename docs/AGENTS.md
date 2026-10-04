@@ -47,12 +47,12 @@ Deep notes beyond the quick-ref:
 ## 🧰 The MCP surface
 
 If your client speaks MCP, point it at `proxmox-lab mcp` (stdio JSON-RPC 2.0).
-All 33 tools call the same handlers the CLI binds — same behavior, same gates:
+All 34 tools call the same handlers the CLI binds — same behavior, same gates:
 
 | Group | Tools |
 |---|---|
 | leases | `lease_begin`, `lease_heartbeat`, `lease_end`, `lease_list`, `lease_destroy`, `lease_register` |
-| guests | `guest_create`, `guest_clone`, `guest_start`, `guest_stop`, `guest_destroy`, `guest_snapshot`, `guest_template`, `guest_probe`, `guest_list`, `guest_run` |
+| guests | `guest_create`, `guest_clone`, `guest_media`, `guest_start`, `guest_stop`, `guest_destroy`, `guest_snapshot`, `guest_template`, `guest_probe`, `guest_list`, `guest_run` |
 | files | `push_file`, `pull_file` |
 | console | `console_screenshot`, `console_type`, `console_keys`, `console_move`, `console_click`, `console_drag`, `console_calibrate`, `console_grid`, `console_burst` |
 | hygiene & health | `cleanup_expired`, `journal_query`, `doctor`, `power_status`, `storage_status`, `net_capture` |
@@ -111,6 +111,25 @@ the error names the `lease-register` command that fixes it. Read it rather
 than retrying.
 
 ## 📦 Creating and feeding guests
+
+Before `guest create`, size the machine from the host's free resources.
+
+```bash
+proxmox-lab storage status   # each store's avail, in bytes
+proxmox-lab status           # memory.free, memory.total, cpu_count
+```
+
+`storage status` is the disk figure. `status` is the RAM and CPU figure.
+Pick a disk and a memory size the task needs, and leave headroom. A small
+test guest stays small: a few GB of disk and a gigabyte or two of RAM is
+enough to boot and look. Leave the rest of the store. Leave the host
+enough RAM to keep itself and its other guests running. Memory is your
+judgment — a large share of the host's RAM is still your call to make,
+so make it with headroom left.
+
+`guest create` refuses a disk larger than the free space on that store
+before it creates anything. The error names the store and the free
+amount. Read it and ask for less.
 
 ```bash
 proxmox-lab guest create --lease "$L" --vmid 9001 --name probe --start

@@ -40,7 +40,7 @@ target = "proxmox"           # ssh alias/host reached as root
 
 [pve]
 node = "pve"                 # node name used in pvesh paths
-template_vmid = 100          # default template for guest clone/create
+template_vmid = 100          # clone source; must be template: 1, or create refuses
 
 [power]
 mac = ""                     # wired NIC MAC for WoL (discovered by init)
@@ -60,6 +60,7 @@ _PXL_LEASE = re.compile(r"pxl-lease=([a-z0-9-]{8,80})")
 _PXL_EXPIRY = re.compile(r"pxl-expiry=(\d+)")
 _CONFIG_LINE = re.compile(r"^([A-Za-z0-9_-]+):\s?(.*)$")
 _VMID_LINE = re.compile(r"^\s*(\d+)\s")
+_TEMPLATE_VALUE = re.compile(r"^template:\s*(\S+)")
 
 #: Interfaces that are never the wired uplink WoL needs: loopback, the Proxmox
 #: bridges, guest taps, firewall chains and anything clearly wireless/virtual.
@@ -277,6 +278,15 @@ def _drifted_guests(ssh: Any, state_root: Path) -> list[dict]:
     return drifted
 
 
+def _config_is_template(text: str) -> bool:
+    """True when a ``qm config``/``pct config`` dump says ``template: 1``."""
+    for line in text.splitlines():
+        match = _TEMPLATE_VALUE.match(line.strip())
+        if match and match.group(1).strip('"') in ("1", "on", "true"):
+            return True
+    return False
+
+
 def cmd_doctor(lab: Any, args: argparse.Namespace) -> None:
     """The §G checklist; exits non-zero when any check fails.
 
@@ -406,13 +416,23 @@ def cmd_doctor(lab: Any, args: argparse.Namespace) -> None:
         if not vmid:
             emit("template_vmid", True, "warning: [pve] template_vmid is not set")
             return
-        for tool in ("qm", "pct"):
+        for tool, kind in (("qm", "qemu"), ("pct", "lxc")):
             result = ssh.run(
                 [tool, "config", str(vmid)], timeout=_REMOTE_CHECK_TIMEOUT
             )
-            if result.ok and _text(result.stdout).strip():
-                emit("template_vmid", True, f"{tool} knows vmid {vmid}")
-                return
+            text = _text(result.stdout).strip() if result.ok else ""
+            if not text:
+                continue
+            if _config_is_template(text):
+                emit("template_vmid", True, f"{kind} {vmid} is a template")
+            else:
+                emit(
+                    "template_vmid",
+                    True,
+                    f"warning: {kind} {vmid} exists but is not a template "
+                    "(template: 1); guest create will not clone it",
+                )
+            return
         emit(
             "template_vmid",
             True,

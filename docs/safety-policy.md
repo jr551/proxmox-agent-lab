@@ -11,7 +11,7 @@ narrowly-scoped authorization.
 ## Commands
 
 Authoritative flags verified against `src/proxmox_agent_lab/cli.py` and the
-`guest`, `console`, `gc`, `cleanup` and `power` registrations.
+`guest`, `console`, `gc`, `memflow`, `cleanup` and `power` registrations.
 
 | Command | Authorization flag | Scope |
 |---|---|---|
@@ -23,13 +23,15 @@ Authoritative flags verified against `src/proxmox_agent_lab/cli.py` and the
 | `proxmox-lab cleanup-expired --orphans-only --host-change-authorized` | both flags | reclaim orphans and nothing else — no lease finalized, host left as found |
 | `proxmox-lab cleanup-expired --reclaim-orphans --host-change-authorized --include-active` | `--include-active` on top | also stop an orphan whose 30-minute task/uptime/CPU signals say it is in use |
 | `proxmox-lab gc install` / `proxmox-lab gc uninstall` | `--host-change-authorized` | write or remove the root GC script, its state dir and one crontab line on the host |
+| `proxmox-lab memflow host-setup` | `--host-change-authorized` | install the memflow helper on the host; `--print` previews the script and changes nothing |
+| `proxmox-lab memflow write` / `memflow phys-write` | `--lease` and `--i-understand` | patch live RAM of a lease-owned running qemu guest; the bytes are not audited |
 | `proxmox-lab power wake` / `proxmox-lab power shutdown` | `--standalone-authorized` | bare host power outside any lease — a person, not the lease finalizer, owns shutdown |
 
 The same gates exist on the MCP surface as data, not flags: `lease_destroy`,
 `guest_destroy` and `cleanup_expired` must carry `"confirm": true`; a missing
-or false value fails `-32602` before anything runs. The server exposes no `gc`
-and no standalone `power wake`/`shutdown` tool at all — host maintenance and
-bare power levers stay CLI-only.
+or false value fails `-32602` before anything runs. The server exposes no `gc`, no `memflow`, and no standalone
+`power wake`/`shutdown` tool. Host maintenance, live memory access and bare
+power stay on the CLI.
 
 ## Invariants
 

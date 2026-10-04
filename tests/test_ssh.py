@@ -130,6 +130,44 @@ class CheckAllowedTests(unittest.TestCase):
         with self.assertRaises(ssh_module.PolicyError):
             ssh_module.check_allowed(["cat", "/etc/shadow"])
 
+    def test_memflow_helper_is_shape_checked(self) -> None:
+        helper = ssh_module.MEMFLOW_HELPER
+        ssh_module.check_allowed([helper, "doctor"])
+        ssh_module.check_allowed([helper, "read", "101", "0x1000", "64"])
+        ssh_module.check_allowed(
+            [helper, "write", "101", "0x1000", "9090"], memory_write=True
+        )
+        ssh_module.check_allowed(
+            [ssh_module.MEMFLOW_SETUP], host_change=True
+        )
+        ssh_module.check_allowed(
+            ["tee", "/tmp/pxl-memflow-setup"], host_change=True
+        )
+        ssh_module.check_allowed(
+            [
+                "install", "-m", "0755",
+                "/tmp/pxl-memflow-setup", ssh_module.MEMFLOW_SETUP,
+            ],
+            host_change=True,
+        )
+        ssh_module.check_allowed(
+            ["rm", "-f", "/tmp/pxl-memflow-setup"], host_change=True
+        )
+        refused = (
+            [helper, "write", "101", "0x1000", "9090"],
+            [helper, "bash", "101"],
+            [helper, "read", "101", "0x1000;id", "64"],
+            [helper, "read", "101", "0x1000", "0"],
+            [helper, "scan", "101", "aa", "1000"],
+            ["pxl-memflow-run", "doctor"],
+            [ssh_module.MEMFLOW_SETUP],
+            [ssh_module.MEMFLOW_SETUP, "--extra"],
+        )
+        for argv in refused:
+            with self.subTest(argv=argv):
+                with self.assertRaises(ssh_module.PolicyError):
+                    ssh_module.check_allowed(argv)
+
 
 class RunPolicyTests(unittest.TestCase):
     def test_refusals_raise_policy_error_and_spawn_nothing(self) -> None:
@@ -296,12 +334,14 @@ class FakeSSHTests(unittest.TestCase):
                     "argv": ["qm", "status", "101"],
                     "stdin": b"x",
                     "host_change": True,
+                    "memory_write": False,
                     "timeout": 7,
                 },
                 {
                     "argv": ["qm", "start", "101"],
                     "stdin": None,
                     "host_change": False,
+                    "memory_write": False,
                     "timeout": None,
                 },
             ],

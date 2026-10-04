@@ -7,6 +7,32 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `proxmox-lab memflow`: agentless memory introspection of a lease-owned,
+  running qemu guest, over the same ssh allowlist as the rest of the lab.
+  `host-setup` installs the helper and is gated by
+  `--host-change-authorized`. Reads are audited as address, length and
+  counts. `write` and `phys-write` need `--i-understand`, and the seam
+  refuses those subcommands without it. The old Ghidra-in-an-LXC pipeline
+  is not carried: it created guests outside the lease stamp.
+
+### Fixed
+
+- Docs and the repository guide described a 23-tool MCP server after the
+  console pointer tools had already made it 29.
+- `guest create` clones `[pve] template_vmid` only when that guest is
+  actually a template (`template: 1`). A normal VM is refused before
+  `qm clone`. `doctor` warns instead of reporting that VM as a healthy
+  template.
+- The host GC looks for `qm` and `pct` in `/usr/sbin` when cron's PATH
+  does not include them, instead of treating a healthy node as unlistable.
+- `lease-end` exits successfully when it leaves the host up because other
+  guests are still running. A power-off that was attempted and could not
+  be verified is still an error. The skill and agent guide say the same
+  thing. The README is the short path: install, one lease, and where the
+  rest of the docs live.
+
 ## 0.19.0 - 2026-09-28
 
 Rewritten as a slim SSH-only control plane. The whole remote surface is one

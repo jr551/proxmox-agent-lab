@@ -123,8 +123,9 @@ class DiagnosticsTestCase(unittest.TestCase):
         return (json.loads(text) if text.strip() else None), error
 
     def script_healthy_host(
-        self, *, hostname: bytes = b"pve\n", qm_list: bytes = b"",
+        self, *, hostname: bytes = b"pve\n",         qm_list: bytes = b"",
         pct_list: bytes = b"",
+        template_config: bytes = b"template: 1\nname: tpl\n",
     ) -> None:
         """Everything §G asks the host for, answering healthy.
 
@@ -141,7 +142,10 @@ class DiagnosticsTestCase(unittest.TestCase):
             stdout=b'{"version": "9.0"}',
         )
         self.ssh.add(r"^pveversion$", stdout=b"pve-manager/9.0.0\n")
-        self.ssh.add(r"^qm config 9025$", stdout=b"template: 1\nname: tpl\n")
+        self.ssh.add(
+            r"^qm config 9025$",
+            stdout=template_config,
+        )
         # No crontab/script/log rules: gc.status reads them as absent.
 
     def check(self, report: dict, name: str) -> dict:
@@ -279,6 +283,20 @@ class DoctorTests(DiagnosticsTestCase):
         )
         self.assertTrue(all(c["ok"] for c in report["checks"]))
         self.assertEqual(report["problems"], [])
+        self.assertIn(
+            "is a template", self.check(report, "template_vmid")["detail"]
+        )
+
+    def test_a_non_template_vmid_warns_without_failing(self) -> None:
+        self.script_healthy_host(template_config=b"name: real-vm\nmemory: 8192\n")
+        report, err = self.run_json(
+            diagnostics.cmd_doctor, host_checks=False
+        )
+        self.assertIsNone(err)
+        self.assertTrue(report["ok"])
+        detail = self.check(report, "template_vmid")["detail"]
+        self.assertIn("warning", detail)
+        self.assertIn("not a template", detail)
 
     def test_missing_config_fails_and_remote_checks_are_skipped(self) -> None:
         missing = Path(self.tmp.name) / "nope.toml"

@@ -199,6 +199,7 @@ class RequireOwnedTests(GuestCase):
 class CreateTests(GuestCase):
     def test_create_from_a_template_restamps_the_metadata(self) -> None:
         self.open_lease()
+        self.fake.add(r"^qm config 9000$", stdout=b"template: 1\nname: tpl\n")
         self.fake.add(r"^qm clone 9000 101")
         self.fake.add(r"^qm set 101")
         self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
@@ -209,10 +210,11 @@ class CreateTests(GuestCase):
         tags, description = metadata = lab_guest.metadata_for(LEASE, EXPIRY)
         self.assertEqual(metadata, (leases_module.metadata_tags(LEASE),
                                     f"pxl-lease={LEASE} pxl-expiry={EXPIRY}"))
-        self.assertEqual(self.argvs()[0],
+        self.assertEqual(self.argvs()[0], ["qm", "config", "9000"])
+        self.assertEqual(self.argvs()[1],
                          ["qm", "clone", "9000", "101", "--name", "alpha"])
         self.assertEqual(
-            self.argvs()[1],
+            self.argvs()[2],
             ["qm", "set", "101", "--tags", tags,
              "--description", description],
         )
@@ -232,13 +234,31 @@ class CreateTests(GuestCase):
 
     def test_the_configured_template_vmid_is_the_default(self) -> None:
         self.open_lease()
+        self.fake.add(r"^qm config 9025$", stdout=b"template: 1\nname: tpl\n")
         self.fake.add(r"^qm clone 9025 101")
         self.fake.add(r"^qm set 101")
         self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
         self.run_cmd("guest", "create", "--lease", LEASE, "--vmid", "101")
-        # [pve] template_vmid in the fixture config is 9025
-        self.assertEqual(self.argvs()[0],
+        # [pve] template_vmid in the fixture config is 9025. Config is read
+        # first so a normal guest is never cloned.
+        self.assertEqual(self.argvs()[0], ["qm", "config", "9025"])
+        self.assertEqual(self.argvs()[1],
                          ["qm", "clone", "9025", "101", "--name", "pxl-101"])
+
+    def test_create_refuses_to_clone_a_guest_that_is_not_a_template(self) -> None:
+        self.open_lease()
+        self.fake.add(r"^qm config 100$", stdout=b"name: real-vm\nmemory: 8192\n")
+        self.fake.add(r"^pct config 100$", returncode=1, stderr=b"no such CT")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "create", "--lease", LEASE, "--vmid", "101",
+                "--template", "100",
+            )
+        self.assertIn("not a registry-vouched template", str(caught.exception))
+        self.assertEqual(
+            self.argvs(),
+            [["qm", "config", "100"], ["pct", "config", "100"]],
+        )
 
     def test_fresh_qemu_create_stamps_in_the_create_call(self) -> None:
         self.open_lease()
@@ -307,6 +327,7 @@ class CreateTests(GuestCase):
 
     def test_create_registers_the_resource_before_it_starts(self) -> None:
         self.open_lease()
+        self.fake.add(r"^qm config 9000$", stdout=b"template: 1\nname: tpl\n")
         self.fake.add(r"^qm clone 9000 101")
         self.fake.add(r"^qm set 101")
         self.fake.add(r"^qm start 101")

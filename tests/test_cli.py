@@ -44,6 +44,7 @@ PINNED_TOP_LEVEL = [
     "pull",
     "gc",
     "mcp",
+    "memflow",
 ]
 
 def _top_level_names(parser: argparse.ArgumentParser) -> list[str]:
@@ -97,6 +98,20 @@ class ParserBuildTests(unittest.TestCase):
             ["gc", "status", "--help"],
             ["gc", "uninstall", "--help"],
             ["mcp", "--help"],
+            ["memflow", "--help"],
+            ["memflow", "doctor", "--help"],
+            ["memflow", "host-setup", "--help"],
+            ["memflow", "processes", "--help"],
+            ["memflow", "read", "--help"],
+            ["memflow", "phys-read", "--help"],
+            ["memflow", "phys-write", "--help"],
+            ["memflow", "scan", "--help"],
+            ["memflow", "dump", "--help"],
+            ["memflow", "trace", "--help"],
+            ["memflow", "break", "--help"],
+            ["memflow", "boot-diagnose", "--help"],
+            ["memflow", "registers", "--help"],
+            ["memflow", "write", "--help"],
         ):
             with self.subTest(argv=argv):
                 with self.assertRaises(SystemExit) as ctx:

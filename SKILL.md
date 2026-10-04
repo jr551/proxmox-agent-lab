@@ -87,11 +87,14 @@ trap 'proxmox-lab lease-end --lease "$L"' EXIT
 3. Work past ~30 minutes: `proxmox-lab lease-heartbeat --lease "$L"`, or the
    lease expires and the GC / `cleanup-expired` sweeps your guests. One lease
    per session, heartbeated — each begin/end cycle costs a host boot.
-4. `lease-end` tears down the lease's guests and, when no active lease
-   remains, powers the host off with a **verified** probe. It must print
-   `"host_powered_off": true`; if not (or it exits non-zero with a
-   `cleanup_failed` lease), run `proxmox-lab cleanup-expired --all` and report
-   the exact blocker. Never claim done while the host still runs.
+4. `lease-end` destroys this lease's guests. It powers the host off only
+   when nothing else is running, and only after that shutdown is verified
+   (`"host_powered_off": true`). `"host_left_running": true` with a `reason`
+   means the host stayed up on purpose — usually the operator's own guests.
+   Report that reason and stop. Do not power the host off yourself. A
+   non-zero exit, a `cleanup_failed` lease, or a reason that power-off could
+   not be verified is a real failure: run `proxmox-lab cleanup-expired --all`
+   and report the blocker.
 
 Machines that must **survive** use `lease-begin --long-term` — the host then
 stays on until `lease-destroy --lease "$L" --confirm`. Only when the user
@@ -111,9 +114,8 @@ asked for persistence. See [docs/long-term-leases.md](docs/long-term-leases.md).
 | `proxmox-lab lease-list` | active leases |
 | `proxmox-lab lease-destroy --lease L --confirm` | forcibly end a lease (the only exit for long-term) |
 | `proxmox-lab lease-abandon --lease L --confirm` | close a lease, touching neither guests nor host power |
-| `proxmox-lab lease-register --lease L --kind qemu\|lxc --vmid N` | adopt an existing guest (`--policy retain` to keep it) |
 | `proxmox-lab cleanup-expired` | sweep expired leases; `--all`, or `--reclaim-orphans` with `--host-change-authorized` |
-| `proxmox-lab guest create --lease L --vmid N` | clone the configured template (`--fresh` builds from scratch) |
+| `proxmox-lab guest create --lease L --vmid N` | clone `[pve] template_vmid` when it is `template: 1` (`--fresh` builds from scratch; a normal VM is refused) |
 | `proxmox-lab guest clone --lease L --vmid N --source M` | clone a registry-vouched template |
 | `proxmox-lab guest start --lease L --vmid N` / `guest stop` | lifecycle; stop is graceful then hard |
 | `proxmox-lab guest destroy --lease L --vmid N --confirm` | irreversible delete of a lease-owned guest |
@@ -133,6 +135,7 @@ asked for persistence. See [docs/long-term-leases.md](docs/long-term-leases.md).
 | `proxmox-lab console calibrate --vmid N --action start` | lay markers to measure this client's image scaling |
 | `proxmox-lab power status` / `wake` / `shutdown` | manual power; wake/shutdown need `--standalone-authorized` |
 | `proxmox-lab gc install` / `status` / `uninstall` | host-side GC cron; install/uninstall need `--host-change-authorized` |
+| `proxmox-lab memflow …` | read a lease-owned qemu guest from the hypervisor; see below |
 | `proxmox-lab mcp` | serve the MCP tool surface over stdio |
 
 ## MCP server
@@ -172,8 +175,7 @@ active lease the server performs the verified host shutdown itself.
 | `console_calibrate` | measure this client's image scaling (`action`, `samples`) |
 | `console_grid` | screenshot with a coordinate grid burned in |
 | `console_burst` | capture several frames in one call, stitched |
-| `cleanup_expired` | sweep expired leases for a lease (`confirm`; may power off an idle host) |
-
+| `cleanup_expired` | sweep expired leases (`confirm`; may power off an idle host) |
 | `journal_query` | audit events from lab.db (read-only) |
 | `doctor` | end-to-end health check (read-only) |
 | `power_status` | host reachability and what pins it on (read-only) |
@@ -213,8 +215,9 @@ calibrated clicks are refused. Re-calibrate; never fall back to
 Pointer input is a mutation like any other: lease-gated, and it drives the
 QEMU HID tablet over the same ssh seam. Nothing is installed in the guest.
 
-`gc` and standalone `power wake`/`shutdown` are CLI-only: host maintenance and
-bare power levers belong to operators, not agents.
+`gc`, `memflow`, and standalone `power wake`/`shutdown` are CLI-only: host
+maintenance, live memory access and bare power levers belong to operators,
+not the MCP surface.
 
 ## Guest metadata contract
 
@@ -253,6 +256,24 @@ them yourself — `lease-register` is the way in.
   `pxl-expiry` has passed and powers the host off when nothing is running —
   the net for agents that walked away.
 
+## Memory, from underneath
+
+`memflow` reads a running qemu guest from the hypervisor rather than from
+inside the guest. Every such command names a lease that owns that guest; an
+unregistered or stopped guest is refused before the helper runs. The journal
+records that a read happened (address, length, counts), never the bytes.
+
+```bash
+proxmox-lab memflow host-setup --print
+proxmox-lab memflow processes --lease "$L" --vmid 9001
+proxmox-lab memflow boot-diagnose --lease "$L" --vmid 9001
+```
+
+`host-setup` installs the helper on the host and needs
+`--host-change-authorized`. `write` and `phys-write` change live RAM and need
+`--i-understand`, and only when the user asked to patch that guest. Full
+command list: [docs/memflow.md](docs/memflow.md).
+
 ## Docs
 
 [docs/INSTALL.md](docs/INSTALL.md) — host prep (WoL, ssh) and full setup ·
@@ -261,4 +282,5 @@ them yourself — `lease-register` is the way in.
 [docs/safety-policy.md](docs/safety-policy.md) — enforced invariants ·
 [docs/troubleshooting.md](docs/troubleshooting.md) — failure modes ·
 [docs/architecture.md](docs/architecture.md) — how it works ·
-[docs/VERIFICATION.md](docs/VERIFICATION.md) — what has been exercised on hardware
+[docs/VERIFICATION.md](docs/VERIFICATION.md) — what has been exercised on hardware ·
+[docs/memflow.md](docs/memflow.md) — agentless memory reads

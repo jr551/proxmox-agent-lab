@@ -4,10 +4,9 @@
 purpose -- an unreachable host, an expired lease, a refused mutation, a
 missing secret -- is a message for the operator, not a programming error, and
 ``cli.main`` prints it without a traceback. Subsystems define their own
-subclasses or sibling error types (``config.ConfigError``,
-``secrets_store.SecretError``, ``power.PowerError``,
-``mariadb.MariaDBError``) when callers need to distinguish them; the CLI's
-expected-error list collects all of them so a routine failure never surfaces
+subclasses (``config.ConfigError``, ``power.PowerError``,
+``ssh.PolicyError``) when callers need to distinguish them; the CLI's
+expected-error list collects ``LabError`` so a routine failure never surfaces
 as a crash.
 """
 

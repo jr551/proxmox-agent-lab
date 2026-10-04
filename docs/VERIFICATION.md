@@ -23,15 +23,31 @@ pre-existing guest (100–103) untouched.
 
 Claims below are still labelled per-section: test-suite evidence unless the
 section says otherwise. What remains unobserved is the host power-off
-duty and the installed `pxl-gc` crontab — see
-"What it cannot prove".
+duty — see "What it cannot prove".
+
+On 2026-10-04 a throwaway config was pointed at node `pve` (PVE 9.2.2).
+`doctor` was clean on ssh, host tools, the node name, `lab.db`, an already
+installed `pxl-gc`, and no metadata drift, and it warned that
+`[pve] template_vmid` is a normal guest rather than `template: 1`.
+`guest create` against that vmid refused before `qm clone`. A fresh LXC
+(not a clone) was created, started, probed, given a command, and used for
+a push/pull whose sha256 matched, then destroyed. `lease-end` left the
+host up because other guests were running, and exited 0. `power status`
+showed the host reachable. `gc install` replaced the script (checksum
+match, crontab line unchanged). A `--dry-run` with `PATH=/usr/bin:/bin`
+enumerated every guest and refused to power off. A later read of the cron
+log showed the scheduled runs doing the same: each guest skipped, power-off
+refused while two guests were running.
+`memflow doctor` refused because `/usr/local/bin/pxl-memflow-run` is not
+installed; the helper was not built during this check. Guests already on
+the node were left as found.
 
 That does not mean the suite is thin — it means the boundary between
 "the code does X" and "Proxmox accepts X" is drawn explicitly, not assumed.
 
 ## The suite that exists
 
-355 tests, warning-clean (`PYTHONWARNINGS=error`), run with:
+373 tests, warning-clean (`PYTHONWARNINGS=error`), run with:
 
 ```bash
 python3 -m unittest discover -s tests -q
@@ -56,7 +72,7 @@ Three harnesses do the heavy lifting:
   power-off decision run end to end.
 - **Real stdio for the MCP server** — `test_mcp.py` spawns
   `proxmox-lab mcp` and speaks newline-delimited JSON-RPC over real pipes:
-  `initialize`, `tools/list` returning exactly 23 schema'd tools,
+  `initialize`, `tools/list` returning exactly 29 schema'd tools,
   `tools/call` dispatch, error shapes, and the idle-shutdown self-wake.
 
 ## What the suite proves
@@ -102,8 +118,16 @@ Verified as code behavior, area by area:
   only expired `pxl` guests; skips `pxl-expiry=0`, templates, and
   unparseable metadata with a warning; serializes per-vmid under flock;
   powers off only on two *consecutive* clear runs ≥600 s apart; `--dry-run`
-  deletes nothing; idempotent install/uninstall of its one crontab line.
-- **MCP.** Over real stdio: initialize shape, the static 23-tool list, bad
+  deletes nothing; `qm`/`pct` are found in `/usr/sbin` when cron's PATH
+  omits them; idempotent install/uninstall of its one crontab line.
+- **Memflow.** Lease ownership and a running qemu guest are required before
+  any helper argv; an oversized `--len`, a write without `--i-understand`,
+  and `host-setup` without `--host-change-authorized` spawn nothing. Audited
+  fields are address, length and counts — never bytes, process names or
+  scanned boot text. The helper's own argv shape (subcommand, numeric vmid,
+  bounded hex) is refused at the seam. Building that helper on a host is
+  not what the suite does.
+- **MCP.** Over real stdio: initialize shape, the static 29-tool list, bad
   params as `-32602` naming the field, action failures as `-32603` with
   redacted messages, notifications answered with silence, every call
   refreshing the idle clock, and the idle sweep firing a verified shutdown
@@ -112,7 +136,8 @@ Verified as code behavior, area by area:
 ## What it cannot prove
 
 The seams that stub the host are also the seams where reality can disagree.
-None of the following has been observed on this reworked code:
+Except where the 2026-10-04 note above says a path was watched, none of
+the following has been observed on this reworked code:
 
 - **Every byte on the wire to a live Proxmox.** FakeSSH asserts the argv the
   tool *emits*; it cannot confirm the real `qm`/`pct` accept it. Three
@@ -123,20 +148,20 @@ None of the following has been observed on this reworked code:
   stop), and `qm guest exec --synchronous` (falls back to async exec +
   `exec-status` polling). If a fallback fires on hardware, that is the
   first time it has ever run.
-- **A real guest doing anything.** No guest has been created, cloned,
-  started, probed, run-in, screenshotted, or typed at under this code.
-  `guest run`'s remote quoting, `guest probe`'s agent detection, and the
-  exec-status polling loop are all asserted against scripted output.
+- **A real guest doing everything.** One fresh LXC was created, started,
+  probed, run-in, pushed, pulled, and destroyed (2026-10-04). Cloning a
+  real template, screenshots, and console typing have not been watched.
+  `guest run`'s remote quoting and the exec-status polling loop are
+  asserted against scripted output; the LXC `pct exec` path is what ran.
 - **The host actually coming up or going down.** The magic packet's bytes
   are proven; a NIC receiving one is not. Verified shutdown's probe math is
   proven; real sshd dying mid-request, DDNS lag, and a warm host refusing
   to die are not covered by a fake clock. And the MCP/idle power-off has
   never been watched happen — the self-wake fires in tests, the physical
   shutdown it would trigger has not been staged.
-- **`gc install`'s byte stream landing.** Install/uninstall are
-  FakeSSH-tested; whether the script survives a real `install`+crontab
-  round-trip on the node, and whether root's cron actually runs it, is
-  unobserved. `gc status`'s drift detection is unit-tested only.
+- **`gc uninstall`.** Install, a checksum match, and scheduled runs are
+  observed (2026-10-04): the cron log shows each guest skipped and
+  power-off refused while guests are running. Uninstall was not run.
 - **Concurrent controllers on one `lab.db`.** WAL covers same-host
   concurrency in tests. Two machines running the tool against one host
   (orphans in each other's eyes) is a documented design limit, not a tested
@@ -294,7 +319,7 @@ L=$(proxmox-lab lease-begin --purpose "verification sweep" \
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 trap 'proxmox-lab lease-end --lease "$L"' EXIT
 
-proxmox-lab guest create --lease "$L" --vmid 9100 --name verify --start
+proxmox-lab guest create --lease "$L" --vmid 9100 --name verify --fresh --start
 proxmox-lab guest probe --vmid 9100
 proxmox-lab guest run --lease "$L" --vmid 9100 -- uname -a
 proxmox-lab push --lease "$L" --vmid 9100 --file ./probe.bin --dest /tmp/probe.bin
@@ -303,10 +328,12 @@ proxmox-lab console screenshot --vmid 9100 --out screen.png
 proxmox-lab journal --limit 20
 ```
 
-`lease-end` (via the trap) then destroys the guest and verifies the host
-power-off — exercising the two riskiest paths (guest lifecycle and verified
-shutdown) in one run. For the GC, `proxmox-lab gc install` plus one
-`--dry-run`-equivalent log read on the host covers the rest.
+`lease-end` (via the trap) then destroys the guest. It powers the host off
+only when nothing else is running and the shutdown can be verified; if
+other guests are running it leaves the host up and says why. `--fresh` is
+required unless `[pve] template_vmid` is actually `template: 1`. For the
+GC, `proxmox-lab gc install` plus one `--dry-run` under `PATH=/usr/bin:/bin`
+covers the rest.
 
 Check the claims rather than trusting them. If something here is no longer
 true, the honest fix is to change this page, not to leave it aspirational.

@@ -91,6 +91,24 @@ show active leases
 serve the MCP tool surface over stdio (JSON-RPC 2.0)
 
 
+## `proxmox-lab memflow`
+
+read a lease-owned qemu guest's memory from the hypervisor
+
+- `proxmox-lab memflow boot-diagnose` — classify a stuck boot from registers and guest RAM text
+- `proxmox-lab memflow break` — breakpoint, then report where it stopped
+- `proxmox-lab memflow doctor` — prove the helper is installed
+- `proxmox-lab memflow dump` — copy a memory region to a local file
+- `proxmox-lab memflow host-setup` — install the memflow helper on the host
+- `proxmox-lab memflow phys-read` — read guest-physical RAM (any guest OS)
+- `proxmox-lab memflow phys-write` — write into guest-physical RAM
+- `proxmox-lab memflow processes` — list a running guest's processes from outside it
+- `proxmox-lab memflow read` — read guest kernel virtual memory
+- `proxmox-lab memflow registers` — report the guest vCPU registers
+- `proxmox-lab memflow scan` — search guest-physical RAM for bytes
+- `proxmox-lab memflow trace` — single-step and disassemble
+- `proxmox-lab memflow write` — write into live guest kernel memory
+
 ## `proxmox-lab power`
 
 host power: wake it, check it, or verify a shutdown

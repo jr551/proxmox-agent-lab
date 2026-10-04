@@ -61,8 +61,8 @@ This is deliberate, not incidental:
 - Tests patch `cli` attributes (`mock.patch.object(LAB, "STATE_ROOT", ...)`);
   because every helper reads them through `lab` at call time, patching keeps
   working after a function moves to its own module.
-- `mcp.py` binds the same `cmd_*` handlers the CLI binds, so the 23-tool MCP
-  surface and the CLI cannot drift.
+- `mcp.py` binds the same `cmd_*` handlers the CLI binds, so the 29-tool MCP
+  surface and the CLI cannot drift. `memflow` is CLI-only.
 - `cli._module()` rebuilds the module object (and the `proxmox_lab`
   compatibility name) when the file is path-loaded outside `sys.modules`.
 
@@ -95,6 +95,10 @@ each other's handlers.
 - `ssh.check_allowed` refuses any remote command outside `ALLOWED_COMMANDS`
   before a process spawns; `HOST_CHANGE_COMMANDS` additionally need
   `host_change=True`, which the CLI gates behind `--host-change-authorized`.
+  The memflow helper is the same kind of exception as `qm`: one absolute
+  path (`/usr/local/bin/pxl-memflow-run`) with a fixed argument shape, and
+  its write subcommands need `memory_write=True`. Host setup runs only
+  `/usr/local/sbin/pxl-memflow-setup` with `host_change=True`.
 - `lease-begin` does not wake the host: it probes the ssh seam and refuses
   on an unreachable host, directing the operator to
   `power wake --standalone-authorized`.

@@ -276,6 +276,12 @@ def cmd_create(lab: Any, args: Any) -> dict:
                 cores=args.cores,
             )
     else:
+        source_kind = _clone_source_kind(lab, prox, template)
+        if source_kind != kind:
+            raise LabError(
+                f"template {template} is a {source_kind} guest, not {kind}. "
+                f"Pass --kind {source_kind}, or --fresh to build without cloning."
+            )
         prox.clone(kind, template, vmid, name=name)
         stamp_guest(prox, kind, vmid, lease_id, expires_at)
     _register_resource(lab, lease_id, kind, vmid, name=name)

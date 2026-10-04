@@ -703,6 +703,7 @@ def cmd_lease_end(lab: Any, args: argparse.Namespace) -> None:
             + describe_shared_resources(shared)
         )
     persistent = [x for x in others if leases_module.is_long_term(x)]
+    left_up_on_purpose = False
     if persistent:
         # Say this loudly. A machine left running is the surprise nobody
         # wants on their electricity bill.
@@ -720,6 +721,7 @@ def cmd_lease_end(lab: Any, args: argparse.Namespace) -> None:
             running = []
         result["host_left_running"] = True
         if running:
+            left_up_on_purpose = True
             result["reason"] = (
                 "guest(s) still running outside any tracked lease: "
                 + ", ".join(str(vmid) for vmid in running)
@@ -747,7 +749,7 @@ def cmd_lease_end(lab: Any, args: argparse.Namespace) -> None:
                 "a host boot and provisioning.",
                 file=sys.stderr,
             )
-    if failures or (not others and not host_powered_off):
+    if failures or (not others and not host_powered_off and not left_up_on_purpose):
         raise LabError("Lease cleanup or host power-off did not complete")
 
 

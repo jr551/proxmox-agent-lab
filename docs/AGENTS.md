@@ -26,9 +26,11 @@ Deep notes beyond the quick-ref:
   `proxmox-lab power wake --standalone-authorized` (the flag exists precisely
   because bare power has no lease finalizer behind it), then retry. Never hold
   bare power yourself — `power wake`/`power shutdown` are gated for a reason.
-- Put `lease-end` in a trap/finally so it runs even when the work fails. It
-  must print `"host_powered_off": true` when it closed the last lease; if it
-  does not, say so plainly rather than reporting success.
+- Put `lease-end` in a trap/finally so it runs even when the work fails.
+  `"host_powered_off": true` means the host went down.
+  `"host_left_running": true` means it stayed up on purpose; quote `reason`
+  and stop. A non-zero exit or a `cleanup_failed` lease is the failure to
+  report.
 - `lease-end` refuses before it touches anything if a guest it would destroy
   is still registered to another non-terminal lease, naming the guest and that
   lease. Do not reach for `--shared-guests-authorized` to get past it: end or
@@ -50,7 +52,7 @@ All 29 tools call the same handlers the CLI binds — same behavior, same gates:
 | leases | `lease_begin`, `lease_heartbeat`, `lease_end`, `lease_list`, `lease_destroy`, `lease_register` |
 | guests | `guest_create`, `guest_clone`, `guest_start`, `guest_stop`, `guest_destroy`, `guest_probe`, `guest_list`, `guest_run` |
 | files | `push_file`, `pull_file` |
-| console | `console_screenshot`, `console_type`, `console_keys` |
+| console | `console_screenshot`, `console_type`, `console_keys`, `console_move`, `console_click`, `console_drag`, `console_calibrate`, `console_grid`, `console_burst` |
 | hygiene & health | `cleanup_expired`, `journal_query`, `doctor`, `power_status` |
 
 Notes that matter:
@@ -65,8 +67,8 @@ Notes that matter:
 - Every call refreshes the idle clock and records name + ok + target only —
   after `idle_shutdown_seconds` (default 8h) with no active lease the server
   powers the host off itself. Going silent is not a way to keep the host up.
-- No `gc` and no standalone `power wake`/`shutdown` tools exist. Host
-  maintenance and bare power are operator work.
+- No `gc`, no `memflow`, and no standalone `power wake`/`shutdown` tools
+  exist. Host maintenance, live memory access and bare power are CLI work.
 
 ## 👀 Choosing how to talk to a guest
 
@@ -111,8 +113,9 @@ proxmox-lab guest create --lease "$L" --vmid 9001 --name probe --start
 proxmox-lab guest clone --lease "$L" --vmid 9002 --source 100
 ```
 
-`guest create` clones the configured `[pve] template_vmid` (or builds fresh
-with `--fresh`; LXC fresh needs `--ostemplate`). `guest clone` accepts any
+`guest create` clones the configured `[pve] template_vmid` only when that
+guest is a template (`template: 1`). A normal VM is refused. `--fresh` builds
+from scratch (LXC fresh needs `--ostemplate`). `guest clone` accepts any
 *vouched* source — a config template (`template: 1`) or a `policy=retain`
 registry row. Either way the guest is registered to your lease and stamped
 `proxmoxagentlab` metadata **before** it can ever be started.
@@ -155,9 +158,11 @@ proxmox-lab journal --limit 20
 
 ## 📢 Reporting honestly
 
-- If `lease-end` does not confirm power-off, **say so**. Do not report
-  success. Same for a `cleanup_failed` lease or a `lease-end`/`power shutdown`
-  that exits non-zero.
+- If `lease-end` leaves the host up because other guests are running, quote
+  `reason` and stop. That is a finished lease, not a failed one, and it is
+  not a reason to power the host off. A non-zero exit, a reason that
+  power-off could not be verified, or a `cleanup_failed` lease is a failure:
+  say so. Same for `power shutdown` exiting non-zero.
 - Distinguish *inconclusive* from *negative*. `agent_ok: false` from probe is
   a fact; a screenshot you never took is not. `doctor` marks unreachable-host
   checks `skipped`, and skips never count as failures.
@@ -178,6 +183,9 @@ do not invent flags not listed there.
 - `cleanup-expired --reclaim-orphans` / `--orphans-only` →
   `--host-change-authorized` (`--include-active` overrides the in-use signals)
 - `gc install`/`uninstall` → `--host-change-authorized`
+- `memflow host-setup` → `--host-change-authorized` (`--print` previews the
+  script and changes nothing). `memflow write` / `phys-write` →
+  `--i-understand`, and only when the user asked to patch that guest's RAM
 - `power wake`/`power shutdown` → `--standalone-authorized`, and these are
   *operator* levers: agents work through leases.
 - deleting a guest the lease does not own → not possible, refused outright.

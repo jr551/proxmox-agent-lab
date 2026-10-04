@@ -445,6 +445,20 @@ class CleanupTests(unittest.TestCase):
 
     # -- host power-off -----------------------------------------------------
 
+    def test_end_stays_successful_when_other_guests_keep_the_host_up(self):
+        row = self.begin()
+        with mock.patch.object(
+            cleanup, "running_guest_vmids", return_value=[101, 2000]
+        ):
+            payload, error = self.end(row)
+        self.assertIsNone(error)
+        self.assertFalse(payload["host_powered_off"])
+        self.assertTrue(payload["host_left_running"])
+        self.assertIn("101", payload["reason"])
+        self.assertIn("2000", payload["reason"])
+        self.assertFalse(self.power_off.called)
+        self.assertEqual(self.lease_row(row["id"])["state"], "ended")
+
     def test_end_reports_host_powered_off_truthfully(self):
         row = self.begin()
         self.register(row, "qemu", 101)

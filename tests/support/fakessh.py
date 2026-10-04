@@ -65,6 +65,7 @@ class FakeSSH:
         timeout: float | None = None,
         stdin: bytes | None = None,
         host_change: bool = False,
+        memory_write: bool = False,
     ) -> CommandResult:
         """Record the call, then answer it from the first matching rule."""
         self.calls.append(
@@ -72,6 +73,7 @@ class FakeSSH:
                 "argv": list(argv),
                 "stdin": stdin,
                 "host_change": host_change,
+                "memory_write": memory_write,
                 "timeout": timeout,
             }
         )

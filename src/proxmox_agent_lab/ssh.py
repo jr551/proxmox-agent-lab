@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import posixpath
+import re
 import shlex
 import subprocess
 from typing import Any, Callable, Sequence
@@ -89,6 +90,31 @@ HOST_CHANGE_COMMANDS: frozenset[str] = frozenset(
     {"shutdown", "crontab", "install", "ethtool", "tee", "rm"}
 )
 
+#: The installed memflow helper. Not a shell: one absolute path, and only the
+#: subcommands and argument shapes ``_check_memflow_helper`` names. Reads are
+#: ordinary allowlist members; ``write``/``phys-write`` additionally need
+#: ``memory_write=True``, which the CLI sets only after ``--i-understand``.
+MEMFLOW_HELPER = "/usr/local/bin/pxl-memflow-run"
+
+#: The host-setup script, runnable only as this exact path with
+#: ``host_change=True`` and no arguments. ``memflow host-setup`` installs it
+#: through the same ``tee``/``install`` confinement as the GC script.
+MEMFLOW_SETUP = "/usr/local/sbin/pxl-memflow-setup"
+
+#: Byte caps enforced at the seam so a helper argv cannot ask the host-side
+#: tool to allocate an unbounded buffer. Writes are smaller than reads because
+#: the payload travels as a hex argument, and a multi-megabyte argv is not a
+#: real command line.
+MAX_MEMFLOW_READ = 16 * 1024 * 1024
+MAX_MEMFLOW_WRITE = 64 * 1024
+MAX_MEMFLOW_NEEDLE = 256
+MAX_MEMFLOW_STEPS = 256
+MAX_MEMFLOW_BREAK_TIMEOUT = 120
+MAX_MEMFLOW_HITS = 64
+
+_MEMFLOW_ADDR = re.compile(r"^(?:0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$")
+_MEMFLOW_HEX = re.compile(r"^[0-9a-fA-F]+$")
+
 #: The only host paths ``cat`` may read (host temp hygiene).
 _PXL_TEMP_PREFIX = "/tmp/pxl-"
 
@@ -140,7 +166,105 @@ def _confine(
         )
 
 
-def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
+def _memflow_vmid(token: str) -> None:
+    if not token.isdigit() or not 1 <= int(token) <= 999_999_999:
+        raise PolicyError(f"refused: memflow vmid {token!r}")
+
+
+def _memflow_addr(token: str) -> None:
+    if _MEMFLOW_ADDR.fullmatch(token) is None:
+        raise PolicyError("refused: memflow address is not a plain integer")
+
+
+def _memflow_hex(token: str, *, max_bytes: int) -> None:
+    if (
+        not token
+        or _MEMFLOW_HEX.fullmatch(token) is None
+        or len(token) % 2
+        or len(token) // 2 > max_bytes
+    ):
+        raise PolicyError(
+            "refused: memflow hex payload must be even-length hex of "
+            f"1..{max_bytes} bytes"
+        )
+
+
+def _memflow_int(token: str, *, lo: int, hi: int, name: str) -> None:
+    if not token.isdigit() or not lo <= int(token) <= hi:
+        raise PolicyError(f"refused: memflow {name} must be {lo}..{hi}")
+
+
+def _check_memflow_helper(argv: Sequence[str], *, memory_write: bool) -> None:
+    """Confine ``pxl-memflow-run`` to known subcommands and plain arguments.
+
+    The helper is a root binary that reads ``/proc/<qemu-pid>/mem``. The seam
+    does not decide which guest a lease owns — that gate sits above — but it
+    does refuse a subcommand it does not know, a non-numeric vmid, and a
+    payload that would make the helper allocate without bound. Live writes
+    need ``memory_write=True`` on top of that shape check.
+    """
+    if len(argv) < 2:
+        raise PolicyError("refused: memflow helper needs a subcommand")
+    command = argv[1]
+    rest = list(argv[2:])
+    if command == "doctor":
+        if rest:
+            raise PolicyError("refused: memflow doctor takes no arguments")
+        return
+    if not rest:
+        raise PolicyError("refused: memflow command needs a vmid")
+    _memflow_vmid(rest[0])
+    tail = rest[1:]
+    if command in {"check", "process-list", "registers"}:
+        if tail:
+            raise PolicyError(f"refused: memflow {command} takes only a vmid")
+        return
+    if command in {"read", "phys-read"}:
+        if len(tail) != 2:
+            raise PolicyError(f"refused: memflow {command} takes vmid, addr, len")
+        _memflow_addr(tail[0])
+        _memflow_int(tail[1], lo=1, hi=MAX_MEMFLOW_READ, name="len")
+        return
+    if command in {"write", "phys-write"}:
+        if not memory_write:
+            raise PolicyError(
+                "refused: memflow write mutates guest RAM and needs "
+                "memory_write=True"
+            )
+        if len(tail) != 2:
+            raise PolicyError(f"refused: memflow {command} takes vmid, addr, hex")
+        _memflow_addr(tail[0])
+        _memflow_hex(tail[1], max_bytes=MAX_MEMFLOW_WRITE)
+        return
+    if command == "scan":
+        if len(tail) != 2:
+            raise PolicyError("refused: memflow scan takes vmid, hex, max-hits")
+        _memflow_hex(tail[0], max_bytes=MAX_MEMFLOW_NEEDLE)
+        _memflow_int(tail[1], lo=1, hi=MAX_MEMFLOW_HITS, name="max-hits")
+        return
+    if command == "debug-trace":
+        if len(tail) not in (1, 2):
+            raise PolicyError("refused: memflow debug-trace takes vmid and steps")
+        _memflow_int(tail[0], lo=1, hi=MAX_MEMFLOW_STEPS, name="steps")
+        if len(tail) == 2 and tail[1] != "over":
+            raise PolicyError("refused: memflow debug-trace flag must be 'over'")
+        return
+    if command == "debug-break":
+        if len(tail) != 2:
+            raise PolicyError(
+                "refused: memflow debug-break takes vmid, addr, timeout"
+            )
+        _memflow_addr(tail[0])
+        _memflow_int(
+            tail[1], lo=1, hi=MAX_MEMFLOW_BREAK_TIMEOUT, name="timeout"
+        )
+        return
+    raise PolicyError(f"refused: memflow subcommand {command!r}")
+
+
+def check_allowed(
+    argv: Sequence[str], *, host_change: bool = False, memory_write: bool = False
+) -> None:
     """Raise ``PolicyError`` unless ``argv`` may run on the host.
 
     The rules, in order: ``argv`` must be non-empty and ``argv[0]`` must be
@@ -184,6 +308,16 @@ def check_allowed(argv: Sequence[str], *, host_change: bool = False) -> None:
     if not argv:
         raise PolicyError("refused: empty remote command")
     command = argv[0]
+    if command == MEMFLOW_HELPER:
+        _check_memflow_helper(argv, memory_write=memory_write)
+        return
+    if command == MEMFLOW_SETUP:
+        if list(argv) != [MEMFLOW_SETUP] or not host_change:
+            raise PolicyError(
+                "refused: memflow host-setup runs only as "
+                f"{MEMFLOW_SETUP} with host_change=True"
+            )
+        return
     if command not in ALLOWED_COMMANDS and command not in HOST_CHANGE_COMMANDS:
         raise PolicyError(f"refused: {command!r} is not on the command allowlist")
     if command in HOST_CHANGE_COMMANDS and not host_change:
@@ -326,6 +460,7 @@ class SSH:
         timeout: float | None = None,
         stdin: bytes | None = None,
         host_change: bool = False,
+        memory_write: bool = False,
     ) -> CommandResult:
         """Run one remote argv and return its result.
 
@@ -336,8 +471,10 @@ class SSH:
         ``timeout=None`` uses ``default_timeout``, so every call is bounded.
         ``stdin`` is piped to the remote command. A remote non-zero exit is a
         plain ``CommandResult`` with ``ok`` false, never an exception.
+        ``memory_write`` authorizes ``pxl-memflow-run write``/``phys-write``
+        and nothing else.
         """
-        check_allowed(argv, host_change=host_change)
+        check_allowed(argv, host_change=host_change, memory_write=memory_write)
         limit = self._default_timeout if timeout is None else timeout
         try:
             completed = self._runner(

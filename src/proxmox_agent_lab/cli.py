@@ -465,12 +465,14 @@ def parser() -> argparse.ArgumentParser:
     from . import gc
     from . import guest
     from . import mcp
+    from . import memflow
     from . import transfer
 
     console.register(sub, _module())
     gc.register(sub, _module())
     guest.register(sub, _module())
     mcp.register(sub, _module())
+    memflow.register(sub, _module())
     transfer.register(sub, _module())
     return root
 

@@ -191,9 +191,11 @@ class PxLGcTests(unittest.TestCase):
             (guest / "refuse-stop").touch()
         return guest
 
-    def run_gc(self, *args, now=NOW, stop_timeout="120"):
+    def run_gc(self, *args, now=NOW, stop_timeout="120", bin_dirs=""):
         env = dict(os.environ)
         env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
+        # Empty by default so a workstation's /usr/sbin/qm is never consulted.
+        env["PXL_GC_BIN_DIRS"] = bin_dirs
         env["PXL_GC_STUB_DIR"] = str(self.stub)
         env["PXL_GC_STATE_DIR"] = str(self.state)
         env["PXL_GC_LOCK_DIR"] = str(self.locks)
@@ -379,6 +381,18 @@ class PxLGcTests(unittest.TestCase):
         self.assertNotIn("poweroff", self.calls())
 
     # -- robustness -------------------------------------------------------
+
+    def test_qm_outside_path_is_found_in_sbin(self):
+        # Cron's PATH is /usr/bin:/bin. The collector must still find qm.
+        extra = self.bin / "sbin"
+        extra.mkdir()
+        (self.bin / "qm").rename(extra / "qm")
+        self.add_guest("qm", 101, status="stopped", config=pxl_config(FUTURE))
+        proc = self.run_gc(bin_dirs=str(extra))
+        self.assert_boring(proc)
+        self.assertIn("skip 101: unexpired", proc.stdout)
+        self.assertNotIn("not found on PATH", proc.stdout)
+        self.assertIn("qm config 101", self.calls())
 
     def test_missing_qm_is_survived_and_never_powers_off(self):
         # A failed listing is NOT "no guests exist". The LXC duty still runs

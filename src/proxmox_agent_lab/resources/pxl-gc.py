@@ -91,22 +91,49 @@ def run_command(argv, timeout):
     return rc, err
 
 
+# Cron’s PATH is `/usr/bin:/bin`. `qm` and `pct` live in `/usr/sbin`, so a
+# name lookup that stops at PATH reports a healthy host as unlistable and
+# the collector can neither reap nor prove it is safe to power off.
+DEFAULT_BIN_DIRS = ("/usr/sbin", "/sbin")
+
+
+def binary_dirs():
+    """Extra directories searched after PATH. Tests set `PXL_GC_BIN_DIRS`."""
+    raw = os.environ.get("PXL_GC_BIN_DIRS")
+    if raw is None:
+        return DEFAULT_BIN_DIRS
+    return tuple(part for part in raw.split(os.pathsep) if part)
+
+
+def resolve_binary(name):
+    """Absolute path of a host tool, or None when it cannot be found."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in binary_dirs():
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def enumerate_guests(binary, kind):
     """(guests, ok) from `qm list` / `pct list`.
 
     `ok` is False when the listing itself failed -- the binary missing from
-    PATH, or the command erroring. Callers must NOT read an empty list as
-    "no guests exist": an unknown state is what keeps the power-off duty
-    from firing (fail closed), while the deletion duty simply has nothing
-    it can safely act on.
+    PATH and the usual sbin directories, or the command erroring. Callers
+    must NOT read an empty list as "no guests exist": an unknown state is
+    what keeps the power-off duty from firing (fail closed), while the
+    deletion duty simply has nothing it can safely act on.
     """
-    if shutil.which(binary) is None:
+    resolved = resolve_binary(binary)
+    if resolved is None:
         log(binary + " not found on PATH; cannot enumerate " + kind + " guests")
-        return [], False
-    rc, out, err = capture(binary, ["list"])
+        return [], False, None
+    rc, out, err = capture(resolved, ["list"])
     if rc != 0:
         log(binary + " list failed (" + str(rc) + "): " + err + "; cannot enumerate")
-        return [], False
+        return [], False, None
     guests = []
     lines = out.splitlines()
     for line in lines[1:]:  # first line is the column header
@@ -122,7 +149,7 @@ def enumerate_guests(binary, kind):
             log("unparseable status for " + parts[0] + ", treating as running")
             status = "running"
         guests.append((parts[0], status))
-    return guests, True
+    return guests, True, resolved
 
 
 def fetch_config(binary, vmid):
@@ -236,7 +263,7 @@ def reap_guest(binary, vmid, expiry, stop_timeout, dry, lock_dir, stopped):
         stopped.add(vmid)
         log(vmid + ": destroy")
         argv = [binary, "destroy", vmid]
-        if binary == "qm":
+        if os.path.basename(binary) == "qm":
             argv += ["--purge", "1"]
         rc, err = run_command(argv, timeout=120)
         if rc == 0:
@@ -362,15 +389,17 @@ def main(argv):
     pinned = set()   # (kind, vmid): parseable pxl metadata, expiry 0 or future
     stopped = set()  # (kind, vmid): stopped or destroyed by this run
     known = True     # did every guest listing succeed? (power-off fails closed)
+    tools = {}
     for kind, binary in (("qemu", "qm"), ("lxc", "pct")):
-        guests, ok = enumerate_guests(binary, kind)
+        guests, ok, resolved = enumerate_guests(binary, kind)
+        tools[kind] = resolved
         if not ok:
             known = False
         for vmid, status in guests:
             enumerated.append((kind, vmid, status))
 
     for kind, vmid, status in enumerated:
-        binary = "qm" if kind == "qemu" else "pct"
+        binary = tools[kind]
         try:
             config = fetch_config(binary, vmid)
             if config is None:

@@ -1,6 +1,6 @@
 """The MCP server: stdio JSON-RPC 2.0, stdlib only, no SDK.
 
-``proxmox-lab mcp`` serves the pinned 23-tool surface (rework plan §E) over
+``proxmox-lab mcp`` serves the 29-tool surface over
 stdin/stdout. The wire format is newline-delimited JSON -- one complete
 JSON-RPC message per line, UTF-8, with no ``Content-Length`` framing. stdout
 carries protocol messages only; everything else goes to stderr.

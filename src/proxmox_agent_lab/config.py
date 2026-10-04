@@ -292,7 +292,7 @@ target = "proxmox"           # ssh alias/host reached as root
 
 [pve]
 node = "pve"                 # node name used in pvesh paths
-template_vmid = 100          # default template for guest clone/create
+template_vmid = 100          # clone source; must be template: 1, or create refuses
 
 [power]
 mac = ""                     # wired NIC MAC for WoL (filled by 'proxmox-lab init')

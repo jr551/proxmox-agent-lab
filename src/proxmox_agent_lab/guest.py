@@ -286,6 +286,18 @@ def _register_resource(
 
 # -- handlers --------------------------------------------------------------
 
+def cmd_nextid(lab: Any, args: Any) -> dict:
+    """The cluster's next free VMID. Read-only.
+
+    Pass the printed id to ``guest create``. This command does not create
+    anything, and create does not call it: the agent has to choose the id
+    it just read, because a collision destroys a real machine.
+    """
+    del args
+    prox = _make_proxmox(lab.CONFIG)
+    return _emit({"vmid": prox.cluster_nextid()})
+
+
 def cmd_create(lab: Any, args: Any) -> dict:
     """Create a lease-owned guest: clone the template, or build fresh.
 
@@ -632,6 +644,45 @@ def _safe_ip(prox: Any, vmid: int) -> str | None:
         return None
 
 
+def _ipv4_host(text: str) -> str | None:
+    """An IPv4 host from ``10.1.2.3`` or ``10.1.2.3/24``, never loopback."""
+    host = text.split("/", 1)[0].strip()
+    parts = host.split(".")
+    if len(parts) != 4:
+        return None
+    try:
+        numbers = [int(part) for part in parts]
+    except ValueError:
+        return None
+    if any(number < 0 or number > 255 for number in numbers) or numbers[0] == 127:
+        return None
+    return ".".join(str(number) for number in numbers)
+
+
+def _first_lxc_ipv4(records: Any) -> str | None:
+    if not isinstance(records, list):
+        return None
+    for item in records:
+        if not isinstance(item, dict) or item.get("name") == "lo":
+            continue
+        inet = item.get("inet")
+        if not isinstance(inet, str):
+            continue
+        for piece in inet.replace(",", " ").split():
+            address = _ipv4_host(piece)
+            if address is not None:
+                return address
+    return None
+
+
+def _lxc_ip(prox: Any, vmid: int) -> str | None:
+    """First non-loopback IPv4, or ``None`` when the interface read fails."""
+    try:
+        return _first_lxc_ipv4(prox.lxc_interfaces(vmid))
+    except proxmox_module.ProxmoxError:
+        return None
+
+
 def cmd_probe(lab: Any, args: Any) -> dict:
     """How one guest can be reached, right now. Read-only."""
     vmid = int(args.vmid)
@@ -645,10 +696,10 @@ def cmd_probe(lab: Any, args: Any) -> dict:
         channel = "agent" if agent_ok else "ssh"
     elif kind == "lxc":
         # pct exec is the native channel and needs no agent; it is usable
-        # exactly while the container runs. There is no agent network view
-        # for lxc through the seam.
+        # exactly while the container runs. The address comes from the
+        # container interface list when that read works.
         agent_ok = running
-        ip = None
+        ip = _lxc_ip(prox, vmid)
         channel = "pct"
     else:
         agent_ok = False
@@ -747,6 +798,25 @@ def _refuse_shared(lab: Any, lease_id: str, kind: str, vmid: int) -> None:
         )
 
 
+def _snapshot_children(records: list, name: str) -> list[str]:
+    """Real snapshots whose ``parent`` is ``name``.
+
+    ``current`` is the live state, not a snapshot the caller can delete, so
+    it does not block rollback. Refusing a rollback that still has children
+    is an idea from ProxmoxMCP-Plus (MIT); the check reads our snapshot list.
+    """
+    children: list[str] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        child = str(item.get("name") or "")
+        if child in ("", "current", name):
+            continue
+        if item.get("parent") == name:
+            children.append(child)
+    return children
+
+
 def _require_stopped(prox: Any, kind: str, vmid: int, why: str) -> None:
     state = prox.status(kind, vmid)
     if state != "stopped":
@@ -760,8 +830,9 @@ def cmd_snapshot(lab: Any, args: Any) -> dict:
 
     List and create need the lease. Delete and rollback also need
     ``--confirm`` and a guest no other live lease holds, and rollback
-    refuses a running guest -- rolling back a disk that is in use is how
-    a session loses its machine.
+    refuses a running guest and a snapshot that still has children.
+    Rolling back a disk that is in use, or out from under a child
+    snapshot, is how a session loses its machine.
     """
     lease_id, vmid = str(args.lease), int(args.vmid)
     action = str(args.action)
@@ -795,6 +866,13 @@ def cmd_snapshot(lab: Any, args: Any) -> dict:
         _refuse_shared(lab, lease_id, kind, vmid)
     if action == "rollback":
         _require_stopped(prox, kind, vmid, "rollback")
+        children = _snapshot_children(prox.snapshot_list(kind, vmid), name)
+        if children:
+            listed = ", ".join(children)
+            raise LabError(
+                f"snapshot {name} has child snapshots ({listed}); "
+                f"delete those children first"
+            )
         prox.snapshot_rollback(kind, vmid, name)
         lab.audit(
             "guest-snapshot-rollback",
@@ -947,6 +1025,12 @@ def register(sub: Any, lab: Any) -> None:
 
     guest = sub.add_parser("guest", help="guest lifecycle over the proxmox seam")
     guest_sub = guest.add_subparsers(dest="guest_command", required=True)
+
+    nextid = guest_sub.add_parser(
+        "nextid",
+        help="next free cluster VMID (read-only; pass it to guest create)",
+    )
+    nextid.set_defaults(func=_bind(lab, cmd_nextid))
 
     create = guest_sub.add_parser(
         "create",
@@ -1107,7 +1191,8 @@ def register(sub: Any, lab: Any) -> None:
                              help="required: there is no interactive prompt")
     snap_delete.set_defaults(func=_bind(lab, cmd_snapshot))
     snap_rollback = snap_sub.add_parser(
-        "rollback", help="roll a stopped guest back to a snapshot"
+        "rollback",
+        help="roll a stopped guest back to a snapshot that has no children",
     )
     snap_rollback.add_argument("--lease", required=True)
     snap_rollback.add_argument("--vmid", type=int, required=True)

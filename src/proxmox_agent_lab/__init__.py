@@ -6,4 +6,4 @@ The host stays up unless `[power] auto_shutdown` is true and nothing else
 is running.
 """
 
-__version__ = "0.22.0"
+__version__ = "0.23.0"

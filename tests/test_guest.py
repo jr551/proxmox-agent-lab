@@ -135,8 +135,8 @@ class SurfaceTests(GuestCase):
         ]
         self.assertEqual(
             sorted(action.choices),
-            ["clone", "create", "destroy", "list", "media", "probe", "run",
-             "snapshot", "start", "stop", "template"],
+            ["clone", "create", "destroy", "list", "media", "nextid", "probe",
+             "run", "snapshot", "start", "stop", "template"],
         )
 
 
@@ -289,6 +289,7 @@ class CreateTests(GuestCase):
             "qm", "create", "101", "--name", "alpha",
             "--net0", "virtio,bridge=vmbr0",
             "--memory", "2048", "--cores", "2",
+            "--agent", "1",
             "--tags", tags, "--description", description,
         ])
         # single-call stamping: create + status, and nothing else
@@ -774,6 +775,17 @@ class RunTests(GuestCase):
         self.assertEqual(self.argvs(), [])
 
 
+class NextidTests(GuestCase):
+    def test_nextid_prints_the_cluster_id_and_creates_nothing(self) -> None:
+        self.fake.add(r"^pvesh get /cluster/nextid", stdout=b'"140"\n')
+        payload = self.run_cmd("guest", "nextid")
+        self.assertEqual(payload, {"vmid": 140})
+        self.assertEqual(
+            self.argvs(),
+            [["pvesh", "get", "/cluster/nextid", "--output-format", "json"]],
+        )
+
+
 class ProbeTests(GuestCase):
     def test_probe_reports_an_agent_reachable_qemu_guest(self) -> None:
         self.fake.add(r"^qm status 101", stdout=b"status: running\n")
@@ -797,6 +809,31 @@ class ProbeTests(GuestCase):
             "vmid": 102, "exists": True, "running": False, "kind": "lxc",
             "agent_ok": False, "ip": None, "channel": "pct",
         })
+
+    def test_probe_fills_an_lxc_address_from_interfaces(self) -> None:
+        self.fake.add(r"^pct status 102", stdout=b"status: running\n")
+        self.fake.add(
+            r"^pvesh get /nodes/pve/lxc/102/interfaces",
+            stdout=(
+                b'[{"name":"lo","inet":"127.0.0.1/8"},'
+                b'{"name":"eth0","inet":"10.1.2.3/24"}]'
+            ),
+        )
+        payload = self.run_cmd("guest", "probe", "--vmid", "102")
+        self.assertEqual(payload["ip"], "10.1.2.3")
+        self.assertEqual(payload["channel"], "pct")
+        self.assertTrue(payload["agent_ok"])
+
+    def test_probe_keeps_a_null_lxc_address_when_the_read_fails(self) -> None:
+        self.fake.add(r"^pct status 102", stdout=b"status: running\n")
+        self.fake.add(
+            r"^pvesh get /nodes/pve/lxc/102/interfaces",
+            returncode=1, stderr=b"not running\n",
+        )
+        payload = self.run_cmd("guest", "probe", "--vmid", "102")
+        self.assertTrue(payload["exists"])
+        self.assertIsNone(payload["ip"])
+        self.assertEqual(payload["channel"], "pct")
 
     def test_probe_reports_a_guest_the_node_does_not_know(self) -> None:
         payload = self.run_cmd("guest", "probe", "--vmid", "4242")
@@ -903,6 +940,13 @@ class SnapshotTests(GuestCase):
         self.open_lease()
         self.register_guest(LEASE, "lxc", 102, name="beta")
         self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        self.fake.add(
+            r"^pvesh get /nodes/pve/lxc/102/snapshot",
+            stdout=(
+                b'[{"name":"current","parent":"boot"},'
+                b'{"name":"boot","parent":null}]'
+            ),
+        )
         self.fake.add(r"^pct rollback 102 boot")
         payload = self.run_cmd(
             "guest", "snapshot", "rollback", "--lease", LEASE,
@@ -910,6 +954,27 @@ class SnapshotTests(GuestCase):
         )
         self.assertTrue(payload["rolled_back"])
         self.assertEqual(self.argvs()[-1], ["pct", "rollback", "102", "boot"])
+
+    def test_rollback_refuses_a_snapshot_that_has_children(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
+        self.fake.add(
+            r"^pvesh get /nodes/pve/qemu/101/snapshot",
+            stdout=(
+                b'[{"name":"boot"},'
+                b'{"name":"later","parent":"boot"},'
+                b'{"name":"current","parent":"later"}]'
+            ),
+        )
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "snapshot", "rollback", "--lease", LEASE,
+                "--vmid", "101", "--name", "boot", "--confirm",
+            )
+        self.assertIn("later", str(caught.exception))
+        self.assertIn("delete those children", str(caught.exception))
+        self.assertNotIn(["qm", "rollback", "101", "boot"], self.argvs())
 
     def test_a_bad_snapshot_name_is_refused_before_the_seam(self) -> None:
         self.open_lease()

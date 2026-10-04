@@ -47,15 +47,15 @@ Deep notes beyond the quick-ref:
 ## 🧰 The MCP surface
 
 If your client speaks MCP, point it at `proxmox-lab mcp` (stdio JSON-RPC 2.0).
-All 34 tools call the same handlers the CLI binds — same behavior, same gates:
+All 38 tools call the same handlers the CLI binds — same behavior, same gates:
 
 | Group | Tools |
 |---|---|
 | leases | `lease_begin`, `lease_heartbeat`, `lease_end`, `lease_list`, `lease_destroy`, `lease_register` |
-| guests | `guest_create`, `guest_clone`, `guest_media`, `guest_start`, `guest_stop`, `guest_destroy`, `guest_snapshot`, `guest_template`, `guest_probe`, `guest_list`, `guest_run` |
+| guests | `guest_nextid`, `guest_create`, `guest_clone`, `guest_media`, `guest_start`, `guest_stop`, `guest_destroy`, `guest_snapshot`, `guest_template`, `guest_probe`, `guest_list`, `guest_run` |
 | files | `push_file`, `pull_file` |
 | console | `console_screenshot`, `console_type`, `console_keys`, `console_move`, `console_click`, `console_drag`, `console_calibrate`, `console_grid`, `console_burst` |
-| hygiene & health | `cleanup_expired`, `journal_query`, `doctor`, `power_status`, `storage_status`, `net_capture` |
+| hygiene & health | `cleanup_expired`, `journal_query`, `doctor`, `status`, `power_status`, `storage_status`, `storage_content`, `network_bridges`, `net_capture` |
 
 Notes that matter:
 
@@ -64,7 +64,8 @@ Notes that matter:
   runs. `guest_snapshot` requires it for `delete` and `rollback` only.
   Pass it only when the user asked for that destruction.
 - Guest-scoped tools take `lease_id` + `vmid`; read-only tools (`guest_probe`,
-  `guest_list`, `journal_query`, `doctor`, `power_status`, `storage_status`)
+  `guest_list`, `guest_nextid`, `journal_query`, `doctor`, `status`,
+  `power_status`, `storage_status`, `storage_content`, `network_bridges`)
   need no lease.
 - Results arrive as `content[0].text` carrying the same JSON the CLI prints;
   `console_screenshot` returns the PNG inline as `png_base64`.
@@ -115,9 +116,16 @@ than retrying.
 Before `guest create`, size the machine from the host's free resources.
 
 ```bash
+proxmox-lab guest nextid     # next free VMID; pass it to guest create
+proxmox-lab network bridges  # bridges, so you are not stuck on vmbr0
 proxmox-lab storage status   # each store's avail, in bytes
+proxmox-lab storage content  # volid for --iso, --ostemplate, guest media
 proxmox-lab status           # memory.free, memory.total, cpu_count
 ```
+
+`guest nextid` is a read. Create does not pick an id. A VMID collision
+destroys a real machine. Over MCP the same numbers are `guest_nextid`,
+`network_bridges`, `storage_status`, `storage_content`, and `status`.
 
 `storage status` is the disk figure. `status` is the RAM and CPU figure.
 Pick a disk and a memory size the task needs, and leave headroom. A small
@@ -138,7 +146,10 @@ proxmox-lab guest clone --lease "$L" --vmid 9002 --source 100
 
 `guest create` clones the configured `[pve] template_vmid` only when that
 guest is a template (`template: 1`). A normal VM is refused. `--fresh` builds
-from scratch (LXC fresh needs `--ostemplate`). `guest clone` accepts any
+from scratch (LXC fresh needs `--ostemplate`). A fresh qemu create passes
+`--agent 1` so `guest run` and `guest probe` have a channel; that does not
+install the agent inside the guest. A clone keeps the source's setting.
+`guest clone` accepts any
 *vouched* source — a config template (`template: 1`) or a `policy=retain`
 registry row. Either way the guest is registered to your lease and stamped
 `proxmoxagentlab` metadata **before** it can ever be started.

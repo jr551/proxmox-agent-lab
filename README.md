@@ -10,6 +10,10 @@
 One machine, one Proxmox host, root SSH. Your key is the only credential.
 Python 3.11+, no extra packages.
 
+## Why this one
+
+[ProxmoxMCP-Plus](https://github.com/RekklesNA/ProxmoxMCP-Plus) and [canvrno/ProxmoxMCP](https://github.com/canvrno/ProxmoxMCP) authenticate with a Proxmox API token and call the HTTPS API. This one does not. Your SSH key is the only credential, and every remote command is one argv on an allowlist. A lease owns each guest and deletes it when the lease ends. The host stays up unless `[power] auto_shutdown` is on. `guest create` refuses a disk larger than the free space on that store. Cleanup will not touch a guest without the `proxmoxagentlab` tag. The package is the Python standard library only.
+
 ## 🚀 Setup
 
 ```bash
@@ -44,6 +48,9 @@ That clones your template into a free VMID. If `doctor` warned, use `--fresh` an
 | 📋 | `proxmox-lab status` | Host, leases and guests at a glance |
 | 🪪 | `proxmox-lab lease-begin --purpose "…"` | Open a lease. Nothing else mutates without one |
 | 💓 | `proxmox-lab lease-heartbeat --lease "$L"` | Keep a long session from expiring |
+| 🔢 | `proxmox-lab guest nextid` | Next free VMID. Pass it to create. A collision destroys a real machine |
+| 🌉 | `proxmox-lab network bridges` | Host bridges, so create is not stuck guessing vmbr0 |
+| 💿 | `proxmox-lab storage content` | ISO and template volids for `--iso`, `--ostemplate`, and `guest media` |
 | 🆕 | `proxmox-lab guest create --lease "$L" --vmid N --fresh --iso local:iso/name.iso --start` | Build a guest and boot that CD. Or omit `--iso` and clone a template |
 | ▶️ | `proxmox-lab guest run --lease "$L" --vmid N -- uname -a` | Run a command in the guest |
 | 📤 | `proxmox-lab push --lease "$L" --vmid N --file F --dest P` | Copy a file in |
@@ -56,7 +63,7 @@ That clones your template into a free VMID. If `doctor` warned, use `--fresh` an
 | 💾 | `proxmox-lab storage status` | Free space on each store. Read-only |
 | 🕸️ | `proxmox-lab netcap capture --lease "$L" --vmid N --out cap.pcap` | Pcap of that VM's tap only. TLS stays ciphertext |
 | 🧠 | `proxmox-lab memflow read --lease "$L" --vmid N --addr 0x1000` | Read a running qemu guest from outside it |
-| 🔌 | `proxmox-lab mcp` | The same operations as 34 tools over stdio |
+| 🔌 | `proxmox-lab mcp` | The same operations as 38 tools over stdio |
 
 Agents follow [SKILL.md](SKILL.md). Everything else is in [docs/README.md](docs/README.md).
 

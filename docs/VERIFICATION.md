@@ -127,7 +127,7 @@ Verified as code behavior, area by area:
   scanned boot text. The helper's own argv shape (subcommand, numeric vmid,
   bounded hex) is refused at the seam. Building that helper on a host is
   not what the suite does.
-- **MCP.** Over real stdio: initialize shape, the static 34-tool list, bad
+- **MCP.** Over real stdio: initialize shape, the static 38-tool list, bad
   params as `-32602` naming the field, action failures as `-32603` with
   redacted messages, notifications answered with silence, every call
   refreshing the idle clock, and the idle sweep firing a verified shutdown
@@ -161,6 +161,11 @@ the following has been observed on this reworked code:
   `console type` (as opposed to `console keys`) have not been watched.
   `guest run`'s remote quoting and the exec-status polling loop are
   asserted against scripted output; the LXC `pct exec` path is what ran.
+- **Next free VMID, bridge list, ISO/template volids, LXC probe address,
+  `--agent 1` on fresh `qm create`, and refusing snapshot rollback when
+  children exist.** Unit-tested with FakeSSH only. Not watched on the host
+  for this change. The LXC address read is swallowed when it fails, so a
+  probe still returns.
 - **The host actually coming up or going down.** The magic packet's bytes
   are proven; a NIC receiving one is not. Verified shutdown's probe math is
   proven; real sshd dying mid-request, DDNS lag, and a warm host refusing

@@ -46,6 +46,7 @@ _COMMANDS = {"qemu": "qm", "lxc": "pct"}
 
 _USAGE_ERROR = re.compile(r"(?i)unknown option|unrecognized|usage:")
 _STATUS_LINE = re.compile(r"status:\s*(\S+)")
+_STORAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 class ProxmoxError(LabError):
@@ -138,6 +139,47 @@ class Proxmox:
         )
         return _json_object(_require(result, action), action)
 
+    def cluster_nextid(self) -> int:
+        """Next free cluster VMID (``pvesh get /cluster/nextid``).
+
+        The caller passes this id to ``guest create``. Create does not pick
+        one: a collision destroys a real machine. The idea of asking the
+        cluster, rather than guessing, comes from ProxmoxMCP-Plus (MIT);
+        this is a ``pvesh get`` on this seam, not their client.
+        """
+        action = "pvesh cluster nextid"
+        result = self._ssh.run(
+            ["pvesh", "get", "/cluster/nextid", "--output-format", "json"],
+            timeout=DEFAULT_TIMEOUT,
+        )
+        payload = _json_value(_require(result, action), action)
+        if isinstance(payload, str) and payload.isdecimal():
+            return int(payload)
+        if isinstance(payload, int) and not isinstance(payload, bool) and payload > 0:
+            return payload
+        raise ProxmoxError(f"{action}: expected a VMID")
+
+    def network_bridges(self) -> list:
+        """Linux and OVS bridges (``pvesh`` ``--type any_bridge``).
+
+        ``any_bridge`` is the Proxmox filter that covers ``vmbr*`` and OVS
+        bridges. Same credit as :meth:`cluster_nextid`: the question is
+        theirs, the argv is ours.
+        """
+        action = "pvesh network bridges"
+        result = self._ssh.run(
+            [
+                "pvesh", "get", f"/nodes/{self._node}/network",
+                "--type", "any_bridge",
+                "--output-format", "json",
+            ],
+            timeout=DEFAULT_TIMEOUT,
+        )
+        payload = _json_value(_require(result, action), action)
+        if not isinstance(payload, list):
+            raise ProxmoxError(f"{action}: expected a list")
+        return payload
+
     def pveversion(self) -> str:
         result = self._ssh.run(["pveversion"], timeout=DEFAULT_TIMEOUT)
         return _text(_require(result, "pveversion").stdout)
@@ -226,7 +268,10 @@ class Proxmox:
                 argv += ["--scsihw", "virtio-scsi-pci"]
         if boot is not None:
             argv += ["--boot", boot]
-        argv += ["--tags", tags, "--description", description]
+        # Opens the channel guest run / guest probe use. Does not install
+        # qemu-guest-agent in the guest. Clones keep the source setting.
+        # The flag is an idea from ProxmoxMCP-Plus (MIT), not their code.
+        argv += ["--agent", "1", "--tags", tags, "--description", description]
         _require(self._ssh.run(argv, timeout=CREATE_TIMEOUT), f"qm create {vmid}")
 
     def lxc_create(
@@ -424,6 +469,27 @@ class Proxmox:
             raise ProxmoxError(f"{action}: expected a list")
         return payload
 
+    def storage_content(self, storage: str, content: str) -> list:
+        """Volumes of one content type on one store (``iso`` or ``vztmpl``)."""
+        if content not in ("iso", "vztmpl"):
+            raise ProxmoxError(f"storage content type {content!r} is not iso or vztmpl")
+        if _STORAGE_ID.fullmatch(storage) is None:
+            raise ProxmoxError(f"storage name {storage!r} is not a plain name")
+        action = f"pvesh storage content {storage} {content}"
+        result = self._ssh.run(
+            [
+                "pvesh", "get",
+                f"/nodes/{self._node}/storage/{storage}/content",
+                "--content", content,
+                "--output-format", "json",
+            ],
+            timeout=DEFAULT_TIMEOUT,
+        )
+        payload = _json_value(_require(result, action), action)
+        if not isinstance(payload, list):
+            raise ProxmoxError(f"{action}: expected a list")
+        return payload
+
     # -- status and probes ----------------------------------------------------
 
     def status(self, kind: str, vmid: int) -> str:
@@ -463,6 +529,27 @@ class Proxmox:
                 if str(address.get("ip-address-type", "")).lower() == "ipv4":
                     return str(address.get("ip-address"))
         return None
+
+    def lxc_interfaces(self, vmid: int) -> list:
+        """Container interfaces (``pvesh get .../lxc/<vmid>/interfaces``).
+
+        Probe uses this for an LXC address. A failure here is the caller's
+        to swallow: a dark container must not fail the probe. Idea from
+        ProxmoxMCP-Plus (MIT); the read is ``pvesh get`` on this seam.
+        """
+        action = f"pvesh lxc interfaces {vmid}"
+        result = self._ssh.run(
+            [
+                "pvesh", "get",
+                f"/nodes/{self._node}/lxc/{vmid}/interfaces",
+                "--output-format", "json",
+            ],
+            timeout=DEFAULT_TIMEOUT,
+        )
+        payload = _json_value(_require(result, action), action)
+        if not isinstance(payload, list):
+            raise ProxmoxError(f"{action}: expected a list")
+        return payload
 
     # -- guest execution --------------------------------------------------------
 

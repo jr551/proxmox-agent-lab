@@ -1,4 +1,4 @@
-"""Tests for the MCP server (``mcp.py``): the 34-tool surface over stdio.
+"""Tests for the MCP server (``mcp.py``): the 38-tool surface over stdio.
 
 Two harnesses, both speaking real newline-delimited JSON-RPC bytes:
 
@@ -49,6 +49,7 @@ TOOL_NAMES = [
     "lease_list",
     "lease_destroy",
     "lease_register",
+    "guest_nextid",
     "guest_create",
     "guest_clone",
     "guest_media",
@@ -74,8 +75,11 @@ TOOL_NAMES = [
     "cleanup_expired",
     "journal_query",
     "doctor",
+    "status",
     "power_status",
     "storage_status",
+    "storage_content",
+    "network_bridges",
     "net_capture",
 ]
 
@@ -122,6 +126,9 @@ class FakeLab:
         leases_module.record_mcp_activity(
             Path(self.STATE_ROOT), tool_name, audit=self.audit
         )
+
+    def mcp_idle_elapsed(self) -> int:
+        return 0
 
     def mcp_idle_shutdown_due(self) -> bool:
         return leases_module.mcp_idle_shutdown_due(
@@ -397,13 +404,13 @@ class InProcessProtocolTests(McpTestCase):
         self.assertIn("version", result["serverInfo"])
         self.assertEqual(result["capabilities"], {"tools": {}})
 
-    def test_tools_list_is_exactly_the_34_tools_with_schemas(self):
+    def test_tools_list_is_exactly_the_38_tools_with_schemas(self):
         with _InProcessMcp(self.lab) as server:
             listed = server.request({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/list",
             })
         tools = listed["result"]["tools"]
-        self.assertEqual(len(tools), 34)
+        self.assertEqual(len(tools), 38)
         self.assertEqual([t["name"] for t in tools], TOOL_NAMES)
         for tool in tools:
             schema = tool["inputSchema"]
@@ -766,6 +773,30 @@ class PowerStatusTests(McpTestCase):
         self.assertEqual(
             self.result_payload(response), self.lab.power_status_payload
         )
+
+
+class StatusToolTests(McpTestCase):
+    def test_status_reuses_the_cli_memory_report(self):
+        fake = FakeSSH()
+        fake.add(r"^true")
+        fake.add(r"^pveversion", stdout=b"pve-manager/9.0\n")
+        fake.add(
+            r"^pvesh get /nodes/pve/status",
+            stdout=(
+                b'{"uptime":3,"memory":{"free":100,"total":400,"used":300},'
+                b'"cpuinfo":{"cpus":4}}'
+            ),
+        )
+        fake.add(r"^qm list", stdout=b"VMID NAME STATUS\n")
+        fake.add(r"^pct list", stdout=b"VMID STATUS\n")
+        self.lab.ssh = fake
+        with _InProcessMcp(self.lab) as server:
+            response = server.call("status", {})
+        payload = self.result_payload(response)
+        self.assertEqual(payload["memory"]["free"], 100)
+        self.assertEqual(payload["memory"]["total"], 400)
+        self.assertEqual(payload["cpu_count"], 4)
+        self.assertTrue(payload["reachable"])
 
 
 if __name__ == "__main__":

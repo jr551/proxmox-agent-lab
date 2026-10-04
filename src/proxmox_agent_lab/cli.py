@@ -467,6 +467,7 @@ def parser() -> argparse.ArgumentParser:
     from . import mcp
     from . import memflow
     from . import netcap
+    from . import network
     from . import storage
     from . import transfer
 
@@ -476,6 +477,7 @@ def parser() -> argparse.ArgumentParser:
     mcp.register(sub, _module())
     memflow.register(sub, _module())
     netcap.register(sub, _module())
+    network.register(sub, _module())
     storage.register(sub, _module())
     transfer.register(sub, _module())
     return root

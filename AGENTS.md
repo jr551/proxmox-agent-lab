@@ -5,7 +5,7 @@
 
 ## Project Overview
 
-`proxmox-agent-lab` is a Python package and agent skill for operating a disposable Proxmox research lab. It is a slim SSH-only control plane: `ssh-copy-id root@proxmox` is the whole credential story, `qm`/`pct`/`pvesh` run over one SSH seam, one local SQLite `lab.db` holds leases, resources and the audit journal, and `proxmox-lab mcp` serves the same operations as a 34-tool MCP surface. The `proxmox-lab` CLI takes a lease, creates and operates lease-owned VMs/LXCs, transfers files and drives the console, then destroys lease-owned resources and verifies the host powered off.
+`proxmox-agent-lab` is a Python package and agent skill for operating a disposable Proxmox research lab. It is a slim SSH-only control plane: `ssh-copy-id root@proxmox` is the whole credential story, `qm`/`pct`/`pvesh` run over one SSH seam, one local SQLite `lab.db` holds leases, resources and the audit journal, and `proxmox-lab mcp` serves the same operations as a 38-tool MCP surface. The `proxmox-lab` CLI takes a lease, creates and operates lease-owned VMs/LXCs, transfers files and drives the console, then destroys lease-owned resources and verifies the host powered off.
 
 Use it only for systems the operator owns or is authorized to test. The safety model is part of the product: leases, ownership checks, expiry, audit redaction, the remote-command allowlist, explicit host-change gates, and verified shutdown must remain intact.
 
@@ -16,7 +16,7 @@ Use it only for systems the operator owns or is authorized to test. The safety m
 1. **CLI facade and command registration**
    - `src/proxmox_agent_lab/cli.py` owns configuration loading, parser construction, command policy gates, and the `lab` facade every feature module receives. `__main__.py` and the installed `proxmox-lab` entry point call `cli.main()`.
    - Feature modules register subcommands with `register(sub, lab)` and reach shared state through the `lab` facade (`cli._bind` binds one-argument callables for argparse). Do not create a second command-dispatch architecture.
-   - `mcp.py` is a stdlib-only stdio JSON-RPC 2.0 server (`initialize`, `tools/list`, `tools/call`, 34 tools, no MCP SDK) started by `proxmox-lab mcp`. It binds the *same* `cmd_*` handlers the CLI binds, so the two surfaces cannot drift. `memflow` stays CLI-only.
+   - `mcp.py` is a stdlib-only stdio JSON-RPC 2.0 server (`initialize`, `tools/list`, `tools/call`, 38 tools, no MCP SDK) started by `proxmox-lab mcp`. It binds the *same* `cmd_*` handlers the CLI binds, so the two surfaces cannot drift. `memflow` stays CLI-only.
 
 2. **The one SSH seam**
    - `ssh.py` is the only module that spawns `ssh`: every remote action is a single argv over `ssh -o BatchMode=yes root@<target>`, argv-recordable and timeout-bounded. Arguments are `shlex.quote`d at the seam; no caller composes remote shell strings.

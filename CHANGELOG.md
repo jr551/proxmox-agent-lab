@@ -7,6 +7,36 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+## 0.23.0 - 2026-10-04
+
+### Added
+
+- `guest nextid`, `network bridges`, and `storage content` (CLI and MCP)
+  are read-only looks at the next free VMID, host bridges, and ISO and
+  template volids. Call `guest nextid` before `guest create`: a VMID
+  collision destroys a real machine. Create does not pick an id.
+- `guest probe` fills an LXC address from the container interface list
+  when that read works, and still succeeds when it does not.
+- MCP `status` reports the same `memory.free`, `memory.total`, and
+  `cpu_count` the CLI `status` command already computes.
+- Fresh `qm create` passes `--agent 1` so the guest-agent channel exists.
+  That does not install the agent inside the guest. Clones keep the
+  source's setting.
+- The README and skill say why this server is the SSH-and-lease one:
+  the public Proxmox MCP servers checked (ProxmoxMCP-Plus,
+  canvrno/ProxmoxMCP) authenticate with an API token.
+
+### Changed
+
+- Snapshot rollback refuses when another snapshot lists the target as
+  its parent, and tells the caller to delete those children first.
+  `--confirm` and a stopped guest are still required.
+
+The next-id, bridge, volume, LXC-address, host-memory, guest-agent, and
+snapshot-child checks are ideas from
+[ProxmoxMCP-Plus](https://github.com/RekklesNA/ProxmoxMCP-Plus) (MIT).
+The implementation is this project's SSH argv, not their code.
+
 ## 0.22.0 - 2026-10-04
 
 ### Added

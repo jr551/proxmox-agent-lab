@@ -54,6 +54,28 @@ class ProxmoxTests(unittest.TestCase):
         )
         self.assertEqual(call["timeout"], 30.0)
 
+    def test_cluster_nextid_reads_the_json_string(self) -> None:
+        self.ssh.add(r"pvesh get /cluster/nextid", stdout=b'"120"\n')
+        self.assertEqual(self.pve.cluster_nextid(), 120)
+        self.assertEqual(
+            self.ssh.calls[0]["argv"],
+            ["pvesh", "get", "/cluster/nextid", "--output-format", "json"],
+        )
+
+    def test_network_bridges_asks_for_any_bridge(self) -> None:
+        self.ssh.add(
+            r"pvesh get /nodes/pve1/network",
+            stdout=_j([{"iface": "vmbr0", "type": "bridge"}]),
+        )
+        self.assertEqual(self.pve.network_bridges()[0]["iface"], "vmbr0")
+        self.assertEqual(
+            self.ssh.calls[0]["argv"],
+            [
+                "pvesh", "get", "/nodes/pve1/network",
+                "--type", "any_bridge", "--output-format", "json",
+            ],
+        )
+
     def test_pveversion_returns_stripped_output(self) -> None:
         self.ssh.add("pveversion", stdout=b"pve-manager/8.3.1/abc\n")
         self.assertEqual(self.pve.pveversion(), "pve-manager/8.3.1/abc")
@@ -122,6 +144,8 @@ class ProxmoxTests(unittest.TestCase):
                 "2048",
                 "--cores",
                 "2",
+                "--agent",
+                "1",
                 "--tags",
                 "pxl;lease-abc",
                 "--description",
@@ -336,6 +360,30 @@ class ProxmoxTests(unittest.TestCase):
         self.ssh.add(r"network-get-interfaces", stdout=_j([interfaces[0]]))
         self.assertEqual(self.pve.guest_ip(100), "10.0.0.5")
         self.assertIsNone(self.pve.guest_ip(100))
+
+    def test_lxc_interfaces_reads_the_container_list(self) -> None:
+        self.ssh.add(
+            r"pvesh get /nodes/pve1/lxc/200/interfaces",
+            stdout=_j([{"name": "eth0", "inet": "10.2.0.4/24"}]),
+        )
+        self.assertEqual(self.pve.lxc_interfaces(200)[0]["inet"], "10.2.0.4/24")
+        self.assertEqual(
+            self.ssh.calls[0]["argv"],
+            [
+                "pvesh", "get", "/nodes/pve1/lxc/200/interfaces",
+                "--output-format", "json",
+            ],
+        )
+
+    def test_storage_content_names_the_content_type(self) -> None:
+        self.ssh.add(
+            r"pvesh get /nodes/pve1/storage/local/content",
+            stdout=_j([{"volid": "local:iso/debian.iso", "content": "iso"}]),
+        )
+        rows = self.pve.storage_content("local", "iso")
+        self.assertEqual(rows[0]["volid"], "local:iso/debian.iso")
+        self.assertIn("--content", self.ssh.calls[0]["argv"])
+        self.assertIn("iso", self.ssh.calls[0]["argv"])
 
     # -- guest execution ----------------------------------------------------
 

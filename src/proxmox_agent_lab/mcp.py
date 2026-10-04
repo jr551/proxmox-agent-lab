@@ -1,6 +1,6 @@
 """The MCP server: stdio JSON-RPC 2.0, stdlib only, no SDK.
 
-``proxmox-lab mcp`` serves the 34-tool surface over
+``proxmox-lab mcp`` serves the 38-tool surface over
 stdin/stdout. The wire format is newline-delimited JSON -- one complete
 JSON-RPC message per line, UTF-8, with no ``Content-Length`` framing. stdout
 carries protocol messages only; everything else goes to stderr.
@@ -159,12 +159,25 @@ TOOLS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "guest_nextid",
+        "description": (
+            "Next free cluster VMID (read-only). Call this before "
+            "guest_create and pass the id yourself. A VMID collision "
+            "destroys a real machine. Create does not pick an id."
+        ),
+        "inputSchema": _schema(),
+    },
+    {
         "name": "guest_create",
         "description": (
             "Create a lease-owned guest from the template. "
-            "Read storage_status first and size the disk to the task "
-            "with headroom; a disk larger than that store's free space "
-            "is refused. Leave the host RAM headroom."
+            "Call guest_nextid first and pass that vmid. "
+            "Read storage_status for free disk and status for "
+            "memory.free, memory.total, and cpu_count. Size the disk "
+            "to the task with headroom; a disk larger than that store's "
+            "free space is refused. Leave the host RAM headroom. "
+            "A fresh qemu create enables the guest-agent channel; that "
+            "does not install the agent inside the guest."
         ),
         "inputSchema": _schema(
             required=("lease_id", "vmid"),
@@ -259,7 +272,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "name": "guest_snapshot",
         "description": (
             "List, create, delete or roll back snapshots of a lease-owned "
-            "guest. delete and rollback require confirm."
+            "guest. delete and rollback require confirm. rollback also "
+            "refuses a running guest and a snapshot that still has children."
         ),
         "inputSchema": _schema(
             required=("lease_id", "vmid", "action"),
@@ -432,6 +446,15 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": _schema(host_checks=_BOOL),
     },
     {
+        "name": "status",
+        "description": (
+            "Host, leases, memory.free, memory.total, and cpu_count "
+            "(read-only). Same report as the status command. Use it "
+            "before guest_create so the guest leaves RAM headroom."
+        ),
+        "inputSchema": _schema(),
+    },
+    {
         "name": "power_status",
         "description": "Host reachability and what pins it on (read-only).",
         "inputSchema": _schema(),
@@ -439,6 +462,23 @@ TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "storage_status",
         "description": "Free space on each node store (read-only).",
+        "inputSchema": _schema(),
+    },
+    {
+        "name": "storage_content",
+        "description": (
+            "ISO and template volids (read-only). Pass volid to "
+            "guest_create iso or ostemplate, or to guest_media. "
+            "storage_status remains the free-space view."
+        ),
+        "inputSchema": _schema(storage=_STR),
+    },
+    {
+        "name": "network_bridges",
+        "description": (
+            "Host bridges, including vmbr and any_bridge (read-only). "
+            "Use one as guest_create bridge instead of guessing vmbr0."
+        ),
         "inputSchema": _schema(),
     },
     {
@@ -599,6 +639,12 @@ def _dispatch_lease_register(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
         lab,
         _ns(a, policy=policy, ttl=None),
     )
+
+
+def _dispatch_guest_nextid(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import guest
+
+    return _invoke(guest.cmd_nextid, lab, _ns(a))
 
 
 def _dispatch_guest_create(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
@@ -797,6 +843,24 @@ def _dispatch_storage_status(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
     from . import storage
 
     return _invoke(storage.cmd_status, lab, _ns(a))
+
+
+def _dispatch_storage_content(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import storage
+
+    return _invoke(storage.cmd_content, lab, _ns(a, storage=a.get("storage")))
+
+
+def _dispatch_network_bridges(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import network
+
+    return _invoke(network.cmd_bridges, lab, _ns(a))
+
+
+def _dispatch_status(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import diagnostics
+
+    return _invoke(diagnostics.cmd_status, lab, _ns(a))
 
 
 def _dispatch_net_capture(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
@@ -1093,6 +1157,7 @@ _DISPATCH: dict[str, Callable[[Any, dict[str, Any]], dict[str, Any]]] = {
     "lease_list": _dispatch_lease_list,
     "lease_destroy": _dispatch_lease_destroy,
     "lease_register": _dispatch_lease_register,
+    "guest_nextid": _dispatch_guest_nextid,
     "guest_create": _dispatch_guest_create,
     "guest_clone": _dispatch_guest_clone,
     "guest_media": _dispatch_guest_media,
@@ -1118,8 +1183,11 @@ _DISPATCH: dict[str, Callable[[Any, dict[str, Any]], dict[str, Any]]] = {
     "cleanup_expired": _dispatch_cleanup_expired,
     "journal_query": _dispatch_journal_query,
     "doctor": _dispatch_doctor,
+    "status": _dispatch_status,
     "power_status": _dispatch_power_status,
     "storage_status": _dispatch_storage_status,
+    "storage_content": _dispatch_storage_content,
+    "network_bridges": _dispatch_network_bridges,
     "net_capture": _dispatch_net_capture,
 }
 

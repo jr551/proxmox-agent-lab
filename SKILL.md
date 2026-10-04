@@ -13,6 +13,10 @@ file (`lab.db`, under `[state] dir`). Host power-off is optional
 Proxmox host** except `qm`/`pct`/`pvesh` — plus one optional garbage-collector
 cron line (`gc install`). Zero third-party dependencies.
 
+## Why this one
+
+Public Proxmox MCP servers ([ProxmoxMCP-Plus](https://github.com/RekklesNA/ProxmoxMCP-Plus), [canvrno/ProxmoxMCP](https://github.com/canvrno/ProxmoxMCP)) call the HTTPS API with a separate secret. This server does not. The SSH key is the only credential. One argv allowlist. A lease owns the guests and deletes them at `lease-end`. The host stays up unless `[power] auto_shutdown`. `guest create` refuses a disk bigger than free space. Guests carry a `proxmoxagentlab` tag, and cleanup will not touch one without it. `memflow` is CLI-only. Standard library, zero dependencies.
+
 ## The host may be in use
 
 The Proxmox host is often **someone's live machine** — the lab is a guest on
@@ -28,11 +32,15 @@ Rules that follow from that, and they are not negotiable:
 - **Never touch a guest without a `proxmoxagentlab` tag.** Do not destroy,
   stop, resize or reconfigure it, and do not `lease-register` one you were
   not asked to adopt. A refusal here is the design working, not an obstacle.
-- **Check VMID and storage before creating.** Use an unused VMID and a pool
-  that exists on this host: `guest create --vmid <free> --storage <pool>
-  --disk-gb <n>`. A collision destroys a real machine.
+- **Check VMID and storage before creating.** Run `proxmox-lab guest nextid`
+  and pass that id to `guest create`. Create does not pick one. A collision
+  destroys a real machine. `proxmox-lab network bridges` lists the bridges
+  so you are not stuck guessing `vmbr0`. `proxmox-lab storage content`
+  prints the volid for `--iso`, `--ostemplate`, and `guest media`.
+  `storage status` stays the free-space view.
 - **Size the guest from what is free.** Before `guest create`, run
-  `proxmox-lab storage status` and `proxmox-lab status`. Storage status
+  `proxmox-lab storage status` and `proxmox-lab status` (MCP: `storage_status`
+  and `status`). Storage status
   gives each store's `avail` in bytes. Status gives `memory.free`,
   `memory.total`, and `cpu_count`. Choose a disk and a memory size the
   task needs, with a little headroom, and stop there. A small test guest
@@ -129,7 +137,10 @@ asked for persistence. See [docs/long-term-leases.md](docs/long-term-leases.md).
 | `proxmox-lab lease-destroy --lease L --confirm` | forcibly end a lease (the only exit for long-term) |
 | `proxmox-lab lease-abandon --lease L --confirm` | close a lease, touching neither guests nor host power |
 | `proxmox-lab cleanup-expired` | sweep expired leases; `--all`, or `--reclaim-orphans` with `--host-change-authorized` |
-| `proxmox-lab guest create --lease L --vmid N` | clone `[pve] template_vmid` when it is `template: 1` (`--fresh` builds from scratch; `--iso local:iso/name.iso` boots that CD; a normal VM is refused; a disk larger than the store's free space is refused) |
+| `proxmox-lab guest nextid` | next free cluster VMID (read-only). Pass it to `guest create` |
+| `proxmox-lab network bridges` | host bridges, `vmbr*` and `any_bridge` (read-only) |
+| `proxmox-lab storage content` | ISO and template volids (read-only). `storage status` stays free space |
+| `proxmox-lab guest create --lease L --vmid N` | clone `[pve] template_vmid` when it is `template: 1` (`--fresh` builds from scratch and, for qemu, passes `--agent 1`; that does not install the agent in the guest; `--iso local:iso/name.iso` boots that CD; a normal VM is refused; a disk larger than the store's free space is refused) |
 | `proxmox-lab guest clone --lease L --vmid N --source M` | clone a registry-vouched template |
 | `proxmox-lab guest start --lease L --vmid N` / `guest stop` | lifecycle; stop is graceful then hard |
 | `proxmox-lab guest destroy --lease L --vmid N --confirm` | irreversible delete of a lease-owned guest |
@@ -149,7 +160,7 @@ asked for persistence. See [docs/long-term-leases.md](docs/long-term-leases.md).
 | `proxmox-lab console calibrate --vmid N --action start` | lay markers to measure this client's image scaling |
 | `proxmox-lab power status` / `wake` / `shutdown` | manual power; wake/shutdown need `--standalone-authorized` |
 | `proxmox-lab gc install` / `status` / `uninstall` | host-side GC cron; install/uninstall need `--host-change-authorized` |
-| `proxmox-lab guest snapshot list\|create\|delete\|rollback` | snapshots of a lease-owned guest; delete and rollback need `--confirm`, rollback needs the guest stopped |
+| `proxmox-lab guest snapshot list\|create\|delete\|rollback` | snapshots of a lease-owned guest; delete and rollback need `--confirm`, rollback needs the guest stopped and a snapshot with no children |
 | `proxmox-lab guest template --lease L --vmid N --confirm` | turn a stopped lease-owned guest into a template. Teardown will not destroy it afterwards |
 | `proxmox-lab storage status` | free space on each store (read-only) |
 | `proxmox-lab netcap capture --lease L --vmid N --out cap.pcap` | pcap of that running qemu VM's tap only (`--nic net0`, `--seconds`, `--filter`). No `--iface`. TLS stays ciphertext |
@@ -159,7 +170,7 @@ asked for persistence. See [docs/long-term-leases.md](docs/long-term-leases.md).
 ## MCP server
 
 Point an MCP client at `proxmox-lab mcp` — a stdlib-only JSON-RPC 2.0 server
-on stdio (newline-delimited messages) exposing these 34 tools. They call the
+on stdio (newline-delimited messages) exposing these 38 tools. They call the
 same functions as the CLI; results are `content[0].text` carrying the CLI JSON
 body (screenshots as `png_base64`). Errors are JSON-RPC errors: `-32602` for
 schema/`confirm`/key-name violations, `-32603` for a failed action (redacted).
@@ -174,15 +185,16 @@ active lease the server performs the verified host shutdown itself.
 | `lease_list` | leases (active unless `include_ended`) |
 | `lease_destroy` | forcibly destroy a lease and its guests (`confirm`) |
 | `lease_register` | adopt an existing guest into a lease |
-| `guest_create` | create a lease-owned guest (`fresh`, `iso`, `disk_bus`, `nic`) |
+| `guest_nextid` | next free cluster VMID (read-only; pass it to `guest_create`) |
+| `guest_create` | create a lease-owned guest (`fresh`, `iso`, `disk_bus`, `nic`, `bridge`) |
 | `guest_media` | change a qemu guest's CD or floppy |
 | `guest_clone` | clone a vouched template into a lease-owned guest |
 | `guest_start` | start a lease-owned guest |
 | `guest_stop` | stop a lease-owned guest (graceful, then hard) |
 | `guest_destroy` | destroy a lease-owned guest (`confirm`) |
-| `guest_probe` | how one guest can be reached (read-only) |
+| `guest_probe` | how one guest can be reached (read-only; LXC `ip` from interfaces when that read works) |
 | `guest_list` | registered guests with live state (read-only) |
-| `guest_snapshot` | list/create/delete/rollback snapshots (`confirm` on delete and rollback) |
+| `guest_snapshot` | list/create/delete/rollback snapshots (`confirm` on delete and rollback; rollback refuses children) |
 | `guest_template` | turn a stopped lease-owned guest into a template (`confirm`) |
 | `guest_run` | run a command in a lease-owned guest |
 | `push_file` | copy a local file into a guest |
@@ -199,8 +211,11 @@ active lease the server performs the verified host shutdown itself.
 | `cleanup_expired` | sweep expired leases (`confirm`; may power off an idle host) |
 | `journal_query` | audit events from lab.db (read-only) |
 | `doctor` | end-to-end health check (read-only) |
+| `status` | host, leases, `memory.free`, `memory.total`, `cpu_count` (read-only; same as `proxmox-lab status`) |
 | `power_status` | host reachability and what pins it on (read-only) |
 | `storage_status` | free space on each store (read-only) |
+| `storage_content` | ISO and template volids (read-only) |
+| `network_bridges` | host bridges (read-only) |
 | `net_capture` | pcap of one lease-owned running qemu VM's tap (`out` path; TLS stays ciphertext) |
 
 ### Clicking: which coordinates are you reading?

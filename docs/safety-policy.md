@@ -92,7 +92,12 @@ Every byte to and from the host crosses `ssh.py`, the only module that spawns
   `crontab`, `install`, `ethtool`, `tee`, `rm` additionally need
   `host_change=True`, plumbed from the CLI authorization flags — with the one
   read-only exception `crontab -l`. Anything else, an arbitrary root shell
-  included, is refused as a `PolicyError` before spawn.
+  included, is refused as a `PolicyError` before spawn. The one extra shape
+  is passive VM capture: `timeout --signal=TERM <1-120> tcpdump -n -i
+  tap<vmid>i<n> -w - -U`, optional `-c` and a short BPF expression. The
+  interface must be that guest tap. A bridge, a physical NIC, a veth, or
+  `-w` to a host file is refused before spawn. Which VM may be named is
+  still a lease check above this seam.
 - The remote argv is `shlex.quote`d word-by-word and joined; `;`, `$(...)` and
   spaces arrive as literal argument text, never as shell syntax.
 - `cat` and `tee` are confined to `/tmp/pxl-*`; `rm` to `/tmp/pxl-*` and

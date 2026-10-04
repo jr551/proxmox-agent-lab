@@ -7,6 +7,27 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+## 0.21.0 - 2026-10-04
+
+### Added
+
+- `guest snapshot` (list, create, delete, rollback) and `guest template`,
+  so a stopped lease-owned guest can become a clone source. Delete,
+  rollback and template require `--confirm`. Rollback and template refuse
+  a running guest. Teardown still will not destroy a template.
+- `storage status`: read-only free space for each store on the node.
+- `netcap capture`: a bounded pcap of one lease-owned running qemu VM's
+  tap. The seam accepts `tcpdump` only on `tap<vmid>i<n>`, writing to
+  stdout. There is no interface override and no MITM relay.
+- `guest create --fresh --iso <volid>` boots that CD ahead of the disk.
+
+### Fixed
+
+- `console keys` sends one `qm sendkey` per key. Proxmox 9 rejects several
+  keys in a single call, so a menu selection never arrived.
+- Destroying a template no longer suggests dropping a vouch that no
+  command can drop. The guest stays, and lease-end leaves it in place.
+
 ## 0.20.0 - 2026-10-04
 
 ### Changed

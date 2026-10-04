@@ -108,7 +108,7 @@ class GuestCase(unittest.TestCase):
 
 
 class SurfaceTests(GuestCase):
-    def test_register_exposes_exactly_the_eight_guest_subcommands(self) -> None:
+    def test_register_exposes_the_guest_subcommands(self) -> None:
         parser = argparse.ArgumentParser()
         sub = parser.add_subparsers(dest="command", required=True)
         lab_guest.register(sub, self.lab)
@@ -120,7 +120,7 @@ class SurfaceTests(GuestCase):
         self.assertEqual(
             sorted(action.choices),
             ["clone", "create", "destroy", "list", "probe", "run",
-             "start", "stop"],
+             "snapshot", "start", "stop", "template"],
         )
 
 
@@ -277,6 +277,32 @@ class CreateTests(GuestCase):
         ])
         # single-call stamping: create + status, and nothing else
         self.assertEqual(len(self.argvs()), 2)
+
+    def test_fresh_qemu_create_attaches_an_iso_and_boots_it_first(self) -> None:
+        self.open_lease()
+        self.fake.add(r"^qm create 101")
+        self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
+        self.run_cmd(
+            "guest", "create", "--lease", LEASE, "--vmid", "101",
+            "--fresh", "--storage", "local-lvm", "--disk-gb", "8",
+            "--iso", "local:iso/alpine.iso",
+        )
+        argv = self.argvs()[0]
+        self.assertIn("--ide2", argv)
+        self.assertEqual(
+            argv[argv.index("--ide2") + 1], "local:iso/alpine.iso,media=cdrom"
+        )
+        self.assertIn("order=ide2;scsi0", argv)
+        self.assertIn("virtio-scsi-pci", argv)
+
+    def test_a_bad_iso_volid_never_reaches_the_seam(self) -> None:
+        self.open_lease()
+        with self.assertRaises(errors.LabError):
+            self.run_cmd(
+                "guest", "create", "--lease", LEASE, "--vmid", "101",
+                "--fresh", "--iso", "local:iso/alpine.iso,media=cdrom",
+            )
+        self.assertEqual(self.argvs(), [])
 
     def test_an_explicitly_empty_template_is_a_fresh_create(self) -> None:
         self.open_lease()
@@ -744,6 +770,137 @@ class ListTests(GuestCase):
         narrowed = self.run_cmd("guest", "list", "--lease", OTHER_LEASE)
         self.assertEqual([guest["vmid"] for guest in narrowed["guests"]],
                          [102])
+
+
+class SnapshotTests(GuestCase):
+    def test_list_reads_snapshots_and_audits_nothing(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(
+            r"^pvesh get /nodes/pve/qemu/101/snapshot",
+            stdout=b'[{"name":"current","description":"","snaptime":null},'
+                   b'{"name":"boot","description":"clean","snaptime":10}]',
+        )
+        payload = self.run_cmd(
+            "guest", "snapshot", "list", "--lease", LEASE, "--vmid", "101"
+        )
+        self.assertEqual(payload["snapshots"][1]["name"], "boot")
+        self.lab.audit.assert_not_called()
+
+    def test_create_names_the_snapshot_and_audits_the_name_only(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(r"^qm snapshot 101 boot")
+        payload = self.run_cmd(
+            "guest", "snapshot", "create", "--lease", LEASE, "--vmid", "101",
+            "--name", "boot", "--description", "clean install",
+        )
+        self.assertTrue(payload["created"])
+        self.assertEqual(
+            self.argvs(),
+            [["qm", "snapshot", "101", "boot", "--description", "clean install"]],
+        )
+        self.lab.audit.assert_called_once_with(
+            "guest-snapshot-create",
+            lease=LEASE, vmid=101, kind="qemu", name="boot",
+        )
+
+    def test_delete_demands_confirm_before_any_seam_call(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        with self.assertRaises(errors.LabError):
+            self.run_cmd(
+                "guest", "snapshot", "delete", "--lease", LEASE,
+                "--vmid", "101", "--name", "boot",
+            )
+        self.assertEqual(self.argvs(), [])
+
+    def test_rollback_refuses_a_running_guest(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(r"^qm status 101", stdout=b"status: running\n")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "snapshot", "rollback", "--lease", LEASE,
+                "--vmid", "101", "--name", "boot", "--confirm",
+            )
+        self.assertIn("stopped", str(caught.exception))
+        self.assertNotIn(
+            ["qm", "rollback", "101", "boot"], self.argvs()
+        )
+
+    def test_rollback_of_a_stopped_guest(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "lxc", 102, name="beta")
+        self.fake.add(r"^pct status 102", stdout=b"status: stopped\n")
+        self.fake.add(r"^pct rollback 102 boot")
+        payload = self.run_cmd(
+            "guest", "snapshot", "rollback", "--lease", LEASE,
+            "--vmid", "102", "--name", "boot", "--confirm",
+        )
+        self.assertTrue(payload["rolled_back"])
+        self.assertEqual(self.argvs()[-1], ["pct", "rollback", "102", "boot"])
+
+    def test_a_bad_snapshot_name_is_refused_before_the_seam(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        with self.assertRaises(errors.LabError):
+            self.run_cmd(
+                "guest", "snapshot", "create", "--lease", LEASE,
+                "--vmid", "101", "--name", "current",
+            )
+        self.assertEqual(self.argvs(), [])
+
+
+class TemplateTests(GuestCase):
+    def test_template_demands_confirm_before_any_seam_call(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        with self.assertRaises(errors.LabError):
+            self.run_cmd(
+                "guest", "template", "--lease", LEASE, "--vmid", "101"
+            )
+        self.assertEqual(self.argvs(), [])
+
+    def test_template_converts_a_stopped_guest(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(r"^qm config 101", stdout=b"name: alpha\n")
+        self.fake.add(r"^qm status 101", stdout=b"status: stopped\n")
+        self.fake.add(r"^qm template 101")
+        payload = self.run_cmd(
+            "guest", "template", "--lease", LEASE, "--vmid", "101", "--confirm"
+        )
+        self.assertTrue(payload["template"])
+        self.assertEqual(self.argvs()[-1], ["qm", "template", "101"])
+        self.lab.audit.assert_called_once_with(
+            "guest-template", lease=LEASE, vmid=101, kind="qemu"
+        )
+
+    def test_template_refuses_a_running_guest(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(r"^qm config 101", stdout=b"name: alpha\n")
+        self.fake.add(r"^qm status 101", stdout=b"status: running\n")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "template", "--lease", LEASE, "--vmid", "101",
+                "--confirm",
+            )
+        self.assertIn("stopped", str(caught.exception))
+        self.assertNotIn(["qm", "template", "101"], self.argvs())
+
+    def test_template_refuses_an_existing_template(self) -> None:
+        self.open_lease()
+        self.register_guest(LEASE, "qemu", 101, name="alpha")
+        self.fake.add(r"^qm config 101", stdout=b"template: 1\n")
+        with self.assertRaises(errors.LabError) as caught:
+            self.run_cmd(
+                "guest", "template", "--lease", LEASE, "--vmid", "101",
+                "--confirm",
+            )
+        self.assertIn("already a template", str(caught.exception))
+        self.assertNotIn(["qm", "template", "101"], self.argvs())
 
 
 if __name__ == "__main__":

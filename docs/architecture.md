@@ -61,7 +61,7 @@ This is deliberate, not incidental:
 - Tests patch `cli` attributes (`mock.patch.object(LAB, "STATE_ROOT", ...)`);
   because every helper reads them through `lab` at call time, patching keeps
   working after a function moves to its own module.
-- `mcp.py` binds the same `cmd_*` handlers the CLI binds, so the 29-tool MCP
+- `mcp.py` binds the same `cmd_*` handlers the CLI binds, so the 33-tool MCP
   surface and the CLI cannot drift. `memflow` is CLI-only.
 - `cli._module()` rebuilds the module object (and the `proxmox_lab`
   compatibility name) when the file is path-loaded outside `sys.modules`.

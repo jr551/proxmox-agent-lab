@@ -44,15 +44,19 @@ That clones your template into a free VMID. If `doctor` warned, use `--fresh` an
 | 📋 | `proxmox-lab status` | Host, leases and guests at a glance |
 | 🪪 | `proxmox-lab lease-begin --purpose "…"` | Open a lease. Nothing else mutates without one |
 | 💓 | `proxmox-lab lease-heartbeat --lease "$L"` | Keep a long session from expiring |
-| 🆕 | `proxmox-lab guest create --lease "$L" --vmid N --start` | Clone the template, or `--fresh` to build one |
+| 🆕 | `proxmox-lab guest create --lease "$L" --vmid N --fresh --iso local:iso/name.iso --start` | Build a guest and boot that CD. Or omit `--iso` and clone a template |
 | ▶️ | `proxmox-lab guest run --lease "$L" --vmid N -- uname -a` | Run a command in the guest |
 | 📤 | `proxmox-lab push --lease "$L" --vmid N --file F --dest P` | Copy a file in |
 | 📥 | `proxmox-lab pull --lease "$L" --vmid N --remote P --out F` | Copy a file out |
 | 🔍 | `proxmox-lab guest probe --vmid N` | Can this guest be reached? |
 | 🧹 | `proxmox-lab lease-end --lease "$L"` | Destroy this lease's guests. Host stays up |
 | 🗑️ | `proxmox-lab guest destroy --lease "$L" --vmid N --confirm` | Delete one guest now |
+| 📸 | `proxmox-lab guest snapshot create --lease "$L" --vmid N --name boot` | Snapshot a lease-owned guest. `rollback` needs it stopped, and `--confirm` |
+| 📦 | `proxmox-lab guest template --lease "$L" --vmid N --confirm` | Turn a stopped guest into a template `guest create` can clone |
+| 💾 | `proxmox-lab storage status` | Free space on each store. Read-only |
+| 🕸️ | `proxmox-lab netcap capture --lease "$L" --vmid N --out cap.pcap` | Pcap of that VM's tap only. TLS stays ciphertext |
 | 🧠 | `proxmox-lab memflow read --lease "$L" --vmid N --addr 0x1000` | Read a running qemu guest from outside it |
-| 🔌 | `proxmox-lab mcp` | The same operations as 29 tools over stdio |
+| 🔌 | `proxmox-lab mcp` | The same operations as 33 tools over stdio |
 
 Agents follow [SKILL.md](SKILL.md). Everything else is in [docs/README.md](docs/README.md).
 

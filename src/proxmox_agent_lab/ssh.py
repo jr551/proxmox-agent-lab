@@ -112,6 +112,16 @@ MAX_MEMFLOW_STEPS = 256
 MAX_MEMFLOW_BREAK_TIMEOUT = 120
 MAX_MEMFLOW_HITS = 64
 
+#: Passive VM capture. ``timeout`` is not a general command: the only shape
+#: ``check_allowed`` accepts is ``timeout --signal=TERM <seconds> tcpdump``
+#: writing a pcap to stdout from one guest tap. Seconds and packet count are
+#: capped here so a caller cannot pin the host on an open capture.
+MAX_CAPTURE_SECONDS = 120
+MAX_CAPTURE_PACKETS = 100_000
+MAX_CAPTURE_FILTER_TOKENS = 24
+_TAP_IFACE = re.compile(r"^tap([1-9][0-9]{0,8})i([0-9]{1,2})$")
+_BPF_TOKEN = re.compile(r"^[A-Za-z0-9_./:@=()\[\]&!<>,]{1,64}$")
+
 _MEMFLOW_ADDR = re.compile(r"^(?:0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$")
 _MEMFLOW_HEX = re.compile(r"^[0-9a-fA-F]+$")
 
@@ -262,6 +272,62 @@ def _check_memflow_helper(argv: Sequence[str], *, memory_write: bool) -> None:
     raise PolicyError(f"refused: memflow subcommand {command!r}")
 
 
+def _check_capture(argv: Sequence[str]) -> None:
+    """The only ``timeout`` shape: tcpdump on one guest tap, pcap to stdout.
+
+    A bridge, a physical NIC, a veth, or ``-w`` to a host path would see or
+    store traffic this process does not own. Those are refused here, before
+    spawn. Which tap a lease may name is decided above this seam.
+    """
+    rest = list(argv[1:])
+    if rest[:1] != ["--signal=TERM"] or len(rest) < 8:
+        raise PolicyError(
+            "refused: timeout may only run "
+            "'timeout --signal=TERM <seconds> tcpdump -n -i tap<vmid>i<n> "
+            "-w - -U'"
+        )
+    seconds = rest[1]
+    if (
+        not seconds.isdigit()
+        or not 1 <= int(seconds) <= MAX_CAPTURE_SECONDS
+    ):
+        raise PolicyError(
+            "refused: capture duration must be 1.."
+            f"{MAX_CAPTURE_SECONDS} seconds"
+        )
+    if rest[2] != "tcpdump":
+        raise PolicyError("refused: timeout may only run tcpdump")
+    flags = rest[3:]
+    if flags[:2] != ["-n", "-i"] or flags[3:6] != ["-w", "-", "-U"]:
+        raise PolicyError(
+            "refused: tcpdump must be '-n -i <tap> -w - -U' "
+            "(stdout only, no name resolution)"
+        )
+    iface = flags[2]
+    if _TAP_IFACE.fullmatch(iface) is None:
+        raise PolicyError(
+            "refused: capture interface must be one guest tap, "
+            "tap<vmid>i<n>"
+        )
+    tail = flags[6:]
+    if tail[:1] == ["-c"]:
+        if len(tail) < 2 or not tail[1].isdigit() or not (
+            1 <= int(tail[1]) <= MAX_CAPTURE_PACKETS
+        ):
+            raise PolicyError(
+                "refused: capture -c must be 1.."
+                f"{MAX_CAPTURE_PACKETS} packets"
+            )
+        tail = tail[2:]
+    if len(tail) > MAX_CAPTURE_FILTER_TOKENS:
+        raise PolicyError("refused: capture filter is too long")
+    for token in tail:
+        if token.startswith("-") or _BPF_TOKEN.fullmatch(token) is None:
+            raise PolicyError(
+                "refused: capture filter tokens must be plain BPF words"
+            )
+
+
 def check_allowed(
     argv: Sequence[str], *, host_change: bool = False, memory_write: bool = False
 ) -> None:
@@ -302,6 +368,10 @@ def check_allowed(
     lease and ownership gating over which guest or host a caller may touch --
     lives above this seam.
 
+    ``timeout`` is not on the allowlist. The one accepted shape is a bounded
+    ``tcpdump`` of a single ``tap<vmid>i<n>`` interface, writing the pcap to
+    stdout (``-w -``). Any other ``timeout`` argv is a ``PolicyError``.
+
     The check runs before any process is spawned; a refusal therefore costs
     nothing and never reaches the host.
     """
@@ -317,6 +387,9 @@ def check_allowed(
                 "refused: memflow host-setup runs only as "
                 f"{MEMFLOW_SETUP} with host_change=True"
             )
+        return
+    if command == "timeout":
+        _check_capture(argv)
         return
     if command not in ALLOWED_COMMANDS and command not in HOST_CHANGE_COMMANDS:
         raise PolicyError(f"refused: {command!r} is not on the command allowlist")

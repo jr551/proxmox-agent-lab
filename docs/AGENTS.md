@@ -9,8 +9,9 @@
 The lab is one Proxmox host driven over **root SSH** from this controller;
 every byte crosses one `ssh` subprocess with a command allowlist. All state —
 leases, resource registry, journal — lives in one local SQLite file, `lab.db`
-under `[state] dir`. Nothing runs on the host except `qm`/`pct`/`pvesh` and,
-optionally, one GC cron line.
+under `[state] dir`. Remote commands stay on the ssh allowlist. The
+host-side extras are the GC cron and, for one command, `tcpdump` on a
+lease-owned VM's tap.
 
 ## 🔑 The one rule
 
@@ -46,23 +47,25 @@ Deep notes beyond the quick-ref:
 ## 🧰 The MCP surface
 
 If your client speaks MCP, point it at `proxmox-lab mcp` (stdio JSON-RPC 2.0).
-All 29 tools call the same handlers the CLI binds — same behavior, same gates:
+All 33 tools call the same handlers the CLI binds — same behavior, same gates:
 
 | Group | Tools |
 |---|---|
 | leases | `lease_begin`, `lease_heartbeat`, `lease_end`, `lease_list`, `lease_destroy`, `lease_register` |
-| guests | `guest_create`, `guest_clone`, `guest_start`, `guest_stop`, `guest_destroy`, `guest_probe`, `guest_list`, `guest_run` |
+| guests | `guest_create`, `guest_clone`, `guest_start`, `guest_stop`, `guest_destroy`, `guest_snapshot`, `guest_template`, `guest_probe`, `guest_list`, `guest_run` |
 | files | `push_file`, `pull_file` |
 | console | `console_screenshot`, `console_type`, `console_keys`, `console_move`, `console_click`, `console_drag`, `console_calibrate`, `console_grid`, `console_burst` |
-| hygiene & health | `cleanup_expired`, `journal_query`, `doctor`, `power_status` |
+| hygiene & health | `cleanup_expired`, `journal_query`, `doctor`, `power_status`, `storage_status`, `net_capture` |
 
 Notes that matter:
 
-- `lease_destroy`, `guest_destroy` and `cleanup_expired` require
-  `"confirm": true` — missing or false fails `-32602` before anything runs.
-  Pass it only when the user asked for the destruction.
+- `lease_destroy`, `guest_destroy`, `guest_template` and `cleanup_expired`
+  require `"confirm": true` — missing or false fails `-32602` before anything
+  runs. `guest_snapshot` requires it for `delete` and `rollback` only.
+  Pass it only when the user asked for that destruction.
 - Guest-scoped tools take `lease_id` + `vmid`; read-only tools (`guest_probe`,
-  `guest_list`, `journal_query`, `doctor`, `power_status`) need no lease.
+  `guest_list`, `journal_query`, `doctor`, `power_status`, `storage_status`)
+  need no lease.
 - Results arrive as `content[0].text` carrying the same JSON the CLI prints;
   `console_screenshot` returns the PNG inline as `png_base64`.
 - Every call refreshes the idle clock and records name + ok + target only —

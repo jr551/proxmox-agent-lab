@@ -46,8 +46,14 @@ guest lifecycle over the proxmox seam
 - `proxmox-lab guest list` — registered guests joined with live state (read-only)
 - `proxmox-lab guest probe` — how can this guest be reached? (read-only)
 - `proxmox-lab guest run` — run a command in a lease-owned guest
+- `proxmox-lab guest snapshot` — list, create, delete or roll back snapshots
+  - `proxmox-lab guest snapshot create` — take a snapshot
+  - `proxmox-lab guest snapshot delete` — delete a snapshot
+  - `proxmox-lab guest snapshot list` — snapshots on this guest
+  - `proxmox-lab guest snapshot rollback` — roll a stopped guest back to a snapshot
 - `proxmox-lab guest start` — start a lease-owned guest
 - `proxmox-lab guest stop` — stop a lease-owned guest (graceful, then hard)
+- `proxmox-lab guest template` — turn a stopped lease-owned guest into a template
 
 ## `proxmox-lab init`
 
@@ -109,6 +115,12 @@ read a lease-owned qemu guest's memory from the hypervisor
 - `proxmox-lab memflow trace` — single-step and disassemble
 - `proxmox-lab memflow write` — write into live guest kernel memory
 
+## `proxmox-lab netcap`
+
+capture one lease-owned VM's traffic to a local pcap
+
+- `proxmox-lab netcap capture` — tcpdump that VM's tap (passive; TLS stays ciphertext)
+
 ## `proxmox-lab power`
 
 host power: wake it, check it, or verify a shutdown
@@ -130,3 +142,10 @@ copy a local file into a guest
 ## `proxmox-lab status`
 
 host and lease overview
+
+
+## `proxmox-lab storage`
+
+read-only view of node storage
+
+- `proxmox-lab storage status` — free space and content flags for each store

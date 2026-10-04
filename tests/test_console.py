@@ -316,15 +316,20 @@ class KeysTests(_ConsoleCase):
         fields.update(overrides)
         return argparse.Namespace(**fields)
 
-    def test_every_name_goes_out_in_one_sendkey_call(self) -> None:
+    def test_each_name_is_its_own_sendkey_call(self) -> None:
         result = self.capture(
             console_module.cmd_keys,
             self.keys_args(["ret", "f2", "ctrl-alt-delete"]),
         )
         self.assertEqual(
             [call["argv"] for call in self.fake.calls],
-            [["qm", "sendkey", "101", "ret", "f2", "ctrl-alt-delete"]],
+            [
+                ["qm", "sendkey", "101", "ret"],
+                ["qm", "sendkey", "101", "f2"],
+                ["qm", "sendkey", "101", "ctrl-alt-delete"],
+            ],
         )
+        self.assertEqual(len(self.sleeps), 2)
         self.assertEqual(
             result,
             {"vmid": 101, "lease": "L1", "sent_keys": 3, "ok": True},
@@ -342,7 +347,11 @@ class KeysTests(_ConsoleCase):
         )
         self.assertEqual(
             [call["argv"] for call in self.fake.calls],
-            [["qm", "sendkey", "101", "shift-a", "shift-1", "spc"]],
+            [
+                ["qm", "sendkey", "101", "shift-a"],
+                ["qm", "sendkey", "101", "shift-1"],
+                ["qm", "sendkey", "101", "spc"],
+            ],
         )
 
     def test_unknown_key_name_lists_names_and_sends_nothing(self) -> None:

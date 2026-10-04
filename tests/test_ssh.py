@@ -168,6 +168,29 @@ class CheckAllowedTests(unittest.TestCase):
                 with self.assertRaises(ssh_module.PolicyError):
                     ssh_module.check_allowed(argv)
 
+    def test_capture_is_tcpdump_on_one_guest_tap_only(self) -> None:
+        ssh_module.check_allowed([
+            "timeout", "--signal=TERM", "15", "tcpdump", "-n", "-i",
+            "tap101i0", "-w", "-", "-U", "-c", "10", "tcp", "port", "443",
+        ])
+        refused = (
+            ["timeout", "15", "tcpdump", "-i", "tap101i0"],
+            ["timeout", "--signal=TERM", "15", "bash", "-c", "id"],
+            ["timeout", "--signal=TERM", "15", "tcpdump", "-n", "-i",
+             "vmbr0", "-w", "-", "-U"],
+            ["timeout", "--signal=TERM", "15", "tcpdump", "-n", "-i",
+             "tap101i0", "-w", "/tmp/x.pcap", "-U"],
+            ["timeout", "--signal=TERM", "9999", "tcpdump", "-n", "-i",
+             "tap101i0", "-w", "-", "-U"],
+            ["timeout", "--signal=TERM", "15", "tcpdump", "-n", "-i",
+             "tap101i0", "-w", "-", "-U", "-z", "id"],
+            ["tcpdump", "-i", "tap101i0", "-w", "-"],
+        )
+        for argv in refused:
+            with self.subTest(argv=argv):
+                with self.assertRaises(ssh_module.PolicyError):
+                    ssh_module.check_allowed(argv)
+
 
 class RunPolicyTests(unittest.TestCase):
     def test_refusals_raise_policy_error_and_spawn_nothing(self) -> None:

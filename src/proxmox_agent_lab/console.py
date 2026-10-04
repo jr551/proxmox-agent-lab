@@ -778,8 +778,9 @@ def cmd_keys(lab: Any, args: argparse.Namespace) -> dict[str, Any]:
 
     Mutating: gated on lease ownership before any seam call. Each token is a
     QEMU key name (`ret`, `f2`, `spc`), a stacked combination
-    (`ctrl-alt-delete`), or a single character translated through KEYMAP;
-    all names go out in one `qm sendkey <vmid> <key...>`. Only the key count
+    (`ctrl-alt-delete`), or a single character translated through KEYMAP.
+    Current ``qm sendkey`` accepts one key per call, so each name is its own
+    argv; a combination stays one hyphenated argument. Only the key count
     is audited -- key names can spell typed content.
     """
     vmid = int(args.vmid)
@@ -787,9 +788,12 @@ def cmd_keys(lab: Any, args: argparse.Namespace) -> dict[str, Any]:
     _require_qemu_guest(lab, lease_id, vmid)
     names = [name for token in args.keys for name in key_for(token)]
     ssh = _make_ssh(lab.CONFIG)
-    result = ssh.run(["qm", "sendkey", str(vmid), *names])
-    if not result.ok:
-        raise LabError(f"qm sendkey {vmid} failed: {_describe(result)}")
+    for index, name in enumerate(names):
+        result = ssh.run(["qm", "sendkey", str(vmid), name])
+        if not result.ok:
+            raise LabError(f"qm sendkey {vmid} failed: {_describe(result)}")
+        if index + 1 < len(names):
+            _sleep(1.0 / MAX_CHARS_PER_SECOND)
     lab.audit("console-keys", lease=lease_id, vmid=vmid, count=len(names))
     output: dict[str, Any] = {
         "vmid": vmid, "lease": lease_id, "sent_keys": len(names), "ok": True,

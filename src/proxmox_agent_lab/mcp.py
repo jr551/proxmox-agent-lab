@@ -1,6 +1,6 @@
 """The MCP server: stdio JSON-RPC 2.0, stdlib only, no SDK.
 
-``proxmox-lab mcp`` serves the 29-tool surface over
+``proxmox-lab mcp`` serves the 33-tool surface over
 stdin/stdout. The wire format is newline-delimited JSON -- one complete
 JSON-RPC message per line, UTF-8, with no ``Content-Length`` framing. stdout
 carries protocol messages only; everything else goes to stderr.
@@ -226,6 +226,36 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": _schema(lease_id=_STR, state=_STATE),
     },
     {
+        "name": "guest_snapshot",
+        "description": (
+            "List, create, delete or roll back snapshots of a lease-owned "
+            "guest. delete and rollback require confirm."
+        ),
+        "inputSchema": _schema(
+            required=("lease_id", "vmid", "action"),
+            lease_id=_STR,
+            vmid=_INT,
+            action={"type": "string",
+                    "enum": ["list", "create", "delete", "rollback"]},
+            name=_STR,
+            description=_STR,
+            confirm=_BOOL,
+        ),
+    },
+    {
+        "name": "guest_template",
+        "description": (
+            "Turn a stopped lease-owned guest into a template. "
+            "Requires confirm; teardown will not destroy it afterwards."
+        ),
+        "inputSchema": _schema(
+            required=("lease_id", "vmid", "confirm"),
+            lease_id=_STR,
+            vmid=_INT,
+            confirm=_BOOL,
+        ),
+    },
+    {
         "name": "guest_run",
         "description": "Run a command in a lease-owned guest.",
         "inputSchema": _schema(
@@ -376,13 +406,37 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": "Host reachability and what pins it on (read-only).",
         "inputSchema": _schema(),
     },
+    {
+        "name": "storage_status",
+        "description": "Free space on each node store (read-only).",
+        "inputSchema": _schema(),
+    },
+    {
+        "name": "net_capture",
+        "description": (
+            "Capture one lease-owned running qemu VM's tap to a local pcap. "
+            "Passive; TLS stays ciphertext."
+        ),
+        "inputSchema": _schema(
+            required=("lease_id", "vmid", "out"),
+            lease_id=_STR,
+            vmid=_INT,
+            out=_STR,
+            nic=_STR,
+            seconds={**_INT, "maximum": 120},
+            count={**_INT, "maximum": 100_000},
+            filter=_STR,
+        ),
+    },
 )
 
 _TOOL_NAMES = {tool["name"] for tool in TOOLS}
 _SCHEMAS = {tool["name"]: tool["inputSchema"] for tool in TOOLS}
 
 #: The tools that can destroy: `confirm` must be literally `true` (§E).
-_CONFIRM_TOOLS = frozenset({"lease_destroy", "guest_destroy", "cleanup_expired"})
+_CONFIRM_TOOLS = frozenset({
+    "lease_destroy", "guest_destroy", "guest_template", "cleanup_expired",
+})
 
 _JSON_TYPES = {
     "string": str,
@@ -651,6 +705,60 @@ def _guest_run_with_stdin(
         "stderr": text(result.stderr),
         "duration_ms": duration_ms,
     }
+
+
+def _dispatch_guest_snapshot(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import guest
+
+    action = str(a["action"])
+    if action in ("delete", "rollback") and a.get("confirm") is not True:
+        if "confirm" not in a:
+            raise _ParamsError(
+                "guest_snapshot: missing required field 'confirm'"
+            )
+        raise _ParamsError("guest_snapshot: field 'confirm' must be true")
+    if action != "list" and not a.get("name"):
+        raise _ParamsError("guest_snapshot: missing required field 'name'")
+    return _invoke(
+        guest.cmd_snapshot,
+        lab,
+        _ns(
+            a,
+            lease=a["lease_id"],
+            name=a.get("name"),
+            description=a.get("description"),
+            confirm=a.get("confirm") is True,
+        ),
+    )
+
+
+def _dispatch_guest_template(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import guest
+
+    return _invoke(guest.cmd_template, lab, _ns(a, lease=a["lease_id"]))
+
+
+def _dispatch_storage_status(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import storage
+
+    return _invoke(storage.cmd_status, lab, _ns(a))
+
+
+def _dispatch_net_capture(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
+    from . import netcap
+
+    return _invoke(
+        netcap.cmd_capture,
+        lab,
+        _ns(
+            a,
+            lease=a["lease_id"],
+            nic=a.get("nic") or "net0",
+            seconds=int(a.get("seconds") or netcap.DEFAULT_SECONDS),
+            count=int(a.get("count") or 0),
+            filter=a.get("filter"),
+        ),
+    )
 
 
 def _dispatch_guest_run(lab: Any, a: dict[str, Any]) -> dict[str, Any]:
@@ -937,6 +1045,8 @@ _DISPATCH: dict[str, Callable[[Any, dict[str, Any]], dict[str, Any]]] = {
     "guest_destroy": _dispatch_guest_destroy,
     "guest_probe": _dispatch_guest_probe,
     "guest_list": _dispatch_guest_list,
+    "guest_snapshot": _dispatch_guest_snapshot,
+    "guest_template": _dispatch_guest_template,
     "guest_run": _dispatch_guest_run,
     "push_file": _dispatch_push_file,
     "pull_file": _dispatch_pull_file,
@@ -953,6 +1063,8 @@ _DISPATCH: dict[str, Callable[[Any, dict[str, Any]], dict[str, Any]]] = {
     "journal_query": _dispatch_journal_query,
     "doctor": _dispatch_doctor,
     "power_status": _dispatch_power_status,
+    "storage_status": _dispatch_storage_status,
+    "net_capture": _dispatch_net_capture,
 }
 
 

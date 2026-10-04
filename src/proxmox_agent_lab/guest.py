@@ -39,6 +39,9 @@ from .errors import LabError
 
 _CONFIG_LINE = re.compile(r"^([A-Za-z0-9_-]+):\s?(.*)$")
 _PXL_EXPIRY = re.compile(r"pxl-expiry=(\d+)")
+_SNAP_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+_ISO_VOLID = re.compile(r"^[A-Za-z0-9_.-]+:iso/[A-Za-z0-9_.+-]+$")
+_MAX_SNAPSHOT_DESCRIPTION = 200
 
 DEFAULT_STOP_TIMEOUT = 120
 DEFAULT_RUN_TIMEOUT = 300
@@ -101,9 +104,8 @@ def _vouched(row: dict | None, cfg: dict | None, kind: str, vmid: int) -> LabErr
         reasons.append("its config is a template (template: 1)")
     return LabError(
         f"{kind} {vmid} is registry-vouched ({'; '.join(reasons) or 'no reason'}): "
-        f"templates and retained registry guests are clone sources and "
-        f"read-only surface, never driven or destroyed by a lease. Destroy "
-        f"the clones instead, or drop the vouching first."
+        f"a template or a retained guest is a clone source. guest destroy "
+        f"and lease-end leave it in place. Delete the clones, not the source."
     )
 
 
@@ -236,6 +238,8 @@ def cmd_create(lab: Any, args: Any) -> dict:
     still visible to cleanup.
     """
     lease_id, vmid, kind = str(args.lease), int(args.vmid), str(args.kind)
+    if getattr(args, "iso", None) and kind != "qemu":
+        raise LabError("--iso is only for a fresh qemu guest")
     lease = _lease_for_mutation(lab, lease_id)
     expires_at = int(lease["expires_at"])
     name = args.name or f"pxl-{vmid}"
@@ -262,6 +266,11 @@ def cmd_create(lab: Any, args: Any) -> dict:
                 rootfs=rootfs,
             )
         else:
+            iso = getattr(args, "iso", None) or None
+            if iso is not None and _ISO_VOLID.fullmatch(str(iso)) is None:
+                raise LabError(
+                    "--iso must be a storage volid like local:iso/name.iso"
+                )
             scsi0 = None
             if args.storage:
                 disk_gb = int(args.disk_gb or 32)
@@ -274,8 +283,13 @@ def cmd_create(lab: Any, args: Any) -> dict:
                 scsi0=scsi0,
                 memory=args.memory,
                 cores=args.cores,
+                iso=str(iso) if iso else None,
             )
     else:
+        if getattr(args, "iso", None):
+            raise LabError(
+                "--iso is only for a fresh qemu guest; pass --fresh"
+            )
         source_kind = _clone_source_kind(lab, prox, template)
         if source_kind != kind:
             raise LabError(
@@ -592,6 +606,152 @@ def cmd_list(lab: Any, args: Any) -> dict:
     return _emit({"guests": guests})
 
 
+def _snapshot_name(name: str) -> str:
+    if name == "current" or _SNAP_NAME.fullmatch(name) is None:
+        raise LabError(
+            "snapshot name must start with a letter and use only letters, "
+            "digits, '_' and '-' (not 'current')"
+        )
+    return name
+
+
+def _snapshot_description(raw: str | None) -> str | None:
+    if raw is None or raw == "":
+        return None
+    if "\n" in raw or "\r" in raw or len(raw) > _MAX_SNAPSHOT_DESCRIPTION:
+        raise LabError(
+            "snapshot description must be one line of at most "
+            f"{_MAX_SNAPSHOT_DESCRIPTION} characters"
+        )
+    return raw
+
+
+def _refuse_shared(lab: Any, lease_id: str, kind: str, vmid: int) -> None:
+    """Refuse when another live lease also registers this guest."""
+    with _open_store(lab) as store:
+        owner = store.owner_elsewhere(lease_id, kind, vmid)
+    if owner:
+        raise LabError(
+            f"{kind} {vmid} is also registered to lease {owner}, which is "
+            f"still live: a guest another lease owns is never snapshotted "
+            f"away or turned into a template from under it"
+        )
+
+
+def _require_stopped(prox: Any, kind: str, vmid: int, why: str) -> None:
+    state = prox.status(kind, vmid)
+    if state != "stopped":
+        raise LabError(
+            f"{kind} {vmid} must be stopped before {why} (status={state})"
+        )
+
+
+def cmd_snapshot(lab: Any, args: Any) -> dict:
+    """List, create, delete or roll back snapshots of a lease-owned guest.
+
+    List and create need the lease. Delete and rollback also need
+    ``--confirm`` and a guest no other live lease holds, and rollback
+    refuses a running guest -- rolling back a disk that is in use is how
+    a session loses its machine.
+    """
+    lease_id, vmid = str(args.lease), int(args.vmid)
+    action = str(args.action)
+    row = require_owned(lab, lease_id, None, vmid)
+    kind = str(row["kind"])
+    prox = _make_proxmox(lab.CONFIG)
+    if action == "list":
+        records = prox.snapshot_list(kind, vmid)
+        snapshots = [
+            {
+                "name": item.get("name"),
+                "description": item.get("description") or "",
+                "snaptime": item.get("snaptime"),
+            }
+            for item in records
+            if isinstance(item, dict)
+        ]
+        return _emit({
+            "lease_id": lease_id,
+            "vmid": vmid,
+            "kind": kind,
+            "snapshots": snapshots,
+        })
+    name = _snapshot_name(str(getattr(args, "name", "") or ""))
+    if action in ("delete", "rollback") and not getattr(args, "confirm", False):
+        raise LabError(
+            f"snapshot {action} removes guest state; pass --confirm to mean it "
+            "(there is no interactive prompt)"
+        )
+    if action in ("delete", "rollback"):
+        _refuse_shared(lab, lease_id, kind, vmid)
+    if action == "rollback":
+        _require_stopped(prox, kind, vmid, "rollback")
+        prox.snapshot_rollback(kind, vmid, name)
+        lab.audit(
+            "guest-snapshot-rollback",
+            lease=lease_id, vmid=vmid, kind=kind, name=name,
+        )
+        return _emit({
+            "lease_id": lease_id, "vmid": vmid, "kind": kind,
+            "snapshot": name, "rolled_back": True,
+        })
+    if action == "delete":
+        prox.snapshot_delete(kind, vmid, name)
+        lab.audit(
+            "guest-snapshot-delete",
+            lease=lease_id, vmid=vmid, kind=kind, name=name,
+        )
+        return _emit({
+            "lease_id": lease_id, "vmid": vmid, "kind": kind,
+            "snapshot": name, "deleted": True,
+        })
+    if action == "create":
+        description = _snapshot_description(getattr(args, "description", None))
+        prox.snapshot_create(kind, vmid, name, description=description)
+        lab.audit(
+            "guest-snapshot-create",
+            lease=lease_id, vmid=vmid, kind=kind, name=name,
+        )
+        return _emit({
+            "lease_id": lease_id, "vmid": vmid, "kind": kind,
+            "snapshot": name, "created": True,
+        })
+    raise LabError(f"unknown snapshot action {action!r}")
+
+
+def cmd_template(lab: Any, args: Any) -> dict:
+    """Turn a stopped lease-owned guest into a clone source.
+
+    ``guest create`` will only clone a guest whose config says
+    ``template: 1``. This is the command that writes that bit. It is
+    irreversible from the lease's point of view: teardown already refuses
+    to destroy a template, so the machine outlives the lease.
+    """
+    lease_id, vmid = str(args.lease), int(args.vmid)
+    if not getattr(args, "confirm", False):
+        raise LabError(
+            "guest template is hard to undo and teardown will not destroy "
+            "it afterwards; pass --confirm to mean it "
+            "(there is no interactive prompt)"
+        )
+    row = require_owned(lab, lease_id, None, vmid)
+    kind = str(row["kind"])
+    _refuse_shared(lab, lease_id, kind, vmid)
+    prox = _make_proxmox(lab.CONFIG)
+    cfg = _guest_config(prox, kind, vmid)
+    if cfg is not None and _is_template(cfg):
+        raise LabError(f"{kind} {vmid} is already a template")
+    _require_stopped(prox, kind, vmid, "template conversion")
+    prox.make_template(kind, vmid)
+    lab.audit("guest-template", lease=lease_id, vmid=vmid, kind=kind)
+    return _emit({
+        "lease_id": lease_id,
+        "vmid": vmid,
+        "kind": kind,
+        "template": True,
+    })
+
+
 def cmd_run(lab: Any, args: Any) -> dict:
     """Run one command in a lease-owned guest; the guest's real exit code.
 
@@ -666,6 +826,11 @@ def register(sub: Any, lab: Any) -> None:
     )
     create.add_argument("--fresh", action="store_true",
                         help="build from scratch instead of cloning a template")
+    create.add_argument(
+        "--iso",
+        help="fresh qemu only: boot this CD volid (local:iso/name.iso). "
+             "The image's own menu may still default to the hard disk",
+    )
     create.set_defaults(func=_bind(lab, cmd_create))
 
     clone = guest_sub.add_parser(
@@ -726,3 +891,44 @@ def register(sub: Any, lab: Any) -> None:
     run.add_argument("command", nargs=argparse.REMAINDER,
                      help="command and arguments (use -- before flag-like args)")
     run.set_defaults(func=_bind(lab, cmd_run))
+
+    snap = guest_sub.add_parser(
+        "snapshot", help="list, create, delete or roll back snapshots"
+    )
+    snap_sub = snap.add_subparsers(dest="action", required=True)
+    snap_list = snap_sub.add_parser("list", help="snapshots on this guest")
+    snap_list.add_argument("--lease", required=True)
+    snap_list.add_argument("--vmid", type=int, required=True)
+    snap_list.set_defaults(func=_bind(lab, cmd_snapshot))
+    snap_create = snap_sub.add_parser("create", help="take a snapshot")
+    snap_create.add_argument("--lease", required=True)
+    snap_create.add_argument("--vmid", type=int, required=True)
+    snap_create.add_argument("--name", required=True)
+    snap_create.add_argument("--description")
+    snap_create.set_defaults(func=_bind(lab, cmd_snapshot))
+    snap_delete = snap_sub.add_parser("delete", help="delete a snapshot")
+    snap_delete.add_argument("--lease", required=True)
+    snap_delete.add_argument("--vmid", type=int, required=True)
+    snap_delete.add_argument("--name", required=True)
+    snap_delete.add_argument("--confirm", action="store_true",
+                             help="required: there is no interactive prompt")
+    snap_delete.set_defaults(func=_bind(lab, cmd_snapshot))
+    snap_rollback = snap_sub.add_parser(
+        "rollback", help="roll a stopped guest back to a snapshot"
+    )
+    snap_rollback.add_argument("--lease", required=True)
+    snap_rollback.add_argument("--vmid", type=int, required=True)
+    snap_rollback.add_argument("--name", required=True)
+    snap_rollback.add_argument("--confirm", action="store_true",
+                               help="required: there is no interactive prompt")
+    snap_rollback.set_defaults(func=_bind(lab, cmd_snapshot))
+
+    template = guest_sub.add_parser(
+        "template",
+        help="turn a stopped lease-owned guest into a template",
+    )
+    template.add_argument("--lease", required=True)
+    template.add_argument("--vmid", type=int, required=True)
+    template.add_argument("--confirm", action="store_true",
+                          help="required: teardown will not destroy it afterwards")
+    template.set_defaults(func=_bind(lab, cmd_template))

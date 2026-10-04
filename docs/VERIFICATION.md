@@ -72,7 +72,7 @@ Three harnesses do the heavy lifting:
   power-off decision run end to end.
 - **Real stdio for the MCP server** — `test_mcp.py` spawns
   `proxmox-lab mcp` and speaks newline-delimited JSON-RPC over real pipes:
-  `initialize`, `tools/list` returning exactly 29 schema'd tools,
+  `initialize`, `tools/list` returning exactly 33 schema'd tools,
   `tools/call` dispatch, error shapes, and the idle-shutdown self-wake.
 
 ## What the suite proves
@@ -127,7 +127,7 @@ Verified as code behavior, area by area:
   scanned boot text. The helper's own argv shape (subcommand, numeric vmid,
   bounded hex) is refused at the seam. Building that helper on a host is
   not what the suite does.
-- **MCP.** Over real stdio: initialize shape, the static 29-tool list, bad
+- **MCP.** Over real stdio: initialize shape, the static 33-tool list, bad
   params as `-32602` naming the field, action failures as `-32603` with
   redacted messages, notifications answered with silence, every call
   refreshing the idle clock, and the idle sweep firing a verified shutdown
@@ -149,8 +149,16 @@ the following has been observed on this reworked code:
   `exec-status` polling). If a fallback fires on hardware, that is the
   first time it has ever run.
 - **A real guest doing everything.** One fresh LXC was created, started,
-  probed, run-in, pushed, pulled, and destroyed (2026-10-04). Cloning a
-  real template, screenshots, and console typing have not been watched.
+  probed, run-in, pushed, pulled, and destroyed (2026-10-04). The same day,
+  three fresh qemu guests booted Alpine, openSUSE Leap, and FreeBSD
+  installer CDs via `guest create --fresh --iso`. Screenshots showed each
+  installer. Snapshot create, list, delete, and rollback, `storage status`,
+  and a tap pcap from each guest all completed. `console keys` with two
+  names was rejected by this Proxmox (`qm sendkey` takes one key); after
+  that fix, the same two keys moved the openSUSE menu on to loading its
+  kernel. Those guests were destroyed afterwards. Existing guests were
+  left as found, and the host stayed up. Cloning a real template and
+  `console type` (as opposed to `console keys`) have not been watched.
   `guest run`'s remote quoting and the exec-status polling loop are
   asserted against scripted output; the LXC `pct exec` path is what ran.
 - **The host actually coming up or going down.** The magic packet's bytes

@@ -184,6 +184,7 @@ class Proxmox:
         scsi0: str | None = None,
         memory: int | None = None,
         cores: int | None = None,
+        iso: str | None = None,
     ) -> None:
         argv = ["qm", "create", str(vmid), "--name", name, "--net0", net0]
         if scsi0 is not None:
@@ -192,6 +193,14 @@ class Proxmox:
             argv += ["--memory", str(memory)]
         if cores is not None:
             argv += ["--cores", str(cores)]
+        if iso is not None:
+            # CD first, then the disk, so an empty disk does not hide the
+            # installer. virtio-scsi is what current installers expect to
+            # see when a scsi disk was requested.
+            argv += ["--ide2", f"{iso},media=cdrom"]
+            argv += ["--boot", "order=ide2;scsi0" if scsi0 else "order=ide2"]
+            if scsi0 is not None:
+                argv += ["--scsihw", "virtio-scsi-pci"]
         argv += ["--tags", tags, "--description", description]
         _require(self._ssh.run(argv, timeout=CREATE_TIMEOUT), f"qm create {vmid}")
 
@@ -303,6 +312,76 @@ class Proxmox:
         if purge and tool == "qm":
             argv += ["--purge", "1"]
         _require(self._ssh.run(argv, timeout=DEFAULT_TIMEOUT), f"{tool} destroy {vmid}")
+
+    def make_template(self, kind: str, vmid: int) -> None:
+        """Convert a stopped guest into a Proxmox template (``qm``/``pct template``)."""
+        tool = _tool(kind)
+        _require(
+            self._ssh.run([tool, "template", str(vmid)], timeout=DEFAULT_TIMEOUT),
+            f"{tool} template {vmid}",
+        )
+
+    def snapshot_list(self, kind: str, vmid: int) -> list:
+        """Snapshot records from a read-only ``pvesh get``."""
+        segment = "lxc" if kind == "lxc" else "qemu"
+        action = f"pvesh snapshots {kind} {vmid}"
+        result = self._ssh.run(
+            [
+                "pvesh", "get",
+                f"/nodes/{self._node}/{segment}/{vmid}/snapshot",
+                "--output-format", "json",
+            ],
+            timeout=DEFAULT_TIMEOUT,
+        )
+        payload = _json_value(_require(result, action), action)
+        if not isinstance(payload, list):
+            raise ProxmoxError(f"{action}: expected a list")
+        return payload
+
+    def snapshot_create(
+        self, kind: str, vmid: int, name: str, *, description: str | None = None
+    ) -> None:
+        tool = _tool(kind)
+        argv = [tool, "snapshot", str(vmid), name]
+        if description:
+            argv += ["--description", description]
+        _require(
+            self._ssh.run(argv, timeout=CLONE_TIMEOUT),
+            f"{tool} snapshot {vmid} {name}",
+        )
+
+    def snapshot_delete(self, kind: str, vmid: int, name: str) -> None:
+        tool = _tool(kind)
+        _require(
+            self._ssh.run(
+                [tool, "delsnapshot", str(vmid), name], timeout=CLONE_TIMEOUT
+            ),
+            f"{tool} delsnapshot {vmid} {name}",
+        )
+
+    def snapshot_rollback(self, kind: str, vmid: int, name: str) -> None:
+        tool = _tool(kind)
+        _require(
+            self._ssh.run(
+                [tool, "rollback", str(vmid), name], timeout=CLONE_TIMEOUT
+            ),
+            f"{tool} rollback {vmid} {name}",
+        )
+
+    def storage_status(self) -> list:
+        """Configured storages on this node, from a read-only ``pvesh get``."""
+        action = "pvesh storage status"
+        result = self._ssh.run(
+            [
+                "pvesh", "get", f"/nodes/{self._node}/storage",
+                "--output-format", "json",
+            ],
+            timeout=DEFAULT_TIMEOUT,
+        )
+        payload = _json_value(_require(result, action), action)
+        if not isinstance(payload, list):
+            raise ProxmoxError(f"{action}: expected a list")
+        return payload
 
     # -- status and probes ----------------------------------------------------
 

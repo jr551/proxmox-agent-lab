@@ -704,6 +704,7 @@ class IdleShutdownTests(McpTestCase):
         fake = FakeSSH()  # no rules: probe() answers False
         seam = proxmox_module.Proxmox(fake, "pve")
         self.lab.idle_threshold = 0  # any recorded activity reads as stale
+        self.lab.CONFIG.power.auto_shutdown = True
         self.lab.shutdown_host = (
             lambda api=None: cleanup_module.shutdown_host(self.lab, api)
         )

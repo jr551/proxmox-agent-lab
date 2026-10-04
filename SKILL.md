@@ -1,6 +1,6 @@
 ---
 name: proxmox-agent-lab
-description: Drive a self-hosted Proxmox lab over root SSH with leased, fail-closed guests and automatic host power on/off. Create, start, probe, and destroy VMs and LXC containers, run commands, move files, and type at or screenshot guest consoles — from the `proxmox-lab` CLI or its stdio MCP server. Use for authorized security research, clean-machine testing, installers, home labs, or spare-PC virtualization.
+description: Drive a self-hosted Proxmox lab over root SSH with leased, fail-closed guests. Host power-off is optional. Create, start, probe, and destroy VMs and LXC containers, run commands, move files, and type at or screenshot guest consoles — from the `proxmox-lab` CLI or its stdio MCP server. Use for authorized security research, clean-machine testing, installers, home labs, or spare-PC virtualization.
 ---
 
 # proxmox-agent-lab
@@ -8,8 +8,8 @@ description: Drive a self-hosted Proxmox lab over root SSH with leased, fail-clo
 One controller (this machine) drives one Proxmox host over **root SSH** — the
 `ssh` binary and your keys/agent are the only transport and the only
 credential. All lease, resource, and journal state lives in one local SQLite
-file (`lab.db`, under `[state] dir`). The host powers itself on for work and
-is verified powered off when the last lease ends. **Nothing runs on the
+file (`lab.db`, under `[state] dir`). Host power-off is optional
+(`[power] auto_shutdown`, default false). **Nothing runs on the
 Proxmox host** except `qm`/`pct`/`pvesh` — plus one optional garbage-collector
 cron line (`gc install`). Zero third-party dependencies.
 
@@ -61,8 +61,9 @@ Rules that follow from that, and they are not negotiable:
    mac = "aa:bb:cc:dd:ee:ff" # wired NIC MAC for Wake-on-LAN
    ```
 
-   The whole file is nine keys — `[power] broadcast`/`port`, `[state] dir`,
-   `[lease] ttl_seconds`/`idle_shutdown_seconds` have sane defaults. See
+   `[power] broadcast`/`port`/`auto_shutdown`, `[state] dir`, and
+   `[lease] ttl_seconds`/`idle_shutdown_seconds` have sane defaults.
+   `auto_shutdown` is false: the host stays up unless you turn it on. See
    [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 4. `proxmox-lab doctor` checks everything end to end and exits non-zero on
@@ -86,15 +87,17 @@ trap 'proxmox-lab lease-end --lease "$L"' EXIT
    `power status`) take no lease.
 3. Work past ~30 minutes: `proxmox-lab lease-heartbeat --lease "$L"`, or the
    lease expires and the GC / `cleanup-expired` sweeps your guests. One lease
-   per session, heartbeated — each begin/end cycle costs a host boot.
-4. `lease-end` destroys this lease's guests. It powers the host off only
-   when nothing else is running, and only after that shutdown is verified
-   (`"host_powered_off": true`). `"host_left_running": true` with a `reason`
-   means the host stayed up on purpose — usually the operator's own guests.
-   Report that reason and stop. Do not power the host off yourself. A
-   non-zero exit, a `cleanup_failed` lease, or a reason that power-off could
-   not be verified is a real failure: run `proxmox-lab cleanup-expired --all`
-   and report the blocker.
+   per session, heartbeated. With `auto_shutdown` on, each begin/end cycle
+   can cost a host boot.
+4. `lease-end` destroys this lease's guests. It does **not** power the host
+   off unless `[power] auto_shutdown` is true. With the default, it prints
+   `"host_left_running": true` and a `reason`; that is success. Report it
+   and stop. Do not power the host off yourself. When auto-shutdown is on,
+   `"host_powered_off": true` means it went down, and a host left up because
+   other guests are running is still success — quote `reason`. A non-zero
+   exit, a `cleanup_failed` lease, or a reason that power-off could not be
+   verified is a real failure: run `proxmox-lab cleanup-expired --all` and
+   report the blocker.
 
 Machines that must **survive** use `lease-begin --long-term` — the host then
 stays on until `lease-destroy --lease "$L" --confirm`. Only when the user

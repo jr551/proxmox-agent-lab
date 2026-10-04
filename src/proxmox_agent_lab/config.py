@@ -10,7 +10,7 @@ The canonical schema is the whole schema (docs/rework-plan.md §G)::
 
     [ssh]    target                      ssh alias/host reached as root
     [pve]    node, template_vmid
-    [power]  mac, broadcast, port
+    [power]  mac, broadcast, port, auto_shutdown
     [state]  dir                         lab.db lives here
     [lease]  ttl_seconds, idle_shutdown_seconds
 
@@ -64,6 +64,9 @@ DEFAULTS: dict[str, Any] = {
         "mac": "",
         "broadcast": "255.255.255.255",
         "port": 9,
+        # Lease-end, the idle sweep and the host GC leave the host up unless
+        # this is true. `power shutdown` is the explicit path either way.
+        "auto_shutdown": False,
     },
     "state": {
         # lab.db lives here.
@@ -298,6 +301,7 @@ template_vmid = 100          # clone source; must be template: 1, or create refu
 mac = ""                     # wired NIC MAC for WoL (filled by 'proxmox-lab init')
 broadcast = "255.255.255.255"
 port = 9
+auto_shutdown = false        # true: power off when the lab is idle
 
 [state]
 dir = "~/.local/share/proxmox-agent-lab"   # lab.db lives here

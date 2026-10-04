@@ -39,8 +39,9 @@ Deep notes beyond the quick-ref:
   `proxmox-lab lease-heartbeat --lease "$L"` — a heartbeat extends the lease
   *and* rewrites `pxl-expiry` on every registered guest, so neither
   `cleanup-expired` nor the host GC reaps live work.
-- One lease per session. Each begin/end cycle can cost a host boot and a
-  verified power-off; reuse the lease, don't churn it.
+- One lease per session. Automatic power-off is off unless
+  `[power] auto_shutdown` is true. With it on, each begin/end cycle can
+  cost a host boot; reuse the lease, don't churn it.
 
 ## 🧰 The MCP surface
 

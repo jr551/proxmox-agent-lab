@@ -200,6 +200,7 @@ class PxLGcTests(unittest.TestCase):
         env["PXL_GC_STATE_DIR"] = str(self.state)
         env["PXL_GC_LOCK_DIR"] = str(self.locks)
         env["PXL_GC_POWEROFF"] = "poweroff -h now"
+        env.setdefault("PXL_GC_AUTO_SHUTDOWN", "1")
         env["PXL_GC_NOW"] = str(now)
         env["PXL_GC_STOP_TIMEOUT"] = str(stop_timeout)
         return subprocess.run(
@@ -347,6 +348,30 @@ class PxLGcTests(unittest.TestCase):
         self.assertIn("qm destroy 101 --purge 1", calls)
 
     # -- power-off-when-idle ---------------------------------------------
+
+    def test_poweroff_stays_off_unless_opted_in(self):
+        self.state.mkdir(exist_ok=True)
+        self.stamp().write_text(str(NOW - 700) + "\n")
+        off = subprocess.run(
+            [sys.executable, str(GC_SCRIPT)],
+            capture_output=True, text=True, timeout=60,
+            env={
+                **os.environ,
+                "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
+                "PXL_GC_STUB_DIR": str(self.stub),
+                "PXL_GC_STATE_DIR": str(self.state),
+                "PXL_GC_LOCK_DIR": str(self.locks),
+                "PXL_GC_POWEROFF": "poweroff -h now",
+                "PXL_GC_NOW": str(NOW),
+                "PXL_GC_STOP_TIMEOUT": "120",
+                "PXL_GC_BIN_DIRS": "",
+                "PXL_GC_AUTO_SHUTDOWN": "0",
+            },
+        )
+        self.assertEqual(off.returncode, 0, off.stderr)
+        self.assertIn("automatic power-off is off; host left up", off.stdout)
+        self.assertNotIn("poweroff", self.calls())
+        self.assertNotIn("powering off", off.stdout)
 
     def test_idle_poweroff_requires_two_clear_runs(self):
         first = self.run_gc(now=NOW)

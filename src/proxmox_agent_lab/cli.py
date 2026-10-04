@@ -172,8 +172,8 @@ def host_power_policy() -> dict[str, Any]:
     return cleanup_module.host_power_policy(_module())
 
 
-def shutdown_host(api: Any = None) -> bool:
-    return cleanup_module.shutdown_host(_module(), api)
+def shutdown_host(api: Any = None, *, requested: bool = False) -> bool:
+    return cleanup_module.shutdown_host(_module(), api, requested=requested)
 
 
 def guest_status(api: Any, kind: str, vmid: int) -> str:
@@ -259,10 +259,10 @@ def cmd_power_shutdown(args: argparse.Namespace) -> None:
         raise LabError(
             "Standalone power-off is refused by default: with no lease left "
             "there is no finalizer to verify the host actually went off. "
-            "Lease-end shuts the host down as part of normal work; pass "
+            "Automatic power-off is [power] auto_shutdown; pass "
             "--standalone-authorized only when a person owns the host."
         )
-    if not shutdown_host(None):
+    if not shutdown_host(None, requested=True):
         raise LabError(
             "the host did not power off: it may still be reachable, guests "
             "may still be running, or the shutdown could not be verified. "

@@ -1,19 +1,16 @@
 # proxmox-agent-lab
 
-**A disposable Proxmox guest for an agent, cleaned up when the lease ends.**
+**Disposable Proxmox guests over SSH. The lease cleans them up. Powering the host off is optional.**
 
 [![CI](https://github.com/jr551/proxmox-agent-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/jr551/proxmox-agent-lab/actions/workflows/ci.yml)
 [![GitHub release](https://img.shields.io/github/v/release/jr551/proxmox-agent-lab)](https://github.com/jr551/proxmox-agent-lab/releases/latest)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-One machine drives one Proxmox host over root SSH. The agent takes a lease,
-creates what it needs, and `lease-end` destroys those guests. The host powers
-off only when nothing else is running. Your SSH key is the only credential.
-Python 3.11 or newer, no extra packages, nothing to install on the host
-except an optional cleanup cron job.
+One machine, one Proxmox host, root SSH. Your key is the only credential.
+Python 3.11+, no extra packages.
 
-## Setup
+## 🚀 Setup
 
 ```bash
 ssh-copy-id root@your-proxmox-host
@@ -22,10 +19,9 @@ proxmox-lab init
 proxmox-lab doctor
 ```
 
-`init` writes a config. `doctor` checks SSH, the node, and the local store,
-and exits non-zero when something is wrong. Read its warnings.
+`init` writes the config. `doctor` checks SSH, the node and the store. Read its warnings. A template that is not `template: 1` will not be cloned.
 
-## One session
+## 🧪 One session
 
 ```bash
 L=$(proxmox-lab lease-begin --purpose "build a test rig" \
@@ -36,25 +32,51 @@ proxmox-lab guest create --lease "$L" --vmid 9101 --start
 proxmox-lab guest run --lease "$L" --vmid 9101 -- uname -a
 ```
 
-That clones your template into an unused VMID. If `doctor` warned that it
-is not `template: 1`, pass `--fresh` and an OS image instead (`--kind lxc`
-and `--ostemplate` for a container). Check the VMID is free first. A
-collision destroys a real machine.
+That clones your template into a free VMID. If `doctor` warned, use `--fresh` and an OS image instead (`--kind lxc --ostemplate …` for a container). A VMID collision destroys a real machine.
 
-If `lease-end` leaves the host up, it prints `reason`. That usually means
-your own guests are running. Leave the host up.
+`lease-end` destroys that lease's guests and leaves the host up. `"host_left_running": true` is the normal result.
 
-## Sharing a host
+## ⌨️ Commands
 
-Guests the lab creates are tagged `proxmoxagentlab`. Cleanup never stops or
-deletes a guest without that tag. The host stays on while any guest is
-running, including yours.
+| | Command | What it does |
+|---|---|---|
+| 🩺 | `proxmox-lab doctor` | Is the host reachable and the config sound? |
+| 📋 | `proxmox-lab status` | Host, leases and guests at a glance |
+| 🪪 | `proxmox-lab lease-begin --purpose "…"` | Open a lease. Nothing else mutates without one |
+| 💓 | `proxmox-lab lease-heartbeat --lease "$L"` | Keep a long session from expiring |
+| 🆕 | `proxmox-lab guest create --lease "$L" --vmid N --start` | Clone the template, or `--fresh` to build one |
+| ▶️ | `proxmox-lab guest run --lease "$L" --vmid N -- uname -a` | Run a command in the guest |
+| 📤 | `proxmox-lab push --lease "$L" --vmid N --file F --dest P` | Copy a file in |
+| 📥 | `proxmox-lab pull --lease "$L" --vmid N --remote P --out F` | Copy a file out |
+| 🔍 | `proxmox-lab guest probe --vmid N` | Can this guest be reached? |
+| 🧹 | `proxmox-lab lease-end --lease "$L"` | Destroy this lease's guests. Host stays up |
+| 🗑️ | `proxmox-lab guest destroy --lease "$L" --vmid N --confirm` | Delete one guest now |
+| 🧠 | `proxmox-lab memflow read --lease "$L" --vmid N --addr 0x1000` | Read a running qemu guest from outside it |
+| 🔌 | `proxmox-lab mcp` | The same operations as 29 tools over stdio |
 
-Agents should follow [SKILL.md](SKILL.md). The other docs are listed in
-[docs/README.md](docs/README.md). Memory reads of a lease-owned qemu guest
-are command-line only: [docs/memflow.md](docs/memflow.md).
+Agents follow [SKILL.md](SKILL.md). Everything else is in [docs/README.md](docs/README.md).
 
-`proxmox-lab mcp` serves the same operations as 29 tools over stdio.
+## 🔌 Power, if you want it
 
-MIT licensed. Only for machines you own or are allowed to test:
-[RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
+The host stays on. Turn automatic power-off on only for a machine that should sleep when the lab is idle:
+
+```toml
+[power]
+auto_shutdown = true
+```
+
+Then `lease-end`, the idle sweep and the cleanup cron power it off when nothing is running, and only after that is verified. Your own guests keep it up.
+
+Or power it off once, yourself:
+
+```bash
+proxmox-lab power shutdown --standalone-authorized
+proxmox-lab power wake --standalone-authorized
+proxmox-lab power status
+```
+
+## 🛡️ Sharing a host
+
+Guests the lab creates are tagged `proxmoxagentlab`. Cleanup never stops or deletes a guest without that tag.
+
+MIT licensed. Only for machines you own or are allowed to test: [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).

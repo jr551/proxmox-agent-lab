@@ -7,6 +7,14 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+## 0.20.0 - 2026-10-04
+
+### Changed
+
+- Automatic host power-off is off unless `[power] auto_shutdown` is true.
+  `lease-end`, the idle sweep and the host GC leave the host up.
+  `power shutdown --standalone-authorized` still powers it off on request.
+
 ### Added
 
 - `proxmox-lab memflow`: agentless memory introspection of a lease-owned,

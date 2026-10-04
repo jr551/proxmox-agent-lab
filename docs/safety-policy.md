@@ -51,7 +51,10 @@ power stay on the CLI.
    or destroyed: they are clone sources and read-only surface. `guest destroy`
    additionally refuses a readable guest config that carries no `proxmoxagentlab` tag —
    a machine somebody else owns can never be mistaken for ours.
-5. Host power-off is verified, never assumed. After `shutdown -h now` the host
+5. Automatic host power-off is off unless `[power] auto_shutdown` is true.
+   `lease-end`, the idle sweep and the host GC then leave the host up.
+   `power shutdown --standalone-authorized` is the explicit path and ignores
+   that switch. When a shutdown does run, it is verified, never assumed. After `shutdown -h now` the host
    is probed alternately over ssh and TCP :22; `host_powered_off` is `true`
    only after at least six consecutive all-fail rounds spanning at least 30
    seconds. A timeout reports `host_powered_off: false` and exits non-zero.

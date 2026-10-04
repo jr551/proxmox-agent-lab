@@ -45,6 +45,10 @@ STATE_DIR = "/var/lib/pxl-gc"
 #: GC's two-consecutive-clear-runs rule.
 CRON_MARKER = "# pxl-gc"
 CRON_LINE = "*/10 * * * * /usr/local/sbin/pxl-gc >>/var/log/pxl-gc.log 2>&1"
+CRON_LINE_AUTO = (
+    "*/10 * * * * PXL_GC_AUTO_SHUTDOWN=1 "
+    "/usr/local/sbin/pxl-gc >>/var/log/pxl-gc.log 2>&1"
+)
 CRON_BLOCK = CRON_MARKER + "\n" + CRON_LINE + "\n"
 
 #: The host-side log the crontab line appends to; ``gc status`` tails it.
@@ -105,12 +109,14 @@ def _strip_own_block(text: str) -> tuple[str, bool]:
     return body, len(kept) != len(lines)
 
 
-def _ensure_crontab(existing: str | None) -> tuple[str, str]:
+def _ensure_crontab(
+    existing: str | None, *, block: str = CRON_BLOCK
+) -> tuple[str, str]:
     """The crontab to write and what changed: added | replaced | unchanged."""
     if existing is None or not existing.strip():
-        return CRON_BLOCK, "added"
+        return block, "added"
     stripped, had_block = _strip_own_block(existing)
-    desired = stripped + CRON_BLOCK
+    desired = stripped + block
     if existing == desired:
         return existing, "unchanged"
     return desired, "replaced" if had_block else "added"
@@ -124,7 +130,7 @@ def _require_host_change(host_change: bool, action: str) -> None:
         )
 
 
-def install(ssh: Any, *, host_change: bool) -> dict:
+def install(ssh: Any, *, host_change: bool, auto_shutdown: bool = False) -> dict:
     """Ship the script, ensure the state dir, ensure exactly one crontab line.
 
     Raises ``PolicyError`` before the first ssh call unless ``host_change``;
@@ -167,7 +173,11 @@ def install(ssh: Any, *, host_change: bool) -> dict:
     if not state_dir.ok:
         raise GcError(f"creating {STATE_DIR} failed: {_text(state_dir.stderr)}")
     existing = _crontab_text(ssh, host_change=host_change)
-    desired, cron_change = _ensure_crontab(existing)
+    block = (
+        CRON_MARKER + "\n" + CRON_LINE_AUTO + "\n"
+        if auto_shutdown else CRON_BLOCK
+    )
+    desired, cron_change = _ensure_crontab(existing, block=block)
     if cron_change != "unchanged":
         written = ssh.run(
             ["crontab", "-"], stdin=desired.encode(), host_change=host_change
@@ -266,6 +276,13 @@ def cmd_install(lab: Any, args: Any) -> None:
     report = install(
         lab.ssh,
         host_change=bool(getattr(args, "host_change_authorized", False)),
+        auto_shutdown=bool(
+            getattr(
+                getattr(getattr(lab, "CONFIG", None), "power", None),
+                "auto_shutdown",
+                False,
+            )
+        ),
     )
     print(json.dumps(report, sort_keys=True))
 

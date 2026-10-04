@@ -319,6 +319,23 @@ def run_poweroff():
         log("poweroff command sent: " + " ".join(argv))
 
 
+def automatic_poweroff():
+    """True only when the operator opted in.
+
+    ``PXL_GC_AUTO_SHUTDOWN=1`` (what ``gc install`` writes into cron when
+    ``[power] auto_shutdown`` is true) or a stamp file ``auto-shutdown`` in
+    the state dir. Absent means the collector reaps guests and leaves the
+    host up.
+    """
+    raw = os.environ.get("PXL_GC_AUTO_SHUTDOWN", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    state = os.environ.get("PXL_GC_STATE_DIR") or DEFAULT_STATE_DIR
+    return os.path.isfile(os.path.join(state, "auto-shutdown"))
+
+
 def power_pass(enumerated, pinned, stopped, now, state_dir, dry, known):
     """Second duty: power the host off when idle across two clear runs >=10 min apart.
 
@@ -326,7 +343,12 @@ def power_pass(enumerated, pinned, stopped, now, state_dir, dry, known):
     is NOT "no guests running" -- a listing failure under a running untracked
     guest would otherwise power the host off under live work, so the duty
     refuses to judge and drops any clear stamp (fail closed, §F).
+
+    The duty itself is off unless automatic power-off was opted into.
     """
+    if not automatic_poweroff():
+        log("automatic power-off is off; host left up")
+        return
     if not known:
         log("not clear: guest enumeration failed; refusing to power off")
         try:

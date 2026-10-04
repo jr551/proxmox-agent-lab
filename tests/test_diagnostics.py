@@ -174,12 +174,13 @@ class InitTests(DiagnosticsTestCase):
             {
                 "ssh": ["target"],
                 "pve": ["node", "template_vmid"],
-                "power": ["broadcast", "mac", "port"],
+                "power": ["auto_shutdown", "broadcast", "mac", "port"],
                 "state": ["dir"],
                 "lease": ["idle_shutdown_seconds", "ttl_seconds"],
             },
         )
         self.assertEqual(parsed["power"]["mac"], "")
+        self.assertFalse(parsed["power"]["auto_shutdown"])
         self.assertIsNone(out["mac_discovered"])
         self.assertIn("warning", out)
         self.assertEqual(out["config"], str(path))

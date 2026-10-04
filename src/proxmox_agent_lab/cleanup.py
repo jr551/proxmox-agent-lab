@@ -157,14 +157,19 @@ def running_guest_vmids(lab: Any, api: Any) -> list[int]:
     )
 
 
-def host_power_policy(lab: Any) -> dict[str, Any]:
-    """Policy that would keep the host powered on regardless of leases.
+def auto_shutdown_enabled(lab: Any) -> bool:
+    """Whether lease-end, the idle sweep and the host GC may power the host off.
 
-    The old LXC-only VPS policy lived on ``[proxmox] guest_mode`` and died
-    with the API stack: the new config schema (rework plan §G) reads exactly
-    its own keys and has no such knob, so nothing keeps the host on by policy.
+    Off unless ``[power] auto_shutdown`` is true. ``power shutdown`` is a
+    separate, explicit request and does not consult this.
     """
-    return {}
+    power = getattr(getattr(lab, "CONFIG", None), "power", None)
+    return bool(getattr(power, "auto_shutdown", False))
+
+
+def host_power_policy(lab: Any) -> dict[str, Any]:
+    """Whether this config will power the host off on its own."""
+    return {"auto_shutdown": auto_shutdown_enabled(lab)}
 
 
 def _tcp_probe(target: str, port: int, timeout: float = 3.0) -> bool:
@@ -175,13 +180,23 @@ def _tcp_probe(target: str, port: int, timeout: float = 3.0) -> bool:
         return False
 
 
-def shutdown_host(lab: Any, api: Any) -> bool:
+def shutdown_host(lab: Any, api: Any, *, requested: bool = False) -> bool:
     """Shut the lab machine down and confirm it actually went off.
 
     Verified by repeated probe failure across ssh AND TCP (contract §2) --
     never assumed, and there is no force-off path any more: a host that
     refuses to die is reported, loudly.
+
+    Automatic callers (lease-end, the idle sweep) no-op unless
+    ``[power] auto_shutdown`` is true. ``requested=True`` is the explicit
+    ``power shutdown`` path and ignores that switch.
     """
+    if not requested and not auto_shutdown_enabled(lab):
+        lab.audit(
+            "lab-power-off-skipped",
+            reason="[power] auto_shutdown is false",
+        )
+        return False
     config = lab.CONFIG
     seam = _make_proxmox(config)
     transport = _ssh_of(seam)
@@ -676,9 +691,16 @@ def cmd_lease_end(lab: Any, args: argparse.Namespace) -> None:
     failures = finalize_lease(lab, seam, lease)
     others = leases_module.active_leases(lease_root, excluding=args.lease)
     host_powered_off = False
-    if not others:
+    skipped_auto = False
+    if not others and auto_shutdown_enabled(lab):
         # After every lease is closed -- and only then -- the host may go.
         host_powered_off = shutdown_host(lab, seam)
+    elif not others:
+        skipped_auto = True
+        lab.audit(
+            "lab-power-off-skipped",
+            reason="[power] auto_shutdown is false",
+        )
     lab.audit(
         "lease-end",
         lease=args.lease,
@@ -692,6 +714,7 @@ def cmd_lease_end(lab: Any, args: argparse.Namespace) -> None:
         "failures": failures,
         "remaining_active_leases": [x["id"] for x in others],
         "host_powered_off": host_powered_off,
+        **host_power_policy(lab),
     }
     if lease.get("transferred_resources"):
         result["left_to_another_lease"] = lease["transferred_resources"]
@@ -704,7 +727,16 @@ def cmd_lease_end(lab: Any, args: argparse.Namespace) -> None:
         )
     persistent = [x for x in others if leases_module.is_long_term(x)]
     left_up_on_purpose = False
-    if persistent:
+    if skipped_auto:
+        left_up_on_purpose = True
+        result["host_left_running"] = True
+        result["reason"] = (
+            "automatic host power-off is off ([power] auto_shutdown = false)"
+        )
+        result["to_power_off"] = (
+            "proxmox-lab power shutdown --standalone-authorized"
+        )
+    elif persistent:
         # Say this loudly. A machine left running is the surprise nobody
         # wants on their electricity bill.
         result["host_left_running"] = True
@@ -807,8 +839,13 @@ def cmd_lease_destroy(lab: Any, args: argparse.Namespace) -> None:
         leases_module.save_lease(lease_root, lease)
     others = leases_module.active_leases(lease_root, excluding=args.lease)
     host_powered_off = False
-    if not others:
+    if not others and auto_shutdown_enabled(lab):
         host_powered_off = shutdown_host(lab, seam)
+    elif not others:
+        lab.audit(
+            "lab-power-off-skipped",
+            reason="[power] auto_shutdown is false",
+        )
     lab.audit("long-term-destroyed", lease=args.lease, failures=failures,
               host_powered_off=host_powered_off)
     print(json.dumps({
@@ -1011,9 +1048,13 @@ def cmd_cleanup_expired(lab: Any, args: argparse.Namespace) -> None:
     idle_shutdown_triggered = False
     idle_seconds = leases_module.mcp_idle_elapsed(state_root)
     threshold_seconds = int(config.lease.idle_shutdown_seconds)
-    if not remaining and (cleaned or getattr(args, "all", False)):
+    if (
+        auto_shutdown_enabled(lab)
+        and not remaining
+        and (cleaned or getattr(args, "all", False))
+    ):
         host_powered_off = shutdown_host(lab, seam)
-    elif leases_module.mcp_idle_shutdown_due(
+    elif auto_shutdown_enabled(lab) and leases_module.mcp_idle_shutdown_due(
         state_root, idle_shutdown_seconds=threshold_seconds
     ):
         idle_shutdown_triggered = True

@@ -46,7 +46,8 @@ def fake_config() -> SimpleNamespace:
         pve=SimpleNamespace(node="pve", template_vmid=9000),
         lease=SimpleNamespace(ttl_seconds=7200, idle_shutdown_seconds=28800),
         power=SimpleNamespace(
-            mac="aa:bb:cc:dd:ee:ff", broadcast="255.255.255.255", port=9
+            mac="aa:bb:cc:dd:ee:ff", broadcast="255.255.255.255", port=9,
+            auto_shutdown=True,
         ),
     )
 
@@ -444,6 +445,17 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(self.lease_row(row["id"])["state"], "active")
 
     # -- host power-off -----------------------------------------------------
+
+    def test_end_leaves_the_host_up_when_auto_shutdown_is_off(self):
+        row = self.begin()
+        self.lab.CONFIG.power.auto_shutdown = False
+        payload, error = self.end(row)
+        self.assertIsNone(error)
+        self.assertFalse(payload["host_powered_off"])
+        self.assertFalse(payload["auto_shutdown"])
+        self.assertIn("auto_shutdown", payload["reason"])
+        self.assertFalse(self.power_off.called)
+        self.assertEqual(self.lease_row(row["id"])["state"], "ended")
 
     def test_end_stays_successful_when_other_guests_keep_the_host_up(self):
         row = self.begin()

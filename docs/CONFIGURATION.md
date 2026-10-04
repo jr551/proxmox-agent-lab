@@ -1,6 +1,6 @@
 # Configuration
 
-One TOML file is the entire configuration surface: nine keys, all site
+One TOML file is the entire configuration surface: ten keys, all site
 values, nothing secret. The control plane is ssh with your own agent and
 keys, so no credential ever belongs in this file — or on any command line.
 
@@ -38,6 +38,7 @@ template_vmid = 100          # default template for guest clone/create
 mac = ""                     # wired NIC MAC for Wake-on-LAN
 broadcast = "255.255.255.255"
 port = 9
+auto_shutdown = false        # true: power the host off when the lab is idle
 
 [state]
 dir = "~/.local/share/proxmox-agent-lab"   # lab.db lives here
@@ -67,6 +68,7 @@ idle_shutdown_seconds = 28800
 | `mac` | *(unset)* | The wired NIC's MAC address, used to build the Wake-on-LAN packet. Read it on the host console with `ip -br link show` and take the interface that carries your LAN IP — usually `enp*`/`eno*`, not `vmbr0`. |
 | `broadcast` | `255.255.255.255` | Where magic packets are sent. If your router drops the global broadcast, set your LAN's directed broadcast instead (e.g. `192.168.1.255`). |
 | `port` | `9` | UDP destination port of the magic packet. |
+| `auto_shutdown` | `false` | When true, `lease-end`, the idle sweep and the host GC power the host off once nothing is running, and only after that shutdown is verified. When false (the default) those paths leave the host up. `power shutdown --standalone-authorized` still works either way. |
 
 ### `[state]`
 
@@ -79,7 +81,7 @@ idle_shutdown_seconds = 28800
 | Key | Default | Meaning |
 |---|---|---|
 | `ttl_seconds` | `7200` | How long a lease lives without a heartbeat. A lease not renewed inside this window is swept: its guests are destroyed and its resources released. |
-| `idle_shutdown_seconds` | `28800` | With no active lease and no MCP tool call for this long, the host is shut down — verified by probing until it stops answering, never assumed. Every MCP tool call refreshes the clock. |
+| `idle_shutdown_seconds` | `28800` | How long the lab must sit with no active lease and no MCP tool call before an idle sweep *may* power the host off. It does so only when `[power] auto_shutdown` is true, and only after the shutdown is verified. Every MCP tool call refreshes the clock. |
 
 ## Environment variables
 

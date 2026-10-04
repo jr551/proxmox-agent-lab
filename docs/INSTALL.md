@@ -111,8 +111,10 @@ description: pxl-lease=<id> pxl-expiry=<epoch>
 
 - A guest **without** a `proxmoxagentlab` tag is never destroyed, stopped or reclaimed.
 - Lab guests are visible in the normal web UI; filter by the `proxmoxagentlab` tag.
-- The host is powered off only when nothing is running — including your own
+- The host is not powered off unless `[power] auto_shutdown` is true. Even
+  then it powers off only when nothing is running — including your own
   unlabelled guests — and only after two clear checks minutes apart.
+  `power shutdown --standalone-authorized` is the explicit command.
 - Pick storage and VMIDs that do not collide with your own:
   `guest create --storage <name> --disk-gb <n> --vmid <id>`.
 

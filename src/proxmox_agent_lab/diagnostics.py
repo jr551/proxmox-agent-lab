@@ -46,6 +46,7 @@ template_vmid = 100          # clone source; must be template: 1, or create refu
 mac = ""                     # wired NIC MAC for WoL (discovered by init)
 broadcast = "255.255.255.255"
 port = 9
+auto_shutdown = false        # true: power off when the lab is idle
 
 [state]
 dir = "~/.local/share/proxmox-agent-lab"   # lab.db lives here
